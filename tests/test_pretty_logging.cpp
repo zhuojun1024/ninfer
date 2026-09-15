@@ -179,8 +179,7 @@ int main() {
             startup_output.find("loading weights | 16.0 GiB") != std::string::npos &&
             startup_output.find("weights ready | 16.0 GiB | 2.0s | 8.00 GiB/s") !=
                 std::string::npos &&
-            startup_output.find(
-                "engine ready | qwen3.6-27b | formats q4_g64_fp16,q8_g32_fp16 | total 3.0s") !=
+            startup_output.find("engine ready | qwen3.6-27b | total 3.0s | weights 16.0 GiB") !=
                 std::string::npos &&
             startup_output.find("CUDA initialized") == std::string::npos,
         "normal startup pretty output is noisy or incomplete");

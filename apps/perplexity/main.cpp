@@ -414,7 +414,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     std::filesystem::rename(temporary, final);
 
     std::cout << "Perplexity result\n"
-              << "artifact: " << load.model_name << " / " << load.prefill_signature << '\n'
+              << "artifact: " << load.model_name << '\n'
               << "kv: " << kv_name(options.kv) << ", corpus: " << corpus.corpus_id << " / "
               << corpus.mode << ", context/stride: " << options.context << '/' << options.stride
               << "\n\n";

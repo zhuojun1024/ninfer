@@ -303,14 +303,8 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
     const double total_seconds = impl_->engine_elapsed_ns != 0
                                      ? static_cast<double>(impl_->engine_elapsed_ns) * 1.0e-9
                                      : load.load_seconds;
-    std::ostringstream formats;
-    for (std::size_t i = 0; i < load.weight_formats.size(); ++i) {
-        if (i != 0) { formats << ','; }
-        formats << load.weight_formats[i];
-    }
-    impl_->logger->info("engine ready | {} | formats {} | total {} | weights {}",
-                        format_pretty_text(load.model_name), format_pretty_text(formats.str()),
-                        format_pretty_duration(total_seconds),
+    impl_->logger->info("engine ready | {} | total {} | weights {}",
+                        format_pretty_text(load.model_name), format_pretty_duration(total_seconds),
                         format_pretty_bytes(load.host_to_device_bytes));
     impl_->logger->debug(
         "load detail | architecture {} | artifact read {} | H2D {} | staging peak {} | device "
