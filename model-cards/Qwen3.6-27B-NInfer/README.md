@@ -71,11 +71,13 @@ only for NInfer; it is not a Transformers checkpoint, Safetensors distribution, 
 | Field | Value |
 |---|---|
 | Filename | `qwen3_6_27b.ninfer` |
-| Size | 17,495,537,920 bytes (16.29 GiB) |
-| SHA-256 | `842f0ba90aab6ea3481b28e65872d85ae17007a0b93e25b3490ea2fa6153fdf7` |
+| Size | 17,495,538,688 bytes (16.29 GiB) |
+| SHA-256 | `9b610a7d051e7c4dbf89adb604bd269d248b643c8f6c7ef75bdb871af92c6f6b` |
 | Container version | 3 |
 | Architecture | `Qwen3_5ForCausalLM` |
 | Public model name | `qwen3.6-27b` |
+| Chat template | [qwen3_6.jinja](https://github.com/Neroued/ninfer/blob/98dada0e03cb073fd07f905400b5904bc6e82759/tools/chat_templates/qwen3_6.jinja); override with `--chat-template FILE` |
+| Template defaults | thinking on; closed-turn reasoning omitted |
 
 The file contains Text, Vision, MTP, the optimized proposal head, and frontend resources. Text
 projections use Q4/Q5, vocabulary weights use Q6, and MTP projections use Q8. Vision and speculative
@@ -85,14 +87,14 @@ Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  '842f0ba90aab6ea3481b28e65872d85ae17007a0b93e25b3490ea2fa6153fdf7' \
+  '9b610a7d051e7c4dbf89adb604bd269d248b643c8f6c7ef75bdb871af92c6f6b' \
   'qwen3_6_27b.ninfer' | sha256sum --check
 ```
 
 ## Requirements
 
 - [NInfer](https://github.com/Neroued/ninfer) revision
-  [`04350ba`](https://github.com/Neroued/ninfer/commit/04350ba94c203833598ba1a41943031c468208f1)
+  [`98dada0`](https://github.com/Neroued/ninfer/commit/98dada0e03cb073fd07f905400b5904bc6e82759)
   or later, built from source;
 - 64-bit Linux;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
@@ -253,7 +255,7 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 | Source revision | `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9` |
 | Conversion recipe | `qwen3_6_27b` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
-| Minimum runtime revision | `04350ba94c203833598ba1a41943031c468208f1` |
+| Minimum runtime revision | `98dada0e03cb073fd07f905400b5904bc6e82759` |
 
 The artifact identity, summarized object inventory, and conversion provenance are published in
 [`artifact-manifest.json`](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/blob/main/artifact-manifest.json).

@@ -110,11 +110,13 @@ only for NInfer; it is not a Transformers checkpoint, Safetensors distribution, 
 | Field | Value |
 |---|---|
 | Filename | `qwen3_8_27b.ninfer` |
-| Size | 20,437,520,896 bytes (19.03 GiB) |
-| SHA-256 | `e91dbf53b99ffd2dc2d83f51fb3dfa0ae0b193f6cf9b439050b8a7e5769c6a5c` |
+| Size | 20,437,521,664 bytes (19.03 GiB) |
+| SHA-256 | `81f924d440c27261d820c19a9f8d45794c5aee410f8a68bd358133fa8c0375da` |
 | Container version | 3 |
 | Architecture | `Qwen3_5ForCausalLM` |
 | Public model name | `qwen3.8-27b` |
+| Chat template | [qwen3_8.jinja](https://github.com/Neroued/ninfer/blob/98dada0e03cb073fd07f905400b5904bc6e82759/tools/chat_templates/qwen3_8.jinja); override with `--chat-template FILE` |
+| Template defaults | thinking on; effort `xhigh`; closed-turn reasoning retained |
 | Stored objects | 1,190 (1,184 tensors and 6 resources) |
 
 The Text body uses Q4/Q5 projections, while the token embedding and full output head use
@@ -125,7 +127,7 @@ Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  'e91dbf53b99ffd2dc2d83f51fb3dfa0ae0b193f6cf9b439050b8a7e5769c6a5c' \
+  '81f924d440c27261d820c19a9f8d45794c5aee410f8a68bd358133fa8c0375da' \
   'qwen3_8_27b.ninfer' | sha256sum --check
 ```
 
@@ -139,7 +141,7 @@ retain their stated MTP configurations and revisions.
 ## Requirements
 
 - [NInfer](https://github.com/Neroued/ninfer) revision
-  [`04350ba9`](https://github.com/Neroued/ninfer/commit/04350ba94c203833598ba1a41943031c468208f1)
+  [`04350ba9`](https://github.com/Neroued/ninfer/commit/98dada0e03cb073fd07f905400b5904bc6e82759)
   or later, built from source;
 - 64-bit Linux or native Windows;
 - an NVIDIA GeForce RTX 5090, or two identical RTX 5060 Ti cards (TP-2, server
@@ -267,7 +269,7 @@ card reports no AIME results.
 | Download source | `modelscope.cn/models/Qwen/Qwen3.8-27B` |
 | Conversion recipe | `qwen3_8_27b` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
-| Minimum runtime revision | `04350ba94c203833598ba1a41943031c468208f1` |
+| Minimum runtime revision | `98dada0e03cb073fd07f905400b5904bc6e82759` |
 | Ranking input SHA-256 | `c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5` |
 
 The local source configuration, tensor index, frontend resources, and published CRC32 inventory

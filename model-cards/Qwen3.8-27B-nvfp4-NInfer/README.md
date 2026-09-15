@@ -123,11 +123,13 @@ use row-scaled FP8. Control weights use BF16, with separate MTP, Vision and DFla
 | Field | Value |
 |---|---|
 | Filename | `qwen3_8_27b_nvfp4.ninfer` |
-| Size | 23,719,715,076 bytes (22.09 GiB) |
-| SHA-256 | `f30f254f404a990a1ce395f3d3345ac4eaa3179e090e6bae4d1774461672e85f` |
+| Size | 23,719,715,844 bytes (22.09 GiB) |
+| SHA-256 | `74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82` |
 | Container version | 3 |
 | Architecture | `Qwen3_5ForCausalLM` |
 | Public model name | `qwen3.8-27b` |
+| Chat template | [qwen3_8.jinja](https://github.com/Neroued/ninfer/blob/98dada0e03cb073fd07f905400b5904bc6e82759/tools/chat_templates/qwen3_8.jinja); override with `--chat-template FILE` |
+| Template defaults | thinking on; effort `xhigh`; closed-turn reasoning retained |
 | Stored objects | 1,246 (1,240 tensors and 6 resources) |
 | NVFP4 tensors | 112 |
 | Row-scaled FP8 tensors | 146 |
@@ -141,7 +143,7 @@ Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  'f30f254f404a990a1ce395f3d3345ac4eaa3179e090e6bae4d1774461672e85f' \
+  '74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82' \
   'qwen3_8_27b_nvfp4.ninfer' | sha256sum --check
 ```
 
@@ -155,7 +157,7 @@ retain their stated MTP configurations and revisions.
 ## Requirements
 
 - [NInfer](https://github.com/Neroued/ninfer) revision
-  [`04350ba9`](https://github.com/Neroued/ninfer/commit/04350ba94c203833598ba1a41943031c468208f1)
+  [`04350ba9`](https://github.com/Neroued/ninfer/commit/98dada0e03cb073fd07f905400b5904bc6e82759)
   or later, built from source;
 - 64-bit Linux or native Windows;
 - an NVIDIA GeForce RTX 5090, or two identical RTX 5060 Ti cards (TP-2, server
@@ -365,7 +367,7 @@ AIME results.
 | Conversion recipe | `qwen3_8_27b_nvfp4` |
 | Embedding encoder | `fp8_row_maxabs` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
-| Minimum runtime revision | `04350ba94c203833598ba1a41943031c468208f1` |
+| Minimum runtime revision | `98dada0e03cb073fd07f905400b5904bc6e82759` |
 | Ranking input SHA-256 | `c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5` |
 
 The artifact identity, summarized object inventory, and conversion provenance are published in
