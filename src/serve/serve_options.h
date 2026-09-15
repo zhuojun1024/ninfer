@@ -22,6 +22,7 @@ inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;
+    std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
     std::string api_key;                          // empty => no auth
@@ -51,9 +52,8 @@ struct ServeOptions {
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
-    bool enable_thinking =
-        true; // default thinking mode for the generation prompt (--no-thinking opts out)
-    bool preserve_thinking = false;
+    std::optional<bool> enable_thinking;
+    std::optional<bool> preserve_thinking;
     // Process-level default reasoning effort for thinking-enabled requests that do not select one.
     // Unset keeps the loaded chat template's own default; --reasoning-effort names one explicitly.
     std::optional<ninfer::ReasoningEffort> default_reasoning_effort;

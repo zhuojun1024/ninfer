@@ -49,6 +49,8 @@ Alternatively, `cmake --preset dev` enables products, tests and benchmarks toget
 After building, `ctest --preset dev` runs the same CTest suite. See
 [Build system](../docs/maintainer/build-system.md) for local interpreter presets.
 
+The chat-template reference test uses Python Jinja2.
+
 Run a focused target for a localized change:
 
 ```bash

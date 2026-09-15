@@ -47,3 +47,11 @@ set_tests_properties(
 ninfer_add_test(ninfer_host_timing_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_timing.cpp"
   LIBRARIES ninfer_core)
+
+ninfer_add_test(ninfer_jinja_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_jinja.cpp"
+  LIBRARIES ninfer_jinja ninfer::json)
+
+add_test(NAME ninfer_chat_templates_test
+  COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_chat_templates.py
+          $<TARGET_FILE:ninfer_jinja_test>)

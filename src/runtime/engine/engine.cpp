@@ -220,10 +220,10 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const SamplingMode sampling_mode =
-        input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
     auto prepared      = impl_->frontend_->prepare(std::move(input), control);
     PromptSummary info = prepared.summary();
+    const SamplingMode sampling_mode =
+        info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
     if (info.prompt_tokens > impl_->capacity) {
         throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
     }

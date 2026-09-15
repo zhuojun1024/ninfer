@@ -16,10 +16,11 @@ namespace ninfer::serve {
 using MediaAcquirer = std::function<ninfer::OwnedMedia(const ContentPart&)>;
 
 struct ResolvedPromptSemantics {
-    bool enable_thinking = true;
+    std::optional<bool> enable_thinking;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
     std::optional<ninfer::ReasoningEffort> effective_reasoning_effort;
-    bool preserve_thinking = false;
+    std::optional<bool> preserve_thinking;
+    std::string chat_template_kwargs_json;
 };
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
