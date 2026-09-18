@@ -42,6 +42,9 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
+    // Second device for tensor-parallel (TP-2) generation. -1 (default) selects the single-GPU
+    // path; set via --devices <a>,<b> to run the dedicated TP-2 core across two GPUs.
+    int device_b                           = -1;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;

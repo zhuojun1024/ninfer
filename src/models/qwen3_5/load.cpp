@@ -1,9 +1,13 @@
 #include "models/qwen3_5/load.h"
 
 #include "artifact/reader.h"
+#include "core/tp/tp_materialize.h"
 #include "models/qwen3_5/load/bindings.h"
+#include "models/qwen3_5/load/tp_shard_views.h"
+#include "models/qwen3_5/load/tp_split_spec.h"
 
 #include <utility>
+#include <vector>
 
 namespace ninfer::models::qwen3_5 {
 
@@ -116,6 +120,25 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions
                                   DeviceContext& device, const StartupObserver* observer) {
     artifact::Reader reader(path);
     return materialize_model(plan_load(reader, options), device, observer);
+}
+
+std::pair<std::unique_ptr<Model>, std::unique_ptr<Model>>
+materialize_model_tp2(LoadPlan&& plan, DeviceContext& device0, DeviceContext& device1,
+                      const StartupObserver* observer) {
+    if (!plan.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
+    auto data    = std::move(plan.impl_);
+    const auto& directory = data->materialization.source->directory();
+    const auto spec       = loading::build_tp_split_spec(directory, data->config.text);
+    auto [backing0, backing1] =
+        tp::materialize_tp2(*data->materialization.source, data->materialization, device0,
+                            device1, spec, observer);
+    auto bound0 = loading::shard_views(data->pending, directory, backing0, spec, 0);
+    auto bound1 = loading::shard_views(data->pending, directory, backing1, spec, 1);
+    auto model0 = make_shard_model(data->config, data->options, data->weights, std::move(bound0),
+                                   data->resources, data->info, std::move(backing0));
+    auto model1 = make_shard_model(data->config, data->options, data->weights, std::move(bound1),
+                                   data->resources, data->info, std::move(backing1));
+    return {std::move(model0), std::move(model1)};
 }
 
 } // namespace ninfer::models::qwen3_5

@@ -8,6 +8,7 @@
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/tp2_generation_core.h"
 
 #include <algorithm>
 #include <limits>
@@ -148,38 +149,58 @@ class Engine::Impl {
 public:
     using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
     using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
+    using TP2Core        = runtime::TP2GenerationCore;
     using Core =
-        std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>>;
+        std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
+                     std::unique_ptr<TP2Core>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(std::move(engine_options))),
-          device(initialize_device(options)) {
+        : options(runtime::normalize_engine_options(std::move(engine_options))) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
-        auto constructed  = runtime::construct_model(options, device);
-        active            = std::move(constructed.instance);
-        load              = std::move(constructed.load);
-        sampling_defaults = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
-        if (options.purpose == EnginePurpose::CausalScoring) {
-            core = std::make_unique<ScoringCore>(*active, device);
+        if (options.device_b >= 0) {
+            // Dedicated tensor-parallel (TP-2) core: it owns both device contexts and its own
+            // Frontend, so the single-GPU device and ModelInstance are not constructed.
+            auto tp2_core = std::make_unique<TP2Core>(options, options.device, options.device_b);
+            load            = tp2_core->load_summary();
+            frontend_       = std::make_unique<models::qwen3_5::Frontend>(tp2_core->frontend());
+            capacity        = options.max_context;
+            sampling_defaults = frontend_->sampling_defaults();
+            core            = std::move(tp2_core);
         } else {
-            core = std::make_unique<GenerationCore>(*active, device, options,
-                                                    std::move(constructed.context_cost));
+            device = initialize_device(options);
+            auto constructed = runtime::construct_model(options, device);
+            active          = std::move(constructed.instance);
+            load            = std::move(constructed.load);
+            frontend_       = std::make_unique<models::qwen3_5::Frontend>(active->frontend);
+            capacity        = active->capacity;
+            sampling_defaults = active->frontend.sampling_defaults();
+            if (options.purpose == EnginePurpose::CausalScoring) {
+                core = std::make_unique<ScoringCore>(*active, device);
+            } else {
+                core = std::make_unique<GenerationCore>(*active, device, options,
+                                                        std::move(constructed.context_cost));
+            }
         }
         finalize_phase.complete();
     }
 
     ~Impl() noexcept {
-        device.bind_to_current_thread_noexcept();
         core.emplace<std::monostate>();
-        try {
-            device.synchronize();
-        } catch (...) {}
+        // The TP-2 core owns its own device contexts; the single-GPU path owns the device member.
+        if (active != nullptr) {
+            device.bind_to_current_thread_noexcept();
+            try {
+                device.synchronize();
+            } catch (...) {}
+        }
     }
 
     EngineOptions options;
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
+    std::unique_ptr<models::qwen3_5::Frontend> frontend_;
+    std::uint32_t capacity = 0;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     Core core;
@@ -201,9 +222,9 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     const SamplingMode sampling_mode =
         input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    auto prepared      = impl_->active->frontend.prepare(std::move(input), control);
+    auto prepared      = impl_->frontend_->prepare(std::move(input), control);
     PromptSummary info = prepared.summary();
-    if (info.prompt_tokens > impl_->active->capacity) {
+    if (info.prompt_tokens > impl_->capacity) {
         throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
     }
     const PromptPreparationStats preparation = prepared.preparation_stats();
@@ -216,14 +237,14 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    if (token_ids.size() > impl_->active->capacity) {
+    if (token_ids.size() > impl_->capacity) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           context_capacity_error(token_ids.size(), impl_->active->capacity));
+                           context_capacity_error(token_ids.size(), impl_->capacity));
     }
     auto prepared =
-        impl_->active->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
+        impl_->frontend_->prepare_tokens(std::move(token_ids), allow_prefix_identity);
     PromptSummary info = prepared.summary();
-    if (info.prompt_tokens > impl_->active->capacity) {
+    if (info.prompt_tokens > impl_->capacity) {
         throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
     }
     const PromptPreparationStats preparation = prepared.preparation_stats();
@@ -233,7 +254,7 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->active->frontend.tokenize_text(text);
+    return impl_->frontend_->tokenize_text(text);
 }
 
 std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
@@ -269,12 +290,12 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->active->frontend.count_tokens(std::move(input), control);
+    return impl_->frontend_->count_tokens(std::move(input), control);
 }
 
 PromptCapabilities Engine::prompt_capabilities() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->active->frontend.prompt_capabilities();
+    return impl_->frontend_->prompt_capabilities();
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -386,7 +407,7 @@ MemorySummary Engine::memory_summary() const {
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->active->frontend.media_cache_summary();
+    return impl_->frontend_->media_cache_summary();
 }
 
 RuntimeStats Engine::runtime_stats() const {

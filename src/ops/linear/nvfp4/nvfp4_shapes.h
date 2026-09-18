@@ -15,4 +15,10 @@ extern const Nvfp4LinearShape kNvfp4N16384K5120;
 extern const Nvfp4LinearShape kNvfp4N34816K5120;
 extern const Nvfp4LinearShape kNvfp4N5120K6144;
 extern const Nvfp4LinearShape kNvfp4N5120K17408;
+// TP-2 half-size shapes (column-parallel: N/2; row-parallel: K/2).
+extern const Nvfp4LinearShape kNvfp4N7168K5120;    ///< gdn_input_proj shard (14336/2)
+extern const Nvfp4LinearShape kNvfp4N8192K5120;    ///< QKV shard (16384/2)
+extern const Nvfp4LinearShape kNvfp4N17408K5120;   ///< gate+up shard (34816/2)
+extern const Nvfp4LinearShape kNvfp4N5120K3072;    ///< o_proj shard (6144/2)
+extern const Nvfp4LinearShape kNvfp4N5120K8704;    ///< down_proj shard (17408/2)
 } // namespace ninfer::ops::detail

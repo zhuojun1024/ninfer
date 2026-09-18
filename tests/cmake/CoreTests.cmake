@@ -7,6 +7,10 @@ add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_tp_device_pair_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tp_device_pair.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cpp"
   LIBRARIES ninfer_core)
 
@@ -33,6 +37,7 @@ ninfer_add_test(ninfer_gdn_replay_records_test
 
 set_tests_properties(
   ninfer_device_test
+  ninfer_tp_device_pair_test
   ninfer_decode_graph_test
   ninfer_arena_test
   ninfer_kv_cache_test

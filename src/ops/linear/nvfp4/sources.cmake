@@ -7,6 +7,12 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n34816_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k6144.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k17408.cu"
+  # TP-2 half-size shapes.
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n7168_k5120.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n8192_k5120.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n17408_k5120.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k3072.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k8704.cu"
 )
 
 target_sources(ninfer_nvfp4_non_rdc PRIVATE

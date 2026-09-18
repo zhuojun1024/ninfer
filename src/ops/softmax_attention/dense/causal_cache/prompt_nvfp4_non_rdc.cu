@@ -13,10 +13,17 @@ namespace {
 template <typename Geometry, typename CacheView, typename Metadata>
 void launch_for(const Tensor& q, const Tensor& positions, float scale, const CacheView& cache,
                 Metadata metadata, Tensor& out, cudaStream_t stream) {
-    static const cudaError_t attr = cudaFuncSetAttribute(
-        causal_attention_prompt_nvfp4_kernel<Geometry, Metadata>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptNvfp4SmemBytes);
-    CUDA_CHECK(attr);
+    // Per-device opt-in: a function-local static would configure only the first shard's device.
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    static bool attr_done[64] = {};
+    const int attr_slot = (device >= 0 && device < 64) ? device : 0;
+    if (!attr_done[attr_slot]) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            causal_attention_prompt_nvfp4_kernel<Geometry, Metadata>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptNvfp4SmemBytes));
+        attr_done[attr_slot] = true;
+    }
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const dim3 grid(static_cast<unsigned>(div_up(tokens, kCausalPromptNvfp4Br)),
@@ -38,6 +45,10 @@ void dispatch(const Tensor& q, const Tensor& positions, float scale, const Cache
               Metadata metadata, Tensor& out, cudaStream_t stream) {
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         launch_for<CausalD256H24Kv4>(q, positions, scale, cache, metadata, out, stream);
+        return;
+    }
+    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
+        launch_for<CausalD256H12Kv2>(q, positions, scale, cache, metadata, out, stream);
         return;
     }
     launch_for<CausalD256H16Kv2>(q, positions, scale, cache, metadata, out, stream);

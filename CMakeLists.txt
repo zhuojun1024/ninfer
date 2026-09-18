@@ -14,6 +14,18 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
+# WSL2's virtualized driver (591.x) segfaults inside the driver JIT compiler
+# during CUDA initialization with the dynamically linked CUDA 13.1 runtime;
+# the static runtime avoids that path. Off by default: native builds keep the
+# dynamic runtime.
+option(NINFER_STATIC_CUDART "Link the CUDA runtime statically" OFF)
+if(NINFER_STATIC_CUDART)
+  set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+  set(NINFER_CUDART_TARGET CUDA::cudart_static)
+else()
+  set(NINFER_CUDART_TARGET CUDA::cudart)
+endif()
+
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)

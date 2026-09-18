@@ -20,12 +20,16 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                                                   cudaStream_t stream) {
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
-    // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
-    static const cudaError_t attr_bf16 =
+    // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling. The opt-in
+    // attribute is per-device (cudaFuncSetAttribute configures the current device's copy of the
+    // kernel), so it must be applied on every launch rather than once per process: a TP-2 forward
+    // runs the same kernel on two devices, and the second device's copy would otherwise keep the
+    // 48 KiB default and reject the 96 KiB launch. Idempotent, so the per-call cost is negligible.
+    const cudaError_t attr_bf16 =
         cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptSmemBytes);
     CUDA_CHECK(attr_bf16);
-    static const cudaError_t attr_i8 =
+    const cudaError_t attr_i8 =
         cudaFuncSetAttribute(causal_attention_prompt_i8_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
     CUDA_CHECK(attr_i8);
@@ -82,6 +86,11 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
                                                                        metadata, out, stream);
         return;
     }
+    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
+        causal_attention_prompt_attention_launch_for<CausalD256H12Kv2>(q, positions, scale, cache,
+                                                                       metadata, out, stream);
+        return;
+    }
     causal_attention_prompt_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,
                                                                    metadata, out, stream);
 }
@@ -117,6 +126,11 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
         if (q.ne[1] == CausalD256H24Kv4::QHeads) {
             causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(
                 q, positions, scale, cache, metadata, out, stream);
+            return;
+        }
+        if (q.ne[1] == CausalD256H12Kv2::QHeads) {
+            causal_attention_prompt_attention_launch_for<CausalD256H12Kv2>(q, positions, scale, cache,
+                                                                           metadata, out, stream);
             return;
         }
         causal_attention_prompt_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,

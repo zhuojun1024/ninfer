@@ -66,6 +66,37 @@ void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stre
                                cudaMemcpyHostToDevice, stream));
 }
 
+// Materialize a contiguous [rows, columns] block of a fused projection output whose row blocks
+// (q|k|gate|v for attention, q|k|v|z for GDN) are concatenated along dim 0. Dim 0 is the innermost
+// (contiguous) axis of every activation tensor in this file, so a row sub-block of a wider parent is
+// a strided window: at T == 1 the slice degenerates to a single column and stays contiguous, which
+// is why the single-token decode path can alias it directly, but a batched prefill must materialize
+// the block before handing it to ops that require contiguous operands (rmsnorm, RoPE, the paged
+// attention, the split convolution, gated_delta_net).
+void copy_row_block(const Tensor& parent, std::int32_t row_begin, std::int32_t rows, Tensor& dst,
+                    cudaStream_t stream) {
+    const std::int32_t parent_rows = parent.ne[0];
+    const std::int32_t columns     = parent.ne[1];
+    if (parent.ne[2] != 1 || parent.ne[3] != 1 || !parent.is_contiguous() || parent.data == nullptr) {
+        throw std::invalid_argument("copy_row_block: parent must be a contiguous matrix");
+    }
+    if (rows <= 0 || columns <= 0 || row_begin < 0 || rows > parent_rows - row_begin) {
+        throw std::invalid_argument("copy_row_block: invalid row range");
+    }
+    if (dst.dtype != parent.dtype || dst.ne[0] != rows || dst.ne[1] != columns || dst.ne[2] != 1 ||
+        dst.ne[3] != 1 || !dst.is_contiguous() || dst.data == nullptr) {
+        throw std::invalid_argument("copy_row_block: destination must be a contiguous [rows, cols]");
+    }
+    const std::size_t element = dtype_size(parent.dtype);
+    CUDA_CHECK(cudaMemcpy2DAsync(dst.data, static_cast<std::size_t>(rows) * element,
+                                 static_cast<const unsigned char*>(parent.data) +
+                                     static_cast<std::size_t>(row_begin) * element,
+                                 static_cast<std::size_t>(parent_rows) * element,
+                                 static_cast<std::size_t>(rows) * element,
+                                 static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice,
+                                 stream));
+}
+
 void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<std::int32_t> shape,
                           const char* label) {
     if (t.dtype != dtype) { throw std::invalid_argument(std::string(label) + " dtype mismatch"); }
@@ -837,49 +868,77 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
-    const auto& p  = std::get<AttentionParameters>(w.mixer);
-    cudaStream_t s = ctx_.stream;
+void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph,
+                           Tensor* delta) {
+    const auto& p   = std::get<AttentionParameters>(w.mixer);
+    const auto& cfg = shard_config();
+    cudaStream_t s  = ctx_.stream;
     const int T    = x.ne[1];
     if (active_causal_attention_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
 
-    const auto projection = workspace::text_attention_projection(work_, config_, T);
-    Tensor h              = projection.hidden;
-    ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
+    auto projection = workspace::text_attention_projection(work_, cfg, T);
+    Tensor h        = projection.hidden;
+    ops::rmsnorm(x, w.input_norm, cfg.rms_norm_eps, true, h, s);
 
-    Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
-                                              dimension(config_.attention->num_attention_heads), T});
-    Tensor gate      = projection.gate.view({dimension(config_.attention->head_dim),
-                                             dimension(config_.attention->num_attention_heads), T});
-    Tensor k         = projection.key.view({dimension(config_.attention->head_dim),
-                                            dimension(config_.attention->num_key_value_heads), T});
-    Tensor v         = projection.value.view({dimension(config_.attention->head_dim),
-                                              dimension(config_.attention->num_key_value_heads), T});
-    Tensor q_flat    = q.view({dimension(config_.attention->query_width()), T});
-    Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
-    Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
-    Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
-    attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    Tensor q         = projection.query.view({dimension(cfg.attention->head_dim),
+                                              dimension(cfg.attention->num_attention_heads), T});
+    Tensor gate      = projection.gate.view({dimension(cfg.attention->head_dim),
+                                             dimension(cfg.attention->num_attention_heads), T});
+    Tensor k         = projection.key.view({dimension(cfg.attention->head_dim),
+                                            dimension(cfg.attention->num_key_value_heads), T});
+    Tensor v         = projection.value.view({dimension(cfg.attention->head_dim),
+                                              dimension(cfg.attention->num_key_value_heads), T});
+    // The fused QKV+gate projection is a single GEMM whose output rows are laid out
+    // [q | k | gate | v]. The per-shard fused weight (q/gate rows halved, k/v rows unchanged)
+    // is run through the generic linear op, then the output is viewed into q/k/gate/v. This
+    // mirrors the FFN-delta decomposition and avoids the shape-specific fused attn GEMM kernels
+    // (which are registered for the full-model row counts only).
+    const std::int32_t q_rows  = dimension(cfg.attention->query_width());
+    const std::int32_t k_rows  = dimension(cfg.attention->key_width());
+    const std::int32_t fused_n = 2 * q_rows + 2 * k_rows;
+    Tensor fused = work_.alloc(DType::BF16, {fused_n, T});
+    const auto& proj_w = std::get<LinearParameters>(p.projection);
+    ops::linear(h, proj_w.weight, fused, proj_w.policy, work_, s);
+    if (T > 1) {
+        // Batched width: the four blocks are strided row windows of the fused output, so they are
+        // materialized into the (already sized) workspace projection buffers.
+        copy_row_block(fused, 0, q_rows, projection.query, s);
+        copy_row_block(fused, q_rows, k_rows, projection.key, s);
+        copy_row_block(fused, q_rows + k_rows, q_rows, projection.gate, s);
+        copy_row_block(fused, 2 * q_rows + k_rows, k_rows, projection.value, s);
+    } else {
+        // Single column: the slices are contiguous, so q/k/gate/v alias the fused buffer directly.
+        q    = fused.slice(0, 0, q_rows).view({dimension(cfg.attention->head_dim),
+                                               dimension(cfg.attention->num_attention_heads), T});
+        k    = fused.slice(0, q_rows, k_rows).view({dimension(cfg.attention->head_dim),
+                                                    dimension(cfg.attention->num_key_value_heads), T});
+        gate = fused.slice(0, q_rows + k_rows, q_rows)
+                   .view({dimension(cfg.attention->head_dim),
+                          dimension(cfg.attention->num_attention_heads), T});
+        v    = fused.slice(0, 2 * q_rows + k_rows, k_rows)
+                   .view({dimension(cfg.attention->head_dim),
+                          dimension(cfg.attention->num_key_value_heads), T});
+    }
 
-    const auto results = workspace::text_attention_results(work_, config_, T);
+    const auto results = workspace::text_attention_results(work_, cfg, T);
     Tensor qn =
-        results.normalized_query.view({dimension(config_.attention->head_dim),
-                                       dimension(config_.attention->num_attention_heads), T});
-    Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
-                                             dimension(config_.attention->num_key_value_heads), T});
-    ops::rmsnorm(q, p.query_norm, config_.rms_norm_eps, true, qn, s);
-    ops::rmsnorm(k, p.key_norm, config_.rms_norm_eps, true, kn, s);
+        results.normalized_query.view({dimension(cfg.attention->head_dim),
+                                       dimension(cfg.attention->num_attention_heads), T});
+    Tensor kn = results.normalized_key.view({dimension(cfg.attention->head_dim),
+                                             dimension(cfg.attention->num_key_value_heads), T});
+    ops::rmsnorm(q, p.query_norm, cfg.rms_norm_eps, true, qn, s);
+    ops::rmsnorm(k, p.key_norm, cfg.rms_norm_eps, true, kn, s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, s);
+    text_rope(rope_for_op, *cfg.rope_parameters, qn, kn, s);
 
-    Tensor a = results.attention.view({dimension(config_.attention->head_dim),
-                                       dimension(config_.attention->num_attention_heads), T});
+    Tensor a = results.attention.view({dimension(cfg.attention->head_dim),
+                                       dimension(cfg.attention->num_attention_heads), T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
     if (active_sequence_batch_ != 0) {
@@ -887,63 +946,83 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         if (width <= 0 || width * active_sequence_batch_ != T) {
             throw std::logic_error("Text sequence batch binding does not match aggregate columns");
         }
-        Tensor q_batch        = qn.view({dimension(config_.attention->head_dim),
-                                         dimension(config_.attention->num_attention_heads), width,
+        Tensor q_batch        = qn.view({dimension(cfg.attention->head_dim),
+                                         dimension(cfg.attention->num_attention_heads), width,
                                          active_sequence_batch_});
-        Tensor k_batch        = kn.view({dimension(config_.attention->head_dim),
-                                         dimension(config_.attention->num_key_value_heads), width,
+        Tensor k_batch        = kn.view({dimension(cfg.attention->head_dim),
+                                         dimension(cfg.attention->num_key_value_heads), width,
                                          active_sequence_batch_});
-        Tensor v_batch        = v.view({dimension(config_.attention->head_dim),
-                                        dimension(config_.attention->num_key_value_heads), width,
+        Tensor v_batch        = v.view({dimension(cfg.attention->head_dim),
+                                        dimension(cfg.attention->num_key_value_heads), width,
                                         active_sequence_batch_});
-        Tensor a_batch        = a.view({dimension(config_.attention->head_dim),
-                                        dimension(config_.attention->num_attention_heads), width,
+        Tensor a_batch        = a.view({dimension(cfg.attention->head_dim),
+                                        dimension(cfg.attention->num_attention_heads), width,
                                         active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+            {dimension(cfg.attention->head_dim),
+             dimension(cfg.attention->num_attention_heads),
+             dimension(cfg.attention->num_key_value_heads)},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(cfg.attention->head_dim))),
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
             a_batch, s);
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+            {dimension(cfg.attention->head_dim),
+             dimension(cfg.attention->num_attention_heads),
+             dimension(cfg.attention->num_key_value_heads)},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(cfg.attention->head_dim))),
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a,
             s);
     }
     ops::sigmoid_mul(gate, a, s);
 
-    ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    const Tensor a_flat = a.view({dimension(cfg.attention->query_width()), T});
+    if (delta == nullptr) {
+        ops::linear_add(a_flat, p.output.weight, x, p.output.policy, work_, s);
+    } else {
+        ops::linear(a_flat, p.output.weight, *delta, p.output.policy, work_, s);
+    }
 }
 
-void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
-    const auto& p  = std::get<GdnParameters>(w.mixer);
-    cudaStream_t s = ctx_.stream;
+void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph,
+                          Tensor* delta) {
+    const auto& p   = std::get<GdnParameters>(w.mixer);
+    const auto& cfg = shard_config();
+    cudaStream_t s  = ctx_.stream;
     const int T    = x.ne[1];
 
-    const auto control = workspace::gdn_control(work_, config_, T);
+    const auto control = workspace::gdn_control(work_, cfg, T);
     Tensor h           = control.hidden;
-    Tensor g           = control.g;
-    Tensor beta        = control.beta;
-    gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
+    // The GDN gating projections (a/b) run in full on both shards: a_log/dt_bias are replicated
+    // at the full 48 value heads, so g/beta must be allocated at the full head count (the
+    // gating op hardcodes 48). The delta net below slices them to this shard's local heads.
+    const std::int32_t full_value_heads = dimension(config_.gdn->linear_num_value_heads);
+    Tensor g      = work_.alloc(DType::FP32, {full_value_heads, T});
+    Tensor beta   = work_.alloc(DType::FP32, {full_value_heads, T});
+    gdn_norm_control(x, w.input_norm, cfg.rms_norm_eps, p, h, g, beta, work_,
                      ctx_.execution_view());
 
-    const auto projection = workspace::gdn_projection(work_, config_, T);
-    Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
-                                             dimension(config_.gdn->linear_num_value_heads), T});
-    Tensor qc = projection.query;
-    Tensor kc = projection.key;
-    Tensor vc = projection.value;
-    if (ph == Phase::Verify) {
+    // The GDN projection is phase-dependent:
+    // - Batched Verify (speculative decoding): fused shape-specific ops (gdn_projection_snapshot/
+    //   record), registered for the full-model row counts. Uses workspace-allocated qc/kc/vc/z.
+    // - Prefill (T>1, single-GPU): fused shape-specific op (gdn_projection), registered for the
+    //   full-model row counts. Uses workspace-allocated qc/kc/vc/z + separate qkv buffer.
+    // - Everything else, i.e. single-token decode (T=1) and every head-split shard width:
+    //   decomposed GEMM (generic ops::linear on the shard's fused weight) + conv. The fused GEMM
+    //   output [q|k|v|z] is sliced into the conv input (qkv) and the output gate (z), and qc/kc/vc
+    //   are separate workspace buffers the conv writes, so the conv input never overlaps its
+    //   outputs.
+    Tensor qc, kc, vc, z;
+    // A head-split shard has no fused record workspace for the width>1 op, so it takes the same
+    // decomposed route as its prefill; the phase still selects the decode-equivalent kernels.
+    const bool batched_verify =
+        (ph == Phase::Verify) && (active_sequence_batch_ > 1 || active_sequence_width_ > 1) &&
+        shard_config_ == nullptr;
+    if (batched_verify) {
         if (active_sequence_batch_ == 0 || active_linear_state_source_slots_ == nullptr) {
             throw std::logic_error(
                 "Verify GDN requires an explicit sequence batch and state slots");
@@ -955,16 +1034,22 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         if (gdn_state_action_ == GdnStateAction::UpdateInPlace && width != 1) {
             throw std::logic_error("In-place batched GDN update requires width one");
         }
+        const auto projection = workspace::gdn_projection(work_, cfg, T);
+        z  = projection.output_gate.view({dimension(cfg.gdn->linear_value_head_dim),
+                                          dimension(cfg.gdn->linear_num_value_heads), T});
+        qc = projection.query;
+        kc = projection.key;
+        vc = projection.value;
         Tensor projection_input =
-            h.view({dimension(config_.hidden_size), width, active_sequence_batch_});
+            h.view({dimension(cfg.hidden_size), width, active_sequence_batch_});
         Tensor query_output =
-            qc.view({dimension(config_.gdn->key_width()), width, active_sequence_batch_});
+            qc.view({dimension(cfg.gdn->key_width()), width, active_sequence_batch_});
         Tensor key_output =
-            kc.view({dimension(config_.gdn->key_width()), width, active_sequence_batch_});
+            kc.view({dimension(cfg.gdn->key_width()), width, active_sequence_batch_});
         Tensor value_output =
-            vc.view({dimension(config_.gdn->value_width()), width, active_sequence_batch_});
+            vc.view({dimension(cfg.gdn->value_width()), width, active_sequence_batch_});
         Tensor gate_output =
-            z.view({dimension(config_.gdn->value_width()), width, active_sequence_batch_});
+            z.view({dimension(cfg.gdn->value_width()), width, active_sequence_batch_});
         Tensor conv_states = state_.layer_view(static_cast<std::uint32_t>(gidx)).conv;
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
@@ -972,19 +1057,67 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
-            gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
+            gdn_projection_record(projection_input, p, *cfg.gdn, conv_states, valid,
                                   *active_linear_state_source_slots_, records.conv, query_output,
                                   key_output, value_output, gate_output, work_, s);
         } else {
-            gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
+            gdn_projection_snapshot(projection_input, p, *cfg.gdn, conv_states, valid,
                                     *active_linear_state_source_slots_,
                                     *active_linear_state_destination_slots_, query_output,
                                     key_output, value_output, gate_output, work_, s);
         }
-    } else {
-        Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
-        Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
+    } else if (T > 1 && shard_config_ == nullptr) {
+        // Prefill (single-GPU, T>1): fused shape-specific GEMM + conv (original behavior). The
+        // fused op is registered for the full-model fused row count only, so a head-split shard
+        // (half the fused rows) takes the decomposed route below instead.
+        const auto projection = workspace::gdn_projection(work_, cfg, T);
+        z  = projection.output_gate.view({dimension(cfg.gdn->linear_value_head_dim),
+                                          dimension(cfg.gdn->linear_num_value_heads), T});
+        qc = projection.query;
+        kc = projection.key;
+        vc = projection.value;
+        Tensor qkv    = workspace::gdn_prefill_conv(work_, cfg, T);
+        Tensor z_flat = z.view({dimension(cfg.gdn->value_width()), T});
         gdn_projection(h, p, qkv, z_flat, work_, s);
+        Tensor conv_state_in =
+            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
+        Tensor conv_state_out =
+            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
+        ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
+                                      s);
+    } else {
+        // Single-token decode (T=1): decomposed GEMM (generic ops::linear on the per-shard
+        // fused weight) + conv. The GEMM writes [q|k|v|z] into a single fused buffer; q/k/v are
+        // sliced from it as the conv input, z is sliced as the output gate, and qc/kc/vc are
+        // separate workspace buffers (conv outputs) so the conv input does not overlap them.
+        const std::int32_t gdn_q_rows = dimension(cfg.gdn->key_width());
+        const std::int32_t gdn_v_rows = dimension(cfg.gdn->value_width());
+        const std::int32_t fused_n    = 2 * gdn_q_rows + 2 * gdn_v_rows;
+        Tensor fused = work_.alloc(DType::BF16, {fused_n, T});
+        const auto& proj_w = std::get<LinearParameters>(p.projection);
+        ops::linear(h, proj_w.weight, fused, proj_w.policy, work_, s);
+        auto projection = workspace::gdn_projection(work_, cfg, T);
+        qc = projection.query;
+        kc = projection.key;
+        vc = projection.value;
+        Tensor qkv;
+        if (T > 1) {
+            // Batched width: the [q|k|v] and [z] blocks are strided row windows of the fused
+            // output, so they are materialized into contiguous buffers before the split
+            // convolution (which requires a contiguous input) and the output gate.
+            qkv = workspace::gdn_prefill_conv(work_, cfg, T);
+            copy_row_block(fused, 0, 2 * gdn_q_rows + gdn_v_rows, qkv, s);
+            copy_row_block(fused, 2 * gdn_q_rows + gdn_v_rows, gdn_v_rows, projection.output_gate,
+                           s);
+            z = projection.output_gate.view({dimension(cfg.gdn->linear_value_head_dim),
+                                             dimension(cfg.gdn->linear_num_value_heads), T});
+        } else {
+            // Single column: the slices are contiguous and alias the fused buffer directly.
+            qkv = fused.slice(0, 0, 2 * gdn_q_rows + gdn_v_rows);
+            z = fused.slice(0, 2 * gdn_q_rows + gdn_v_rows, gdn_v_rows)
+                    .view({dimension(cfg.gdn->linear_value_head_dim),
+                           dimension(cfg.gdn->linear_num_value_heads), T});
+        }
         Tensor conv_state_in =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor conv_state_out =
@@ -993,49 +1126,69 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                                       s);
     }
 
-    Tensor q_recurrent = qc.view({dimension(config_.gdn->linear_key_head_dim),
-                                  dimension(config_.gdn->linear_num_key_heads), T});
-    Tensor k_recurrent = kc.view({dimension(config_.gdn->linear_key_head_dim),
-                                  dimension(config_.gdn->linear_num_key_heads), T});
+    Tensor q_recurrent = qc.view({dimension(cfg.gdn->linear_key_head_dim),
+                                  dimension(cfg.gdn->linear_num_key_heads), T});
+    Tensor k_recurrent = kc.view({dimension(cfg.gdn->linear_key_head_dim),
+                                  dimension(cfg.gdn->linear_num_key_heads), T});
 
-    Tensor vv = vc.view({dimension(config_.gdn->linear_value_head_dim),
-                         dimension(config_.gdn->linear_num_value_heads), T});
-    Tensor o  = workspace::gdn_recurrent_output(work_, config_, T)
-                   .view({dimension(config_.gdn->linear_value_head_dim),
-                          dimension(config_.gdn->linear_num_value_heads), T});
-    if (ph == Phase::Verify) {
+    // The GDN gating projections run in full (48 heads, replicated a_log/dt_bias); slice
+    // g/beta to this shard's local value heads (shard 0 = heads [0, H), shard 1 = [H, 2H)).
+    const std::int32_t local_heads = dimension(cfg.gdn->linear_num_value_heads);
+    const std::int32_t g_head0     = shard_index_ * local_heads;
+    Tensor g_local    = g.slice(0, g_head0, local_heads);
+    Tensor beta_local = beta.slice(0, g_head0, local_heads);
+    if (T > 1) {
+        // Batched width: the shard's heads are a strided row window of the full 48-head gating
+        // output, and gated_delta_net requires contiguous g/beta.
+        Tensor g_block    = work_.alloc(DType::FP32, {local_heads, T});
+        Tensor beta_block = work_.alloc(DType::FP32, {local_heads, T});
+        copy_row_block(g, g_head0, local_heads, g_block, s);
+        copy_row_block(beta, g_head0, local_heads, beta_block, s);
+        g_local    = g_block;
+        beta_local = beta_block;
+    }
+
+    Tensor vv = vc.view({dimension(cfg.gdn->linear_value_head_dim),
+                         dimension(cfg.gdn->linear_num_value_heads), T});
+    Tensor o  = workspace::gdn_recurrent_output(work_, cfg, T)
+                   .view({dimension(cfg.gdn->linear_value_head_dim),
+                          dimension(cfg.gdn->linear_num_value_heads), T});
+    // A head-split shard runs the decomposed recurrent path for the verify window too: the batched
+    // verify views need the fused record workspace the shard does not have, and the recurrence is
+    // sequential in both phases, so the shard's numerics do not depend on this branch.
+    if (ph == Phase::Verify && shard_config_ == nullptr) {
         Tensor recurrent_states  = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
         const std::int32_t width = active_sequence_width_;
-        Tensor q_batch           = q_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
-                                                     dimension(config_.gdn->linear_num_key_heads), width,
+        Tensor q_batch           = q_recurrent.view({dimension(cfg.gdn->linear_key_head_dim),
+                                                     dimension(cfg.gdn->linear_num_key_heads), width,
                                                      active_sequence_batch_});
-        Tensor k_batch           = k_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
-                                                     dimension(config_.gdn->linear_num_key_heads), width,
+        Tensor k_batch           = k_recurrent.view({dimension(cfg.gdn->linear_key_head_dim),
+                                                     dimension(cfg.gdn->linear_num_key_heads), width,
                                                      active_sequence_batch_});
-        Tensor v_batch           = vv.view({dimension(config_.gdn->linear_value_head_dim),
-                                            dimension(config_.gdn->linear_num_value_heads), width,
+        Tensor v_batch           = vv.view({dimension(cfg.gdn->linear_value_head_dim),
+                                            dimension(cfg.gdn->linear_num_value_heads), width,
                                             active_sequence_batch_});
         Tensor g_batch =
-            g.view({dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
-        Tensor beta_batch = beta.view(
-            {dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
+            g_local.view({dimension(cfg.gdn->linear_num_value_heads), width, active_sequence_batch_});
+        Tensor beta_batch = beta_local.view(
+            {dimension(cfg.gdn->linear_num_value_heads), width, active_sequence_batch_});
         Tensor out_batch =
-            o.view({dimension(config_.gdn->linear_value_head_dim),
-                    dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
+            o.view({dimension(cfg.gdn->linear_value_head_dim),
+                    dimension(cfg.gdn->linear_num_value_heads), width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
             ops::gated_delta_net_replay_record(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
-                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                    1.0 / std::sqrt(static_cast<double>(cfg.gdn->linear_key_head_dim))),
                 recurrent_states, valid, *active_linear_state_source_slots_, records.key,
                 records.value, records.gate, out_batch, s);
         } else {
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
-                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                    1.0 / std::sqrt(static_cast<double>(cfg.gdn->linear_key_head_dim))),
                 /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
                 *active_linear_state_destination_slots_, out_batch, s);
         }
@@ -1045,19 +1198,23 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         Tensor recurrent_state_out =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
         ops::gated_delta_net(
-            q_recurrent, k_recurrent, vv, g, beta,
+            q_recurrent, k_recurrent, vv, g_local, beta_local,
             static_cast<float>(1.0 /
-                               std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                               std::sqrt(static_cast<double>(cfg.gdn->linear_key_head_dim))),
             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o, s);
     }
 
-    Tensor on = workspace::gdn_normalized_output(work_, config_, T)
-                    .view({dimension(config_.gdn->linear_value_head_dim),
-                           dimension(config_.gdn->linear_num_value_heads), T});
-    ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
+    Tensor on = workspace::gdn_normalized_output(work_, cfg, T)
+                    .view({dimension(cfg.gdn->linear_value_head_dim),
+                           dimension(cfg.gdn->linear_num_value_heads), T});
+    ops::gated_rmsnorm(o, p.norm, z, cfg.rms_norm_eps, on, s);
 
-    ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    const Tensor on_flat = on.view({dimension(cfg.gdn->value_width()), T});
+    if (delta == nullptr) {
+        ops::linear_add(on_flat, p.output.weight, x, p.output.policy, work_, s);
+    } else {
+        ops::linear(on_flat, p.output.weight, *delta, p.output.policy, work_, s);
+    }
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1073,44 +1230,89 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
     ffn(h, weights.ffn, x, hints, work_, ctx_.stream);
 }
 
+void TextContext::mixer_layer(const BlockParameters& block, Tensor& x, std::size_t layer,
+                              Phase ph, Tensor* delta) {
+    const bool prefill = ph == Phase::Prefill;
+    const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
+    const auto compact = dimension(config_.compact_layer_indices[layer]);
+    nvtx::ScopedRange layer_range(
+        full ? (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull)
+             : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
+        full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
+    try {
+        nvtx::ScopedRange mixer_range(
+            full ? (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention)
+                 : (prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn),
+            full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
+        auto scope = work_.scope();
+        if (full) {
+            attn_mix(block, x, compact, ph, delta);
+        } else {
+            gdn_mix(block, x, compact, ph, delta);
+        }
+    } catch (const std::exception& error) {
+        throw std::runtime_error("text/layers/" + std::to_string(layer) +
+                                 (prefill ? " prefill" : " verify") +
+                                 " columns=" + std::to_string(x.ne[1]) + ": " + error.what());
+    }
+}
+
+void TextContext::mlp_layer(const BlockParameters& block, Tensor& x, std::size_t layer,
+                            Phase ph) {
+    const bool prefill = ph == Phase::Prefill;
+    try {
+        nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
+                                nvtx::Category::PostMixer, layer);
+        auto scope = work_.scope();
+        mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
+    } catch (const std::exception& error) {
+        throw std::runtime_error("text/layers/" + std::to_string(layer) +
+                                 (prefill ? " prefill" : " verify") +
+                                 " columns=" + std::to_string(x.ne[1]) + ": " + error.what());
+    }
+}
+
+void TextContext::single_layer(const BlockParameters& block, Tensor& x, std::size_t layer,
+                               Phase ph) {
+    mixer_layer(block, x, layer, ph);
+    mlp_layer(block, x, layer, ph);
+}
+
+void TextContext::tp_mixer_layer(const BlockParameters& block, Tensor& x, Tensor& delta,
+                                 std::size_t layer, Phase ph) {
+    mixer_layer(block, x, layer, ph, &delta);
+}
+
+void TextContext::tp_mlp_layer(const BlockParameters& block, Tensor& x, std::size_t layer,
+                               Phase ph) {
+    mlp_layer(block, x, layer, ph);
+}
+
+void TextContext::tp_mlp_delta(const BlockParameters& block, Tensor& x, Tensor& delta,
+                               std::size_t layer, Phase ph) {
+    const bool prefill = ph == Phase::Prefill;
+    try {
+        nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
+                                nvtx::Category::PostMixer, layer);
+        auto scope = work_.scope();
+        Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
+        ops::rmsnorm(x, block.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
+        ffn_delta(h, block.ffn, delta, next_projection_hints(static_cast<int>(layer)), work_,
+                  ctx_.stream);
+    } catch (const std::exception& error) {
+        throw std::runtime_error("text/layers/" + std::to_string(layer) +
+                                 (prefill ? " prefill" : " verify") +
+                                 " columns=" + std::to_string(x.ne[1]) + ": " + error.what());
+    }
+}
+
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
-    const bool prefill = ph == Phase::Prefill;
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
-        const auto& block  = parameters_.text.layers[layer];
-        const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
-        const auto compact = dimension(config_.compact_layer_indices[layer]);
-        nvtx::ScopedRange layer_range(
-            full ? (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull)
-                 : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
-            full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
-        try {
-            {
-                nvtx::ScopedRange mixer_range(
-                    full ? (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention)
-                         : (prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn),
-                    full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
-                auto scope = work_.scope();
-                if (full) {
-                    attn_mix(block, x, compact, ph);
-                } else {
-                    gdn_mix(block, x, compact, ph);
-                }
-            }
-            {
-                nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer
-                                                : nvtx::Name::VerifyPostMixer,
-                                        nvtx::Category::PostMixer, layer);
-                auto scope = work_.scope();
-                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
-            }
-            if constexpr (Tap::enabled) {
-                tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
-            }
-        } catch (const std::exception& error) {
-            throw std::runtime_error("text/layers/" + std::to_string(layer) +
-                                     (prefill ? " prefill" : " verify") +
-                                     " columns=" + std::to_string(x.ne[1]) + ": " + error.what());
+        const auto& block = parameters_.text.layers[layer];
+        single_layer(block, x, layer, ph);
+        if constexpr (Tap::enabled) {
+            tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
         }
     }
 }
@@ -1118,6 +1320,330 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
 void TextContext::run_layers(Tensor& x, Phase ph) {
     NullTap tap;
     run_layers(x, ph, tap);
+}
+
+void TextContext::forward_tp2(TextContext& peer, tp::DevicePair& pair, std::int32_t token,
+                              std::int32_t position, Tensor& logits, Tensor& logits_peer,
+                              Tensor* mtp_input_hidden) {
+    const std::int32_t hidden = dimension(config_.hidden_size);
+    const std::int32_t vocab  = dimension(config_.vocab_size);
+    if (vocab % 2 != 0 || logits.ne[0] != vocab || logits.ne[1] != 1 ||
+        logits_peer.ne[0] != vocab || logits_peer.ne[1] != 1) {
+        throw std::invalid_argument("forward_tp2: logits buffers must be full-vocabulary [V,1]");
+    }
+    // No work_.reset() here: the caller owns the logits buffers in this arena, and resetting
+    // would let the internal allocations overwrite them.
+    // Bind the replicated-mixer state on both shards. A single token at position zero attends
+    // only to itself, so the paged cache is empty and the GDN state slot is zeroed. The RAII
+    // guards live until the end of the forward (a bind lambda would destroy them immediately),
+    // and each shard's device is bound before any of its allocations or kernels.
+    struct BindState {
+        Tensor cache_positions;
+        Tensor rope_positions;
+        Tensor kv_table_rows;
+        Tensor state_source;
+        Tensor state_destination;
+        ops::CausalAttentionExecutionEnvelope envelope{1, 1};
+    };
+    auto make_bind = [&](TextContext& c, WorkspaceArena& arena) {
+        c.ctx_.bind_to_current_thread();
+        BindState b;
+        b.envelope        = {position + 1, position + 1};
+        b.cache_positions = arena.alloc(DType::I32, {1});
+        ops::set_i32_scalar(b.cache_positions, position, c.ctx_.stream);
+        b.rope_positions = arena.alloc(DType::I32, {1});
+        ops::set_i32_scalar(b.rope_positions, position, c.ctx_.stream);
+        b.kv_table_rows     = arena.alloc(DType::I32, {1});
+        ops::set_i32_scalar(b.kv_table_rows, 0, c.ctx_.stream);
+        b.state_source      = arena.alloc(DType::I32, {1});
+        ops::set_i32_scalar(b.state_source, 0, c.ctx_.stream);
+        b.state_destination = arena.alloc(DType::I32, {1});
+        ops::set_i32_scalar(b.state_destination, 0, c.ctx_.stream);
+        return b;
+    };
+    const BindState bind0 = make_bind(*this, work_);
+    const BindState bind1 = make_bind(peer, peer.work_);
+    ScopedPositions cache0(active_cache_positions_, bind0.cache_positions);
+    ScopedPositions rope0(active_rope_positions_, bind0.rope_positions);
+    ScopedEnvelope envelope0(active_causal_attention_envelope_, bind0.envelope);
+    ScopedValue<const Tensor*> kv0(active_kv_table_rows_, &bind0.kv_table_rows);
+    ScopedValue<const Tensor*> source0(active_linear_state_source_slots_, &bind0.state_source);
+    ScopedValue<const Tensor*> destination0(active_linear_state_destination_slots_,
+                                            &bind0.state_destination);
+    ScopedValue<std::int32_t> batch0(active_sequence_batch_, 1);
+    ScopedValue<std::int32_t> width0(active_sequence_width_, 1);
+    ScopedPositions cache1(peer.active_cache_positions_, bind1.cache_positions);
+    ScopedPositions rope1(peer.active_rope_positions_, bind1.rope_positions);
+    ScopedEnvelope envelope1(peer.active_causal_attention_envelope_, bind1.envelope);
+    ScopedValue<const Tensor*> kv1(peer.active_kv_table_rows_, &bind1.kv_table_rows);
+    ScopedValue<const Tensor*> source1(peer.active_linear_state_source_slots_,
+                                       &bind1.state_source);
+    ScopedValue<const Tensor*> destination1(peer.active_linear_state_destination_slots_,
+                                            &bind1.state_destination);
+    ScopedValue<std::int32_t> batch1(peer.active_sequence_batch_, 1);
+    ScopedValue<std::int32_t> width1(peer.active_sequence_width_, 1);
+
+    ctx_.bind_to_current_thread();
+    Tensor ids = work_.alloc(DType::I32, {1});
+    ops::set_i32_scalar(ids, token, ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    Tensor ids_peer = peer.work_.alloc(DType::I32, {1});
+    ops::set_i32_scalar(ids_peer, token, peer.ctx_.stream);
+
+    ctx_.bind_to_current_thread();
+    Tensor x      = work_.alloc(DType::BF16, {hidden, 1});
+    Tensor x_peer = peer.work_.alloc(DType::BF16, {hidden, 1});
+    ops::embedding(ids, *embed_, x, ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    ops::embedding(ids_peer, *peer.embed_, x_peer, peer.ctx_.stream);
+    NullTap tap;
+    run_layers_tp2(peer, pair, x, x_peer, Phase::Verify, tap);
+
+    ctx_.bind_to_current_thread();
+    Tensor hidden_out      = work_.alloc(DType::BF16, {hidden, 1});
+    peer.ctx_.bind_to_current_thread();
+    Tensor hidden_out_peer = peer.work_.alloc(DType::BF16, {hidden, 1});
+    ctx_.bind_to_current_thread();
+    ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden_out, ctx_.stream);
+    if (mtp_input_hidden != nullptr) {
+        // The MTP layer consumes the final-norm hidden; hand the caller its own stable copy so this
+        // context's workspace scope can end.
+        if (mtp_input_hidden->dtype != DType::BF16 || mtp_input_hidden->ne[0] != hidden ||
+            mtp_input_hidden->ne[1] != 1) {
+            throw std::invalid_argument("forward_tp2: MTP hidden buffer must be [hidden,1] BF16");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mtp_input_hidden->data, hidden_out.data, hidden_out.bytes(),
+                                   cudaMemcpyDeviceToDevice, ctx_.stream));
+    }
+    peer.ctx_.bind_to_current_thread();
+    ops::rmsnorm(x_peer, *peer.final_norm_, config_.rms_norm_eps, true, hidden_out_peer,
+                 peer.ctx_.stream);
+
+
+    // The lm_head is weight-tied to the token embedding (the same physical object), so it is
+    // replicated in full on both shards - each holds the complete [vocab, hidden] weight. The
+    // hidden_out is identical on both shards (replicated mixers plus the all-reduced FFN delta),
+    // so each shard computes the full-vocabulary logits independently and the two agree exactly.
+    // No all-reduce is needed for the head.
+    ctx_.bind_to_current_thread();
+    project(hidden_out, *lm_head_, logits, work_, ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    project(hidden_out_peer, *peer.lm_head_, logits_peer, peer.work_, peer.ctx_.stream);
+}
+
+std::int32_t TextContext::forward_tp2_token(TextContext& peer, tp::DevicePair& pair,
+                                            std::int32_t token, std::int32_t position) {
+    const std::int32_t vocab = dimension(config_.vocab_size);
+    auto scope = work_.scope();
+    Tensor logits      = work_.alloc(DType::BF16, {vocab, 1});
+    Tensor logits_peer = peer.work_.alloc(DType::BF16, {vocab, 1});
+    forward_tp2(peer, pair, token, position, logits, logits_peer);
+    // forward_tp2 leaves the current device on the peer card; bind each shard before its
+    // argmax so the device pointer resolves in the correct address space. The lm_head is
+    // replicated, so the two shards' logits are bit-identical and their argmax must agree;
+    // comparing both makes a shard divergence a hard failure at the sampling boundary.
+    ctx_.bind_to_current_thread();
+    Tensor sampled = work_.alloc(DType::I32, {1});
+    ops::argmax(logits, sampled, vocab, ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    Tensor sampled_peer = peer.work_.alloc(DType::I32, {1});
+    ops::argmax(logits_peer, sampled_peer, vocab, peer.ctx_.stream);
+    std::int32_t token_id      = 0;
+    std::int32_t token_id_peer = 0;
+    ctx_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(&token_id, sampled.data, sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost, ctx_.stream));
+    CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+    peer.ctx_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(&token_id_peer, sampled_peer.data, sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost, peer.ctx_.stream));
+    CUDA_CHECK(cudaStreamSynchronize(peer.ctx_.stream));
+    if (token_id != token_id_peer) {
+        throw std::logic_error("forward_tp2_token: shard argmax mismatch at position " +
+                               std::to_string(position) + " (" + std::to_string(token_id) +
+                               " vs " + std::to_string(token_id_peer) + ")");
+    }
+    return token_id;
+}
+
+void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
+                                      std::span<const int> ids, std::int32_t first_position,
+                                      Tensor* logits, Tensor* logits_peer,
+                                      Tensor* mtp_input_hidden, Tensor* logits_columns,
+                                      Tensor* hidden_columns, Phase phase) {
+    const std::int32_t hidden = dimension(config_.hidden_size);
+    const std::int32_t vocab  = dimension(config_.vocab_size);
+    const std::int32_t tokens = static_cast<std::int32_t>(ids.size());
+    if (tokens <= 0) { throw std::invalid_argument("forward_tp2_prefill requires tokens"); }
+    if (first_position < 0) {
+        throw std::invalid_argument("forward_tp2_prefill: position must be non-negative");
+    }
+    if (logits_columns == nullptr) {
+        if (logits == nullptr || logits_peer == nullptr) {
+            throw std::invalid_argument(
+                "forward_tp2_prefill: a prefill chunk must request the last column logits");
+        }
+        if (logits->ne[0] != vocab || logits->ne[1] != 1 || logits_peer->ne[0] != vocab ||
+            logits_peer->ne[1] != 1) {
+            throw std::invalid_argument(
+                "forward_tp2_prefill: logits buffers must be full-vocabulary [V,1]");
+        }
+    } else if (logits != nullptr || logits_peer != nullptr) {
+        // The per-column buffer carries the last column as well, so a second lm_head read
+        // would score exactly the same bytes again.
+        throw std::invalid_argument(
+            "forward_tp2_prefill: per-column logits replace the [V,1] last-column buffers");
+    }
+    // The execution envelope is the chunk's inclusive key extent: the chunk appends positions
+    // [first_position, first_position + tokens) and its last query reads every one of them. This
+    // is exactly the binding the validated single-device prefill chunk uses.
+    const std::uint32_t visible_end =
+        static_cast<std::uint32_t>(first_position) + static_cast<std::uint32_t>(tokens);
+    struct BindState {
+        Tensor ids;
+        Tensor positions;
+        Tensor kv_table_rows;
+        Tensor state_source;
+        Tensor state_destination;
+        ops::CausalAttentionExecutionEnvelope envelope{1, 1};
+    };
+    // Bind the replicated mixer state on both shards. The RAII guards live until the end of the
+    // forward (a bind lambda would destroy them immediately), and each shard's device is bound
+    // before any of its allocations or kernels. No work_.reset() here: the caller owns the logits
+    // buffers in this arena, and resetting would let the internal allocations overwrite them.
+    auto make_bind = [&](TextContext& c, WorkspaceArena& arena) {
+        c.ctx_.bind_to_current_thread();
+        BindState b;
+        b.envelope    = {visible_end, visible_end};
+        b.ids         = arena.alloc(DType::I32, {tokens});
+        b.positions   = arena.alloc(DType::I32, {tokens});
+        copy_i32(ids.data(), b.ids, c.ctx_.stream);
+        ops::fill_i32_positions(b.positions, first_position, c.ctx_.stream);
+        b.kv_table_rows = arena.alloc(DType::I32, {1});
+        ops::set_i32_scalar(b.kv_table_rows, 0, c.ctx_.stream);
+        b.state_source = arena.alloc(DType::I32, {1});
+        ops::set_i32_scalar(b.state_source, 0, c.ctx_.stream);
+        b.state_destination = arena.alloc(DType::I32, {1});
+        ops::set_i32_scalar(b.state_destination, 0, c.ctx_.stream);
+        return b;
+    };
+    const BindState bind0 = make_bind(*this, work_);
+    const BindState bind1 = make_bind(peer, peer.work_);
+    // Cache and RoPE positions coincide here: the TP-2 path runs without vision or a RoPE delta, so
+    // the cache position of every chunk token is its own absolute position.
+    ScopedPositions cache0(active_cache_positions_, bind0.positions);
+    ScopedPositions rope0(active_rope_positions_, bind0.positions);
+    ScopedEnvelope envelope0(active_causal_attention_envelope_, bind0.envelope);
+    ScopedValue<const Tensor*> kv0(active_kv_table_rows_, &bind0.kv_table_rows);
+    ScopedValue<const Tensor*> source0(active_linear_state_source_slots_, &bind0.state_source);
+    ScopedValue<const Tensor*> destination0(active_linear_state_destination_slots_,
+                                            &bind0.state_destination);
+    ScopedPositions cache1(peer.active_cache_positions_, bind1.positions);
+    ScopedPositions rope1(peer.active_rope_positions_, bind1.positions);
+    ScopedEnvelope envelope1(peer.active_causal_attention_envelope_, bind1.envelope);
+    ScopedValue<const Tensor*> kv1(peer.active_kv_table_rows_, &bind1.kv_table_rows);
+    ScopedValue<const Tensor*> source1(peer.active_linear_state_source_slots_,
+                                      &bind1.state_source);
+    ScopedValue<const Tensor*> destination1(peer.active_linear_state_destination_slots_,
+                                            &bind1.state_destination);
+
+    ctx_.bind_to_current_thread();
+    Tensor x      = work_.alloc(DType::BF16, {hidden, tokens});
+    Tensor x_peer = peer.work_.alloc(DType::BF16, {hidden, tokens});
+    ops::embedding(bind0.ids, *embed_, x, ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    ops::embedding(bind1.ids, *peer.embed_, x_peer, peer.ctx_.stream);
+    NullTap tap;
+    if (phase == Phase::Verify) {
+        // The verify window runs the phase the single-token decode path runs, so its per-column
+        // logits agree with decode on near-ties. That phase needs the explicit sequence bindings the
+        // decode path sets (one row, one column per window token, the live state as the source slot),
+        // which prefill leaves unset because it is a single column.
+        Tensor verify_source_slots = work_.alloc(DType::I32, {1});
+        ops::set_i32_scalar(verify_source_slots, 0, ctx_.stream);
+        // Batched MTP attention keys off active_sequence_batch_ != 0, so the window also needs the
+        // per-row valid-column count and the backend KV row table that decode binds per row.
+        Tensor verify_valid_columns = work_.alloc(DType::I32, {1});
+        ops::set_i32_scalar(verify_valid_columns, tokens, ctx_.stream);
+        Tensor verify_backend_rows = work_.alloc(DType::I32, {1});
+        ops::set_i32_scalar(verify_backend_rows, 0, ctx_.stream);
+        ScopedValue<std::int32_t> verify_batch(active_sequence_batch_, 1);
+        ScopedValue<std::int32_t> verify_width(active_sequence_width_, tokens);
+        ScopedValue<const Tensor*> verify_source(active_linear_state_source_slots_,
+                                                 &verify_source_slots);
+        ScopedValue<const Tensor*> verify_valid(active_valid_columns_, &verify_valid_columns);
+        ScopedValue<const Tensor*> verify_backend(active_backend_kv_table_rows_,
+                                                  &verify_backend_rows);
+        // The verify path reads positions as [width, batch]; prefill binds them flat for its chunk.
+        Tensor verify_positions = work_.alloc(DType::I32, {tokens, 1});
+        ops::fill_i32_positions(verify_positions, first_position, ctx_.stream);
+        ScopedPositions verify_cache(active_cache_positions_, verify_positions);
+        ScopedPositions verify_rope(active_rope_positions_, verify_positions);
+        ScopedValue<std::int32_t> verify_peer_batch(peer.active_sequence_batch_, 1);
+        ScopedValue<std::int32_t> verify_peer_width(peer.active_sequence_width_, tokens);
+        ScopedValue<const Tensor*> verify_peer_source(peer.active_linear_state_source_slots_,
+                                                      &verify_source_slots);
+        ScopedValue<const Tensor*> verify_peer_valid(peer.active_valid_columns_,
+                                                     &verify_valid_columns);
+        ScopedValue<const Tensor*> verify_peer_backend(peer.active_backend_kv_table_rows_,
+                                                       &verify_backend_rows);
+        ScopedPositions verify_peer_cache(peer.active_cache_positions_, verify_positions);
+        ScopedPositions verify_peer_rope(peer.active_rope_positions_, verify_positions);
+        run_layers_tp2(peer, pair, x, x_peer, phase, tap);
+    } else {
+        run_layers_tp2(peer, pair, x, x_peer, phase, tap);
+    }
+
+    ctx_.bind_to_current_thread();
+    Tensor xf      = work_.alloc(DType::BF16, {hidden, tokens});
+    peer.ctx_.bind_to_current_thread();
+    Tensor xf_peer = peer.work_.alloc(DType::BF16, {hidden, tokens});
+    ctx_.bind_to_current_thread();
+    ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, ctx_.stream);
+    if (mtp_input_hidden != nullptr) {
+        // The MTP layer's prefill chunk consumes the whole chunk's final-norm hidden.
+        if (mtp_input_hidden->dtype != DType::BF16 || mtp_input_hidden->ne[0] != hidden ||
+            mtp_input_hidden->ne[1] != tokens) {
+            throw std::invalid_argument(
+                "forward_tp2_prefill: MTP hidden buffer must be [hidden,T] BF16");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mtp_input_hidden->data, xf.data, xf.bytes(),
+                                   cudaMemcpyDeviceToDevice, ctx_.stream));
+    }
+    peer.ctx_.bind_to_current_thread();
+    ops::rmsnorm(x_peer, *peer.final_norm_, config_.rms_norm_eps, true, xf_peer, peer.ctx_.stream);
+
+    // Only the chunk's last column feeds the first sample, exactly like the single-device prefill's
+    // final chunk. The lm_head is weight-tied to the token embedding and replicated in full on both
+    // shards, so both compute the full-vocabulary logits independently and agree exactly.
+    ctx_.bind_to_current_thread();
+    if (logits_columns != nullptr) {
+        // Speculative verification scores every column: column j predicts the token after the one
+        // it reads, so it judges the draft placed at j+1. Its last column is exactly the logits
+        // the [V,1] projection below would produce, so that read is not repeated.
+        if (logits_columns->dtype != DType::BF16 || logits_columns->ne[0] != vocab ||
+            logits_columns->ne[1] != tokens) {
+            throw std::invalid_argument(
+                "forward_tp2_prefill: per-column logits buffer must be [V,T] BF16");
+        }
+        project(xf, *lm_head_, *logits_columns, work_, ctx_.stream);
+    } else {
+        project(xf.slice(1, tokens - 1, 1), *lm_head_, *logits, work_, ctx_.stream);
+        peer.ctx_.bind_to_current_thread();
+        project(xf_peer.slice(1, tokens - 1, 1), *peer.lm_head_, *logits_peer, peer.work_,
+                peer.ctx_.stream);
+    }
+    if (hidden_columns != nullptr) {
+        // The next round's MTP bridge consumes the final-norm hidden of the accepted column.
+        if (hidden_columns->dtype != DType::BF16 || hidden_columns->ne[0] != hidden ||
+            hidden_columns->ne[1] != tokens) {
+            throw std::invalid_argument(
+                "forward_tp2_prefill: per-column hidden buffer must be [hidden,T] BF16");
+        }
+        ctx_.bind_to_current_thread();
+        CUDA_CHECK(cudaMemcpyAsync(hidden_columns->data, xf.data, xf.bytes(),
+                                   cudaMemcpyDeviceToDevice, ctx_.stream));
+    }
 }
 
 template <class Tap>

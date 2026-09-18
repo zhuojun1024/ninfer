@@ -117,11 +117,16 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     const auto& k      = matrix(inputs[1]);
     const auto& third  = matrix(inputs[2]);
     const auto& fourth = matrix(inputs[3]);
+    // Structural (not exact-value) geometry check so the same projection is accepted at the
+    // full-model shape and at the per-shard (head-split) shape: attention has q=gate and
+    // k=v with q=6*k (24 q heads vs 4 kv heads at head_dim 256, halved to 12/2 per shard);
+    // GDN has q=k and v=z with v=3*q (48 v heads vs 16 k heads at head_dim 128, halved to
+    // 24/8 per shard). All four blocks share the hidden input dimension.
     const bool dense =
-        attention ? q == std::vector<std::uint64_t>{6144, 5120} &&
-                        k == std::vector<std::uint64_t>{1024, 5120} && third == q && fourth == k
-                  : q == std::vector<std::uint64_t>{2048, 5120} && k == q &&
-                        third == std::vector<std::uint64_t>{6144, 5120} && fourth == third;
+        attention ? (third == q && fourth == k && q[0] == 6 * k[0] &&
+                     q[1] == k[1] && third[1] == q[1] && fourth[1] == k[1])
+                  : (k == q && fourth == third && third[0] == 3 * q[0] &&
+                     q[1] == k[1] && third[1] == q[1] && fourth[1] == q[1]);
     const bool moe =
         attention ? q == std::vector<std::uint64_t>{4096, 2048} &&
                         k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k

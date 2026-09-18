@@ -69,6 +69,34 @@ std::size_t current_free_device_bytes() {
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    if (options.device_b >= 0 && options.purpose == EnginePurpose::Generation) {
+        // Dedicated tensor-parallel (TP-2) generation core: exactly one request at a time, no
+        // speculative decoding, no CUDA Graphs, no context cache, and a page-aligned KV capacity
+        // sized to the full context (the core builds its own paged cache from max_context).
+        options.max_concurrency      = 1;
+        options.max_pending_requests = 1;
+        // The TP-2 core reads the prefill chunk itself. Clamp the request to the range its
+        // cross-device allreduce staging buffer and its per-chunk activation peak can carry
+        // (0 selects the default width).
+        {
+            std::uint32_t chunk = options.prefill_chunk == 0 ? 1024U : options.prefill_chunk;
+            if (chunk < 128U) { chunk = 128U; }
+            if (chunk > 1024U) { chunk = 1024U; }
+            options.prefill_chunk = chunk - chunk % 128U;
+        }
+        options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
+        // The TP-2 core drives its own single-request round loop, so only the MTP backend (which
+        // proposes from the artifact's own nextn head and needs no companion component) is
+        // available here. DFlash/DFlash2 need a separate draft component the dual-shard loader does
+        // not bring up.
+        if (options.speculative.backend == SpeculativeBackend::DFlash ||
+            options.speculative.backend == SpeculativeBackend::DFlash2) {
+            throw std::invalid_argument("TP-2 generation supports --spec mtp only");
+        }
+        options.enable_vision        = false;
+        options.use_cuda_graph       = false;
+        options.context_cache        = ContextCacheOptions{.enabled = false};
+    }
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;

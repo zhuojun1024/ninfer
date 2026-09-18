@@ -69,7 +69,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--devices A,B] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -259,6 +259,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+        } else if (arg == "--devices") {
+            // Two comma-separated device indices, e.g. --devices 0,2. Enables the TP-2 core.
+            const std::string value = require_value("--devices");
+            const auto comma = value.find(',');
+            if (comma == std::string::npos) {
+                throw std::invalid_argument("--devices expects <a>,<b> (two device indices)");
+            }
+            options.device   = parse_nonnegative_int(value.substr(0, comma).c_str(), "devices");
+            options.device_b = parse_nonnegative_int(value.substr(comma + 1).c_str(), "devices");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {

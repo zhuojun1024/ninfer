@@ -43,6 +43,10 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& text, const std::string& p) {
     out.key          = b.parameter(p + "gdn/key", {k, h}, {p + "mixer_input"});
     out.value        = b.parameter(p + "gdn/value", {v, h}, {p + "mixer_input"});
     out.z            = b.parameter(p + "gdn/z", {v, h}, {p + "mixer_input"});
+    // The GDN gating projections (a/b) and their per-head scalars (a_log/dt_bias) stay replicated
+    // in full: each shard runs the full 48-head gating GEMM and slices g/beta to its local value
+    // heads. The binding runs against the full-model config (48 value heads), and the physical
+    // a/b objects are (48, hidden) each, so they are bound at the full head count.
     out.a_projection = b.parameter(p + "gdn/a_projection", {heads, h}, {p + "mixer_input"});
     out.b_projection = b.parameter(p + "gdn/b_projection", {heads, h}, {p + "mixer_input"});
     out.a_log        = b.direct(p + "gdn/a_log", {heads}, QType::FP32);

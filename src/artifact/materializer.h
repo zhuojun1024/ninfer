@@ -8,7 +8,12 @@
 
 #include <memory>
 #include <span>
+#include <utility>
 #include <vector>
+
+namespace ninfer::tp {
+struct TPSplitSpec;
+}
 
 namespace ninfer::artifact {
 
@@ -52,6 +57,12 @@ struct MaterializationStats {
 
 class MaterializedArtifact {
 public:
+    struct ObjectStorage {
+        std::optional<WeightParent> device;
+        std::optional<WeightParent> host;
+        std::vector<std::byte> host_data;
+    };
+
     MaterializedArtifact()                                           = default;
     ~MaterializedArtifact()                                          = default;
     MaterializedArtifact(MaterializedArtifact&&) noexcept            = default;
@@ -66,15 +77,19 @@ public:
 
     [[nodiscard]] const MaterializationStats& stats() const noexcept { return stats_; }
 
+    // TP-2 construction access (used by ninfer::tp::materialize_tp2).
+    [[nodiscard]] std::vector<ObjectStorage>& tp_objects() noexcept { return objects_; }
+    [[nodiscard]] DeviceArena& tp_arena() noexcept { return *arena_; }
+    [[nodiscard]] MaterializationStats& tp_stats() noexcept { return stats_; }
+    void tp_init(std::size_t object_count, std::uint64_t capacity_bytes) {
+        objects_.resize(object_count);
+        arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity_bytes));
+        stats_.device_capacity_bytes = capacity_bytes;
+    }
+
 private:
     friend MaterializedArtifact materialize(const Reader&, MaterializationPlan&&, DeviceContext&,
                                             const StartupObserver*);
-
-    struct ObjectStorage {
-        std::optional<WeightParent> device;
-        std::optional<WeightParent> host;
-        std::vector<std::byte> host_data;
-    };
 
     std::unique_ptr<DeviceArena> arena_;
     std::vector<ObjectStorage> objects_;

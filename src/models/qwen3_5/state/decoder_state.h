@@ -17,6 +17,10 @@ struct DecoderStateSpec {
     std::uint32_t mtp_layers                = 0;
     std::uint32_t capacity                  = 0;
     std::int32_t kv_heads                   = 0;
+    // The MTP layer can carry a different head split than the text layers (TP-2 runs it replicated
+    // on one shard while the text layers are head-split), so its cache geometry is separate.
+    // Zero means "same as kv_heads".
+    std::int32_t mtp_kv_heads               = 0;
     std::int32_t attention_head_dim         = 0;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     bool enable_mtp                         = false;

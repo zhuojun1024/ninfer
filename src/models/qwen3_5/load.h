@@ -1,10 +1,13 @@
 #pragma once
 
+#include "core/tp/tp_materialize.h"
 #include "models/qwen3_5/model.h"
 
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <utility>
+#include <vector>
 
 namespace ninfer::artifact {
 class Reader;
@@ -37,6 +40,8 @@ private:
     friend LoadPlan plan_load(const artifact::Reader&, LoadOptions);
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
+    friend std::pair<std::unique_ptr<Model>, std::unique_ptr<Model>>
+    materialize_model_tp2(LoadPlan&&, DeviceContext&, DeviceContext&, const StartupObserver*);
 };
 
 [[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {});
@@ -45,5 +50,12 @@ private:
 [[nodiscard]] std::unique_ptr<Model> load_model(const std::filesystem::path& path,
                                                 LoadOptions options, DeviceContext& device,
                                                 const StartupObserver* observer = nullptr);
+
+// TP-2 load: materialize the plan onto two GPUs (split per spec) and build one Model per shard.
+// device0 receives shard 0, device1 receives shard 1. The split spec is derived from the
+// artifact directory and the parsed text config.
+[[nodiscard]] std::pair<std::unique_ptr<Model>, std::unique_ptr<Model>>
+materialize_model_tp2(LoadPlan&& plan, DeviceContext& device0, DeviceContext& device1,
+                      const StartupObserver* observer = nullptr);
 
 } // namespace ninfer::models::qwen3_5

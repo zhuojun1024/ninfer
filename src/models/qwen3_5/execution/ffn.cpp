@@ -87,4 +87,30 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
 }
 
+void ffn_delta(const Tensor& hidden, const FfnParameters& parameters, Tensor& delta,
+               const ops::SparseMoeHints& hints, WorkspaceArena& workspace, cudaStream_t stream) {
+    (void)hints;
+    const auto* p = std::get_if<DenseParameters>(&parameters);
+    if (p == nullptr) { throw std::invalid_argument("ffn_delta: only the dense FFN is sharded"); }
+    const auto& gu    = p->gate_up.weight;
+    const auto& down  = p->down.weight;
+    const auto columns = hidden.ne[1];
+    // The fused linear_swiglu kernels are registered for the full-model gate_up geometry, so the
+    // sharded FFN (half the intermediate rows) uses the shape-generic linear + silu_mul pair, the
+    // same decomposition as the mtp branch above. delta = down(silu(gate) * up), the row-parallel
+    // partial output written without a residual add.
+    Tensor gate_up = workspace.alloc(DType::BF16, {gu.n, columns});
+    {
+        auto call = workspace.scope();
+        ops::linear(hidden, gu, gate_up, p->gate_up.policy, workspace, stream);
+    }
+    Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
+    ops::silu_mul(gate_up.slice(0, 0, gu.n / 2), gate_up.slice(0, gu.n / 2, gu.n / 2), activation,
+                  stream);
+    {
+        auto call = workspace.scope();
+        ops::linear(activation, down, delta, p->down.policy, workspace, stream);
+    }
+}
+
 } // namespace ninfer::models::qwen3_5::execution

@@ -7,7 +7,9 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
+#include "core/tp/device_pair.h"
 #include "core/weight.h"
+#include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/sparse_moe.h"
@@ -19,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iostream>
 #include <span>
 #include <vector>
 
@@ -98,8 +101,83 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // Tensor-parallel surface: run one layer's mixer (attention or GDN) on this shard's device,
+    // writing the row-parallel output-projection delta (without the residual add) into delta.
+    // A tensor-parallel driver calls this on each shard context and all-reduces the delta before
+    // adding it to the shared residual. The single-GPU path uses single_layer instead.
+    void tp_mixer_layer(const BlockParameters& block, Tensor& x, Tensor& delta, std::size_t layer,
+                        Phase phase);
+    void tp_mlp_layer(const BlockParameters& block, Tensor& x, std::size_t layer, Phase phase);
+    // Tensor-parallel FFN tail: post-mixer norm + the sharded FFN, writing the row-parallel
+    // down-projection delta (without the residual add) into `delta`. The driver all-reduces the
+    // delta across shards and adds the sum to the shared residual once. The mixer is replicated,
+    // so `x` is identical on every shard and no all-reduce is needed after the mixer.
+    void tp_mlp_delta(const BlockParameters& block, Tensor& x, Tensor& delta, std::size_t layer,
+                      Phase phase);
+    // Tensor-parallel lockstep layer loop: runs each layer's mixer (replicated) on both shards,
+    // then the sharded FFN delta on both shards, all-reduces the delta, and adds the summed delta
+    // to the shared residual once. The mixer is replicated, so the residual is identical on both
+    // shards at the FFN input and no all-reduce is needed after the mixer.
+    template <class Tap>
+    void run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor& x, Tensor& x_peer,
+                        Phase ph, Tap& tap);
+
+    // Tensor-parallel single-token forward at `position`: embedding on both shards, the lockstep
+    // layer loop, the final norm, and the lm_head. The lm_head is weight-tied to the token
+    // embedding (the same physical object), so it is replicated in full on both shards and each
+    // computes the full-vocabulary logits independently; the two agree exactly and no all-reduce
+    // is needed. `position` is the absolute cache/RoPE position, so the replicated mixers attend
+    // to the cached prefix [0, position) and update the paged KV cache and GDN state in place,
+    // enabling a stateful autoregressive decode. `logits` and `logits_peer` must be
+    // full-vocabulary BF16 [V, 1] buffers.
+    // mtp_input_hidden (optional, [hidden,1] BF16) receives the final-norm hidden (the lm_head
+    // input), which is the hidden the multi-token-prediction layer consumes.
+    void forward_tp2(TextContext& peer, tp::DevicePair& pair, std::int32_t token,
+                     std::int32_t position, Tensor& logits, Tensor& logits_peer,
+                     Tensor* mtp_input_hidden = nullptr);
+    // Tensor-parallel single-token forward at `position` returning the argmax token id on this
+    // shard's device. The full-vocabulary logits are identical on both shards (replicated
+    // lm_head), so the argmax agrees across shards.
+    [[nodiscard]] std::int32_t forward_tp2_token(TextContext& peer, tp::DevicePair& pair,
+                                                 std::int32_t token, std::int32_t position = 0);
+    // Tensor-parallel batched prefill forward. Runs the lockstep layer loop at Phase::Prefill over
+    // the T tokens of one chunk and then projects the columns the caller asked for through the
+    // lm_head. `ids` are this chunk's prompt tokens and `first_position` is the absolute position
+    // of its first token, so consecutive chunks continue the same sequence: the replicated mixers
+    // append to the paged KV cache and update the GDN state in place, exactly like the
+    // single-device prefill chunk.
+    // Exactly one of the two logits forms is requested. The common prefill chunk needs only its
+    // last column, which drives the first sample, so it passes `logits` / `logits_peer`
+    // (full-vocabulary BF16 [V,1] buffers, one per shard). A speculative verify window needs every
+    // column, because each column scores the draft that follows it, so it passes `logits_columns`
+    // and leaves the [V,1] buffers null: that buffer's last column already is the last column's
+    // logits, and projecting it again would repeat a whole lm_head read per round.
+    // mtp_input_hidden (optional, [hidden,T] BF16) receives the whole chunk's final-norm hidden
+    // (the lm_head input), which is the hidden the multi-token-prediction layer consumes.
+    // logits_columns (optional, [V,T] BF16) receives every column's logits and hidden_columns
+    // (optional, [hidden,T] BF16) every column's final-norm hidden.
+    // `phase` selects the layer loop the window runs in. A speculative verify window must use
+    // Phase::Verify: that is the phase the single-token decode path runs, so its per-column logits
+    // agree with the token the decode path would commit instead of drifting on near-ties.
+    void forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair, std::span<const int> ids,
+                             std::int32_t first_position, Tensor* logits, Tensor* logits_peer,
+                             Tensor* mtp_input_hidden = nullptr, Tensor* logits_columns = nullptr,
+                             Tensor* hidden_columns = nullptr, Phase phase = Phase::Prefill);
+
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+
+    // Tensor-parallel head split: point this context at the per-shard TextConfig (head counts
+    // halved) and record the shard index. The mixer ops then run on the per-shard geometry while
+    // the replicated components (embeddings, norms, lm_head, GDN gating) keep the full-model
+    // config. With no shard config set the context runs the full model (single-GPU path).
+    void set_shard_config(const TextConfig* config, int shard_index) noexcept {
+        shard_config_ = config;
+        shard_index_  = shard_index;
+    }
+    [[nodiscard]] const TextConfig& shard_config() const noexcept {
+        return shard_config_ != nullptr ? *shard_config_ : config_;
+    }
 
     [[nodiscard]] const LinearParameters* proposal_head() const noexcept { return proposal_head_; }
 
@@ -155,15 +233,38 @@ public:
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
+    // MTP prefill chunk: appends the chunk's MTP K/V from the target residual stream and, on the
+    // final chunk, emits the layer's hidden state, full-vocabulary logits and first draft token.
+    // Public because the tensor-parallel route drives the MTP layer per chunk from the runtime.
+    void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
+                           const Tensor& positions, const Tensor& rope_positions,
+                           ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
+                           Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
 private:
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
 
-    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
+                  Tensor* delta = nullptr);
+    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
+                 Tensor* delta = nullptr);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);
+    // One transformer layer's mixer (attention or GDN) on this shard's device. When delta is
+    // null the mixer's output projection is added to the residual in place (single-GPU path);
+    // otherwise the row-parallel output projection is written to delta without the residual
+    // add, so a tensor-parallel driver can all-reduce the delta across shards first.
+    void mixer_layer(const BlockParameters& block, Tensor& x, std::size_t layer, Phase phase,
+                     Tensor* delta = nullptr);
+    // One transformer layer's post-mixer FFN (post-attention norm + dense FFN) on this shard's
+    // device, updating the residual in place. Its row-parallel down projection leaves a partial
+    // residual, so the caller all-reduces before the next layer.
+    void mlp_layer(const BlockParameters& block, Tensor& x, std::size_t layer, Phase phase);
+    // Runs one full transformer layer (mixer + post-mixer FFN) on this shard's device. The
+    // single-GPU path; a tensor-parallel driver calls mixer_layer / mlp_layer directly so it can
+    // interleave all-reduce at the two per-layer boundaries.
+    void single_layer(const BlockParameters& block, Tensor& x, std::size_t layer, Phase phase);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
@@ -185,10 +286,6 @@ private:
                           const Tensor& rope_positions,
                           ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                           const Tensor* input_embeddings);
-    void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
-                           const Tensor& positions, const Tensor& rope_positions,
-                           ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
-                           Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
 
     struct MultimodalPrefill {
@@ -211,6 +308,8 @@ private:
     DeviceContext& ctx_;
     const Parameters& parameters_;
     const TextConfig& config_;
+    const TextConfig* shard_config_ = nullptr;
+    std::int32_t shard_index_       = 0;
     WorkspaceArena& work_;
     qwen3_5::PagedKVCacheView kv_;
     qwen3_5::PagedKVCacheView mtp_kv_;
@@ -249,5 +348,54 @@ private:
     const ops::SamplingConfig* sampling_config_ = nullptr;
     const MtpParameters* mtp_                   = nullptr;
 };
+
+template <class Tap>
+void TextContext::run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor& x, Tensor& x_peer,
+                                 Phase ph, Tap& tap) {
+    for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
+        const auto& block      = parameters_.text.layers[layer];
+        const auto& block_peer = peer.parameters_.text.layers[layer];
+        // One layer's activations are dead once the layer is done. Without this scope the two
+        // deltas below would accumulate over all 64 layers, which only fits at T=1 - at a batched
+        // prefill width each layer would leak 2 * hidden * T * 2 bytes (1.3 GiB at T=1024).
+        auto layer_scope      = work_.scope();
+        auto layer_scope_peer = peer.work_.scope();
+        // Allocate both deltas before any mixer/FFN work: the mixer and FFN ops allocate in a
+        // nested scope that frees on exit, so the deltas (allocated in this outer scope) survive
+        // the ops and remain valid for the allreduce.
+        Tensor mixer_delta      = work_.alloc(DType::BF16, {dimension(config_.hidden_size), x.ne[1]});
+        Tensor mixer_delta_peer = peer.work_.alloc(DType::BF16, {dimension(config_.hidden_size), x.ne[1]});
+        ctx_.bind_to_current_thread();
+        tp_mixer_layer(block, x, mixer_delta, layer, ph);
+        peer.ctx_.bind_to_current_thread();
+        peer.tp_mixer_layer(block_peer, x_peer, mixer_delta_peer, layer, ph);
+        // The mixer output projections are row-parallel, so each shard holds a partial mixer
+        // output; all-reduce the delta and add the sum to the shared residual once. The allreduce
+        // stages both deltas on the compute streams that produced them (D2H after the mixer
+        // kernels, H2D before residual_add), so no pre-sync is needed.
+        ctx_.bind_to_current_thread();
+        pair.allreduce(mixer_delta.data, mixer_delta_peer.data, mixer_delta.bytes(), ctx_.stream,
+                       peer.ctx_.stream);
+        ctx_.bind_to_current_thread();
+        ops::residual_add(mixer_delta, x, ctx_.stream);
+        peer.ctx_.bind_to_current_thread();
+        ops::residual_add(mixer_delta_peer, x_peer, peer.ctx_.stream);
+        Tensor delta      = work_.alloc(DType::BF16, {dimension(config_.hidden_size), x.ne[1]});
+        Tensor delta_peer = peer.work_.alloc(DType::BF16, {dimension(config_.hidden_size), x.ne[1]});
+        ctx_.bind_to_current_thread();
+        tp_mlp_delta(block, x, delta, layer, ph);
+        peer.ctx_.bind_to_current_thread();
+        peer.tp_mlp_delta(block_peer, x_peer, delta_peer, layer, ph);
+        ctx_.bind_to_current_thread();
+        pair.allreduce(delta.data, delta_peer.data, delta.bytes(), ctx_.stream, peer.ctx_.stream);
+        ctx_.bind_to_current_thread();
+        ops::residual_add(delta, x, ctx_.stream);
+        peer.ctx_.bind_to_current_thread();
+        ops::residual_add(delta_peer, x_peer, peer.ctx_.stream);
+        if constexpr (Tap::enabled) {
+            tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
+        }
+    }
+}
 
 } // namespace ninfer::models::qwen3_5::execution

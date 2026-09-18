@@ -12,8 +12,14 @@ struct Fp8LinearShape {
 
 extern const Fp8LinearShape kFp8N14336K5120;
 extern const Fp8LinearShape kFp8N16384K5120;
+extern const Fp8LinearShape kFp8N8192K5120;
+extern const Fp8LinearShape kFp8N7168K5120;
 extern const Fp8LinearShape kFp8N34816K5120;
 extern const Fp8LinearShape kFp8N5120K6144;
 extern const Fp8LinearShape kFp8N5120K17408;
 extern const Fp8LinearShape kFp8N248320K5120;
+extern const Fp8LinearShape kFp8N124160K5120; // TP-2 lm_head shard (half vocabulary)
+extern const Fp8LinearShape kFp8N17408K5120; // TP-2 gate/up shard (mixed-precision FFN)
+extern const Fp8LinearShape kFp8N5120K8704;  // TP-2 down shard (mixed-precision FFN)
+extern const Fp8LinearShape kFp8N5120K3072;  // TP-2 mixer output shard (attention/gdn output)
 } // namespace ninfer::ops::detail

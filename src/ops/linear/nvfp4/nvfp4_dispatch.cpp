@@ -7,7 +7,10 @@
 namespace ninfer::ops::detail {
 namespace {
 const std::array kShapes{&kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
-                         &kNvfp4N5120K6144, &kNvfp4N5120K17408};
+                         &kNvfp4N5120K6144, &kNvfp4N5120K17408,
+                         // TP-2 half-size shapes.
+                         &kNvfp4N7168K5120, &kNvfp4N8192K5120, &kNvfp4N17408K5120,
+                         &kNvfp4N5120K3072, &kNvfp4N5120K8704};
 
 const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
     if (!valid_linear_policy(policy))

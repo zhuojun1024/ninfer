@@ -13,6 +13,7 @@ add_library(ninfer_engine STATIC
   engine/model_instance.cpp
   contract/sampling.cpp
   engine/engine.cpp
+  engine/tp2_generation_core.cpp
 )
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)

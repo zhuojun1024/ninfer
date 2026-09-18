@@ -152,6 +152,9 @@ struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
+    // Second device for tensor-parallel (TP-2) generation. Negative (default) selects the
+    // single-GPU path; a nonnegative value with purpose Generation enables the dedicated TP-2 core.
+    int device_b                       = -1;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;

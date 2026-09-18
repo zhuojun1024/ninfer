@@ -27,4 +27,12 @@ ops::WeightInput Model::input(WeightId id) const {
     return input(WeightUseId{id, 0});
 }
 
+std::unique_ptr<Model> make_shard_model(Config config, LoadOptions options, ModelWeights weights,
+                                        std::vector<BoundWeight> bound, FrontendResources resources,
+                                        InstanceInfo info, artifact::MaterializedArtifact backing) {
+    return std::unique_ptr<Model>(new Model(std::move(config), options, std::move(weights),
+                                            std::move(bound), std::move(resources),
+                                            std::move(info), std::move(backing)));
+}
+
 } // namespace ninfer::models::qwen3_5

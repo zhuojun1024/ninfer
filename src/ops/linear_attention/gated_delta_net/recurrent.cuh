@@ -452,6 +452,9 @@ struct FoldGeometry {
 
 using FoldGeometry48x48 = FoldGeometry<48, 16, 48, 10240>;
 using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
+// Two-way tensor-parallel shard of the 48-layer geometry: half the key and value heads, so the
+// value/qk group ratio and the per-head state shape are unchanged.
+using FoldGeometry48x24 = FoldGeometry<48, 8, 24, 5120>;
 
 template <class Geometry>
 struct FoldAccess {

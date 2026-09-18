@@ -57,6 +57,14 @@ private:
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
           FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing);
 
+    // TP-2 shard construction: build a Model from a shard's bound weights and backing. The
+    // config, options, weights, resources and info are shared (copied) across shards.
+    friend std::unique_ptr<Model> make_shard_model(Config config, LoadOptions options,
+                                                   ModelWeights weights,
+                                                   std::vector<BoundWeight> bound,
+                                                   FrontendResources resources, InstanceInfo info,
+                                                   artifact::MaterializedArtifact backing);
+
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
     artifact::MaterializedArtifact backing_;
     Config config_;
@@ -66,5 +74,14 @@ private:
     FrontendResources resources_;
     InstanceInfo info_;
 };
+
+// TP-2 shard construction: build a Model from a shard's bound weights and backing. The config,
+// options, weights, resources and info are shared (copied) across shards.
+[[nodiscard]] std::unique_ptr<Model> make_shard_model(Config config, LoadOptions options,
+                                                      ModelWeights weights,
+                                                      std::vector<BoundWeight> bound,
+                                                      FrontendResources resources,
+                                                      InstanceInfo info,
+                                                      artifact::MaterializedArtifact backing);
 
 } // namespace ninfer::models::qwen3_5

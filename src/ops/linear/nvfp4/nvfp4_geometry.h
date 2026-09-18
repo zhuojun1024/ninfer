@@ -35,6 +35,11 @@ using Nvfp4N5120K17408 = Nvfp4Geometry<5120, 17408>;
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
+// TP-2 shard input widths: the mixer output projections consume the head-split
+// attention/GDN width (3072), and the sharded FFN down projection consumes the half
+// intermediate width (8704).
+using Nvfp4Activation3072Geometry = Nvfp4ActivationGeometry<3072>;
+using Nvfp4Activation8704Geometry = Nvfp4ActivationGeometry<8704>;
 
 enum class Nvfp4GeometryId : std::uint8_t {
     N14336K5120,

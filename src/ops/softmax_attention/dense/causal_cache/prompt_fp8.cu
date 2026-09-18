@@ -7,6 +7,8 @@
 #include "ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -16,10 +18,20 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
                                                       float scale, const CacheView& cache,
                                                       Metadata metadata, Tensor& out,
                                                       cudaStream_t stream) {
-    static const cudaError_t attr = cudaFuncSetAttribute(
-        causal_attention_prompt_fp8_kernel<Geometry, Metadata>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptFp8SmemBytes);
-    CUDA_CHECK(attr);
+    // The opt-in shared-memory attribute is a per-device property of the function, so a plain
+    // function-local static only configures the first device that reaches this path. A
+    // tensor-parallel run launches this instantiation from every shard's context, and a device that
+    // never opted in rejects the >48 KiB launch with cudaErrorInvalidValue.
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    static bool attr_done[64] = {};
+    const int attr_slot = (device >= 0 && device < 64) ? device : 0;
+    if (!attr_done[attr_slot]) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            causal_attention_prompt_fp8_kernel<Geometry, Metadata>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptFp8SmemBytes));
+        attr_done[attr_slot] = true;
+    }
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const dim3 grid(static_cast<unsigned>(div_up(tokens, kCausalPromptFp8Br)),
@@ -33,6 +45,14 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
             static_cast<const __half*>(cache.v_scale_pages.data), metadata,
             static_cast<const std::int32_t*>(positions.data), scale,
             static_cast<__nv_bfloat16*>(out.data), tokens);
+    if (std::getenv("NINFER_KV_DIAG") != nullptr) {
+        std::fprintf(stderr,
+                     "[kvdiag] fp8 tokens=%d grid=(%u,%u) smem=%zu k=%p v=%p ks=%p vs=%p stream=%p\n",
+                     tokens, grid.x, grid.y,
+                     static_cast<std::size_t>(kCausalPromptFp8SmemBytes), cache.k_pages.data,
+                     cache.v_pages.data, cache.k_scale_pages.data, cache.v_scale_pages.data,
+                     static_cast<const void*>(stream));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -44,6 +64,11 @@ void causal_attention_prompt_fp8_attention_dispatch(const Tensor& q, const Tenso
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_prompt_fp8_attention_launch_for<CausalD256H24Kv4>(
             q, positions, scale, cache, metadata, out, stream);
+        return;
+    }
+    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
+        causal_attention_prompt_fp8_attention_launch_for<CausalD256H12Kv2>(q, positions, scale, cache,
+                                                                           metadata, out, stream);
         return;
     }
     causal_attention_prompt_fp8_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,

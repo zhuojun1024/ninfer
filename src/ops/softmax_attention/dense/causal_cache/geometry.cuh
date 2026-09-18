@@ -14,5 +14,8 @@ struct CausalAttentionGeometry : AttentionHeadMapping<QHeadsValue, KVHeadsValue>
 
 using CausalD256H24Kv4 = CausalAttentionGeometry<24, 4, 1>;
 using CausalD256H16Kv2 = CausalAttentionGeometry<16, 2, 2>;
+// TP-2 tensor-parallel shard of the 24/4 model: half the query heads and half the KV heads. The
+// group size stays 6, so the contiguous query-head to KV-head mapping is unchanged.
+using CausalD256H12Kv2 = CausalAttentionGeometry<12, 2, 2>;
 
 } // namespace ninfer::ops
