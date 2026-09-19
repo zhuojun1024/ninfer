@@ -2,3 +2,10 @@
 # default whitespace checks.
 /third_party/spdlog/include/** -whitespace
 /third_party/spdlog/src/** -whitespace
+
+# This checkout lives on Windows while its build and measurement harnesses run in a WSL tree
+# populated from it, so scripts must keep LF endings on both sides of the copy.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.ps1   text eol=lf
+*.jinja text eol=lf
