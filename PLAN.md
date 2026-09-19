@@ -605,6 +605,67 @@ KV 容量与显存余量（实测，带 `--vision`）：capacity 8192 → kv 145
 capacity 131072 → kv 2322 MiB、free 2002/1580 MiB。**Windows 推荐 131072**（262144 是 WSL 配方，
 WDDM 下余量过小）。
 
+**进度（Round 10）：与 llama.cpp `ar3-opt` 的同机对照 —— decode 打平的原因不在内核**
+
+新增/修改脚本：`tools/win_port/bench_serve.ps1`（同一套工作负载压任意 OpenAI 兼容服务，数字全取服务端自报的 `timings`）、
+`tools/win_port/serve_llama.ps1`（把本机调好的 llama.cpp 配方固化，含 `-Stop`/`-Status`；与 `serve.ps1` 互斥，同一时刻只驻留一个引擎）、
+`serve.ps1` 增加 `-DraftTokens`。协议：temperature 0、256 输出、medium 思考、两边都开 MTP、同题面、一次一个引擎。
+
+| 工作负载 | ninfer | llama.cpp | 比值 |
+|---|---|---|---|
+| prefill 1.9k | 1,401 tok/s | 764 tok/s | 1.83x |
+| prefill 7.2k | 1,667 tok/s | 1,040 tok/s | 1.60x |
+| prefill 28.5k | 1,552 tok/s | 1,016 tok/s | 1.53x |
+| decode 256 贪婪 token（3 次） | 56.7 / 56.7 / 56.7 tok/s | 51.7 / 52.6 / 52.7 tok/s | 1.08x |
+
+同一 decode 题面的单轮预算：ninfer K=2 38.2 ms/轮、2.18 committed、58.8% 单 draft 接受率；ninfer K=3 40.7 ms、2.27、42.4%；
+llama.cpp `n_max=3` 49.4 ms、2.60、53.8%（llama.cpp 每 256 个 token 复用 95–96 次 CUDA graph）。
+
+结论（完整论证见 `docs/tp2-dual-5060ti.md` 的 Cross-engine comparison 一节）：
+
+1. **batch=1 decode 是权重流不是算力题**：`tok/s = 每轮 committed / 轮时长`，轮时长下限 = 每卡权重字节 / 448 GB/s。
+   ninfer 每卡 10.15 GB/forward，llama.cpp 8.56 GB（用 `llama-gguf` 实测其 GGUF 15.94 GiB 的类型分布：NVFP4 MLP 10.38 GiB、
+   q5_K 注意力/GDN 3.09 GiB、q6_K 词表 1.55 GiB、q8_0 输出头 1.29 GiB）。两者分别落在各自下限的 59% / 39%。
+   两张 5060 Ti 合计 896 GB/s = 一张 5090（1,792 GB/s）的一半，这正是同一 artifact 在 5090 上 71.2 tok/s、在这里 ~57 tok/s 的原因：
+   **TP-2 是容量决策（27B 装不进单张 16 GiB），不是提速决策**。
+2. ninfer 的定向优化确实生效在"算得动"的地方：每轮比 llama.cpp 快 23%，prefill 快 1.5–1.8 倍。
+3. 吃掉这点优势的四项：**draft 深度**（2.18 vs 2.60；本 artifact 上 K=3 反而掉到 55.7）、**FP8 权重多读约 26% 字节**、
+   **TP-2 关掉了 CUDA graph**（`model_instance.cpp:99` `use_cuda_graph=false`，~1,009 kernel/forward、~2.9 ms 启动间隔）
+   且**头切分把 allreduce 翻倍到 128 次/token**、融合投影内核在分片行上被绕过（`text.cpp:1104-1113`）、
+   **MTP 链每轮 7–10 ms 串行在 host**（`mtp_propose_window` 每个 draft 一次 `cudaStreamSynchronize`）。
+4. 后续优化顺序（按证据强度）：(a) 给 TP-2 的 verify forward 上 exact-batch CUDA graph（~7.6%/轮）；
+   (b) 把 attention/GDN/embedding/head 与末 8 层 FFN 从 FP8 换 NVFP4（每卡每 token −2.6 GB，约 +18%，有精度代价）；
+   (c) 减少 collective 次数（不切头或合并同层两次 AR）；(d) 让 draft 链与下一轮 verify 重叠或下沉到设备端。
+
+**Round 10 追加：优化 ①③④ 的理论收益核算（模型推算，非实测）**
+
+decode 单轮 38.2 ms / 2.166 committed（=56.7 tok/s）拆账：权重流 25.6 ms（448 GB/s 理论 22.7 ms，效率 89%）
++ allreduce 1.7 ms（128 次 × 9–18 µs，已从 42 µs 优化过）+ 发射间隙 2.91 ms（1009 kernel/forward，nsys 实测）
++ MTP 链 / accept-fold / host 同步 7.7 ms（= 轮时长 − verify 30.5 ms）。
+prefill 每 1024-token 块 660 ms 拆账（按 worklog Round 35c 的 580 ms = AR 350 + MMA 188 + 其它 35 换算到 Windows）：
+AR ≈350 ms（53%）、MMA+其它 ≈310 ms；AR 已贴 Gen4 x4 链路地板（2.6 MB/token ÷ 7 GB/s → 2.67k tok/s）。
+
+| 项 | decode 理论收益 | prefill 理论收益 |
+|---|---|---|
+| ① exact-batch CUDA graph | 发射间隙 2.91 → 0：38.2→35.3 ms，61.4 tok/s（+8.3%） | 块内间隙摊薄，≈ −0.4% |
+| ③ collective 重叠（**不是删掉**，TP 必需） | −1.7 ms（与 draft 链重叠）：→33.6 ms，64.5 tok/s | AR 与 MMA 重叠：660→≈390 ms，**≈2.6k tok/s**（受链路 2.67k 封顶） |
+| ④ draft 链下沉/重叠（保留 ~3 ms 设备端） | −4.7 ms：→28.9 ms，**74.9 tok/s（+32%）** | 不适用（prefill 不走 MTP） |
+
+合计理论值：decode **≈75 tok/s**（绝对地板 22.7+3.0=25.7 ms → 84 tok/s）；prefill **≈2.6k tok/s**（worklog 自己的保守估计 1.5x → ≈2.1k）。
+③ 的边界：worklog 已算过头切分的账——AR 次数 64→128 多花 4.9 ms，换回 9.4 ms 计算，净赚；
+所以"减少 AR 次数"必须放弃权重切分，在 decode 上一定亏，唯一正确方向是"重叠"。
+
+**①③④ 的显存账**（每卡；Windows 131072 实测 free 2002/1580 MiB，262144 配方 free 0/196 MiB）：
+
+| 项 | 增量/卡 | 机制 |
+|---|---|---|
+| ① CUDA graph | ≈ 0–几 MiB（若用 graph 私有 pool 最坏 ≈ 192 MiB） | 所有 arena 启动即常驻（workspace 192.0、state 293.6、KV、权重），graph 只新增 exec 与节点簿记；硬前提是把 AR arrival token 从 mapped host 移到设备端（KiB 级）。风险点本仓库出现过：capture 内 `cudaMallocAsync` 会变成 graph memory node（TMA 描述符那次），故 capture 期的一切分配必须先预分配 |
+| ③ AR∥MMA 子块流水 | **+190–580 MiB** | 2–4 个 in-flight 子块各自需要激活区（workspace 192 MiB × 流水级数）与 GDN 状态快照（state 293.6 由 4–5 份组成，≈59–73 MiB/份）。AR staging 本身是 `cudaHostAllocMapped` 的 host pinned（2×24 MiB × 2 缓冲 = 96 MiB/卡），扩容只吃主机内存 |
+| ④ draft 链下沉/重叠 | 只去 host 同步 ≈ 0–10s MiB；若让 verify 与 draft **并发**则需第二份 MTP KV：**+258 MiB**（仅 shard 0，131072） | MTP 权重 430 MiB 已在两卡复制、MTP KV 已存在（262144 时 516.2 MiB 仅在 shard 0） |
+
+合计 **+0.2–0.85 GiB/卡**：131072 能放下（余量降到 shard 0 ≈ 1.4–1.8 GiB、shard 1 ≈ 1.0–1.4 GiB），
+262144 放不下（free 0/196）。反过来 ② 权重 NVFP4 化会**省** ≈2.15 GiB/卡——② 与 ③ 一起做等于既提速又把 262144 装回来。
+
 **mapped-pinned spike（go/no-go 已通过）**：`tools/win_port/spike.ps1`（源 `tp_mapped_spike.cu`）实测
 peer access 0→1 / 1→0 均为 0（SYS 拓扑，无 P2P）；`cudaHostAllocPortable|cudaHostAllocMapped` +
 `cudaHostGetDevicePointer` 两卡均成功且 peer 看到**同一 UVA 地址**；跨卡读 mapped host 内存校验
@@ -690,5 +751,40 @@ Ctrl+C 停止），只有 `-Background` 才用 `Start-Process`；自测服务时
 - 结论：该条款属硬件约束（不是移植缺口）。若要字面满足，需要另造小 artifact：Windows 侧无 torch（miniconda
   3.13 未装），WSL 侧有项目 py311 环境可转换，但还需写一个 tiny 模型的 recipe —— 属独立子任务，等用户决定
   是否投入。
+**进度（Round 54 第 8 轮）：单卡 CLI 小 artifact 子任务计划（跨压缩记忆）**
+
+目标：在本机产出一个小到能装进单张 16 GiB 卡的 `.ninfer`，然后用 Windows `ninfer.exe` 单卡跑通
+「加载 → 生成 → 采样」，为「跑通单卡 CLI」条款提供实测证据。
+
+已确认的门槛与事实（勿重复调研）：
+- 本机唯一 artifact：`D:\LLM\qwen3_8_27b_nvfp4.ninfer`（27B NVFP4，单卡需 ~20.2 GiB > 16.3 GiB）；引擎
+  `src/runtime` 内**没有**预分配容量前置检查，强行单卡会被 WDDM 换页 → 禁止尝试。
+- Windows python 为 miniconda 3.13，**无 torch**；WSL 侧无 miniconda/py311（AGENTS.md 里那是上游作者机器）。
+- 转换器入口 `python -m tools.convert`（`tools/convert/__main__.py`），官方 recipe 只有 27B 级
+  （`qwen3_8_27b_nvfp4` 等），tiny 模型需自写 recipe（`--recipe my_recipe.py[:configure]` 或 `--override`）。
+- 文档：`docs/weight-conversion.md`（recipe/source/override 语义、safetensors 源）。
+
+拟定步骤（每步可独立验证，失败即可回退）：
+1. 装**CPU 版** torch（避免 2.5 GB CUDA 轮子）：优先 `pip install torch --index-url
+   https://download.pytorch.org/whl/cpu`；直连失败再走本机代理 `http://127.0.0.1:7897`。若不可行，改走
+   「纯 numpy 的合成 `LogicalSource`」，绕开 torch。
+2. 读 `tools/artifact/*.py` 的 `LogicalSource` 接口 + `tools/convert/sources/safetensors.py` 的用法，确定合成源
+   需要提供什么（张量名/形状/字节）。
+3. 按 `src/models/qwen3_5/config.cpp` 的校验与 HF 命名写一个 tiny config（例如 2 层、hidden 1024、
+   head_dim 128、q/kv heads 满足整除约束），生成随机权重（numpy/torch，fp32/bf16 即可）。
+4. `tools/convert` 转换出小 artifact（先试 `--override` 只改 source/输出路径，必要时写 tiny recipe）。
+5. Windows 单卡运行：`ninfer.exe <tiny.ninfer> --prompt "..." --max-new 8`，记录加载时间、是否生成、退出码；
+   若引擎对极小 shape 有硬约束（静态断言/blocksize），按报错调大 config 的最小可行值。
+6. 成功则写入 `docs/windows.md`（单卡 CLI 实测数据）并提交；长期不收敛则把该条款记为硬件+工具链限制。
+**进度（Round 54 第 9 轮）：子任务前置条件就绪**
+
+- CPU 版 torch 已装在 `build-win\torch-venv`（gitignored，不动 base 环境）：**torch 2.14.0+cpu / numpy 2.5.3** ✓
+  （`build-win\torch-venv\Scripts\python.exe`）。
+- 转换器接口已确认：`python -m tools.convert --model <checkpoint目录> --recipe <官方名|file[:func]> --out X.ninfer
+  [--components text] [--override file.py] [--source NAME=PATH] [--name NAME] [--device DEVICE]`；
+  `--model` 即「主 checkpoint/config + 默认资源」。
+- 下一步（按代价从低到高）：① 先直接用官方 recipe 跑 tiny checkpoint（`--recipe qwen3_8_27b_nvfp4
+  --components text`），若它按 config 驱动逐层映射即可零改动成功；② 不成功再写 tiny recipe/override；
+  ③ 生成脚本放 `tools/win_port/tiny_model.py`（合成 tiny config + 随机 bf16 权重，HF 命名）。
 
 

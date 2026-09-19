@@ -59,6 +59,68 @@ use `temperature 0` per request and the response's `usage` token counts, one req
 The startup after CUDA-graph capture is a one-off 14.4 s on this configuration; it is outside the
 numbers above.
 
+## Cross-engine comparison: llama.cpp `ar3-opt`
+
+The reference engine on this machine is a tuned llama.cpp build (`C:\llama_ar3-opt`, source branch
+`ar3-opt` at `C:\llama.cpp`), so both engines were measured back to back on the same two cards with
+the same protocol and exactly one engine resident at a time: one non-streaming chat completion at a
+time, `temperature 0`, 256 generated tokens, `--reasoning-effort medium`, MTP speculative decoding
+on both sides, identical prompt text, and every number taken from the server's own `timings` block.
+Prefill rows send a fresh nonce-prefixed filler prompt with `max_tokens 1`, so prefix caching cannot
+fake them. ninfer runs `--devices 0,1 --max-context 131072 --kv-dtype fp8 --spec mtp
+--draft-tokens 2 --lm-head-draft`; llama.cpp runs the owner's recipe via
+`tools/win_port/serve_llama.ps1` (`-sm tensor -ts 1,1 -c 262144 --spec-type draft-mtp
+--spec-draft-n-max 3 -fa on -ctk q8_0 -ctv q5_0`). Script `tools/win_port/bench_serve.ps1`,
+raw results `build-win/bench-ninfer.json` and `build-win/bench-llama.json`.
+
+| Workload | ninfer | llama.cpp | Ratio |
+|---|---|---|---|
+| prefill, 1.9k-token prompt | 1,401 tok/s | 764 tok/s | 1.83x |
+| prefill, 7.2k-token prompt | 1,667 tok/s | 1,040 tok/s | 1.60x |
+| prefill, 28.5k-token prompt | 1,552 tok/s | 1,016 tok/s | 1.53x |
+| decode, 256 greedy tokens, 3 reps | 56.7 / 56.7 / 56.7 tok/s | 51.7 / 52.6 / 52.7 tok/s | 1.08x |
+
+Round breakdown for the identical decode prompt:
+
+| | ninfer K=2 | ninfer K=3 | llama.cpp n_max=3 |
+|---|---|---|---|
+| round time | 38.2 ms | 40.7 ms | 49.4 ms |
+| committed tokens per round | 2.18 | 2.27 | 2.60 |
+| per-draft acceptance | 58.8% | 42.4% | 53.8% |
+
+**Decode does not separate because batch-1 decode is weight streaming, not compute.** Each engine
+reads every weight once per forward, so `tok/s = committed tokens per round / round time`, and the
+floor of the round time is `weight bytes per shard / 448 GB/s`. ninfer streams 10.15 GB per shard per
+forward; llama.cpp streams 8.56 GB (`llama-gguf` reports 15.94 GiB for its GGUF: 10.38 GiB NVFP4 MLP,
+3.09 GiB q5_K attention/GDN, 1.55 GiB q6_K embedding, 1.29 GiB q8_0 head). The two engines land at
+38.2 ms and 49.4 ms per round, 59% and 39% of their respective floors, once the draft chain and the
+host-side steps are counted. Two 5060 Ti together have 896 GB/s, half of one RTX 5090's 1,792 GB/s,
+which is why this artifact decodes at 71.2 tok/s on a 5090 and at ~57 tok/s here: TP-2 is a capacity
+decision (the 27B artifact does not fit on a single 16 GiB card), not a speed one.
+
+Engine work is where ninfer is ahead - a 23% shorter round than llama.cpp and 1.5-1.8x the prefill
+throughput - and four things consume that on decode:
+
+- **Draft depth.** llama.cpp commits 2.60 tokens per round against 2.18 here. Raising
+  `--draft-tokens` to 3 does not pay on this artifact: the round grows to 40.7 ms while acceptance
+  falls to 42.4%, so decode drops to 55.7 tok/s. Each extra draft is host-serialized
+  (`mtp_propose_window` synchronizes per draft) and adds only ~0.1 committed tokens.
+- **Weight bytes.** Roughly a quarter of the per-token traffic is stored at one byte per element:
+  attention/GDN projections, embedding, output head and the last eight layers' FFN are FP8 where the
+  reference GGUF spends 0.56-0.69 B/element. Repacking them as NVFP4 would remove ~2.6 GB per shard
+  per token, at a quality cost.
+- **TP-2 structural losses.** This route runs with `use_cuda_graph = false`
+  (`src/runtime/engine/model_instance.cpp:99`), so a verify forward launches ~1,009 kernels and pays
+  ~2.9 ms of launch gaps; splitting heads doubles the collectives to 128 allreduces per token
+  (~2.6 MB round trip, 9-18 us each); the fused `linear_swiglu`/`attn_input_proj` kernels are
+  registered for full-model rows only and are bypassed on shard-local rows. llama.cpp captures the
+  whole round, draft chain included, in CUDA graphs (95-96 replays per 256-token answer).
+- **Draft chain on the host.** Two drafts cost 7-10 ms of the 38.2 ms round on top of the ~30 ms
+  verify forward, so the MTP chain, not the kernels, is the largest single overhead.
+
+Caveat: llama.cpp ran with the owner's exact command line and therefore its default batch/ubatch; a
+larger `-ub` was not tried and could move its prefill numbers.
+
 ## KV cache quantization
 
 `--kv-dtype` supports `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`. All of them work on the
