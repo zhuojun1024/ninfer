@@ -37,9 +37,9 @@ public:
     // Prefix-reuse state snapshots per shard: slot 0 is the prefill end, the others are rewinds
     // behind it. Chat templates render the previous assistant turn and the generation tail
     // differently, so two consecutive prompts share everything up to a point a little before the
-    // earlier prompt's end. The rewind depths follow the gap the previous pair of prompts showed,
-    // with a wider slot so a growing gap still lands on a reusable boundary.
-    static constexpr std::size_t kReuseSnapshotCount = 3;
+    // earlier prompt's end. One rewind behind the prefill end covers that gap; every extra slot is
+    // another 73 MiB of resident state per shard, which this context ceiling cannot spare.
+    static constexpr std::size_t kReuseSnapshotCount = 2;
     // Extra state slot (beyond the reuse snapshots) holding the pre-verify state of the current MTP
     // round: RecordForReplay advances the live state by the whole window, so the fold must replay the
     // committed columns from this snapshot instead of stacking on an already advanced state.
@@ -184,10 +184,9 @@ private:
     // positions its state snapshots correspond to, and whether those snapshots are usable.
     std::vector<TokenId> cached_prompt_tokens_;
     std::array<std::uint32_t, kReuseSnapshotCount> cached_boundaries_{};
-    // Rewind depths used for the snapshots of the next prefill, predicted from the previous pair of
+    // Rewind depth used for the snapshots of the next prefill, predicted from the previous pair of
     // prompts' shared-prefix gap.
     std::uint32_t rewind_near_ = 9;
-    std::uint32_t rewind_far_  = 72;
     bool cached_state_valid_ = false;
 
     // Multi-token prediction (--spec mtp): the proposal window, and how often the MTP layer's

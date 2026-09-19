@@ -32,6 +32,14 @@ ninfer_add_op_test(ninfer_linear_tp2_split_nvfp4_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tp2_split_nvfp4.cpp"
   LIBRARIES ninfer_linear_test_support)
 
+ninfer_add_op_test(ninfer_linear_tp2_split_fp8_head_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tp2_split_fp8_head.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
+ninfer_add_op_test(ninfer_linear_tp2_split_grouped_head_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tp2_split_grouped_head.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
 ninfer_add_op_test(ninfer_linear_fp8_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_a16.cpp"
   LIBRARIES ninfer_linear_test_support)

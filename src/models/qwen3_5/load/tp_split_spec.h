@@ -1,13 +1,14 @@
 #pragma once
 
-// Builds the TP-2 split spec for the Qwen3.5 27B dense text component (FFN-only sharding).
-// The attention and GDN mixers are replicated in full on both GPUs (their fused projection ops
-// validate full-model geometry), while the dense FFN is sharded and the lm_head is split:
-//   - gate/up: GatherRows (two equal row blocks, each halved) - column-parallel.
-//   - FFN down: RowParallel (the intermediate input columns are split).
-//   - lm_head: ColumnParallel (vocab rows split).
-//   - token_embedding, norms, mixer projections, conv, gating, mixer output projections:
-//     Replicated.
+// Builds the TP-2 split spec for the Qwen3.5 27B dense text component (head-parallel mixers).
+// The attention and GDN mixers are sharded by head, the dense FFN is sharded, and the output head
+// is vocabulary-split when its only consumer is the target logits:
+//   - attention/GDN fused input projections: GatherRows; GDN causal conv: GatherCols.
+//   - mixer output projections and FFN down: RowParallel; FFN gate/up: GatherRows.
+//   - output_head and the reduced proposal/head: ColumnParallel (vocab rows split) when
+//     TpSplitOptions asks for it.
+//   - token_embedding: RowParallel (hidden columns split; both shards keep every vocabulary row).
+//   - norms and GDN gating: Replicated.
 // Objects not classified are replicated.
 
 #include "artifact/schema.h"
@@ -16,7 +17,22 @@
 
 namespace ninfer::models::qwen3_5::loading {
 
+// Split choices that depend on how the loaded route consumes the artifact.
+struct TpSplitOptions {
+    // Vocabulary-split the text output head. Valid only when the head has a single consumer, the
+    // target logits: selecting an unoptimized (Full) proposal head makes this object weight-tied to
+    // the MTP proposal, which runs on shard 0 alone and needs every vocabulary row, so that route
+    // keeps it replicated. The engine merges the two halves back into the full [V, T] logits
+    // before sampling.
+    bool split_output_head = false;
+    // Vocabulary-split the optimized (reduced) proposal head. The table is identical on both
+    // shards although only shard 0 samples a draft from it; splitting halves the resident copy and
+    // the pair merges the draft logits back to the reduced vocabulary before the argmax.
+    bool split_proposal_head = false;
+};
+
 [[nodiscard]] tp::TPSplitSpec build_tp_split_spec(const artifact::Directory& directory,
-                                                  const TextConfig& config);
+                                                  const TextConfig& config,
+                                                  const TpSplitOptions& options = {});
 
 } // namespace ninfer::models::qwen3_5::loading

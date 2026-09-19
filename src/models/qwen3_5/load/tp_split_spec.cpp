@@ -41,14 +41,18 @@ std::int32_t as_i32(std::uint64_t value) {
 // all-reduce after each mixer. The GDN gating projections (a/b), a_log and dt_bias stay
 // replicated: each shard runs the full 48-head gating GEMM and slices g/beta to its local value
 // heads, so no 1-D fp32 split or gating-op change is needed. Embeddings and norms are replicated.
-TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const TextConfig& config) {
+TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const TextConfig& config,
+                                const TpSplitOptions& options) {
     // Reverse map: physical object index -> text-component parameter names referencing it. Every
     // binding carries at least one part, including a whole-object binding (which stores a single
     // part spanning that object), so indexing by the part's object covers both forms. The
     // whole_object flag is a boolean marker, not an object index, and must not key this map.
     std::map<std::size_t, std::set<std::string>> names_by_object;
     for (const auto& [name, binding] : directory.bindings) {
-        if (name.rfind("text/", 0) != 0 && name.rfind("mtp/", 0) != 0) { continue; }
+        if (name.rfind("text/", 0) != 0 && name.rfind("mtp/", 0) != 0 &&
+            name.rfind("proposal/", 0) != 0) {
+            continue;
+        }
         for (const auto& p : binding.parts) { names_by_object[p.object.index].insert(name); }
     }
 
@@ -99,12 +103,26 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
             // savings at the cost of a second lockstep all-reduce path. Keep them whole everywhere.
             split.kind = WeightSplitKind::Replicated;
         } else if (has_name("token_embedding")) {
-            split.kind = WeightSplitKind::Replicated;
+            // Row-parallel (hidden dimension): each shard holds the whole vocabulary with half the
+            // hidden columns, so no token id can fall outside a shard's rows and the gather needs
+            // no per-shard bounds handling. The engine assembles the full hidden state from the
+            // pair before the layer loop (the text forwards) and before the MTP stem's projection.
+            split.kind = WeightSplitKind::RowParallel;
+        } else if (has_name("proposal/head")) {
+            // The optimized proposal head is a reduced-vocabulary draft head: only shard 0 samples a
+            // draft from it, but the table itself is the same on both shards. Vocabulary-parallel
+            // when asked for, so each shard projects its own row block and the pair assembles the
+            // draft logits exactly as the target logits are assembled.
+            split.kind = options.split_proposal_head ? WeightSplitKind::ColumnParallel
+                                                     : WeightSplitKind::Replicated;
         } else if (has_name("output_head")) {
-            // The lm_head is weight-tied to the token embedding and each shard computes the
-            // full-vocabulary logits independently (the final hidden state is identical on both
-            // shards), so the head stays replicated rather than column-parallel.
-            split.kind = WeightSplitKind::Replicated;
+            // Vocabulary-parallel when the head has one consumer (the target logits): each shard
+            // then holds rows [shard * V/2, (shard + 1) * V/2) and the engine assembles the full
+            // logits from the pair before sampling. A Full proposal head makes this object
+            // weight-tied to the MTP proposal, which runs on shard 0 alone and needs every row,
+            // so that route keeps it replicated.
+            split.kind = options.split_output_head ? WeightSplitKind::ColumnParallel
+                                                   : WeightSplitKind::Replicated;
         } else if (n == 2 * attn_q + 2 * attn_k && k == hidden) {
             // Attention fused input projection, physical row order [q | k | gate | v]. Each block
             // is halved across the two GPUs and the halves concatenated in block order.

@@ -123,21 +123,20 @@ public:
                         Phase ph, Tap& tap);
 
     // Tensor-parallel single-token forward at `position`: embedding on both shards, the lockstep
-    // layer loop, the final norm, and the lm_head. The lm_head is weight-tied to the token
-    // embedding (the same physical object), so it is replicated in full on both shards and each
-    // computes the full-vocabulary logits independently; the two agree exactly and no all-reduce
-    // is needed. `position` is the absolute cache/RoPE position, so the replicated mixers attend
-    // to the cached prefix [0, position) and update the paged KV cache and GDN state in place,
-    // enabling a stateful autoregressive decode. `logits` and `logits_peer` must be
-    // full-vocabulary BF16 [V, 1] buffers.
+    // layer loop, the final norm, and the lm_head. The head is either replicated in full on both
+    // shards or vocabulary-split (see project_head_tp2); either way both shards leave the complete
+    // full-vocabulary logits in their buffer. `position` is the absolute cache/RoPE position, so
+    // the mixers attend to the cached prefix [0, position) and update the paged KV cache and GDN
+    // state in place, enabling a stateful autoregressive decode. `logits` and `logits_peer` must
+    // be full-vocabulary BF16 [V, 1] buffers.
     // mtp_input_hidden (optional, [hidden,1] BF16) receives the final-norm hidden (the lm_head
     // input), which is the hidden the multi-token-prediction layer consumes.
     void forward_tp2(TextContext& peer, tp::DevicePair& pair, std::int32_t token,
                      std::int32_t position, Tensor& logits, Tensor& logits_peer,
                      Tensor* mtp_input_hidden = nullptr);
     // Tensor-parallel single-token forward at `position` returning the argmax token id on this
-    // shard's device. The full-vocabulary logits are identical on both shards (replicated
-    // lm_head), so the argmax agrees across shards.
+    // shard's device. Both shards hold the complete logits, so their argmax must agree; a
+    // disagreement is a shard divergence.
     [[nodiscard]] std::int32_t forward_tp2_token(TextContext& peer, tp::DevicePair& pair,
                                                  std::int32_t token, std::int32_t position = 0);
     // Tensor-parallel batched prefill forward. Runs the lockstep layer loop at Phase::Prefill over
@@ -164,13 +163,18 @@ public:
                              Tensor* mtp_input_hidden = nullptr, Tensor* logits_columns = nullptr,
                              Tensor* hidden_columns = nullptr, Phase phase = Phase::Prefill);
 
+    // Registers the peer shard's context and the device pair. The tensor-parallel driver sets this
+    // on both shards once, so operations that only run on one shard (the MTP stem) can still drive
+    // the peer's half of a column-split weight.
+    void set_tp_peer(TextContext* peer, tp::DevicePair* pair);
+
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
-    // Tensor-parallel head split: point this context at the per-shard TextConfig (head counts
-    // halved) and record the shard index. The mixer ops then run on the per-shard geometry while
-    // the replicated components (embeddings, norms, lm_head, GDN gating) keep the full-model
-    // config. With no shard config set the context runs the full model (single-GPU path).
+    // Tensor-parallel split: point this context at the per-shard TextConfig (head counts halved)
+    // and record the shard index. The mixer and weight ops then run on the per-shard geometry,
+    // while the components the spec keeps replicated (norms, GDN gating) use the full-model config.
+    // With no shard config set the context runs the full model (single-GPU path).
     void set_shard_config(const TextConfig* config, int shard_index) noexcept {
         shard_config_ = config;
         shard_index_  = shard_index;
@@ -241,6 +245,33 @@ public:
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
 private:
+    // Vocabulary-parallel output head (TP-2). Projects `hidden` / `hidden_peer` through each
+    // shard's half of the output head and assembles the complete [V, T] logits into `logits` and
+    // `logits_peer`, so sampling and the speculative accept/reject see the full vocabulary on
+    // both shards. With a replicated head this is the two independent full projections that agree
+    // exactly, and no collective runs.
+    void project_head_tp2(TextContext& peer, tp::DevicePair& pair, const Tensor& hidden,
+                          const Tensor& hidden_peer, Tensor& logits, Tensor& logits_peer);
+
+    // True when the token embedding owns only half the hidden columns (RowParallel split).
+    [[nodiscard]] bool embedding_is_split() const noexcept;
+
+    // Token embedding on the tensor-parallel pair. Each shard gathers its own half of the hidden
+    // columns into a compact [hidden/2, T] block; merge_local_row_blocks then assembles the full
+    // [hidden, T] state on both shards. With a replicated table this is the two independent gathers
+    // (identical rows, no collective). ids_peer already holding the same token ids on the peer skips
+    // the broadcast; a null x_peer destination allocates a peer scratch window for the merge.
+    void embedding_tp2(TextContext& peer, tp::DevicePair& pair, const Tensor& ids,
+                       const Tensor* ids_peer, Tensor& x, Tensor* x_peer);
+
+    // Places each shard's compact [local_rows, T] block at its half of the contiguous [rows, T]
+    // destination, zeroes the other half and all-reduces the pair, so both destinations end with
+    // the sum of two disjoint row blocks (their concatenation). The row blocks are strided windows
+    // of a wider parent, so each side needs a compact source and an explicit placement copy.
+    void merge_local_row_blocks(TextContext& peer, tp::DevicePair& pair, const Tensor& local,
+                                const Tensor& local_peer, Tensor& destination,
+                                Tensor& destination_peer, std::int32_t local_rows);
+
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
@@ -310,6 +341,9 @@ private:
     const TextConfig& config_;
     const TextConfig* shard_config_ = nullptr;
     std::int32_t shard_index_       = 0;
+    // Peer shard registration for operations that run on one shard alone (see set_tp_peer).
+    TextContext* peer_tp_    = nullptr;
+    tp::DevicePair* pair_tp_ = nullptr;
     WorkspaceArena& work_;
     qwen3_5::PagedKVCacheView kv_;
     qwen3_5::PagedKVCacheView mtp_kv_;

@@ -119,16 +119,17 @@ std::vector<BoundWeight> shard_views(std::span<const PendingWeight> pending,
                 view.shape[0]    = n;
                 view.shape[1]    = k / 2;
             } else {
-                // ColumnParallel: whole-object row split into two equal halves.
+                // ColumnParallel: whole-object row split into two equal halves. The materialized
+                // shard payload already holds exactly this shard's rows, so its view covers that
+                // payload from the start - the same shard-local convention as GatherRows/GatherCols
+                // (the parent geometry here is the shard's own n/2 x k slice).
                 if (part.begin != 0 || part.end != n * k) {
                     throw std::invalid_argument(
                         "shard view: ColumnParallel requires a whole-object part");
                 }
-                const std::uint64_t row_begin = static_cast<std::uint64_t>(shard) * (n / 2);
-                const std::uint64_t row_count = n / 2;
-                shard_part.begin = row_begin * k;
-                shard_part.end   = (row_begin + row_count) * k;
-                view.shape[0]    = row_count;
+                shard_part.begin = 0;
+                shard_part.end   = (n / 2) * k;
+                view.shape[0]    = n / 2;
                 view.shape[1]    = k;
             }
             }

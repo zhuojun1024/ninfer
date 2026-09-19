@@ -97,6 +97,35 @@ void copy_row_block(const Tensor& parent, std::int32_t row_begin, std::int32_t r
                                  stream));
 }
 
+// Inverse of copy_row_block: materialize a contiguous [rows, columns] source into the row block
+// [row_begin, row_begin + rows) of a wider contiguous parent. The vocabulary-parallel output head
+// needs it because dim 0 is the innermost axis: a shard projects its own vocabulary rows compactly
+// and then stamps them into the full-logits buffer at its vocabulary offset.
+void write_row_block(const Tensor& src, Tensor& parent, std::int32_t row_begin, cudaStream_t stream) {
+    const std::int32_t parent_rows = parent.ne[0];
+    const std::int32_t rows        = src.ne[0];
+    const std::int32_t columns     = src.ne[1];
+    if (parent.ne[2] != 1 || parent.ne[3] != 1 || !parent.is_contiguous() ||
+        parent.data == nullptr) {
+        throw std::invalid_argument("write_row_block: parent must be a contiguous matrix");
+    }
+    if (src.ne[2] != 1 || src.ne[3] != 1 || !src.is_contiguous() || src.data == nullptr ||
+        src.dtype != parent.dtype) {
+        throw std::invalid_argument("write_row_block: source must be a contiguous matrix");
+    }
+    if (rows <= 0 || columns <= 0 || row_begin < 0 || rows > parent_rows - row_begin) {
+        throw std::invalid_argument("write_row_block: invalid row range");
+    }
+    const std::size_t element = dtype_size(parent.dtype);
+    CUDA_CHECK(cudaMemcpy2DAsync(static_cast<unsigned char*>(parent.data) +
+                                     static_cast<std::size_t>(row_begin) * element,
+                                 static_cast<std::size_t>(parent_rows) * element, src.data,
+                                 static_cast<std::size_t>(rows) * element,
+                                 static_cast<std::size_t>(rows) * element,
+                                 static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice,
+                                 stream));
+}
+
 void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<std::int32_t> shape,
                           const char* label) {
     if (t.dtype != dtype) { throw std::invalid_argument(std::string(label) + " dtype mismatch"); }
@@ -315,6 +344,129 @@ void TextContext::set_gdn_state_action(GdnStateAction action,
     replay_records_   = replay_records;
 }
 
+void TextContext::set_tp_peer(TextContext* peer, tp::DevicePair* pair) {
+    if (peer == nullptr || pair == nullptr) {
+        throw std::invalid_argument("set_tp_peer: peer context and device pair must be set");
+    }
+    if (peer == this) { throw std::invalid_argument("set_tp_peer: a shard cannot be its own peer"); }
+    peer_tp_ = peer;
+    pair_tp_ = pair;
+}
+
+bool TextContext::embedding_is_split() const noexcept {
+    return dimension(embed_->k) != dimension(config_.hidden_size);
+}
+
+void TextContext::merge_local_row_blocks(TextContext& peer, tp::DevicePair& pair,
+                                         const Tensor& local, const Tensor& local_peer,
+                                         Tensor& destination, Tensor& destination_peer,
+                                         std::int32_t local_rows) {
+    const std::int32_t full_rows = destination.ne[0];
+    const std::int32_t columns   = destination.ne[1];
+    if (local_rows <= 0 || local_rows * 2 != full_rows || columns <= 0 || shard_index_ < 0 ||
+        peer.shard_index_ < 0 || peer.shard_index_ == shard_index_) {
+        throw std::logic_error(
+            "merge_local_row_blocks: a split weight needs exactly half the rows and two distinct "
+            "shards");
+    }
+    const auto matrix = [columns](const Tensor& t, std::int32_t rows, const char* label) {
+        if (t.dtype != DType::BF16 || t.ne[0] != rows || t.ne[1] != columns || t.ne[2] != 1 ||
+            t.ne[3] != 1 || !t.is_contiguous() || t.data == nullptr) {
+            throw std::invalid_argument(std::string("merge_local_row_blocks: ") + label +
+                                        " must be a contiguous BF16 [rows, T] matrix");
+        }
+    };
+    matrix(local, local_rows, "local block");
+    matrix(local_peer, local_rows, "peer block");
+    matrix(destination, full_rows, "destination");
+    matrix(destination_peer, full_rows, "peer destination");
+
+    ctx_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemsetAsync(destination.data, 0, destination.bytes(), ctx_.stream));
+    write_row_block(local, destination, shard_index_ * local_rows, ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    CUDA_CHECK(
+        cudaMemsetAsync(destination_peer.data, 0, destination_peer.bytes(), peer.ctx_.stream));
+    write_row_block(local_peer, destination_peer, peer.shard_index_ * local_rows, peer.ctx_.stream);
+    ctx_.bind_to_current_thread();
+    pair.allreduce(destination.data, destination_peer.data, destination.bytes(), ctx_.stream,
+                   peer.ctx_.stream);
+}
+
+void TextContext::embedding_tp2(TextContext& peer, tp::DevicePair& pair, const Tensor& ids,
+                                const Tensor* ids_peer, Tensor& x, Tensor* x_peer) {
+    const std::int32_t hidden = dimension(config_.hidden_size);
+    const std::int32_t local  = dimension(embed_->k);
+    if (ids.dtype != DType::I32 || ids.ne[0] <= 0 || ids.ne[1] != 1 || ids.ne[2] != 1 ||
+        ids.ne[3] != 1 || !ids.is_contiguous() || ids.data == nullptr) {
+        throw std::invalid_argument("embedding_tp2: ids must be a contiguous I32 [T] tensor");
+    }
+    if (local == hidden) {
+        // Replicated table: both shards hold every row, so each gathers its own copy.
+        if (ids_peer == nullptr || x_peer == nullptr) {
+            throw std::invalid_argument(
+                "embedding_tp2: a replicated embedding needs both shards' ids and destinations");
+        }
+        ctx_.bind_to_current_thread();
+        ops::embedding(ids, *embed_, x, ctx_.stream);
+        peer.ctx_.bind_to_current_thread();
+        ops::embedding(*ids_peer, *peer.embed_, *x_peer, peer.ctx_.stream);
+        return;
+    }
+    if (local <= 0 || local * 2 != hidden || shard_index_ < 0 || peer.shard_index_ < 0 ||
+        peer.shard_index_ == shard_index_ || dimension(peer.embed_->k) != local) {
+        throw std::logic_error(
+            "embedding_tp2: a column-split embedding needs half the hidden size per shard on two "
+            "distinct shards");
+    }
+    const std::int32_t columns = x.ne[1];
+    if (x.dtype != DType::BF16 || x.ne[0] != hidden || columns <= 0 || x.ne[2] != 1 || x.ne[3] != 1 ||
+        !x.is_contiguous() || x.data == nullptr) {
+        throw std::invalid_argument(
+            "embedding_tp2: destination must be a contiguous BF16 [hidden, T] matrix");
+    }
+    ctx_.bind_to_current_thread();
+    auto scope      = work_.scope();
+    Tensor partial  = work_.alloc(DType::BF16, {local, columns});
+    ops::embedding(ids, *embed_, partial, ctx_.stream);
+
+    peer.ctx_.bind_to_current_thread();
+    auto peer_scope          = peer.work_.scope();
+    Tensor partial_peer      = peer.work_.alloc(DType::BF16, {local, columns});
+    Tensor destination_peer  = x_peer != nullptr ? *x_peer
+                                                 : peer.work_.alloc(DType::BF16, {hidden, columns});
+    Tensor ids_peer_storage;
+    Tensor ids_peer_view;
+    if (ids_peer == nullptr) {
+        // The peer needs the same token ids. The text path already binds them per shard; the MTP
+        // stem only owns them here, so mirror a private copy into a zeroed peer buffer and sum the
+        // pair - a broadcast that needs no host round trip.
+        // The pair's all-reduce works in 16-byte units, so the broadcast buffer is padded up and
+        // the tail zeroed on both sides; only the leading ids are read.
+        const std::size_t id_bytes = static_cast<std::size_t>(ids.ne[0]) * sizeof(std::int32_t);
+        const std::size_t broadcast_bytes = ((id_bytes + 15u) / 16u) * 16u;
+        const std::int32_t words = static_cast<std::int32_t>(broadcast_bytes / sizeof(std::int32_t));
+        ctx_.bind_to_current_thread();
+        Tensor ids_staging = work_.alloc(DType::I32, {words});
+        CUDA_CHECK(cudaMemsetAsync(ids_staging.data, 0, broadcast_bytes, ctx_.stream));
+        CUDA_CHECK(cudaMemcpyAsync(ids_staging.data, ids.data, id_bytes,
+                                   cudaMemcpyDeviceToDevice, ctx_.stream));
+        peer.ctx_.bind_to_current_thread();
+        ids_peer_storage = peer.work_.alloc(DType::I32, {words});
+        CUDA_CHECK(cudaMemsetAsync(ids_peer_storage.data, 0, broadcast_bytes, peer.ctx_.stream));
+        ctx_.bind_to_current_thread();
+        pair.allreduce(ids_staging.data, ids_peer_storage.data, broadcast_bytes, ctx_.stream,
+                       peer.ctx_.stream);
+        // The gather validates ids against the output's token extent, so the peer reads only the
+        // leading ids from the padded staging buffer.
+        ids_peer_view = ids_peer_storage.slice(0, 0, ids.ne[0]);
+        ids_peer      = &ids_peer_view;
+    }
+    peer.ctx_.bind_to_current_thread();
+    ops::embedding(*ids_peer, *peer.embed_, partial_peer, peer.ctx_.stream);
+    merge_local_row_blocks(peer, pair, partial, partial_peer, x, destination_peer, local);
+}
+
 void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
                                    const Tensor* input_embeddings, Tensor& x, Tensor& ah) {
     cudaStream_t s     = ctx_.stream;
@@ -335,7 +487,17 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
         emb = input_embeddings->view({dimension(config_.hidden_size), T});
     } else {
         emb = roots.embedding;
-        ops::embedding(flat_ids, *embed_, emb, s);
+        if (embedding_is_split()) {
+            // The MTP layer runs on this shard alone, so the column split needs the peer's half:
+            // broadcast the token ids and let it gather its columns, then merge.
+            if (peer_tp_ == nullptr || pair_tp_ == nullptr) {
+                throw std::logic_error(
+                    "mtp_forward_stem: a column-split token embedding needs set_tp_peer");
+            }
+            embedding_tp2(*peer_tp_, *pair_tp_, flat_ids, nullptr, emb, nullptr);
+        } else {
+            ops::embedding(flat_ids, *embed_, emb, s);
+        }
     }
 
     Tensor e = roots.normalized_embedding;
@@ -602,9 +764,57 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
     if (proposal_head_ != nullptr) {
-        Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
-        project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
-        ops::argmax(proposal_logits, proposal_tokens,
+        const std::int32_t rows = dimension(proposal_head_->weight.n);
+        if (rows == proposal_head_n_) {
+            Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
+            project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
+            ops::argmax(proposal_logits, proposal_tokens,
+                        proposal_head_ids_
+                            ? proposal_head_n_
+                            : dimension(parameters_.model.resources().public_token_count),
+                        ctx_.stream);
+            if (proposal_head_ids_ != nullptr) {
+                ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_,
+                                              proposal_head_n_, ctx_.stream);
+            }
+            return;
+        }
+        // Vocabulary-split draft head: each shard projects its own row block of the reduced
+        // vocabulary into the draft logits, and the pair merges them back to [rows*2, T] on both
+        // shards. Only this shard samples, and only this shard runs the MTP layer, so it hands the
+        // peer the pre-head hidden state it needs.
+        if (rows <= 0 || rows * 2 != proposal_head_n_ || peer_tp_ == nullptr || pair_tp_ == nullptr ||
+            peer_tp_->proposal_head_ == nullptr ||
+            dimension(peer_tp_->proposal_head_->weight.n) != rows) {
+            throw std::logic_error(
+                "proposal_argmax: a split proposal head needs half the rows on a peer that holds "
+                "the matching half");
+        }
+        TextContext& peer                  = *peer_tp_;
+        tp::DevicePair& pair               = *pair_tp_;
+        const std::int32_t hidden_size = dimension(config_.hidden_size);
+        ctx_.bind_to_current_thread();
+        Tensor merged = work_.alloc(DType::BF16, {proposal_head_n_, T});
+        Tensor hidden_local = work_.alloc(DType::BF16, {hidden_size, T});
+        CUDA_CHECK(cudaMemcpyAsync(hidden_local.data, hidden.data, hidden_local.bytes(),
+                                   cudaMemcpyDeviceToDevice, ctx_.stream));
+        peer.ctx_.bind_to_current_thread();
+        Tensor hidden_peer = peer.work_.alloc(DType::BF16, {hidden_size, T});
+        CUDA_CHECK(cudaMemsetAsync(hidden_peer.data, 0, hidden_peer.bytes(), peer.ctx_.stream));
+        ctx_.bind_to_current_thread();
+        pair.allreduce(hidden_local.data, hidden_peer.data, hidden_local.bytes(), ctx_.stream,
+                       peer.ctx_.stream);
+
+        Tensor part = work_.alloc(DType::BF16, {rows, T});
+        project(hidden_local, *proposal_head_, part, work_, ctx_.stream);
+        peer.ctx_.bind_to_current_thread();
+        Tensor part_peer = peer.work_.alloc(DType::BF16, {rows, T});
+        project(hidden_peer, *peer.proposal_head_, part_peer, peer.work_, peer.ctx_.stream);
+        Tensor merged_peer = peer.work_.alloc(DType::BF16, {proposal_head_n_, T});
+        merge_local_row_blocks(peer, pair, part, part_peer, merged, merged_peer, rows);
+
+        ctx_.bind_to_current_thread();
+        ops::argmax(merged, proposal_tokens,
                     proposal_head_ids_
                         ? proposal_head_n_
                         : dimension(parameters_.model.resources().public_token_count),
@@ -1381,6 +1591,41 @@ void TextContext::run_layers(Tensor& x, Phase ph) {
     run_layers(x, ph, tap);
 }
 
+void TextContext::project_head_tp2(TextContext& peer, tp::DevicePair& pair, const Tensor& hidden,
+                                   const Tensor& hidden_peer, Tensor& logits, Tensor& logits_peer) {
+    const std::int32_t vocab = dimension(config_.vocab_size);
+    const std::int32_t local = dimension(lm_head_->weight.n);
+    if (local == vocab) {
+        // Replicated head: both shards hold every row and their inputs agree exactly (replicated
+        // mixers plus the all-reduced FFN delta), so each computes the full-vocabulary logits on
+        // its own and no collective is needed.
+        ctx_.bind_to_current_thread();
+        project(hidden, *lm_head_, logits, work_, ctx_.stream);
+        peer.ctx_.bind_to_current_thread();
+        project(hidden_peer, *peer.lm_head_, logits_peer, peer.work_, peer.ctx_.stream);
+        return;
+    }
+    if (local <= 0 || local * 2 != vocab || shard_index_ < 0 || peer.shard_index_ < 0 ||
+        peer.shard_index_ == shard_index_) {
+        throw std::logic_error(
+            "project_head_tp2: a vocabulary-split output head needs exactly half the vocabulary and "
+            "two distinct shards");
+    }
+    // Each shard projects only its own vocabulary rows into a compact block; the merge stamps them
+    // into the full-logits buffers at their vocabulary offsets and sums the pair, which yields the
+    // complete [V, T] logits on both shards.
+    const std::int32_t columns = logits.ne[1];
+    ctx_.bind_to_current_thread();
+    auto scope      = work_.scope();
+    Tensor partial  = work_.alloc(DType::BF16, {local, columns});
+    project(hidden, *lm_head_, partial, work_, ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    auto peer_scope     = peer.work_.scope();
+    Tensor partial_peer = peer.work_.alloc(DType::BF16, {local, columns});
+    project(hidden_peer, *peer.lm_head_, partial_peer, peer.work_, peer.ctx_.stream);
+    merge_local_row_blocks(peer, pair, partial, partial_peer, logits, logits_peer, local);
+}
+
 void TextContext::forward_tp2(TextContext& peer, tp::DevicePair& pair, std::int32_t token,
                               std::int32_t position, Tensor& logits, Tensor& logits_peer,
                               Tensor* mtp_input_hidden) {
@@ -1452,9 +1697,7 @@ void TextContext::forward_tp2(TextContext& peer, tp::DevicePair& pair, std::int3
     ctx_.bind_to_current_thread();
     Tensor x      = work_.alloc(DType::BF16, {hidden, 1});
     Tensor x_peer = peer.work_.alloc(DType::BF16, {hidden, 1});
-    ops::embedding(ids, *embed_, x, ctx_.stream);
-    peer.ctx_.bind_to_current_thread();
-    ops::embedding(ids_peer, *peer.embed_, x_peer, peer.ctx_.stream);
+    embedding_tp2(peer, pair, ids, &ids_peer, x, &x_peer);
     NullTap tap;
     run_layers_tp2(peer, pair, x, x_peer, Phase::Verify, tap);
 
@@ -1479,15 +1722,9 @@ void TextContext::forward_tp2(TextContext& peer, tp::DevicePair& pair, std::int3
                  peer.ctx_.stream);
 
 
-    // The lm_head is weight-tied to the token embedding (the same physical object), so it is
-    // replicated in full on both shards - each holds the complete [vocab, hidden] weight. The
-    // hidden_out is identical on both shards (replicated mixers plus the all-reduced FFN delta),
-    // so each shard computes the full-vocabulary logits independently and the two agree exactly.
-    // No all-reduce is needed for the head.
-    ctx_.bind_to_current_thread();
-    project(hidden_out, *lm_head_, logits, work_, ctx_.stream);
-    peer.ctx_.bind_to_current_thread();
-    project(hidden_out_peer, *peer.lm_head_, logits_peer, peer.work_, peer.ctx_.stream);
+    // The head is replicated or vocabulary-split; project_head_tp2 covers both, leaving the full
+    // [V, 1] logits on either shard.
+    project_head_tp2(peer, pair, hidden_out, hidden_out_peer, logits, logits_peer);
 }
 
 std::int32_t TextContext::forward_tp2_token(TextContext& peer, tp::DevicePair& pair,
@@ -1609,9 +1846,7 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
     ctx_.bind_to_current_thread();
     Tensor x      = work_.alloc(DType::BF16, {hidden, tokens});
     Tensor x_peer = peer.work_.alloc(DType::BF16, {hidden, tokens});
-    ops::embedding(bind0.ids, *embed_, x, ctx_.stream);
-    peer.ctx_.bind_to_current_thread();
-    ops::embedding(bind1.ids, *peer.embed_, x_peer, peer.ctx_.stream);
+    embedding_tp2(peer, pair, bind0.ids, &bind1.ids, x, &x_peer);
     NullTap tap;
     if (phase == Phase::Verify) {
         // The verify window runs the phase the single-token decode path runs, so its per-column
@@ -1673,24 +1908,24 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
     ops::rmsnorm(x_peer, *peer.final_norm_, config_.rms_norm_eps, true, xf_peer, peer.ctx_.stream);
 
     // Only the chunk's last column feeds the first sample, exactly like the single-device prefill's
-    // final chunk. The lm_head is weight-tied to the token embedding and replicated in full on both
-    // shards, so both compute the full-vocabulary logits independently and agree exactly.
+    // final chunk. project_head_tp2 covers both head layouts: replicated (two independent full
+    // projections that agree exactly) and vocabulary-split (one half per shard plus an all-reduce).
     ctx_.bind_to_current_thread();
     if (logits_columns != nullptr) {
         // Speculative verification scores every column: column j predicts the token after the one
         // it reads, so it judges the draft placed at j+1. Its last column is exactly the logits
-        // the [V,1] projection below would produce, so that read is not repeated.
+        // the [V,1] projection below would produce, so that read is not repeated. Only the driving
+        // shard carries this buffer, so a split head needs a peer scratch window of the same size.
         if (logits_columns->dtype != DType::BF16 || logits_columns->ne[0] != vocab ||
             logits_columns->ne[1] != tokens) {
             throw std::invalid_argument(
                 "forward_tp2_prefill: per-column logits buffer must be [V,T] BF16");
         }
-        project(xf, *lm_head_, *logits_columns, work_, ctx_.stream);
+        Tensor logits_columns_peer = peer.work_.alloc(DType::BF16, {vocab, tokens});
+        project_head_tp2(peer, pair, xf, xf_peer, *logits_columns, logits_columns_peer);
     } else {
-        project(xf.slice(1, tokens - 1, 1), *lm_head_, *logits, work_, ctx_.stream);
-        peer.ctx_.bind_to_current_thread();
-        project(xf_peer.slice(1, tokens - 1, 1), *peer.lm_head_, *logits_peer, peer.work_,
-                peer.ctx_.stream);
+        project_head_tp2(peer, pair, xf.slice(1, tokens - 1, 1), xf_peer.slice(1, tokens - 1, 1),
+                         *logits, *logits_peer);
     }
     if (hidden_columns != nullptr) {
         // The next round's MTP bridge consumes the final-norm hidden of the accepted column.

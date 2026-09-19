@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -17,10 +18,10 @@ constexpr int kQ6GroupedBlock = kEmbedGatherQ6Group * kEmbedGatherQ6GroupsPerBlo
 constexpr int kQ8GroupedBlock = 32;
 constexpr int kQ8RowBlock     = 256;
 
-template <int BlocksPerToken, int Threads>
+template <int D, int BlocksPerToken, int Threads>
 void launch_fp8(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
     const int grid = ids.ne[0] * BlocksPerToken;
-    embed_gather_fp8_kernel<BlocksPerToken, Threads><<<grid, Threads, 0, stream>>>(
+    embed_gather_fp8_kernel<D, BlocksPerToken, Threads><<<grid, Threads, 0, stream>>>(
         static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
         static_cast<const __nv_bfloat16*>(table.scales), static_cast<__nv_bfloat16*>(out.data));
 }
@@ -149,13 +150,31 @@ void embed_gather_q8_launch(const Tensor& ids, const Weight& table, Tensor& out,
     CUDA_CHECK(cudaGetLastError());
 }
 
+bool embed_gather_fp8_supports_width(std::int32_t d) noexcept {
+    return d == kEmbedGatherFp8D || d == kEmbedGatherFp8DHalf;
+}
+
 void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out,
                              cudaStream_t stream) {
     const std::int32_t T = ids.ne[0];
-    if (T <= 176)
-        launch_fp8<10, 128>(ids, table, out, stream);
-    else
-        launch_fp8<5, 128>(ids, table, out, stream);
+    // One instantiation per supported hidden width. Short sequences spread one token over many
+    // blocks; long sequences use fewer blocks per token so the grids stay bounded.
+    switch (table.k) {
+    case kEmbedGatherFp8D:
+        if (T <= 176)
+            launch_fp8<kEmbedGatherFp8D, 10, 128>(ids, table, out, stream);
+        else
+            launch_fp8<kEmbedGatherFp8D, 5, 128>(ids, table, out, stream);
+        break;
+    case kEmbedGatherFp8DHalf:
+        if (T <= 176)
+            launch_fp8<kEmbedGatherFp8DHalf, 5, 128>(ids, table, out, stream);
+        else
+            launch_fp8<kEmbedGatherFp8DHalf, 2, 128>(ids, table, out, stream);
+        break;
+    default:
+        throw std::invalid_argument("embedding: unsupported FP8 table hidden width");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

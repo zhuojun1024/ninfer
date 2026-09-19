@@ -1287,3 +1287,80 @@ Windows 原生移植（走 WSL2）、新架构支持。
   `softmax_attention`、`kv_cache_append`、`context_kv_materialize`、`sliding_window_attention`、
   `qwen3_5_tp2_load/forward --artifact`；`BUILD_EXIT=0`。
 - 服务状态：8088 = 推荐配置（fp8 KV @131072 + MTP K=2 + temp0.7/top-k20/top-p0.80）。
+
+## Round 50 — 提议头 A/B：`--lm-head-draft`
+
+- 起因：`--lm-head-draft` 把 draft 侧输出头从与主头 weight-tie 的全量头（248320 行 Q8_G32_FP16）换成
+  artifact 里的 indexed proposal head（131072 行频率短表、Q4_G64_FP16，附 `proposal/token_ids` 行→真实 id 映射；
+  加载时经 `load.cpp:83-84` 直接替换 `mtp/output_head` / `draft/output_head`）。verify 仍用全量头，
+  所以它只改「提议什么」，不改最终输出的 token。
+- 脚本：`r50_proposal_head_ab.sh`（中文长文）、`r50b_code_ab.sh`（Python 代码）。两路配置一致：
+  `--devices 0,1 --kv-dtype fp8 --max-context 131072 --kv-capacity auto --temperature 0.7 --top-k 20 --top-p 0.80
+  --spec mtp --draft-tokens 2`，各 6 次采样、串行单请求，仅 opt 路加 `--lm-head-draft`。
+- 中文长文：full 45.18 tok/s（43.20–52.25）、接受 2780/5118=54.3%、content 中位 1294；opt **50.10**（47.53–55.35）、
+  2749/5136=53.5%、中位 1336；两路 `longest0=0`、无退化 ⇒ 吞吐 +10.9%、接受 −0.8pp。
+- Python 代码：full 48.59（45.62–51.07）、接受 4532/7730=58.6%；opt **49.58**（48.85–54.87）、4326/8142=53.1%；
+  两路都 finish=length（1400 token 预算全耗在 reasoning），内容不可比 ⇒ 吞吐 +2.0%、接受 −5.5pp。
+- 显存：opt 每卡 +340 MiB（14600→14940、14338→14678），与 131072×5120 Q4_G64_FP16 ≈ 0.33 GiB 吻合 ——
+  证实 `proposal/head` / `proposal/token_ids` 不以 `text/`、`mtp/` 开头，`tp_split_spec.cpp:51` 的名字反查表不收录它们，
+  于是落到默认分支 `Replicated`：两张卡各存一份。
+- 结论：短表遗漏 + indexed 头的 Q4 量化都会把它的 argmax 推离全量头（散文 −0.8pp、代码 −5.5pp），接受率随域下降；
+  但 head 读取变便宜仍盖过损失（散文 +10.9%、代码 +2.0%）⇒ 是吞吐权衡而非白拿。8088 采用 `--lm-head-draft`
+  （主用途是散文/对话），回退只需去掉一个 flag。
+- 口径坑：TP-2 路径响应里的 `timings.draft_n` 恒为 0，接受率只能用 serve 日志的累计计数器
+  `[mtp] round pos=… accepted=… rate=accepted/drafted`（drafted 恰为轮数×K）。
+
+## Round 51 — 14.9 GiB/卡的显存构成拆解
+
+- 方法：受控配置扫描（每次启动后只读 `nvidia-smi memory.used`，不发请求），配置间作差归因；再对 23.7 GB
+  artifact 用 `tools/artifact/reader` + `tp_split_spec` 的切分规则算出每卡权重字节。全部对得上（误差 ≤2 MiB）。
+- 实测（MiB，shard0/shard1）：2048 无投机 11872/11872；2048+MTP K2 12314/12306；131072 无投机 13904/13904；
+  131072+MTP K2 14600/14338；131072+MTP K2+`--lm-head-draft` 14940/14678。
+- 配置事实（来自 artifact config）：hidden 5120、vocab 248320、64 层（16 full + 48 linear）、attn 24 heads /
+  **4 KV heads / head_dim 256**、GDN key 16×128、value 48×128、conv kernel 4。
+- 关键推导：文本 KV = 16 层 × 每卡 2 个 KV head × 256 × K+V × 1 B = **16 KiB/token/卡** ⇒ 131072 恰好 2 GiB/卡
+  （bf16 要 4 GiB，这就是它只能到 65536 的原因）；MTP 层 KV = 4 heads（未做 head-split）× 256 × 2 × 1 B
+  = 2 KiB/token ⇒ 256 MiB，且只在 shard 0 ⇒ 这是 shard0 比 shard1 大的唯一主因（实测差 262 MiB）。
+  GDN state = 48 × (128×128×24×4 + 5120×3×2) = 73.4 MiB，arena ×5 = 367 MiB。
+- 每卡账本：分片文本权重 8480 + 复制文本权重 2472（embedding 1213 + lm_head 1213 + norms 46）+ MTP 权重 430
+  + 提议头 341 + 文本 KV 2064 + GDN state 367 + workspace 384 + CUDA 上下文/对齐 137 + MTP KV 262（仅 shard0）
+  + replay 记录 ~2 ⇒ 14939/14677，与实测 14940/14678 吻合。
+- 可优化点（按收益排序）：① embedding 与 output head 各 1213 MiB 在两张卡上重复（合计 4.8 GiB），
+  做词表维切分 + 一次 gather 可省 ~1.2 GiB/卡；② state arena 5 份中有 3 份是前缀复用快照、1 份是轮次 scratch，
+  只降快照数可省 ~220 MiB/卡；③ workspace 固定 384 MiB/卡，而单层 prefill 峰值约 140 MiB。
+- 顺带确认：本机 nvidia-smi 有 3 张卡，index 1 是 Tesla T10（0 MiB，未使用），两张 5060 Ti 是 index 0 和 2。
+
+## Round 52 — 262,144 上下文：词表/隐层并行切分 + 显存腾挪
+
+- 目标：artifact 的 `max_position_embeddings` = 262,144 token。Round 51 的账本给出三个方向（词表并行、
+  快照数、workspace），本轮全部落地并逐条验证。
+- **权重切分**（`tp_split_spec` / `tp_shard_views` / `weight_splitter` / `execution/text.cpp`）：
+  - `text/output_head`（248320×5120 FP8 RowScale）与 `proposal/head`（131072×5120 Q4_G64_FP16）按**词表行**切；
+    `text/token_embedding`（同为 FP8 RowScale）按**隐层列**切（不按词表：ids 保持全域，杜绝越界行）。
+  - 两卡各算各的半块，再用 `write_row_block` + 一次 in-place allreduce 合并回 `[V,T]` 才采样/argmax；
+    合并 = 两个不相交行块 + 另一半清零求和 ⇒ 按构造逐位精确，采样与 `speculative_accept_greedy_drafts` 不变。
+  - 踩过的坑：`tp_shard_views` 的 ColumnParallel 必须用分片本地偏移（`begin=0, end=(n/2)*k`）；FP8 切片的
+    `scale_ne[0]`、`scale_nb[1..3]`、`group`/`group_size` 要跟着新行数走（否则 `invalid FP8 weight`）；
+    合并时 peer 半块要写到 `peer.shard_index_*`（写进自己那份会让 argmax 整体偏移 V/2=124160）；
+    ids 广播要按 16 字节补齐（allreduce 要求 %16==0），并用 padded 缓冲的前缀 view 保持 `ne[0]==ids.ne[0]`。
+  - Q4 是**枚举 (n,k) 表**（`q4_dispatch.cpp`），没有 65536×5120 这一档 ⇒ 新增 `select_q4_n65536_k5120`
+    （与 131072 档同构：`gemv_r4_w1_direct` / `ksplit<65536,5120,4|8>` / `mma_r64_c128`）。
+  - FP8 embedding gather 原先只认 hidden=5120 ⇒ kernel 按 D 模板化 + `embed_gather_fp8_supports_width` 查询，
+    新增 `[248320,2560]` 域。
+  - `proposal/head`、`proposal/token_ids` 不以 `text/`、`mtp/` 开头，正是 Round 50 它落到 `Replicated` 的原因；
+    本轮把 `proposal/` 纳入名字表，并加 `TpSplitOptions::split_proposal_head`。
+- **显存腾挪**：前缀复用快照 3→2（state arena 367→294 MiB：聊天模板的轮次间隙只需要 near rewind，
+  实测 16k/65k 相同 prompt 重入 0.30/0.33 s）；workspace 384→192 MiB（单层 prefill 峰值约 140 MiB，
+  超出是报告的 arena overflow 而非越界）。
+- **结果**：262144 正常起服，`nvidia-smi` 每卡 **15614 / 15094 MiB**（余 697 / 1217）；台账 shard0
+  `weights+ctx 11494.6 | kv 4644.2 | state 293.6 | record 2.6 | workspace 192.0`。预填 16057 token / 10.11 s
+  = **1588 tok/s**；解码 512 token / 8.68 s = **59.0 tok/s**（223 轮、2.3 token/轮、每 draft 接受 64.6%），
+  比 131072 时代的 46–49 tok/s 高约 20%（拖步切到两卡并行）；相同长 prompt 重入 0.30 s。
+- **逐位一致的证明**：5 条 greedy 提示在 131072（优化前 `ab-control`）与 262144（`ab-final`）上 hash 全同：
+  `c8540bca7a3c20de` / `589e247eccd554b7` / `b83495f177889c2a` / `7199385e4eb468b0` / `cc73c73125c6f621`。
+- **有记录价值的死路**：把 MTP 层 KV 降到 nvfp4 可省 228 MiB、接受率几乎不变（392/510 vs 391/510），
+  但 5 条 greedy 提示有 3 条输出不同 —— 不是精度泄漏进输出，而是 verify+fold 与单 token 解码是不同执行形状，
+  **draft 模式一变、近似并列的取舍轨迹就变**。最终保留 fp8 MTP KV，买下「逐位一致」这条性质。
+- 测试全绿：`tp2_load`（plain / `--spec mtp` / `--spec mtp --lm-head-draft`）、`tp2_forward`、`embedding`、
+  `linear_tp2_split_fp8_head`、新增 `linear_tp2_split_grouped_head`（**真实** [131072,5120]、T=1/2 与全量 Op 逐位比对）、
+  `linear_tp2_split_nvfp4`、`tp_device_pair`。

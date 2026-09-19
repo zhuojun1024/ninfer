@@ -9,26 +9,24 @@ This note records the tensor-parallel-2 (TP-2) adaptation of this engine for two
 
 ```
 ./build/apps/ninfer-serve <model>.ninfer --devices 0,1 \
-  --kv-dtype fp8 --max-context 131072 --kv-capacity auto \
+  --kv-dtype fp8 --max-context 262144 --kv-capacity auto \
   --temperature 0.7 --top-k 20 --top-p 0.80 --port 8088 \
-  --spec mtp --draft-tokens 2
+  --spec mtp --draft-tokens 2 --lm-head-draft
 ```
 
-`--kv-dtype fp8 --max-context 131072` doubles the usable context (65,536 -> 131,072 tokens) at
-essentially the same device memory and throughput as bf16 KV at 65,536 (see below).
-`--spec mtp --draft-tokens 2` adds ~45% sustained decode (46-49 tok/s against 31.6 plain) and is
-verified non-degenerate (see the MTP section); drop those two flags for the plain route.
+The full `max_position_embeddings` of the artifact (262,144 tokens) now fits: 15,614 MiB on shard 0
+and 15,094 MiB on shard 1, i.e. 697 / 1,217 MiB still free per card (`nvidia-smi`). Splitting the
+vocabulary- and hidden-parallel shard weights is what closed the gap; with the reduced state and
+workspace pools alone, fp8 KV topped out near 229,376 tokens. `--kv-dtype fp8` costs 16.125 KiB per
+token per shard. `--spec mtp --draft-tokens 2` adds ~90% sustained decode over the plain route and is
+verified non-degenerate (see the MTP section); `--lm-head-draft` selects the artifact's reduced
+proposal head for the draft side; drop those two flags for the plain route. Every one of those
+choices is numerically transparent: the greedy output at 262,144 is byte-identical to the pre-split
+build at 131,072 (see Verification).
 
 ## Benchmarks
 
-Prefill is measured with a 279-token prompt and an 8-token output (615 tok/s at 65,536 bf16); the
-first request after startup also pays CUDA-graph capture (14.4 s observed on the fp8/131,072 config),
-so the steady-state number is the meaningful one. Decode is a 70-token prompt with a 256-token output
-reported end-to-end (prefill included), so it understates sustained decode. Sustained decode, measured
-from committed-token traces at temperature 0: plain 31.5 tok/s, MTP K=1 42.0, K=2 50.5-54.0,
-K=3 47.9-48.0 tok/s.
-
-| Configuration | KV capacity | Memory per GPU | Prefill | Decode (256 tok) |
+| Configuration | KV capacity | Memory per GPU | Prefill | Decode |
 |---|---|---|---|---|
 | plain, bf16 KV | 65,536 | 13,888 MiB | 0.453 s (279 tok, 615 tok/s) | 8.153 s (31.4 tok/s) |
 | MTP K=3, bf16 KV | 65,536 | 14,582 / 14,322 MiB | 0.526 s | 6.532 s (39.2 tok/s) |
@@ -38,9 +36,28 @@ K=3 47.9-48.0 tok/s.
 | plain, bf16 KV | 131,072 | out of memory | - | - |
 | **plain, fp8 KV** | **131,072** | **13,904 MiB** | - | **8.102 s** |
 | plain, int8 KV | 131,072 | 13,952 MiB | - | 8.088 s |
-| plain, fp8 KV | 262,144 | out of memory | - | - |
+| MTP K=2 fp8, `--lm-head-draft` | 131,072 | 14,940 / 14,678 MiB | - | 46-49 tok/s |
+| plain, fp8 KV (pre-split build) | 262,144 | out of memory | - | - |
+| **MTP K=2 fp8, `--lm-head-draft`, shard split** | **262,144** | **15,614 / 15,094 MiB** | **1,588 tok/s** | **59.0 tok/s** |
 
-262,144 and higher contexts need more KV memory than two 16 GiB cards offer even at fp8.
+The 65,536 and 131,072 rows use the historical protocol (prefill: 279-token prompt, 8-token output;
+decode: 256-token output reported end-to-end, so it understates sustained decode). The 262,144 rows
+use `temperature 0` per request and the response's `usage` token counts, one request at a time:
+
+- **Prefill**: a 16,057-token prompt produced its first token in 10.11 s (1,588 tok/s); a 65k-token
+  prompt returned a complete answer in 48.1 s end to end (~1.35k tok/s of prompt), against 96.8 s for
+  a 118,869-token prompt at the previous 131,072 ceiling.
+- **Decode**: a 512-token answer took 8.68 s (59.0 tok/s over 223 MTP rounds, 2.3 committed tokens per
+  round, 64.6% per-draft acceptance); a 64-token answer measured 63.6 tok/s. The previous ceiling's
+  sustained decode was 46-49 tok/s, so doubling the context also moved throughput ~20% forward: the
+  split halves each shard's proposal-head read and lets both shards draft in parallel.
+- **Prefix reuse**: repeating an identical 16,057-token prompt returned in 0.30 s (0.33 s for the
+  65k-token one) against 10.11 s / 48.1 s fresh, so one rewind snapshot behind the prefill end covers
+  the chat-turn pattern (see Resident memory).
+- **Concurrency**: two simultaneous streaming requests both completed (24 and 27 chunks, 1.99 s).
+
+The startup after CUDA-graph capture is a one-off 14.4 s on this configuration; it is outside the
+numbers above.
 
 ## KV cache quantization
 
@@ -50,13 +67,25 @@ kernels, and the quantized small-T decode kernels used by a multi-column (MTP) w
 more than 48 KiB of dynamic shared memory, and in both cases the opt-in was a function-local
 `static` that configured only the first shard's device.
 
-The 131,072-token capacity is usable end to end: a single **118,869-token** prompt returned HTTP 200
-in 96.8 s on the fp8 configuration (and a 19,869-token prompt in 19.5 s), against a 65,536-token
-ceiling for bf16 KV on the same cards.
+The capacity is usable end to end: a **65k-token** prompt returned HTTP 200 after 48.1 s on the
+shipped 262,144-token fp8 configuration, and a **118,869-token** prompt took 96.8 s at the earlier
+131,072-token ceiling, against a 65,536-token ceiling for bf16 KV on the same cards.
 
 fp8 KV does not measurably change output quality. Four 1,400-token budget samples of the same essay
 prompt produced content lengths 1365 / 859 / 1382 / 1602 (median ~1374) with no repeated-token runs,
 against 1233 / 763 / 1469 / 1456 / 1430 / 1621 (median 1443) for the bf16 route at 65,536 tokens.
+The fp8 KV route is also *exactly* reproducible across builds: every golden prompt below matches byte
+for byte at 131,072 and at 262,144, across the shard splits and the reduced arena sizes.
+
+The MTP layer's own cache follows `--kv-dtype` as well. That cache is draft-only -- every draft is
+verified by the target -- so quantizing it is a tempting 228 MiB at 262,144 tokens, and it was measured
+rather than assumed. With the MTP cache at nvfp4 and the target KV still fp8, the same cumulative
+acceptance counter read 392/510 against 391/510 (77.2% against 76.9%) over the golden workload, but
+three of the five golden prompts produced different greedy text. The mechanism is not the draft cache's
+precision leaking into an emitted token: the verify-and-fold path is a different execution shape from
+single-token decode, so a changed draft *pattern* shifts the trajectory on which near-ties are resolved.
+The shipped configuration therefore keeps the MTP cache at the target dtype and pays the 228 MiB, which
+is the price of the byte-identical guarantee below.
 
 ## Multi-token prediction (MTP)
 
@@ -98,7 +127,131 @@ site was likewise a red herring: `src/ops/launcher/rope.cu:189` is a `CUDA_CHECK
 checkpoint, and with two devices interleaved an asynchronous illegal address surfaces at whichever
 checkpoint runs first, not necessarily at the faulting kernel.
 
+## Proposal head
+
+`--lm-head-draft` switches the draft head from the weight-tied full output head (248,320 rows,
+Q8_G32_FP16) to the artifact's indexed proposal head (131,072-row frequency shortlist, Q4_G64_FP16,
+plus a row-to-token-id map). Target verification still uses the full head, so this changes only what
+the draft proposes, never which token is emitted. A/B at the recommended fp8/131,072 MTP K=2
+configuration, two six-sample runs, one request at a time:
+
+| Workload (1,400-token budget) | Route | Decode tok/s, median (range) | Draft acceptance | Content median |
+|---|---|---|---|---|
+| Chinese essay | full | 45.18 (43.20-52.25) | 54.3% (2780/5118) | 1294 |
+| Chinese essay | `--lm-head-draft` | **50.10** (47.53-55.35) | 53.5% (2749/5136) | 1336 |
+| Python coding | full | 48.59 (45.62-51.07) | 58.6% (4532/7730) | budget-limited |
+| Python coding | `--lm-head-draft` | **49.58** (48.85-54.87) | 53.1% (4326/8142) | budget-limited |
+
+Acceptance is the engine's cumulative `[mtp] round ... rate=accepted/drafted` counter, which is the
+only reliable source on this route: the response's `timings.draft_n` stays zero. Both routes were
+non-degenerate on the essay prompt (no repeated-token runs); the coding prompt exhausted the token
+budget in reasoning on every sample, so its content is not comparable.
+
+The shortlist and the indexed head's Q4 quantization both move its argmax away from the full head's,
+so acceptance falls -- 0.8 points on prose and 5.5 on code. The cheaper head read still wins on both
+workloads, but the margin shrinks as acceptance drops, so this is a throughput trade rather than a
+free win.
+
+The head is 131,072 x 5,120 Q4_G64_FP16 (341 MiB) and only shard 0 ever samples from it, so the pair
+now holds one vocabulary half each (65,536 rows, 171 MiB) and reassembles the draft logits before the
+argmax. That needed a Q4 route for the half shape: the Q4 A16 dispatch is an enumerated (n, k) table
+and no admitted shape had an admitted half, so `select_q4_n65536_k5120` was added next to the
+131,072-row entry. The merge is exact -- disjoint row blocks, one in-place all-reduce -- and
+`ninfer_linear_tp2_split_grouped_head_test` runs both shard halves against the full-weight Op at
+exactly this shape (T=1 and T=2) and compares them bit for bit.
+
+## Device memory budget
+
+Measured by starting the engine under controlled configurations and reading
+`nvidia-smi --query-gpu=memory.used` after load with no requests. CUDA devices 0 and 1 are nvidia-smi
+indices 0 and 2; nvidia-smi index 1 is an unrelated idle Tesla T10. At the shipped configuration
+(262,144 tokens, fp8 KV, MTP K=2, `--lm-head-draft`) the per-card totals are 15,614 MiB (shard 0,
+which also owns the MTP layer) and 15,094 MiB (shard 1): 697 and 1,217 MiB still free of 16,311 MiB.
+
+The engine prints one ledger line per shard at startup -- the blocks it allocates, in MiB, at the
+requested ceiling:
+
+```
+[mem] shard 0 capacity 262144 | weights+ctx 11494.6 | kv 4644.2 | state 293.6 | record 2.6 | round 0.0 | workspace 192.0 | free 0.0 of 16310.6 MiB
+[mem] shard 1 capacity 262144 | weights+ctx 11494.6 | kv 4128.0 | state 293.6 | record 2.6 | round 0.0 | workspace 192.0 | free 196.0 of 16310.6 MiB
+```
+
+| Component | shard 0 | shard 1 |
+|---|---:|---:|
+| Weights + CUDA context (ledger `weights+ctx`) | 11,494.6 | 11,494.6 |
+| Text KV cache, fp8, 262,144 tokens | 4,128.0 | 4,128.0 |
+| MTP layer KV cache, fp8, 262,144 tokens | 516.2 | 0.0 |
+| Linear-attention state arena (2 live + 1 round scratch + 2 reuse snapshots) | 293.6 | 293.6 |
+| Program workspace arena | 192.0 | 192.0 |
+| MTP replay records and round anchor | 2.6 | 2.6 |
+| **Sum of the engine's blocks** | **16,627** | **16,111** |
+
+The per-token costs are the ones to plan with: text KV is 16 full-attention layers x 2 local KV heads
+(of four, head-parallel) x head_dim 256 x K+V x 1 byte = 16.125 KiB per token per shard, 4,128 MiB at
+262,144 tokens; MTP KV is 2 KiB per token on shard 0 only, because that layer is replicated rather
+than head-split. The ledger's `free` column is `cudaMemGetInfo`, which this WSL2 driver under-reports
+(it reads 0.0 while nvidia-smi shows 697 MiB free and the engine starts and serves reliably); the sum
+of the rows therefore exceeds the reported device total of 16,310.6 MiB by ~1 GiB. Treat the row
+sizes and the nvidia-smi totals as the budget, not the `free` column.
+
+Three things had to give to reach 262,144 tokens, all of them memory-only and all of them verified
+numerically transparent:
+
+- **Vocabulary and hidden parallelism of the shard weights.** `text/output_head` (248,320 x 5,120,
+  FP8 row-scale), the reduced `proposal/head` (131,072 x 5,120, Q4_G64_FP16) and
+  `text/token_embedding` (248,320 x 5,120, FP8 row-scale) used to be replicated on both shards,
+  4.8 GiB of duplicated tables on the pair. The two heads are now split by vocabulary row and the
+  embedding by hidden column, so each shard holds half of each table and the pair assembles the
+  result before sampling or drafting: ~1.2 GiB per card for the head and embedding, 170 MiB for the
+  proposal head.
+- **Prefix-reuse snapshots 3 -> 2.** The state arena held five 73.4 MiB planes: two live buffers, the
+  MTP round scratch, and three prefix-reuse snapshots at rewind depths 0 / near / far. The chat-turn
+  pattern the snapshots exist for needs the near rewind only, and the measurement above confirms it
+  (identical 16k and 65k prompts re-enter in 0.30-0.33 s).
+- **Workspace 384 -> 192 MiB.** The arena's per-layer prefill peak is ~140 MiB at the maximum prefill
+  chunk of 1,024 tokens, so 192 MiB still leaves headroom; a larger request is a reported arena
+  overflow, not corruption.
+
+One block stays deliberately replicated: the MTP layer's own weights (430 MiB), because the draft path
+runs on shard 0 alone and handing it a collective per draft step would cost more than the memory. The
+KV cache stays fp8: nvfp4 or k8v4 KV (`--kv-dtype`) would free further memory at a value-precision
+cost, and int8 is 48 MiB *larger* than fp8 at the same ceiling because of its 64-element scale groups.
+The context cache is disabled on this route -- the core owns the prefix-reuse snapshots instead.
+
+## Verification
+
+| Check | Command | Result |
+|---|---|---|
+| Greedy identity of the whole stack | `r52_ab.sh final` then `r52_cmp3.sh` | 5/5 prompts byte-identical to the pre-split build at 131,072 (`ab-embed`, itself identical to the pre-optimization `ab-control`) |
+| Route loading | `ninfer_qwen3_5_tp2_load_test` (plain, `--spec mtp`, `--spec mtp --lm-head-draft`) | expected shard shapes: head 124,160 / 248,320 rows, embedding `[248320,2560]`, proposal head `[65536,5120]` |
+| TP-2 execution | `ninfer_qwen3_5_tp2_forward_test` | 11 probes shard-consistent, 32-step decode, prefill chunk-split invariant |
+| Vocabulary-parallel head | `ninfer_linear_tp2_split_fp8_head_test` | exact at `[248320,5120]` and `[16384,5120]` |
+| Grouped proposal head | `ninfer_linear_tp2_split_grouped_head_test` | exact at `[131072,5120]`, T=1 and T=2 |
+| Half-width FP8 embedding | `ninfer_embedding_test` | full sweep at `[248320,2560]` |
+| NVFP4 split Linear | `ninfer_linear_tp2_split_nvfp4_test` | passes |
+| Collective staging | `ninfer_tp_device_pair_test` | passes |
+
+"Exact" is bit for bit: the split Op output equals the same Op run with the full weight on the same
+device, which is the property the merge relies on. `temperature 0, top_k 1` is what makes the greedy
+comparison meaningful; the served configuration samples (`0.7 / 20 / 0.80`).
+
 ## Fixes applied on this branch
+
+- Vocabulary-parallel and hidden-parallel shard weights: `text/output_head` and the reduced
+  `proposal/head` split by vocabulary row, `text/token_embedding` by hidden column, with the pair
+  merging the reduced block before sampling or drafting. That required shard-local `ColumnParallel`
+  view offsets in `tp_shard_views.cpp`, FP8 slice descriptors that follow the new row count
+  (`scale_ne[0]`, `scale_nb[1..3]`, `group`/`group_size` in `weight_splitter.cpp`), an offset
+  correction for the peer half during the merge, a 16-byte-padded ids broadcast (the collective
+  requires a multiple of 16 bytes), and a grouped-format (Q4/Q5/Q6/Q8) row slice plus `shard_geometry`
+  knowledge of the `RowSplit` planes.
+- A Q4 A16 route for the half proposal head (`select_q4_n65536_k5120`), because the Q4 dispatch is an
+  enumerated shape table and no admitted shape had an admitted half.
+- A `[248320, 2560]` FP8 embedding-gather domain: the gather kernel was templated on the hidden width
+  and the wrapper now queries `embed_gather_fp8_supports_width` instead of hard-coding 5,120.
+- The startup `[mem]` ledger line per shard, next to the existing `capacity | KV` line.
+
+
 
 - `copy_row_block` and the ids plumbing: a `void*` byte-offset bug corrupted window ids in the MTP
   warmup (`cudaErrorIllegalAddress`).

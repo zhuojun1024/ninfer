@@ -32,12 +32,14 @@ using Clock = std::chrono::steady_clock;
 // Workspace arena per shard. The single-token forward_tp2 peaks at ~600 KB (full-vocab logits
 // plus a handful of [N,1] activations), but a batched prefill chunk holds every intermediate of the
 // widest layer at once: at the maximum chunk width the fused FFN gate/up [17408, T] BF16 alone is
-// ~36 MiB and the per-layer peak is ~140 MiB. 256 MiB covers the largest chunk with headroom while
+// ~36 MiB and the per-layer peak is ~140 MiB. 192 MiB covers the largest chunk with headroom while
 // keeping the per-shard steady state (weights 10.7 GiB + KV + GDN state + snapshots + workspace)
-// under the 16 GB card limit.
-constexpr std::size_t kWorkspaceBytes = 384ULL << 20;
+// under the 16 GB card limit. The context ceiling is set by the KV pool, so this budget is spent
+// exactly: at 262,144 tokens the 128 MiB a 384 MiB arena would hold is the difference between
+// fitting the card and not, and the oversized arena overflow is a reported error, not corruption.
+constexpr std::size_t kWorkspaceBytes = 192ULL << 20;
 
-// Bounds on the adaptive rewind depths (see rewind_near_/rewind_far_).
+// Bounds on the adaptive rewind depth (see rewind_near_).
 constexpr std::uint32_t kReuseRewindMinimum = 4;
 constexpr std::uint32_t kReuseRewindMaximum = 4096;
 
@@ -140,6 +142,10 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
 
     build_shard(shard_a_, 0);
     build_shard(shard_b_, 1);
+    // Column-split weights (the token embedding) are consumed by operations that run on one shard
+    // alone, so both contexts learn their peer and the pair once both shards exist.
+    shard_a_.context->set_tp_peer(shard_b_.context.get(), &pair_);
+    shard_b_.context->set_tp_peer(shard_a_.context.get(), &pair_);
 
     frontend_ = std::make_unique<qwen::Frontend>(
         qwen::make_frontend(shard_a_.model->resources(),
@@ -180,6 +186,8 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     // The MTP layer appends its own K/V up to `mtp_drafts_` positions past the committed frontier
     // (the speculative window), so its pool carries that many tokens of extra physical pages; its
     // execution row only maps the logical capacity.
+    // Everything resident before the pool: the CUDA context and this shard's weight share.
+    double resident_bytes = 0.0;
     const std::uint32_t mtp_physical_pages =
         mtp_shard
             ? pages_for_tokens(capacity) +
@@ -205,6 +213,11 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         });
     const std::size_t kv_bytes = kv_builder.finish(256);
     shard.device.bind_to_current_thread();
+    {
+        std::size_t free_bytes = 0, total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        resident_bytes = static_cast<double>(total_bytes - free_bytes) / 1048576.0;
+    }
     shard.kv_arena = std::make_unique<DeviceArena>(kv_bytes);
     shard.decoder  = std::make_unique<qwen::DecoderState>(shard.kv_arena->alloc_bytes(kv_bytes, 256),
                                                           kv_layout);
@@ -226,7 +239,8 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         plan_linear_attention_state_pool(state_builder, gdn_spec);
     const std::size_t state_bytes = state_builder.finish(256);
     shard.device.bind_to_current_thread();
-    // Live linear-attention pool plus one prefix-reuse snapshot per slot (~77 MiB each).
+    // Live linear-attention pool (two buffers), one prefix-reuse snapshot per slot, and the MTP
+    // round scratch (~77 MiB per plane).
     shard.state_arena   = std::make_unique<DeviceArena>((2 + kReuseSnapshotCount) * state_bytes);
     shard.state_backing = shard.state_arena->alloc_bytes(state_bytes, 256);
     for (auto& snapshot : shard.state_snapshots) {
@@ -235,6 +249,8 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     CUDA_CHECK(cudaMemset(shard.state_backing.data, 0, state_bytes));
     shard.state = std::make_unique<LinearAttentionStatePool>(shard.state_backing, state_layout);
 
+    std::size_t record_bytes = 0;
+    std::size_t round_bytes  = 0;
     if (mtp_enabled_) {
         // ReplaySSM records for one verify window wide, one physical row, per-shard GDN geometry.
         // Both shards verify the window, so both need their own records and fold plan.
@@ -259,7 +275,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                 .value_dim =
                     (scfg.gdn ? qwen::execution::dimension(scfg.gdn->linear_value_head_dim) : 0),
             });
-        const std::size_t record_bytes = record_builder.finish(256);
+        record_bytes = record_builder.finish(256);
         shard.record_arena = std::make_unique<DeviceArena>(record_bytes);
         shard.device.bind_to_current_thread();
         DeviceSpan record_backing = shard.record_arena->alloc_bytes(record_bytes, 256);
@@ -279,6 +295,23 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         // final-norm hidden, captured during prefill priming.
         shard.mtp_anchor_hidden =
             shard.workspace->alloc(DType::BF16, {qwen::execution::dimension(config.hidden_size), 1});
+    }
+    // One startup ledger line per shard: every resident block is allocated before the first
+    // request, so this is the whole device budget at the requested context ceiling.
+    {
+        std::size_t free_bytes = 0, total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        std::fprintf(stderr,
+                     "[mem] shard %d capacity %u | weights+ctx %.1f | kv %.1f | state %.1f | "
+                     "record %.1f | round %.1f | workspace %u.0 | free %.1f of %.1f MiB\n",
+                     shard_index, capacity, resident_bytes,
+                     static_cast<double>(kv_bytes) / 1048576.0,
+                     static_cast<double>((2 + kReuseSnapshotCount) * state_bytes) / 1048576.0,
+                     static_cast<double>(record_bytes) / 1048576.0,
+                     static_cast<double>(round_bytes) / 1048576.0,
+                     static_cast<unsigned>(kWorkspaceBytes >> 20),
+                     static_cast<double>(free_bytes) / 1048576.0,
+                     static_cast<double>(total_bytes) / 1048576.0);
     }
 
     // The execution context is constructed at the end of this function: the MTP layer needs its KV
@@ -348,7 +381,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                 .backend        = SpeculativeBackend::Mtp,
             });
         qwen::complete_round_state_layout(round_builder, round_layout);
-        const std::size_t round_bytes = round_builder.finish(256);
+        round_bytes = round_builder.finish(256);
         shard.round_arena = std::make_unique<DeviceArena>(round_bytes);
         shard.device.bind_to_current_thread();
         DeviceSpan backing = shard.round_arena->alloc_bytes(round_bytes, 256);
@@ -539,10 +572,9 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
         const std::uint32_t gap = static_cast<std::uint32_t>(cached_prompt_tokens_.size() - lcp);
         if (gap != 0) {
             rewind_near_ = std::clamp(gap + 2, kReuseRewindMinimum, kReuseRewindMaximum);
-            rewind_far_  = std::clamp(rewind_near_ * 4 + 8, kReuseRewindMinimum, kReuseRewindMaximum);
         }
     }
-    const std::array<std::uint32_t, kReuseSnapshotCount> rewind_depths{0, rewind_near_, rewind_far_};
+    const std::array<std::uint32_t, kReuseSnapshotCount> rewind_depths{0, rewind_near_};
 
     // Reset per-request state on both shards. The KV pages and execution row 0 are materialized
     // once at startup (build_shard) and reused in place, so a reused prefix needs no KV work at

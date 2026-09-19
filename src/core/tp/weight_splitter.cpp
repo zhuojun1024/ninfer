@@ -30,6 +30,85 @@ struct Nvfp4Geometry {
     }
 };
 
+// Grouped RowSplit payload geometry derived from (n, k): per-row code words, an optional per-row
+// high-bit plane, and one FP16 scale word per 64- (or 32-) value group, each plane 256-byte
+// aligned. Mirrors weight_geometry's RowSplit branch.
+struct GroupedGeometry {
+    std::uint64_t code_bytes_per_row  = 0;
+    std::uint64_t high_bytes_per_row  = 0;
+    std::uint64_t scale_bytes_per_row = 0;
+    std::uint64_t code_bytes          = 0;
+    std::uint64_t high_offset         = 0;
+    std::uint64_t high_bytes          = 0;
+    std::uint64_t scale_offset        = 0;
+    std::uint64_t scale_bytes         = 0;
+    std::uint64_t payload_bytes       = 0;
+
+    static GroupedGeometry of(QType format, std::int32_t n, std::int32_t k) {
+        std::uint64_t group = 0, high_per_group = 0;
+        switch (format) {
+        case QType::Q4_G64_FP16: group = 64; break;
+        case QType::Q5_G64_FP16: group = 64; high_per_group = 8; break;
+        case QType::Q6_G64_FP16: group = 64; high_per_group = 16; break;
+        case QType::Q8_G32_FP16: group = 32; break;
+        default: throw std::invalid_argument("weight splitter: not a grouped RowSplit format");
+        }
+        const std::uint64_t groups = align_up(k, 128) / group;
+        GroupedGeometry g;
+        g.code_bytes_per_row  = groups * 32;
+        g.high_bytes_per_row  = groups * high_per_group;
+        g.scale_bytes_per_row = groups * 2;
+        g.code_bytes          = static_cast<std::uint64_t>(n) * g.code_bytes_per_row;
+        g.high_offset         = align_up(g.code_bytes, 256);
+        g.high_bytes          = static_cast<std::uint64_t>(n) * g.high_bytes_per_row;
+        g.scale_offset        = align_up(g.high_offset + g.high_bytes, 256);
+        g.scale_bytes         = static_cast<std::uint64_t>(n) * g.scale_bytes_per_row;
+        g.payload_bytes       = g.scale_offset + g.scale_bytes;
+        return g;
+    }
+};
+
+// Grouped RowSplit row slice: rows [row_begin, row_begin + row_count). Every plane is contiguous
+// per row block, so the slice is one span copy per plane.
+WeightShard slice_grouped_rows(std::span<const std::uint8_t> full, const Weight& full_weight,
+                              std::int32_t row_begin, std::int32_t row_count) {
+    const std::int32_t k = full_weight.k;
+    if (row_count <= 0 || row_begin < 0 || row_begin + row_count > full_weight.n) {
+        throw std::invalid_argument("weight splitter: invalid grouped row slice");
+    }
+    const GroupedGeometry full_geo  = GroupedGeometry::of(full_weight.qtype, full_weight.n, k);
+    const GroupedGeometry shard_geo = GroupedGeometry::of(full_weight.qtype, row_count, k);
+
+    WeightShard shard;
+    shard.payload.assign(shard_geo.payload_bytes, 0);
+    std::memcpy(shard.payload.data(),
+                full.data() + static_cast<std::size_t>(row_begin) * full_geo.code_bytes_per_row,
+                shard_geo.code_bytes);
+    if (shard_geo.high_bytes_per_row != 0) {
+        std::memcpy(shard.payload.data() + shard_geo.high_offset,
+                    full.data() + full_geo.high_offset +
+                        static_cast<std::size_t>(row_begin) * full_geo.high_bytes_per_row,
+                    shard_geo.high_bytes);
+    }
+    std::memcpy(shard.payload.data() + shard_geo.scale_offset,
+                full.data() + full_geo.scale_offset +
+                    static_cast<std::size_t>(row_begin) * full_geo.scale_bytes_per_row,
+                shard_geo.scale_bytes);
+
+    shard.weight = full_weight;
+    shard.weight.n               = row_count;
+    shard.weight.shape[0]        = row_count;
+    shard.weight.padded_shape[0] = row_count;
+    shard.weight.payload         = shard.payload.data();
+    shard.weight.payload_bytes   = shard.payload.size();
+    shard.weight.qdata           = shard.payload.data();
+    shard.weight.qhigh =
+        shard_geo.high_bytes_per_row != 0 ? shard.payload.data() + shard_geo.high_offset : nullptr;
+    shard.weight.scales          = shard.payload.data() + shard_geo.scale_offset;
+    shard.weight.high_plane_bytes = shard_geo.high_bytes;
+    return shard;
+}
+
 // NVFP4 row slice: rows [row_begin, row_begin + row_count). row_count must be a multiple of
 // 128. The code plane and the scale plane are each contiguous for a row block (the scale
 // tile index is row_tile * k_tiles + scale_tile, so a row block owns a contiguous scale span).
@@ -137,6 +216,13 @@ WeightShard slice_fp8_rows(std::span<const std::uint8_t> full, const Weight& ful
     shard.weight.n               = row_count;
     shard.weight.shape[0]        = row_count;
     shard.weight.padded_shape[0] = row_count;
+    // One BF16 multiplier per row, so the row-scale plane and its row stride follow the new row
+    // count (the plane validator checks both against weight.n).
+    shard.weight.scale_ne[0]     = row_count;
+    const std::int64_t shard_scale_stride = static_cast<std::int64_t>(row_count) * 2;
+    shard.weight.scale_nb[1]              = shard_scale_stride;
+    shard.weight.scale_nb[2]              = shard_scale_stride;
+    shard.weight.scale_nb[3]              = shard_scale_stride;
     shard.weight.payload         = shard.payload.data();
     shard.weight.payload_bytes   = shard.payload.size();
     shard.weight.qdata           = shard.payload.data();
@@ -171,6 +257,9 @@ WeightShard slice_fp8_cols(std::span<const std::uint8_t> full, const Weight& ful
     shard.weight.k               = col_count;
     shard.weight.shape[1]        = col_count;
     shard.weight.padded_shape[1] = col_count;
+    // The row scale spans the whole (now halved) row, so its group follows the new column count.
+    shard.weight.group_size      = static_cast<std::uint32_t>(col_count);
+    shard.weight.group           = col_count;
     shard.weight.payload         = shard.payload.data();
     shard.weight.payload_bytes   = shard.payload.size();
     shard.weight.qdata           = shard.payload.data();
@@ -449,6 +538,19 @@ std::vector<WeightShard> split_weight(std::span<const std::uint8_t> full_payload
         }
         return {slice_nvfp4_cols(full_payload, full_weight, 0, full_weight.k / 2),
                 slice_nvfp4_cols(full_payload, full_weight, full_weight.k / 2, full_weight.k / 2)};
+    }
+    if (full_weight.layout == QuantLayout::RowSplit) {
+        // Grouped integer formats only need the row split: they carry no column-blocked scale
+        // plane, so a column slice would repack code words across group boundaries.
+        if (kind != WeightSplitKind::ColumnParallel) {
+            throw std::invalid_argument("weight splitter: grouped formats support only a row split");
+        }
+        if ((full_weight.n % 2) != 0) {
+            throw std::invalid_argument("weight splitter: column split requires even n");
+        }
+        return {slice_grouped_rows(full_payload, full_weight, 0, full_weight.n / 2),
+                slice_grouped_rows(full_payload, full_weight, full_weight.n / 2,
+                                   full_weight.n / 2)};
     }
     if (full_weight.qtype == QType::BF16) {
         if (kind == WeightSplitKind::ColumnParallel) {

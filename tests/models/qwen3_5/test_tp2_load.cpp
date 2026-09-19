@@ -37,7 +37,8 @@ std::pair<int, int> pick_devices() {
 }
 
 void check_shard_shapes(const qwen::execution::Parameters& parameters, const qwen::Model& model,
-                        int shard, bool expect_mtp) {
+                        int shard, bool expect_mtp, bool expect_split_head,
+                        bool expect_proposal_split) {
     const auto& weights = model.weights();
     if (expect_mtp) {
         // MTP weights are replicated whole on both shards: the proposal runs on shard 0 alone (its
@@ -75,13 +76,34 @@ void check_shard_shapes(const qwen::execution::Parameters& parameters, const qwe
         throw std::runtime_error("shard " + std::to_string(shard) +
                                  " down shape is not [5120,8704]");
     }
-    // output_head: replicated in full. The head is weight-tied to the token embedding, and the
-    // TP-2 forward computes the full-vocabulary logits independently on each shard (the final
-    // hidden state is identical on both shards, so no head all-reduce is needed).
-    const auto& head = model.weight(weights.text.output_head).view;
-    if (head.shape[0] != 248320 || head.shape[1] != 5120) {
+    // output_head: vocabulary-parallel when nothing else consumes the head (no speculative
+    // backend, or the optimized proposal head), otherwise replicated in full because the head is
+    // weight-tied to the MTP proposal that runs on shard 0 alone. A split shard keeps the rows
+    // [shard * V/2, (shard + 1) * V/2) and the forward assembles the full logits from the pair.
+    const std::int64_t head_rows = expect_split_head ? 124160 : 248320;
+    const auto& head             = model.weight(weights.text.output_head).view;
+    if (head.shape[0] != head_rows || head.shape[1] != 5120) {
+        throw std::runtime_error("shard " + std::to_string(shard) + " output_head shape is not [" +
+                                 std::to_string(head_rows) + ",5120]");
+    }
+    // token_embedding: column-parallel over the hidden dimension. Every vocabulary row stays on
+    // both shards, so no token id can fall outside a shard's table; the forward merges the two
+    // halves of the hidden state after the gather.
+    const auto& embedding = model.weight(weights.text.token_embedding).view;
+    if (embedding.shape[0] != 248320 || embedding.shape[1] != 2560) {
         throw std::runtime_error("shard " + std::to_string(shard) +
-                                 " output_head shape is not [248320,5120]");
+                                 " token_embedding shape is not [248320,2560]");
+    }
+    if (expect_mtp) {
+        // The MTP proposal head is the optimized reduced head (both shards hold half of its rows
+        // when the split is on) or the weight-tied text head in the unoptimized route.
+        const auto& mtp_head = model.weight(weights.mtp->output_head).view;
+        const std::int64_t expect_rows = expect_proposal_split ? 65536 : 0;
+        if (mtp_head.shape[1] != 5120 ||
+            (expect_proposal_split ? mtp_head.shape[0] != expect_rows : mtp_head.shape[0] == 0)) {
+            throw std::runtime_error("shard " + std::to_string(shard) +
+                                     " MTP proposal head shape is not the expected row block");
+        }
     }
     // The head-split mixer weights are per-shard halves (attention q [3072,5120] for a
     // full-attn layer: 12 of 24 q heads; GDN q [1024,5120] for a GDN layer: 8 of 16 k heads).
@@ -126,8 +148,10 @@ int main(int argc, char** argv) {
                 } else {
                     throw std::invalid_argument("--spec supports mtp only");
                 }
+            } else if (arg == "--lm-head-draft") {
+                options.proposal_head = ProposalHead::Optimized;
             } else if (arg == "--help") {
-                std::cout << "--artifact PATH [--spec mtp]\n";
+                std::cout << "--artifact PATH [--spec mtp] [--lm-head-draft]\n";
                 return 0;
             } else {
                 throw std::invalid_argument("unknown argument " + arg);
@@ -151,13 +175,17 @@ int main(int argc, char** argv) {
         // Construct both shard Parameters: this is the blocker validated this round.
         qwen::execution::Parameters parameters0(*model0);
         qwen::execution::Parameters parameters1(*model1);
-        const bool expect_mtp = options.speculative == SpeculativeBackend::Mtp;
-        check_shard_shapes(parameters0, *model0, 0, expect_mtp);
-        check_shard_shapes(parameters1, *model1, 1, expect_mtp);
+        const bool expect_mtp   = options.speculative == SpeculativeBackend::Mtp;
+        const bool expect_split = !expect_mtp || options.proposal_enabled();
+        const bool expect_proposal_split = options.proposal_enabled();
+        check_shard_shapes(parameters0, *model0, 0, expect_mtp, expect_split, expect_proposal_split);
+        check_shard_shapes(parameters1, *model1, 1, expect_mtp, expect_split, expect_proposal_split);
         std::cout << path.filename().string() << ": TP-2 dual-shard load passed "
                   << "devices=" << dev0 << "," << dev1 << " layers="
                   << model0->weights().text.layers.size() << " shard_gate=[8704,5120] "
-                  << "shard_down=[5120,8704] head=[248320,5120] replicated\n";
+                  << "shard_down=[5120,8704] head=["
+                  << (expect_split ? "124160" : "248320") << ",5120] "
+                  << (expect_split ? "vocabulary-parallel" : "replicated") << "\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

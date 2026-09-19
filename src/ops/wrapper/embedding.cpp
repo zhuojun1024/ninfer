@@ -169,9 +169,11 @@ void require_q8_metadata(const Weight& table, const Tensor& out) {
 }
 
 void require_fp8_metadata(const Weight& table, const Tensor& out) {
-    constexpr std::int32_t kVocabulary = 248320;
-    constexpr std::int32_t kHidden     = 5120;
-    if (table.n != kVocabulary || table.k != kHidden || out.ne[0] != kHidden) {
+    // The FP8 gather is registered for the full hidden width and for its tensor-parallel half (a
+    // shard holds half the hidden columns with the whole vocabulary). The kernel is row-agnostic,
+    // so any positive vocabulary is valid; the width selects the kernel instantiation.
+    const bool supported_width = detail::embed_gather_fp8_supports_width(table.k);
+    if (table.n <= 0 || !supported_width || out.ne[0] != table.k) {
         throw std::invalid_argument("embedding: unsupported FP8 table shape");
     }
     if ((reinterpret_cast<std::uintptr_t>(out.data) &

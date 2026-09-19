@@ -21,13 +21,17 @@ inline constexpr std::int32_t kEmbedGatherQ8Group          = 32;
 inline constexpr std::int32_t kEmbedGatherQ8D              = 2048;
 inline constexpr std::int32_t kEmbedGatherQ8Groups         = kEmbedGatherQ8D / kEmbedGatherQ8Group;
 inline constexpr std::int32_t kEmbedGatherFp8D             = 5120;
+// Tensor-parallel column split of the FP8 table: each shard stores half the hidden columns.
+inline constexpr std::int32_t kEmbedGatherFp8DHalf         = kEmbedGatherFp8D / 2;
 
-template <int BlocksPerToken, int Threads>
+// D is the table's hidden width (its stored row stride). The kernel is otherwise row-agnostic, so
+// one instantiation per supported hidden width covers every vocabulary and shard of that width.
+template <int D, int BlocksPerToken, int Threads>
 __launch_bounds__(Threads) __global__
     void embed_gather_fp8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                  const __nv_bfloat16* scales, __nv_bfloat16* out) {
-    static_assert(kEmbedGatherFp8D % BlocksPerToken == 0);
-    constexpr int kValuesPerBlock = kEmbedGatherFp8D / BlocksPerToken;
+    static_assert(D % BlocksPerToken == 0);
+    constexpr int kValuesPerBlock = D / BlocksPerToken;
     static_assert(kValuesPerBlock % 4 == 0);
     constexpr int kWordsPerBlock = kValuesPerBlock / 4;
 
@@ -37,8 +41,8 @@ __launch_bounds__(Threads) __global__
     const float scale = __bfloat162float(scales[row]);
 
     const int split_offset = split * kValuesPerBlock;
-    const auto* code_row   = codes + static_cast<std::int64_t>(row) * kEmbedGatherFp8D;
-    auto* output_column    = out + static_cast<std::int64_t>(token) * kEmbedGatherFp8D;
+    const auto* code_row   = codes + static_cast<std::int64_t>(row) * D;
+    auto* output_column    = out + static_cast<std::int64_t>(token) * D;
     for (int word_index = static_cast<int>(threadIdx.x); word_index < kWordsPerBlock;
          word_index += Threads) {
         const int offset    = split_offset + word_index * 4;

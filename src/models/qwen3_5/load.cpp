@@ -128,7 +128,20 @@ materialize_model_tp2(LoadPlan&& plan, DeviceContext& device0, DeviceContext& de
     if (!plan.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
     auto data    = std::move(plan.impl_);
     const auto& directory = data->materialization.source->directory();
-    const auto spec       = loading::build_tp_split_spec(directory, data->config.text);
+    // The head is vocabulary-split only when nothing else consumes it: with an unoptimized (Full)
+    // proposal head, text/output_head is the MTP proposal's own head (same artifact object) and the
+    // MTP layer runs on shard 0 alone, so it must keep every vocabulary row.
+    const bool split_text_head =
+        data->options.purpose == EnginePurpose::Generation &&
+        (!data->options.speculative_enabled() || data->options.proposal_enabled());
+    // The reduced proposal head is a draft-only table that both shards hold in full although only
+    // shard 0 samples from it, so it is split whenever it is loaded.
+    const bool split_proposal_head =
+        data->options.purpose == EnginePurpose::Generation && data->options.proposal_enabled();
+    const auto spec = loading::build_tp_split_spec(
+        directory, data->config.text,
+        loading::TpSplitOptions{.split_output_head   = split_text_head,
+                                .split_proposal_head = split_proposal_head});
     auto [backing0, backing1] =
         tp::materialize_tp2(*data->materialization.source, data->materialization, device0,
                             device1, spec, observer);

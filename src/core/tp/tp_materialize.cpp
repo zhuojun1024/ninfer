@@ -41,6 +41,16 @@ WeightGeometry shard_geometry(const WeightGeometry& full, std::int32_t n,
     // group_size tracks k for FP8 RowScale (one scale per row spanning all k columns).
     g.padded_columns = static_cast<std::uint64_t>(k);
     if (full.layout == QuantLayout::RowScale) { g.group_size = static_cast<std::uint64_t>(k); }
+    if (full.layout == QuantLayout::RowSplit) {
+        // Grouped integer formats (Q4/Q5/Q6_G64, Q8_G32) pack code words, optional high bits and
+        // one FP16 scale per group into separate planes of a row block. The layout derives entirely
+        // from the format and the shape, so reuse the shared geometry function.
+        const std::uint64_t shape[2] = {static_cast<std::uint64_t>(n),
+                                        static_cast<std::uint64_t>(k)};
+        WeightGeometry g = weight_geometry(full.format, full.layout, shape);
+        g.alignment      = full.alignment;
+        return g;
+    }
     const auto align256 = [](std::uint64_t v) { return (v + 255) / 256 * 256; };
     if (full.layout == QuantLayout::BlockScaleK16M128x4) {
         g.code_bytes_per_row = static_cast<std::uint64_t>(k) / 2;
