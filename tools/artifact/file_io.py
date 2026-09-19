@@ -7,10 +7,19 @@ import os
 IO_CHUNK_BYTES = 8 * 1024 * 1024
 WRITEBACK_BYTES = 64 * 1024 * 1024
 
+# Windows text mode rewrites newlines and treats 0x1A as end-of-file, so payload
+# descriptors are always binary; elsewhere O_BINARY does not exist.
+_BINARY = getattr(os, "O_BINARY", 0)
+
 # Page-cache eviction is a Linux facility. Windows exposes no equivalent for an already-open handle, so
 # the discards become no-ops there and Writeback only bounds the dirty bytes it writes.
 _HAS_FADVISE = hasattr(os, "posix_fadvise")
 _PAGE_BYTES = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else IO_CHUNK_BYTES
+
+
+def open_read(path: str | os.PathLike) -> int:
+    """Open an existing payload file for binary reading."""
+    return os.open(path, os.O_RDONLY | _BINARY)
 
 
 def read_at(fd: int, count: int, offset: int) -> bytes:

@@ -62,7 +62,9 @@ def _function(value: str):
     if value in RECIPES:
         return RECIPES[value]
     filename, separator, function = value.rpartition(":")
-    if not separator:
+    if not separator or not Path(filename).is_file():
+        # An absolute Windows path contains a drive colon, so an existing whole
+        # value wins over splitting the entry point off the file.
         filename, function = value, "configure"
     path = Path(filename).resolve()
     spec = importlib.util.spec_from_file_location("ninfer_user_recipe", path)

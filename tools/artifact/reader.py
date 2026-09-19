@@ -9,7 +9,7 @@ from typing import Iterator
 
 from .framing import HEADER, MAGIC, PART_MAGIC, PAYLOAD_ALIGNMENT
 from .layouts import align_up
-from .file_io import discard_cached_pages, IO_CHUNK_BYTES, read_at
+from .file_io import discard_cached_pages, IO_CHUNK_BYTES, open_read, read_at
 from .schema import (
     ArtifactError,
     ArtifactObject,
@@ -32,7 +32,7 @@ class Artifact:
         self._fds: dict[int, int] = {}
         self._validated: set[str] = set()
         try:
-            fd = os.open(self.path, os.O_RDONLY)
+            fd = open_read(self.path)
             self._fds[0] = fd
             entry_bytes = os.fstat(fd).st_size
             raw = read_at(fd, HEADER.size, 0)
@@ -98,7 +98,7 @@ class Artifact:
             return self._fds[index]
         file = self.directory.files[index]
         path = self.path.parent / file.path
-        fd = os.open(path, os.O_RDONLY)
+        fd = open_read(path)
         try:
             raw = read_at(fd, HEADER.size, 0)
             if len(raw) != HEADER.size:

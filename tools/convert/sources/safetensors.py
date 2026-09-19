@@ -12,7 +12,7 @@ import struct
 
 import torch
 
-from tools.artifact.file_io import discard_cached_pages, read_at
+from tools.artifact.file_io import discard_cached_pages, open_read, read_at
 from .logical import LogicalSource
 
 _DTYPES = {
@@ -119,7 +119,7 @@ class SafetensorsSource:
             _, fd = self._fds.popitem(last=False)
             discard_cached_pages(fd)
             os.close(fd)
-        fd = os.open(path, os.O_RDONLY)
+        fd = open_read(path)
         self._fds[path] = fd
         return fd
 

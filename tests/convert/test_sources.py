@@ -58,6 +58,71 @@ def test_nvfp4_source_preserves_words_and_decodes_independently(tmp_path):
         assert source.values(16, 16).numel() == 0
 
 
+def test_modelopt_nvfp4_source_inverts_the_per_tensor_multiplier(tmp_path):
+    codes = torch.tensor(
+        [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]] * 2, dtype=torch.uint8
+    )
+    scales = torch.tensor([[0x38], [0x40]], dtype=torch.uint8)
+    save_file(
+        {
+            "proj.weight": codes,
+            "proj.weight_scale": scales.view(torch.float8_e4m3fn),
+            "proj.weight_scale_2": torch.tensor([0.25], dtype=torch.float32),
+            "proj.input_scale": torch.tensor([0.125], dtype=torch.float32),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    with SafetensorsSource(tmp_path) as store:
+        source = matrix_source(store, "proj.weight", (2, 16))
+        words = source.read_encoded(0, 2)
+        assert torch.equal(words.codes, codes) and torch.equal(words.scales, scales)
+        assert words.weight_divisor == struct.pack("<f", 4.0)
+        assert source.weight_divisor() == struct.pack("<f", 4.0)
+        assert source.input_divisor() == struct.pack("<f", 8.0)
+        table = torch.tensor(
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ]
+        )
+        assert torch.equal(source.values().reshape(2, 16), torch.stack((table / 4, table / 2)))
+
+
+def test_modelopt_tensor_scaled_fp8_source_repeats_its_factor_per_row(tmp_path):
+    codes = torch.tensor([[0x38, 0xB8, 0x40], [0x30, 0xB0, 0x80]], dtype=torch.uint8)
+    save_file(
+        {
+            "proj.weight": codes.view(torch.float8_e4m3fn),
+            "proj.weight_scale": torch.tensor([2.0], dtype=torch.float32),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    with SafetensorsSource(tmp_path) as store:
+        source = matrix_source(store, "proj.weight", (2, 3))
+        assert torch.equal(
+            source.values().reshape(2, 3),
+            torch.tensor([[2.0, -2.0, 4.0], [1.0, -1.0, -0.0]]),
+        )
+        words = source.read_encoded(0, 2)
+        assert words.format == "fp8_e4m3fn_row_bf16"
+        assert torch.equal(words.codes, codes)
+        assert torch.equal(words.scales, torch.full((2,), 2.0, dtype=torch.bfloat16))
+
+
 def test_row_fp8_source_and_reordered_encoded_rows(tmp_path):
     codes = torch.tensor([[0x38, 0xB8, 0x40], [0x30, 0xB0, 0x80]], dtype=torch.uint8)
     scales = torch.tensor([[2.0], [0.5]], dtype=torch.bfloat16)
