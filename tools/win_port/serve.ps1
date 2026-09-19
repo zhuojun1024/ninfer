@@ -18,6 +18,7 @@ param(
     [string] $Binary = "",
     [int] $Port = 8099,
     [int] $Context = 131072,
+    [int] $DraftTokens = 2,
     [switch] $Plain,
     [switch] $Background,
     [string] $LogFile = "",
@@ -79,7 +80,7 @@ $arguments = @(
 if (-not $Plain) {
     $arguments += @(
         "--temperature", "0.7", "--top-k", "20", "--top-p", "0.80",
-        "--spec", "mtp", "--draft-tokens", "2", "--lm-head-draft",
+        "--spec", "mtp", "--draft-tokens", "$DraftTokens", "--lm-head-draft",
         "--vision", "--reasoning-effort", "medium"
     )
 }
