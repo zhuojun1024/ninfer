@@ -462,3 +462,37 @@ gpu2 2805 MHz / 13801 MHz / 84.7 W / util 99% ⇒ **满频、未撞功耗墙（1
      语义一套手写 C++ 渲染器）。要用它 ＝ 新增一种前端语义（含工具调用/多模态/effort 别名），属独立功能，
      需另行确认范围。
 
+---
+
+## 12. 进行中：Windows 原生移植（分支 `feat/windows-native-port`）
+
+**目标**：同一 artifact、同一套产品代码，在原生 Windows 上跑通——先单卡 CLI/serve，再做 TP-2 spike。
+
+**平台面普查（Round 54，已确认）**
+- 很薄：`mmap`/`madvise`/`epoll`/`pthread`/`NUMA`/`setrlimit`/线程亲和 **全无**；线程与同步用 `std::thread`；
+  HTTP 服务端是 cpp-httplib，`src/serve/http_transport.cpp` 已有 `#if defined(__linux__)` 结构可直接补分支。
+- 待改代码：
+  - `src/artifact/file_io.cpp`：`::open`/`::pread`/`O_CLOEXEC` → `CreateFileW` + `ReadFile` + `OVERLAPPED`
+    定位读（注意 >4 GiB 偏移、`FILE_FLAG_SEQUENTIAL_SCAN`），约 50 行。
+  - `src/product/logging/logging.cpp`、`src/serve/request_log.cpp`：`localtime_r`/`getpid`/`isatty`/`strerror_r`。
+  - `src/product/media_acquire/acquire.cpp`：POSIX socket 出站抓图 → 建议改用仓库已有的 cpp-httplib 客户端。
+- 工具链（已核实存在）：VS 2022 Community `D:\Program Files\Microsoft Visual Studio\2022\Community`
+  （`vcvars64.bat` ✓）、Windows CUDA **v13.3**（`sm_120a` 支持 ✓；WSL 侧是 13.1，对比时要记住这个差异）。
+- **最大未知工作量**：`.cu`/`.cpp` 里是否存在 GCC 扩展（`__attribute__`/`__builtin_*`）——需一次 MSVC+nvcc
+  编译扫描才能定价。
+- **最高风险（决定 TP-2 版 Windows 是否成立）**：`cudaHostAllocMapped` 的双卡 in-kernel allreduce
+  （`src/core/tp/device_pair.cu:195`）在 Windows/WDDM 下的可用性与性能。
+- 可参考：三卡分支 `C:\llama.cpp` @ `ar3-opt`，HEAD 为
+  `92758c647 ggml-cuda: add 3-way AllReduce kernel (on by default) + timing instrumentation`——
+  与我们的跨卡集合通信瓶颈（见 §11.7）直接相关。
+
+**步骤**
+1. 单卡 `ninfer` CLI：文件 IO + 日志杂项 + MSVC/CMake 构建；跑 5 个 greedy 提示词与 Linux 结果对照。
+2. 单卡 `ninfer-serve`：HTTP、流式、媒体输入行为对照。
+3. **TP-2 spike**：mapped pinned 双卡是否成立，量 decode 每轮毫秒并与 Linux（~39 ms/轮）对照。
+4. 收尾：Windows 构建/运行写进 `docs/`，脚本 `.ps1` 化，回归清单。
+
+**预期**：机械移植 3–5 天；性能上 WDDM 很可能略逊于 Linux（我们已在 448 GB/s 峰值上只拿到 71%，
+见 §11.7），所以移植的收益主要是**部署便利**，不是速度。
+
+
