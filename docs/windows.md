@@ -90,15 +90,35 @@ under WDDM, the peer device addresses the same UVA address, and cross-card reads
 are correct and run at the same ~1.4-1.9 GiB/s order as the WSL2 path. The end-to-end consequence is the
 Linux-parity decode rate above.
 
+## Tests
+
+```powershell
+pwsh -File tools/win_port/build.ps1 -Configure -Tests 1   # configure and build the suite
+pwsh -File tools/win_port/test.ps1                        # run it through ctest
+pwsh -File tools/win_port/test.ps1 -Filter "artifact|nvfp4"
+```
+
+`test.ps1` puts the FFmpeg and libcurl `bin` directories on `PATH` before invoking ctest; the test executables
+load those DLLs at run time, and without them the Windows loader raises a missing-DLL dialog for every
+executable instead of reporting a failed test.
+
+The suite is the Linux suite. Two platform notes:
+
+- The CUDA fault-injection companion of `ninfer_artifact_materialization_test` relies on GNU ld `--wrap`,
+  which MSVC's linker does not implement, so that source and its link options are excluded on Windows and the
+  executable keeps its materialization and writer-fixture checks.
+- Tests that need a real model artifact report themselves as skipped through ctest's `SKIP_RETURN_CODE`.
+
 ## Platform differences carried by the port
 
 | Area | Windows behavior |
 |---|---|
-| `src/artifact/file_io.cpp` | `CreateFileW` + `ReadFile` with an `OVERLAPPED` offset for positional reads; `FILE_FLAG_SEQUENTIAL_SCAN` for the buffered handle and `FILE_FLAG_NO_BUFFERING` for the direct one |
+| `src/artifact/file_io.cpp` | `CreateFileW` + `ReadFile` with an `OVERLAPPED` offset for positional reads; `FILE_FLAG_SEQUENTIAL_SCAN` for the buffered handle and `FILE_FLAG_NO_BUFFERING` for the direct one. The handle is opened with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` so a reader keeps the POSIX contract: another process may rewrite, replace or delete the artifact underneath it |
+| `tools/artifact/file_io.py` | page-cache discarding is a Linux facility, so `posix_fadvise` and `fdatasync` degrade to a no-op and `fsync`; `read_at`/`write_at` emulate `os.pread`/`os.pwrite`, which Windows lacks |
 | `src/core/uint128.h` | 128-bit accounting without `__int128`: `_umul128` with saturating add, shift and compare |
 | `src/core/host_process.{h,cpp}` | `_getpid`, `_isatty`, `localtime_s`/`gmtime_s`, and `GetConsoleScreenBufferInfo` for the progress width |
 | `src/product/media_acquire/acquire.cpp` | `winsock2`/`ws2tcpip` name resolution with a one-time `WSAStartup`; links `ws2_32` |
-| NVFP4 TMA kernels | the 64-byte-aligned tensor-map aggregate cannot be passed by value under the MSVC parameter ABI (C2719), so `Nvfp4TmaDescriptorStaging` uploads the descriptors into stream-ordered device memory and the kernel takes a pointer |
+| NVFP4 TMA kernels | the 64-byte-aligned tensor-map aggregate cannot be passed by value under the MSVC parameter ABI (C2719), so the kernel takes a descriptor pointer while `Nvfp4TmaDescriptorStaging` publishes the tensor maps through a mapped-pinned host arena. A device-side copy is not an option: this op also runs inside captured CUDA graphs, where a stream-ordered allocation is a memory node settled at instantiation and a pageable host source is gone by replay. The kernel admits each descriptor with `fence.proxy.tensormap::generic.acquire.gpu` because the tensor-map proxy has its own view of the tensor map |
 | `CMakeLists.txt` | MSVC needs `/Zc:preprocessor` (CUDA 13's CCCL rejects the traditional preprocessor), `/utf-8` (bundled fmt), and `NOMINMAX`/`WIN32_LEAN_AND_MEAN` |
 
 ## Limitations

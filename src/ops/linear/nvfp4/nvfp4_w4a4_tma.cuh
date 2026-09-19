@@ -13,6 +13,11 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(_WIN32)
+#    include <atomic>
+#    include <cstring>
+#endif
+
 namespace ninfer::ops::detail {
 
 struct alignas(128) Nvfp4W4a4TmaDescriptors {
@@ -28,23 +33,26 @@ inline void nvfp4_check_runtime(cudaError_t status, const char* operation) {
 }
 
 #if defined(_WIN32)
-// The MSVC kernel-parameter ABI aligns parameters to 16 bytes and rejects a tensor map that requires
-// 64 (C2719), so a descriptor aggregate cannot be passed by value. A pool-backed stream-ordered copy
-// hands the kernel a device pointer whose lifetime is tied to the launch, which keeps several
-// launches in flight without sharing one staging buffer. The tensor map stays legal: PTX accepts it
-// in global space, and this is the storage the by-value parameter would otherwise occupy.
+// The MSVC kernel-parameter ABI aligns parameters to 16 bytes and rejects a tensor map that requires 64
+// (C2719), so the descriptors cannot ride in the parameter list the way they do elsewhere. A device
+// copy is no substitute either: this op also runs inside captured CUDA graphs, where a stream-ordered
+// allocation becomes a memory node whose address is settled at instantiation, and a pageable host
+// source would be dangling by replay. Mapped pinned host memory avoids both problems: the host
+// publishes the descriptor with plain stores and the TMA unit reads that same UVA address, so a
+// captured launch stays valid and the launch path issues no CUDA call at all. The kernel-side acquire
+// fence publishes those stores to the tensor-map proxy, whose view of a tensor map is not the generic
+// one.
 class Nvfp4TmaDescriptorStaging {
 public:
-    Nvfp4TmaDescriptorStaging(const Nvfp4W4a4TmaDescriptors& descriptors, cudaStream_t stream)
-        : stream_(stream) {
-        nvfp4_check_runtime(cudaMallocAsync(&device_, sizeof(Nvfp4W4a4TmaDescriptors), stream),
-                            "TMA descriptor staging allocation");
-        nvfp4_check_runtime(cudaMemcpyAsync(device_, &descriptors, sizeof(Nvfp4W4a4TmaDescriptors),
-                                            cudaMemcpyHostToDevice, stream),
-                            "TMA descriptor staging upload");
-    }
-    ~Nvfp4TmaDescriptorStaging() {
-        if (device_ != nullptr) { (void)cudaFreeAsync(device_, stream_); }
+    // Deep enough that the host never rewrites a descriptor that a queued launch is still reading.
+    static constexpr std::size_t kSlotCount = 32;
+
+    explicit Nvfp4TmaDescriptorStaging(const Nvfp4W4a4TmaDescriptors& descriptors) {
+        Arena& arena            = shared_arena();
+        const std::size_t index = arena.next++ % kSlotCount;
+        std::memcpy(arena.host[index], &descriptors, sizeof(Nvfp4W4a4TmaDescriptors));
+        std::atomic_thread_fence(std::memory_order_release);
+        device_ = arena.device[index];
     }
     Nvfp4TmaDescriptorStaging(const Nvfp4TmaDescriptorStaging&)            = delete;
     Nvfp4TmaDescriptorStaging& operator=(const Nvfp4TmaDescriptorStaging&) = delete;
@@ -52,7 +60,33 @@ public:
     [[nodiscard]] const Nvfp4W4a4TmaDescriptors* get() const noexcept { return device_; }
 
 private:
-    cudaStream_t stream_             = nullptr;
+    struct Arena {
+        Nvfp4W4a4TmaDescriptors* host[kSlotCount]{};
+        Nvfp4W4a4TmaDescriptors* device[kSlotCount]{};
+        std::size_t next = 0;
+    };
+
+    static Arena& shared_arena() {
+        static Arena arena = [] {
+            Arena created{};
+            void* host_base = nullptr;
+            nvfp4_check_runtime(cudaHostAlloc(&host_base,
+                                              sizeof(Nvfp4W4a4TmaDescriptors) * kSlotCount,
+                                              cudaHostAllocMapped | cudaHostAllocPortable),
+                                "TMA descriptor arena allocation");
+            for (std::size_t index = 0; index < kSlotCount; ++index) {
+                auto* host_slot   = static_cast<Nvfp4W4a4TmaDescriptors*>(host_base) + index;
+                void* device_slot = nullptr;
+                nvfp4_check_runtime(cudaHostGetDevicePointer(&device_slot, host_slot, 0),
+                                    "TMA descriptor arena mapping");
+                created.host[index]   = host_slot;
+                created.device[index] = static_cast<Nvfp4W4a4TmaDescriptors*>(device_slot);
+            }
+            return created;
+        }();
+        return arena;
+    }
+
     Nvfp4W4a4TmaDescriptors* device_ = nullptr;
 };
 #endif
@@ -185,6 +219,22 @@ __device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block
     block_x = linear / rows;
 }
 
+#if defined(_WIN32)
+// The Windows path keeps the tensor maps in global memory instead of the kernel parameter space, and the
+// cudaMallocAsync pool hands back the same address on every launch. The tensor-map proxy caches tensor
+// maps per address, so the stream-ordered upload has to be published to that proxy and acquired here;
+// without the pair the TMA instructions can consume the descriptor of an earlier launch. PTX ISA 8.3,
+// SM_90 and later.
+__device__ __forceinline__ void nvfp4_tensormap_publish() {
+    asm volatile("fence.proxy.tensormap::generic.release.gpu;" ::: "memory");
+}
+
+__device__ __forceinline__ void nvfp4_tensormap_acquire(const CUtensorMap* descriptor) {
+    asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], %1;" ::"l"(descriptor), "n"(128)
+                 : "memory");
+}
+#endif
+
 __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUtensorMap* descriptor,
                                                   std::int32_t coordinate0,
                                                   std::int32_t coordinate1,
@@ -211,6 +261,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output) {
 #if defined(_WIN32)
     const Nvfp4W4a4TmaDescriptors& descriptors = *descriptors_storage;
+    nvfp4_tensormap_publish();
+    nvfp4_tensormap_acquire(&descriptors.a_codes);
+    nvfp4_tensormap_acquire(&descriptors.b_codes);
+    nvfp4_tensormap_acquire(&descriptors.a_scales);
+    nvfp4_tensormap_acquire(&descriptors.b_scales);
 #endif
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);

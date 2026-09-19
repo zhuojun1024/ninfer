@@ -3,7 +3,12 @@
 
 #include <spdlog/logger.h>
 
-#include <unistd.h>
+#if defined(_WIN32)
+#    include <fcntl.h>
+#    include <io.h>
+#else
+#    include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -17,36 +22,65 @@
 
 namespace {
 
+#if defined(_WIN32)
+
+// The MSVC CRT keeps stderr on descriptor 2, but pipes, duplication and positional reads carry the
+// underscore names. The pipe is binary so the captured bytes match the POSIX harness exactly.
+constexpr int kStderrFd = 2;
+int pipe_open(int descriptors[2]) { return ::_pipe(descriptors, 65536, _O_BINARY); }
+int duplicate_fd(int descriptor) { return ::_dup(descriptor); }
+int duplicate_onto(int from, int to) { return ::_dup2(from, to); }
+void close_fd(int descriptor) { (void)::_close(descriptor); }
+std::ptrdiff_t read_fd(int descriptor, void* buffer, std::size_t bytes) {
+    return static_cast<std::ptrdiff_t>(::_read(descriptor, buffer, static_cast<unsigned>(bytes)));
+}
+
+#else
+
+constexpr int kStderrFd = STDERR_FILENO;
+int pipe_open(int descriptors[2]) { return ::pipe(descriptors); }
+int duplicate_fd(int descriptor) { return ::dup(descriptor); }
+int duplicate_onto(int from, int to) { return ::dup2(from, to); }
+void close_fd(int descriptor) { ::close(descriptor); }
+std::ptrdiff_t read_fd(int descriptor, void* buffer, std::size_t bytes) {
+    return static_cast<std::ptrdiff_t>(::read(descriptor, buffer, bytes));
+}
+
+#endif
+
 class StderrCapture {
 public:
     StderrCapture() {
-        if (::pipe(pipe_) != 0) { throw std::runtime_error(std::strerror(errno)); }
-        saved_ = ::dup(STDERR_FILENO);
-        if (saved_ < 0 || ::dup2(pipe_[1], STDERR_FILENO) < 0) {
+        if (pipe_open(pipe_) != 0) { throw std::runtime_error(std::strerror(errno)); }
+        saved_ = duplicate_fd(kStderrFd);
+        if (saved_ < 0 || duplicate_onto(pipe_[1], kStderrFd) < 0) {
             throw std::runtime_error(std::strerror(errno));
         }
-        ::close(pipe_[1]);
+#if defined(_WIN32)
+        (void)::_setmode(kStderrFd, _O_BINARY);
+#endif
+        close_fd(pipe_[1]);
         pipe_[1] = -1;
     }
 
     ~StderrCapture() {
         if (saved_ >= 0) {
-            (void)::dup2(saved_, STDERR_FILENO);
-            ::close(saved_);
+            (void)duplicate_onto(saved_, kStderrFd);
+            close_fd(saved_);
         }
-        if (pipe_[0] >= 0) { ::close(pipe_[0]); }
+        if (pipe_[0] >= 0) { close_fd(pipe_[0]); }
     }
 
     std::string finish() {
         std::fflush(stderr);
-        if (::dup2(saved_, STDERR_FILENO) < 0) { throw std::runtime_error(std::strerror(errno)); }
-        ::close(saved_);
+        if (duplicate_onto(saved_, kStderrFd) < 0) { throw std::runtime_error(std::strerror(errno)); }
+        close_fd(saved_);
         saved_ = -1;
 
         std::string output;
         std::array<char, 4096> buffer{};
         for (;;) {
-            const ssize_t count = ::read(pipe_[0], buffer.data(), buffer.size());
+            const std::ptrdiff_t count = read_fd(pipe_[0], buffer.data(), buffer.size());
             if (count == 0) { break; }
             if (count < 0) {
                 if (errno == EINTR) { continue; }
@@ -54,7 +88,7 @@ public:
             }
             output.append(buffer.data(), static_cast<std::size_t>(count));
         }
-        ::close(pipe_[0]);
+        close_fd(pipe_[0]);
         pipe_[0] = -1;
         return output;
     }

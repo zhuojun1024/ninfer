@@ -5,6 +5,11 @@
 #include <cstdint>
 #include <iostream>
 
+#if defined(_WIN32)
+// winnt.h defines the legacy empty macro "near", which would rewrite the helper below.
+#    undef near
+#endif
+
 namespace {
 
 int check(bool condition, const char* message) {

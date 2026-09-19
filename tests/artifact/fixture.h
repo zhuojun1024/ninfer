@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact/schema.h"
+#include "core/host_process.h"
 
 #include <nlohmann/json.hpp>
 
@@ -46,13 +47,22 @@ struct Fixture {
     std::vector<std::byte> payload;
 
     Fixture() : payload(1344) {
-        auto pattern = (std::filesystem::temp_directory_path() / "ninfer-artifact-XXXXXX").string();
-        std::vector<char> buffer(pattern.begin(), pattern.end());
-        buffer.push_back('\0');
-        const char* path = ::mkdtemp(buffer.data());
-        if (!path) { throw std::runtime_error("cannot create fixture directory"); }
-        directory = path;
-        entry     = directory / "model.ninfer";
+        // No mkdtemp on Windows: claim a unique directory name instead, keyed by process so parallel
+        // test executables never share one.
+        const std::filesystem::path temporary_root = std::filesystem::temp_directory_path();
+        for (int attempt = 0; attempt < 128 && directory.empty(); ++attempt) {
+            const std::filesystem::path candidate =
+                temporary_root / ("ninfer-artifact-" + std::to_string(ninfer::host_process_id()) +
+                                  "-" + std::to_string(attempt));
+            std::error_code error;
+            if (std::filesystem::create_directory(candidate, error)) {
+                directory = candidate;
+            } else if (error) {
+                throw std::runtime_error("cannot create fixture directory");
+            }
+        }
+        if (directory.empty()) { throw std::runtime_error("cannot create fixture directory"); }
+        entry = directory / "model.ninfer";
         root      = {
             {"components",
                   {{"text", {{"config", Json::object()}, {"resources", {{"tokenizer.json", "asset"}}}}},

@@ -51,8 +51,11 @@ std::int64_t positional_read(NativeFileHandle handle, std::uint64_t offset, void
 NativeFileHandle open_handle(const std::filesystem::path& path, bool direct) {
     const DWORD flags = FILE_ATTRIBUTE_NORMAL | (direct ? FILE_FLAG_NO_BUFFERING
                                                         : FILE_FLAG_SEQUENTIAL_SCAN);
-    const HANDLE handle = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                        OPEN_EXISTING, flags, nullptr);
+    // Reading must not lock the artifact. POSIX readers stay valid when another process rewrites,
+    // replaces or deletes the file, and the reader and writer-interop checks depend on that.
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    const HANDLE handle = ::CreateFileW(path.c_str(), GENERIC_READ, share, nullptr, OPEN_EXISTING,
+                                        flags, nullptr);
     return handle == INVALID_HANDLE_VALUE ? kInvalidFileHandle : handle;
 }
 

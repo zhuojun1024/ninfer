@@ -644,5 +644,41 @@ Ctrl+C 停止），只有 `-Background` 才用 `Start-Process`；自测服务时
 `docs/windows.md` 限制节）。要真正跑到端到端，需要另造一个小的 `.ninfer` 测试 artifact（转换工具链 +
 合成小 checkpoint），属额外工作；当前 CLI 二进制本身已验证可运行（`--help`），且与 serve 共用同一套
 引擎/加载器（已端到端跑通）。
+**进度（Round 54 第 5 轮）：Windows 测试套件跑通，并抓到一处真实移植缺陷**
+
+- 新增 `tools/win_port/test.ps1`：先把 FFmpeg/curl 的 `bin` 放进 PATH 再跑 ctest。**必须如此**：测试 exe 运行时
+  加载 avcodec/swscale/libcurl，PATH 缺失时 Windows loader 会对每个 exe 弹「找不到 DLL」对话框，而不是报测试失败。
+- Windows 全量测试目标编译链接通过（253 个目标，`BUILD_EXIT=0`）。为跑通测试补的平台分支：
+  `test_pretty_logging`（`pipe/dup/dup2/read` → `_pipe/_dup/_dup2/_read` + `_setmode(_O_BINARY)`）、
+  `test_context_cost`/`test_request_log`（`getpid` → `ninfer::host_process_id()`）、`tests/artifact/fixture.h`
+  （`mkdtemp` → 唯一目录名循环）、`test_gdn_replay_records`（`std::aligned_alloc` → `_aligned_malloc`）、
+  `test_host_timing`（`#undef near`：winnt.h 的遗留空宏）、3 处 `constexpr ... std::sqrt`（MSVC 不折叠）、
+  1 处 `std::array` CTAD 显式化、4 个文件补 `<array>`。
+- 唯一平台排除：`ninfer_artifact_materialization_test` 的 CUDA 故障注入依赖 GNU ld `--wrap`，MSVC 链接器无
+  等价物；`tests/artifact/tests.cmake` 用 `if(NOT MSVC)` 排除该源文件与 `--wrap` 选项，其余检查照常。
+- Python 工具平台分支：`tools/artifact/file_io.py`（`os.sysconf`/`posix_fadvise`/`fdatasync` 有则用、无则
+  降级：丢弃页缓存变 no-op、`fsync` 兜底；新增 `read_at`/`write_at` 封装 `os.pread`/`os.pwrite`），
+  `reader.py`/`writer.py`/`convert/sources/safetensors.py` 改用它。
+- **真实产品缺陷（由测试套件抓到）**：Windows `open_handle` 只用 `FILE_SHARE_READ`，导致**读取 artifact 期间
+  无法重写/替换/删除该文件**（POSIX 读语义允许），表现为 `ninfer_artifact_reader_test` 抛
+  `ios_base::failbit`。已改为 `FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE`，与 POSIX 读语义对齐。
+- 回归：Windows `artifact` 3/3 通过；Linux 23/23 通过（`artifact|context_cost|pretty_logging|request_log|
+  host_timing|resource_manager|kv_cache|gdn|attn_input_proj|gated_delta`），Linux 全量构建 `BUILD_EXIT=0`。
+**进度（Round 54 第 6 轮）：修掉 Windows A4 TMA 的真实缺陷（CUDA Graph 捕获）**
+
+- 症状：`ninfer_linear_nvfp4_a4_test` 在 Windows 上抛 `cudaErrorIllegalInstruction`；`CUDA_LAUNCH_BLOCKING=1`
+  把它定位到 `src/core/decode_graph.cpp:144` 的 `cudaGraphLaunch` —— 即失败发生在**捕获后的 CUDA Graph** 中。
+- 根因：第 4 轮为绕开 MSVC C2719 把 tensor map 改成「`cudaMallocAsync` 设备暂存 + 从**栈上** host 对象
+  `cudaMemcpyAsync`」。这条路在 graph 捕获下不成立：流序分配会变成 graph 的 memory node（地址到实例化时才
+  确定），而 pageable 源指针在 replay 时早已失效 → TMA 读到垃圾描述符 → illegal instruction。
+  Linux 不受影响（那边是 `__grid_constant__` 按值传参）。
+- 修复：Windows 改用 **mapped pinned host arena** 存描述符（`cudaHostAllocMapped|Portable` +
+  `cudaHostGetDevicePointer`，32 槽轮转；host 直接写、TMA 经同一 UVA 地址读），启动路径**不再发出任何 CUDA
+  调用**，因此捕获安全；内核侧用 `fence.proxy.tensormap::generic.release/acquire.gpu` 把描述符发布给
+  tensor-map proxy（PTX ISA 8.3，SM_90+）。linear 与 linear_swiglu 两个 A4 内核同步修改。
+- 结果：`ninfer_linear_nvfp4_a4_test` Windows 通过；Windows 线性/TMA 面 30/30、Linux 同面 29/29。
+- 全量 Windows 套件（124 项）修复前 121 通过/3 失败，现 a4 已修；`ninfer_context_kv_materialize_test` 在整轮
+  串行运行时撞 300 s 超时、单独运行通过（判为干扰，非缺陷）；`ninfer_qwen3_5_frontend_test` 与 Linux 同样
+  存在的既有模板白名单问题。
 
 

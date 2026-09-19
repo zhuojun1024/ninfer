@@ -72,7 +72,7 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
     constexpr int kPairN = M256N128S3::kBlockN / 2;
     const dim3 grid((Geometry::kOutputRows / 2) / kPairN, tokens / M256N128S3::kBlockM);
 #if defined(_WIN32)
-    const Nvfp4TmaDescriptorStaging staged(descriptors, stream);
+    const Nvfp4TmaDescriptorStaging staged(descriptors);
     nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
         <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(staged.get(), alpha, output);
 #else

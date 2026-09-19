@@ -6,10 +6,41 @@ import os
 
 IO_CHUNK_BYTES = 8 * 1024 * 1024
 WRITEBACK_BYTES = 64 * 1024 * 1024
-_PAGE_BYTES = os.sysconf("SC_PAGE_SIZE")
+
+# Page-cache eviction is a Linux facility. Windows exposes no equivalent for an already-open handle, so
+# the discards become no-ops there and Writeback only bounds the dirty bytes it writes.
+_HAS_FADVISE = hasattr(os, "posix_fadvise")
+_PAGE_BYTES = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else IO_CHUNK_BYTES
+
+
+def read_at(fd: int, count: int, offset: int) -> bytes:
+    """Read at an absolute offset. Windows has no os.pread, so seek first. Callers own their descriptor
+    and do not share it between threads, so the file position is private."""
+    if hasattr(os, "pread"):
+        return os.pread(fd, count, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.read(fd, count)
+
+
+def write_at(fd: int, data: bytes | memoryview, offset: int) -> int:
+    """Write at an absolute offset. Windows has no os.pwrite, so seek first (see read_at)."""
+    if hasattr(os, "pwrite"):
+        return os.pwrite(fd, data, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.write(fd, data)
+
+
+def _flush_to_disk(fd: int) -> None:
+    # fdatasync is POSIX-only; Windows flushes through fsync, which has no data-only variant.
+    if hasattr(os, "fdatasync"):
+        os.fdatasync(fd)
+    else:
+        os.fsync(fd)
 
 
 def discard_cached_pages(fd: int, offset: int = 0, count: int | None = None) -> None:
+    if not _HAS_FADVISE:
+        return
     if count is None:
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
     elif count > 0:
@@ -33,7 +64,7 @@ class Writeback:
 
     def flush(self) -> None:
         for fd in self._fds:
-            os.fdatasync(fd)
+            _flush_to_disk(fd)
             discard_cached_pages(fd)
         self._fds.clear()
         self._bytes = 0

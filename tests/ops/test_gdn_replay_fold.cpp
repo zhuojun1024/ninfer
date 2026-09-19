@@ -8,6 +8,7 @@
 #include "core/linear_attention_state.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
+#include <array>
 #include <cstring>
 #include "ops/input_projection_test_common.h"
 #include "ops/op_tester.h"
@@ -272,7 +273,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     Tensor local_state_tensor(local_state.p, DType::FP32,
                               {kStateDim, kStateDim, profile.value_heads});
     Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
-    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    const float kScale = 1.0F / std::sqrt(128.0F); // MSVC does not constant-fold std::sqrt
     WorkspaceArena reference_workspace(256);
 
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
@@ -524,7 +525,7 @@ int run_record_fold_rounds() {
     constexpr std::int32_t kStateSlots   = kWidth + 1;
     constexpr std::int32_t kInitialSlot  = kWidth;
     constexpr std::int32_t kSnapshotBase = 0;
-    constexpr float kScale               = 1.0F / std::sqrt(128.0F);
+    const float kScale                   = 1.0F / std::sqrt(128.0F); // MSVC: no constexpr sqrt
 
     DevicePackedWeight qk_parent(
         quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, 4096, kHidden, 1901U));

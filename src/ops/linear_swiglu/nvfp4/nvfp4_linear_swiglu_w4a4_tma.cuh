@@ -55,6 +55,11 @@ __global__ __launch_bounds__(Schedule::kThreads,
     __nv_bfloat16* __restrict__ output) {
 #if defined(_WIN32)
     const Nvfp4W4a4TmaDescriptors& descriptors = *descriptors_storage;
+    nvfp4_tensormap_publish();
+    nvfp4_tensormap_acquire(&descriptors.a_codes);
+    nvfp4_tensormap_acquire(&descriptors.b_codes);
+    nvfp4_tensormap_acquire(&descriptors.a_scales);
+    nvfp4_tensormap_acquire(&descriptors.b_scales);
 #endif
     static_assert(Geometry::kOutputRows == 34816);
     static_assert(Geometry::kInputRows == 5120);

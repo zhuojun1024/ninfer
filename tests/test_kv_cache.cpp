@@ -2,6 +2,7 @@
 #include "core/host_kv_arena.h"
 #include "core/paged_kv_cache.h"
 
+#include <array>
 #include <cuda_runtime.h>
 
 #include <algorithm>

@@ -3,6 +3,7 @@
 #include "artifact/views.h"
 #include "core/device.h"
 
+#include <array>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -11,9 +12,12 @@
 #include <map>
 #include <optional>
 
+#if !defined(_WIN32)
 namespace ninfer::test {
+// Fault injection through GNU ld --wrap; MSVC's linker has no equivalent.
 void materialization_cuda_errors(DeviceContext& device);
 }
+#endif
 
 namespace {
 
@@ -229,7 +233,9 @@ int main(int argc, char** argv) {
         }
         materialization(device);
         failure_and_host_only(device);
+#if !defined(_WIN32)
         ninfer::test::materialization_cuda_errors(device);
+#endif
         staging_reuse(device);
         std::cout << "artifact materialization checks passed\n";
         return 0;
