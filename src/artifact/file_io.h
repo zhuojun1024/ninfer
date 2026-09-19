@@ -7,6 +7,16 @@
 
 namespace ninfer::artifact {
 
+// Native file handle: a POSIX descriptor or a Windows HANDLE. A Windows handle does not fit an int,
+// so only the private storage follows the platform; the public contract is unchanged.
+#if defined(_WIN32)
+using NativeFileHandle                  = void*;
+inline constexpr NativeFileHandle kInvalidFileHandle = nullptr;
+#else
+using NativeFileHandle                  = int;
+inline constexpr NativeFileHandle kInvalidFileHandle = -1;
+#endif
+
 // Direct reads require aligned offsets and buffers. A short final direct block is allowed;
 // read_exact always requires the complete requested byte range.
 class InputFile {
@@ -24,9 +34,9 @@ public:
 
 private:
     std::filesystem::path path_;
-    int fd_                = -1;
-    mutable int direct_fd_ = -1;
-    std::uint64_t bytes_   = 0;
+    NativeFileHandle fd_                = kInvalidFileHandle;
+    mutable NativeFileHandle direct_fd_ = kInvalidFileHandle;
+    std::uint64_t bytes_                = 0;
 };
 
 } // namespace ninfer::artifact

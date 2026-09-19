@@ -12,6 +12,7 @@ run the CLI or HTTP server.
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
+| [Windows native build](windows.md) | VS2022 + CUDA 13.3 build, native run recipe, verified Windows/WDDM behavior, TP-2 mapped-pinned findings, and platform differences |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.

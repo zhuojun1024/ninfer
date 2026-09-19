@@ -43,14 +43,19 @@ struct Nvfp4LinearSwiGluTmaSharedStorage {
 };
 
 template <class Geometry, class Schedule>
-__global__ __launch_bounds__(
-    Schedule::kThreads,
-    Schedule::
-        kMinBlocksPerSm) void nvfp4_linear_swiglu_w4a4_tma_kernel(const __grid_constant__
-                                                                      Nvfp4W4a4TmaDescriptors
-                                                                          descriptors,
-                                                                  float alpha,
-                                                                  __nv_bfloat16* __restrict__ output) {
+__global__ __launch_bounds__(Schedule::kThreads,
+                   Schedule::kMinBlocksPerSm) void nvfp4_linear_swiglu_w4a4_tma_kernel(
+#if defined(_WIN32)
+    // See Nvfp4TmaDescriptorStaging: the Windows build passes the tensor maps through device memory
+    // because the MSVC kernel-parameter ABI cannot align a by-value descriptor aggregate.
+    const Nvfp4W4a4TmaDescriptors* descriptors_storage, float alpha,
+#else
+    const __grid_constant__ Nvfp4W4a4TmaDescriptors descriptors, float alpha,
+#endif
+    __nv_bfloat16* __restrict__ output) {
+#if defined(_WIN32)
+    const Nvfp4W4a4TmaDescriptors& descriptors = *descriptors_storage;
+#endif
     static_assert(Geometry::kOutputRows == 34816);
     static_assert(Geometry::kInputRows == 5120);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);

@@ -6,6 +6,8 @@
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 
+#include "core/host_process.h"
+
 #include <nlohmann/json.hpp>
 #include <spdlog/logger.h>
 
@@ -163,7 +165,7 @@ std::string safe_component(std::string_view value) {
 std::string timestamp() {
     const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm utc{};
-    gmtime_r(&now, &utc);
+    ninfer::host_gmtime(now, utc);
     std::ostringstream out;
     out << std::put_time(&utc, "%Y%m%d-%H%M%S");
     return out.str();

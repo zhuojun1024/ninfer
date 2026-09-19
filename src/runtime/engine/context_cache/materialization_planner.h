@@ -924,8 +924,8 @@ private:
                            ? item.estimated_total_ns - parent.estimated_total_ns
                            : 0;
             };
-            const __uint128_t left  = static_cast<__uint128_t>(delta(cost)) * b;
-            const __uint128_t right = static_cast<__uint128_t>(delta(prior)) * a;
+            const Uint128 left  = Uint128::multiply(delta(cost), b);
+            const Uint128 right = Uint128::multiply(delta(prior), a);
             if (left != right) { return left < right; }
         }
         return cost.key() < prior.key();

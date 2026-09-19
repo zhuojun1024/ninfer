@@ -1652,7 +1652,8 @@ void TextContext::forward_tp2(TextContext& peer, tp::DevicePair& pair, std::int3
     auto make_bind = [&](TextContext& c, WorkspaceArena& arena) {
         c.ctx_.bind_to_current_thread();
         BindState b;
-        b.envelope        = {position + 1, position + 1};
+        const auto envelope_tokens = static_cast<std::uint32_t>(position + 1);
+        b.envelope                 = {envelope_tokens, envelope_tokens};
         b.cache_positions = arena.alloc(DType::I32, {1});
         ops::set_i32_scalar(b.cache_positions, position, c.ctx_.stream);
         b.rope_positions = arena.alloc(DType::I32, {1});
@@ -1908,10 +1909,12 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
             CUDA_CHECK(cudaMemsetAsync(staging.data, 0, bytes, ctx_.stream));
             peer.ctx_.bind_to_current_thread();
             Tensor source = peer.work_.alloc(DType::BF16, {hidden, count});
-            CUDA_CHECK(cudaMemcpyAsync(source.data,
-                                       vision->embeddings->data +
-                                           static_cast<std::size_t>(visual_begin) * row_bytes,
-                                       bytes, cudaMemcpyDeviceToDevice, peer.ctx_.stream));
+            // The tensor payload is untyped, so the byte offset needs an explicit byte pointer
+            // (void arithmetic is a GCC extension).
+            const auto* embeddings = static_cast<const std::byte*>(vision->embeddings->data);
+            CUDA_CHECK(cudaMemcpyAsync(
+                source.data, embeddings + static_cast<std::size_t>(visual_begin) * row_bytes, bytes,
+                cudaMemcpyDeviceToDevice, peer.ctx_.stream));
             pair.allreduce(staging.data, source.data, bytes, ctx_.stream, peer.ctx_.stream);
             ctx_.bind_to_current_thread();
             Tensor indices = work_.alloc(DType::I32, {count});

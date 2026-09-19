@@ -2,7 +2,11 @@ add_library(ninfer_media_acquire STATIC
   media_acquire/acquire.cpp
 )
 ninfer_internal_includes(ninfer_media_acquire)
-target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+target_link_libraries(ninfer_media_acquire PRIVATE ninfer::curl)
+if(WIN32)
+  # The SSRF address check uses the WinSock name-resolution API directly.
+  target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+endif()
 
 add_library(ninfer_product_prompt_input STATIC
   prompt_input/prompt_input.cpp

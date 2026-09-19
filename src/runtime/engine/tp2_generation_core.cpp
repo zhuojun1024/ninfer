@@ -970,7 +970,8 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             }
             Tensor window_logits   = ws_a.alloc(DType::BF16, {vocab, width});
             round_hidden           = ws_a.alloc(DType::BF16, {hidden, width});
-            Tensor window_drafts   = ws_a.alloc(DType::I32, {mtp_drafts_, 1});
+            Tensor window_drafts =
+                ws_a.alloc(DType::I32, {static_cast<std::int32_t>(mtp_drafts_), 1});
             Tensor target_tokens   = ws_a.alloc(DType::I32, {width, 1});
             Tensor current_extents = ws_a.alloc(DType::I32, {1});
             Tensor round_lengths   = ws_a.alloc(DType::I32, {1});

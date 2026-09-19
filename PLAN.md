@@ -495,4 +495,133 @@ gpu2 2805 MHz / 13801 MHz / 84.7 W / util 99% ⇒ **满频、未撞功耗墙（1
 **预期**：机械移植 3–5 天；性能上 WDDM 很可能略逊于 Linux（我们已在 448 GB/s 峰值上只拿到 71%，
 见 §11.7），所以移植的收益主要是**部署便利**，不是速度。
 
+**进度（Round 54 第 1 轮，已实测）**
+- CMake 配置在原生 Windows 上走到了很深：MSVC 19.44.35228 + nvcc 13.3.73（host=MSVC）+ CUDAToolkit 13.3 全部识别成功，
+  `sm_120a` 被接受，Threads 找到。CMake 用的是 pip 装的 **4.4.2**（仓库要求 ≥3.28；注意 CMake 4 可能对
+  `third_party` 里 `cmake_minimum_required(<3.5)` 报策略错误，必要时加 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`）。
+- `cmake/NinferTargets.cmake` 里**没有任何 GCC 专用 flag**（只有 CUDA 的 `-lineinfo`），原先担心的
+  "GCC 扩展"风险从构建系统这侧看比预想小得多。
+- **唯一 configure 阻塞点**：`cmake/Dependencies.cmake:3` 的 `find_package(PkgConfig REQUIRED)`。
+  它被用来找两样东西：
+  - `FFMPEG`（libavformat/libavcodec/libavutil/libswscale，**无条件 REQUIRED**）：`src/media/decode/decode.cpp`
+    的 60 处调用就是媒体的实际解码器 ⇒ 图片/视频解码依赖它，**不是可选项**。
+  - `libcurl>=7.85`（仅 `NINFER_BUILD_PRODUCT_SUPPORT`）：只被 `src/product/media_acquire/acquire.cpp`
+    用来抓远程 http/https 媒体（26 处）。
+- 机器上既没有 pkg-config/pkgconf，也没有 vcpkg/MSYS2/conda；`C:\WINDOWS\system32\curl.exe` 只是运行时。
+  `C:\ffmpeg-8.1.2-full_build` 只有 `bin`，**没有 `include`/`lib`（dev 文件缺失）**，所以不能直接拿来链接。
+
+**下一步决策（第 2 轮）**
+1. 取 MSVC 可用的 ffmpeg dev 文件：优先 gyan.dev 的 `ffmpeg-release-full-shared`（带 `include/`+`lib/*.lib`）；
+   直连不通时按项目规则走本地代理 `127.0.0.1:7897`；备选是 vcpkg 源码构建（耗时更长）。
+2. 把 `cmake/Dependencies.cmake` 改成平台感知：Unix 保留 pkg-config，Windows 用
+   `NINFER_FFMPEG_ROOT` + `find_path`/`find_library` 定位同一组库；libcurl 同样处理，或把
+   `media_acquire` 的抓取换成 WinHTTP 以彻底去掉该依赖（该文件本身就是 POSIX socket 待改点）。
+3. 重新 configure → 首次编译扫描，定价 `.cu/.cpp` 的 MSVC 兼容性。
+- 已取到 MSVC 可链接的 FFmpeg dev（BtbN win64-gpl-shared）：
+  `D:\ffmpeg-dev\expanded\ffmpeg-master-latest-win64-gpl-shared`，`include/libavcodec|libswscale` 与
+  `lib/{avcodec,avformat,avutil,swscale}.lib` 全部就位。下一步把它接进 `cmake/Dependencies.cmake` 的
+  Windows 分支（`NINFER_FFMPEG_ROOT` + `find_path`/`find_library`，Unix 侧继续走 pkg-config）。
+
+**进程占用纪律（用户要求）**
+- Windows 侧一旦跑起 `ninfer`/`ninfer-serve`，同一个 23.7 GB artifact 会被再装一遍（显存 + host KV/state），
+  与 WSL 侧 8088 服务抢显存和内存。**移植期间 WSL 的 8088 服务保持停止**（Round 54 已停：三卡
+  `memory.used` 均为 0 MiB、health 无响应）；需要跨平台对照测量时再临时启动，测完立即停。
+**进度（Round 54 第 1 轮）：核心库在 Windows 上编译通过**
+
+工具链 VS2022 19.44 + CUDA 13.3 nvcc + Ninja，`-DCMAKE_CUDA_ARCHITECTURES=120a`；
+`tools/win_port/configure.bat` + `build.bat`（`NINFER_JOBS`，默认 12）。当前配置 apps 关
+（`-DNINFER_BUILD_APPS=OFF`），`cmake --build build-win` → `BUILD_EXIT=0`，10 个静态库
+（artifact/core/engine/media_decode/model_loading/model_runtime/nvfp4_non_rdc/ops/runtime_support/text）
++ 394 个目标文件。
+
+移植改动（已落地）：
+
+| 位置 | 问题 | 处理 |
+|---|---|---|
+| `cmake/Dependencies.cmake`、`src/{media,product}/CMakeLists.txt` | 本机无 pkg-config | 平台分支：Windows 走 `NINFER_FFMPEG_ROOT`/`NINFER_LIBCURL_ROOT` + `find_path`/`find_library`；导入目标改名 `ninfer::ffmpeg`/`ninfer::curl` |
+| `CMakeLists.txt` | CUDA 13 的 CCCL 要求 `/Zc:preprocessor`；`windows.h` 的 min/max 宏 | MSVC 下加 `/Zc:preprocessor`（CUDA 经 `-Xcompiler`）+ `NOMINMAX WIN32_LEAN_AND_MEAN` |
+| `src/artifact/file_io.{h,cpp}` | `open/fstat/pread/close`、`unistd.h`、`off_t/ssize_t` | `CreateFileW`（顺序扫描 / `FILE_FLAG_NO_BUFFERING`）+ `ReadFile` 带 `OVERLAPPED` 偏移做定位读；句柄类型 `NativeFileHandle`（Windows 为 `void*`） |
+| `src/ops/linear/nvfp4/nvfp4_w4a4_tma.{cuh,cu}`、`src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.{cuh,cu}` | C2719：128 字节对齐的 TMA 描述符不能按值传参 | 新增 `Nvfp4TmaDescriptorStaging`（`cudaMallocAsync` + `cudaMemcpyAsync` 到设备内存，传指针，仅 `_WIN32`）；内核体内用引用，保证两条路径共享同一份代码 |
+| `src/core/uint128.h`（新） | MSVC 无 `__int128`/`__uint128_t` | 新增 `Uint128`（`_umul128` 或原生 128 位 + 饱和加法/右移/比较）；改 `runtime/contract/resources.h`、`runtime/engine/context_cache/context_cost.cpp`、`context_cache/materialization_planner.h` |
+| `src/core/host_process.h`（新） | `getpid`/`isatty`/`localtime_r` | `host_process_id()`/`host_stderr_is_interactive()`/`host_localtime()`；`context_cost.cpp` 已改用 |
+| `src/text/CMakeLists.txt` | utf8proc C2491（静态库里定义 dllimport） | `target_compile_definitions(ninfer_text PRIVATE UTF8PROC_STATIC)` |
+| `src/models/qwen3_5/execution/text.cpp` | C2397 非恒定窄化（GCC 只警告）；`void*` 算术是 GCC 扩展 | 显式 `static_cast`；先 `static_cast<const std::byte*>` 再做字节偏移 |
+
+经验：GCC 把「非恒定窄化」当警告，MSVC 直接报 C2397，所以 Linux 能编的代码在 Windows 上会逐个暴露，需逐个加显式转换。
+
+Windows 侧资源与路径：
+
+- FFmpeg dev：`D:\ffmpeg-dev\expanded\ffmpeg-master-latest-win64-gpl-shared`（BtbN shared，含 `include/`+`lib/`）。
+- libcurl：`D:\curl-dev\expanded\curl-8.22.0_1-win64-mingw`（**只有 `lib/libcurl.dll.a`，mingw 版**；MSVC 能否直接链接待验证，否则换 vcpkg 或改 WinHTTP）。
+- 模型 artifact：`D:\LLM\qwen3_8_27b_nvfp4.ninfer`（23,719,715,076 B，与 WSL 侧同一个 artifact，可直接做跨平台对照）。
+- 自定义模板：`D:\LLM\chat_template.jinja`（同 WSL 侧那份 28,234 B）。
+
+下一步（apps 关→开）：`src/product/logging/{logging,startup_log}.cpp`（`unistd.h`/`localtime_r`/`isatty`/`sys/ioctl.h` TIOCGWINSZ →
+`host_process.h` + `GetConsoleScreenBufferInfo`）、`src/serve/request_log.cpp`（`getpid`）、
+`src/product/media_acquire/acquire.cpp`（POSIX socket + libcurl）、`src/serve/http_transport.cpp`（`#if defined(__linux__)` 分支）；
+之后单卡 `ninfer` CLI 与 Linux 输出对齐（贪婪基准哈希见 §11），再进 TP-2 mapped-pinned spike。
+**进度（Round 54 第 2 轮）：CLI / serve 全部编译链接通过，并能在 Windows 启动**
+
+配置 `-DNINFER_BUILD_APPS=ON -DBUILD_TESTING=OFF -DNINFER_FFMPEG_ROOT=… -DNINFER_LIBCURL_ROOT=…` →
+`BUILD_EXIT=0`，产物 `build-win/apps/{ninfer,ninfer-serve,ninfer-perplexity}.exe`（各约 188 MB）；
+`ninfer.exe --help` 与 `ninfer-serve.exe --help` 均正常输出、退出码 0（说明 DLL/CRT/链接已就位）。
+
+本轮新增修复：
+
+| 位置 | 问题 | 处理 |
+|---|---|---|
+| `CMakeLists.txt` | spdlog 内置 fmt 要求 `/utf-8` | MSVC 下加 `/utf-8`（CUDA 走 `-Xcompiler`） |
+| `src/core/host_process.{h,cpp}` | `ioctl(TIOCGWINSZ)`、`gmtime_r` | 新增 `host_terminal_columns()`（`GetConsoleScreenBufferInfo`）与 `host_gmtime()`；`src/core/CMakeLists.txt` 注册 `host_process.cpp` |
+| `src/product/logging/{logging,startup_log}.cpp`、`src/serve/request_log.cpp` | `localtime_r`/`isatty`/`getpid`/`unistd.h` | 改用 `core/host_process.h` 的平台函数 |
+| `src/product/media_acquire/acquire.cpp` | `<arpa/inet.h>` 等 POSIX 头；`relative.native().starts_with("..")`（Windows 是宽字符） | 平台分支 `<winsock2.h>/<ws2tcpip.h>` + 一次性 `WSAStartup`；改判首个路径分量是否为 `path("..")` |
+| `src/product/CMakeLists.txt` | WinSock 符号未解析 | 链 `ws2_32` |
+| `cmake/Dependencies.cmake` | `find_library` 选中**静态** `libcurl.a`（mingw 静态档，MSVC 无法链接） | 优先 `find_file(... libcurl.dll.a)` 取导入库，找不到再回退 `find_library` |
+| `apps/perplexity/main.cpp` | `gmtime_r` | 改 `ninfer::host_gmtime`（该文件处于全局匿名命名空间，必须写限定名） |
+
+已验证：MSVC 能链接并**运行** mingw 版 `libcurl.dll.a` + `libcurl-x64.dll`（探针 `tools/win_port/probe_curl_link.bat`，
+打印 `curl libcurl/8.22.0 LibreSSL/…`，退出码 0），因此 `media_acquire` 在 Windows 上继续用 libcurl，暂不需要 WinHTTP 重写。
+
+运行环境（重要）：两个 exe 运行时需要 `PATH` 含
+
+    D:\ffmpeg-dev\expanded\ffmpeg-master-latest-win64-gpl-shared\bin;D:\curl-dev\expanded\curl-8.22.0_1-win64-mingw\bin
+
+（`libcurl-x64.dll` 必须可见）。启动前确认没有第二个模型进程：`nvidia-smi memory.used` 三卡均为 0 MiB。
+
+下一步：单卡 CLI 真实生成（`D:\LLM\qwen3_8_27b_nvfp4.ninfer`）并与 Linux 贪婪基准哈希对齐 → serve 端到端 →
+TP-2 mapped-pinned spike（重点验证 `src/core/tp/device_pair.cu` 的 `cudaHostAllocMapped` 在 WDDM 下是否可用）。
+**进度（Round 54 第 3 轮）：TP-2 在 Windows 上跑通，性能与 Linux 持平；mapped-pinned spike 通过**
+
+端到端实测（`tools/win_port/serve.ps1`，两卡 5060 Ti，artifact `D:\LLM\qwen3_8_27b_nvfp4.ninfer`）：
+
+| 项目 | Linux (WSL2) | Windows |
+|---|---|---|
+| TP-2 纯 decode | 32.8 tok/s | 32.9 tok/s |
+| TP-2 MTP `--draft-tokens 2` | 56.8 tok/s | 56.9 tok/s |
+| 图片轮 decode | 53b 修复后正常 | 60.4 tok/s，MTP 持续（rate=106/174） |
+| 引擎加载（23.7 GB artifact） | — | 35–42 s |
+| 真实 agent 流量（流式 / tools / 图片） | — | 已服务，41–73 tok/s |
+
+KV 容量与显存余量（实测，带 `--vision`）：capacity 8192 → kv 145 MiB、free 4180/3930 MiB；
+capacity 131072 → kv 2322 MiB、free 2002/1580 MiB。**Windows 推荐 131072**（262144 是 WSL 配方，
+WDDM 下余量过小）。
+
+**mapped-pinned spike（go/no-go 已通过）**：`tools/win_port/spike.ps1`（源 `tp_mapped_spike.cu`）实测
+peer access 0→1 / 1→0 均为 0（SYS 拓扑，无 P2P）；`cudaHostAllocPortable|cudaHostAllocMapped` +
+`cudaHostGetDevicePointer` 两卡均成功且 peer 看到**同一 UVA 地址**；跨卡读 mapped host 内存校验
+`sum=match`，带宽约 1.4–1.9 GiB/s（本卡写 5.8 GiB/s）。结论：WDDM 下 in-kernel mapped-pinned allreduce
+可用、与 WSL2 同档，这正是端到端 decode 与 Linux 持平的原因。
+
+**重要环境事实**：`C:\Users\zhuojun\.dsh\settings.yaml` 已配置 `ninfer-win` provider
+（`baseURL: http://127.0.0.1:8099/v1`）且 `agent-default-model` 指向它。也就是说：Windows 侧
+ninfer-serve 跑在 8099 就是本机 DSH 的默认模型服务；测试期间它已服务过真实流式/tools/图片请求
+（`req#4 media 1, prepared 7.91 ms`）。WSL 侧 8088 已停，全机只有一个模型进程。
+
+**脚本教训**：`Start-Process` 起的服务是「调用方 shell 的 job object 子进程」，agent 工具调用结束时会被
+连带杀掉（现象：进程在、GPU 0%、模型从未加载）。因此 `serve.ps1` 默认**前台**运行（终端用户拥有进程，
+Ctrl+C 停止），只有 `-Background` 才用 `Start-Process`；自测服务时必须用 harness 的后台 job（跨调用存活）。
+
+工具与文档：`tools/win_port/` 现全部为 PowerShell（`vcvars/build/serve/spike/fetch_ffmpeg/fetch_curl`，
+旧 `.bat` 已删）；新增 `docs/windows.md` 并在 `docs/README.md` 登记；`docs/windows.md` 含构建、运行、
+平台差异、实测数据与限制（单卡 CLI 需 ≥20.2 GiB 显存，本机 16 GiB 卡只能走 TP-2）。
+
 

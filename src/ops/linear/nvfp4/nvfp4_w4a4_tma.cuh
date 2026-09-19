@@ -22,6 +22,41 @@ struct alignas(128) Nvfp4W4a4TmaDescriptors {
     CUtensorMap b_scales;
 };
 
+inline void nvfp4_check_runtime(cudaError_t status, const char* operation) {
+    if (status == cudaSuccess) { return; }
+    throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+}
+
+#if defined(_WIN32)
+// The MSVC kernel-parameter ABI aligns parameters to 16 bytes and rejects a tensor map that requires
+// 64 (C2719), so a descriptor aggregate cannot be passed by value. A pool-backed stream-ordered copy
+// hands the kernel a device pointer whose lifetime is tied to the launch, which keeps several
+// launches in flight without sharing one staging buffer. The tensor map stays legal: PTX accepts it
+// in global space, and this is the storage the by-value parameter would otherwise occupy.
+class Nvfp4TmaDescriptorStaging {
+public:
+    Nvfp4TmaDescriptorStaging(const Nvfp4W4a4TmaDescriptors& descriptors, cudaStream_t stream)
+        : stream_(stream) {
+        nvfp4_check_runtime(cudaMallocAsync(&device_, sizeof(Nvfp4W4a4TmaDescriptors), stream),
+                            "TMA descriptor staging allocation");
+        nvfp4_check_runtime(cudaMemcpyAsync(device_, &descriptors, sizeof(Nvfp4W4a4TmaDescriptors),
+                                            cudaMemcpyHostToDevice, stream),
+                            "TMA descriptor staging upload");
+    }
+    ~Nvfp4TmaDescriptorStaging() {
+        if (device_ != nullptr) { (void)cudaFreeAsync(device_, stream_); }
+    }
+    Nvfp4TmaDescriptorStaging(const Nvfp4TmaDescriptorStaging&)            = delete;
+    Nvfp4TmaDescriptorStaging& operator=(const Nvfp4TmaDescriptorStaging&) = delete;
+
+    [[nodiscard]] const Nvfp4W4a4TmaDescriptors* get() const noexcept { return device_; }
+
+private:
+    cudaStream_t stream_             = nullptr;
+    Nvfp4W4a4TmaDescriptors* device_ = nullptr;
+};
+#endif
+
 inline void nvfp4_check_driver(CUresult status, const char* operation) {
     if (status == CUDA_SUCCESS) { return; }
     const char* name = nullptr;
@@ -165,8 +200,18 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_tma_kernel(
+#if defined(_WIN32)
+    // The MSVC kernel-parameter ABI aligns parameters to 16 bytes and rejects a tensor map requiring
+    // 64 (C2719), so the Windows build stages the descriptors in device memory and passes a pointer.
+    // The body below is shared with the by-value path through this reference.
+    const Nvfp4W4a4TmaDescriptors* descriptors_storage, float alpha,
+#else
     const __grid_constant__ Nvfp4W4a4TmaDescriptors descriptors, float alpha,
+#endif
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output) {
+#if defined(_WIN32)
+    const Nvfp4W4a4TmaDescriptors& descriptors = *descriptors_storage;
+#endif
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
     static_assert(Schedule::kStages >= 2, "the activation-scale buffer needs two slots");

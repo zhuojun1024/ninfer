@@ -35,6 +35,19 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# CUDA 13 ships CCCL, which rejects the traditional MSVC preprocessor; nvcc forwards host flags
+# through -Xcompiler, so both paths need the conforming preprocessor.
+if(MSVC)
+  add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>")
+  # Sources are UTF-8, and the bundled fmt in spdlog refuses to build without its Unicode support.
+  add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
+  # windows.h otherwise defines min/max as macros, which breaks every std::min/std::max and
+  # std::numeric_limits<T>::max() in the codebase.
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
