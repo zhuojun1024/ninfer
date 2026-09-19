@@ -1385,13 +1385,6 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                 shard_a_.device.stream));
             timing.record(6, shard_a_.device.stream);
             timing.fold_ms += timing.elapsed(5, 6);
-            mtp_draft_checked_ += mtp_drafts_;
-            mtp_draft_hit_ += committed > 1 ? committed - 1 : 0;
-            std::fprintf(stderr,
-                         "[mtp] round pos=%u anchors=%d accepted=%u rate=%llu/%llu\n",
-                         mtp_position, mtp_anchor, committed,
-                         static_cast<unsigned long long>(mtp_draft_hit_),
-                         static_cast<unsigned long long>(mtp_draft_checked_));
         }
         finished = decision.finished();
         if (finished) { result.finish_reason = decision.finish_reason; }

@@ -957,5 +957,58 @@ head-split 分片上无任何语义作用）。这不是 ① 的回归。
   内无任何 host 同步或 D2H（grep 实证）。实测 mtp=3.70~3.75 ms 是**真实 GPU 工作**（两次 T=1 的 MTP 层前向，
   权重流受限），且与 verify 串行。残余机会只有「fold 与 MTP 链重叠」≤0.8 ms（≈2%，fold 走 replay.cpp，不含
   allreduce，理论上可另开流），但要动 AR token 协议/流序，收益风险比不划算 ⇒ 判定 ④ 已完成，不再改。
-- [ ] 步骤 4 ③：prefill AR 与 MMA 重叠（按 slot 的 A→B 子块流水）。
-- [ ] 步骤 5：③④ 完成后复测，更新 docs/tp2-dual-5060ti.md / worklog 并归档。
+- [x] 步骤 4 ③：prefill AR 与 MMA 重叠——**已实现、已实测、已否决**（见下）。
+- [x] 步骤 5：复测与文档更新（③ 的结论写入本文件与 worklog）。
+
+## Round 12：③ prefill AR∥MMA 子块流水（已实现，实测无收益，已回退）
+
+### 实现（完整可用，最终未保留）
+
+- `DeviceContext` 增加第二条流 `collective_stream`（与 `stream`/`transfer_stream` 同生命周期）。
+- `forward_tp2_prefill` 在 `NINFER_TP2_PREFILL_OVERLAP` 打开且 phase=Prefill、`pair.in_kernel_allreduce()`、
+  驱动卡 == `pair.a()`、tokens ≥ 256 时走两子块流水：A=[0,ta)、B=[ta,T)；每层顺序
+  A.mixer → arm(0) → B.mixer → arm(1) → AR(A.mix)/AR(B.mix) → A.res+A.mlp → B.res+B.mlp → A.res2 → B.res2，
+  4 个 AR 各配一对 event（`produced` 在 compute 流、`done` 在 collective 流），
+  子块绑定靠嵌套 `ScopedPositions`/`ScopedEnvelope`（positions/rope 为外层 tensor 的 slice，
+  envelope 分别为 {first+ta,first+ta} 与 {visible_end,visible_end}）。
+- **关键约束（踩坑）**：切分点必须落在激活调度块边界上。初版 ta=tokens/2（300→150+150）会让
+  `tp2_forward_test` 的 chunk-split 不变量失败（max_logit_diff=1.14/1.60）；改成 64 对齐
+  （ta=max(64,(tokens/2)&~63)，300→128+172）后**逐位一致**：
+  `chunking 300 -> 128+172: max_logit_diff=0`、`64+236: max_logit_diff=0`、
+  `T=1024 one chunk vs 4x256: max_logit_diff=0`，且 300/1024 的 top5 与**未切分**的基线逐位相同 ⇒
+  层间 A/B 交错与双流 AR 在数值上完全等价（这是 ③ 唯一确定的技术收益）。
+
+### 实测（同一二进制、无缓存前缀、单请求 2072 token prompt，TTFT 端到端）
+
+| 配置 | run1 | run2 | run3 |
+|---|---|---|---|
+| `NINFER_TP2_PREFILL_OVERLAP=0` | 1249 ms | 1189 ms | — |
+| `NINFER_TP2_PREFILL_OVERLAP=1` | 1258 ms | 1314 ms | 1513 ms（冷启） |
+
+稳定态 ≈ 1219 ms vs ≈ 1286 ms ⇒ 重叠**慢约 5%**。
+
+### 结论（为什么不做）
+
+1. 原成本模型（PLAN:651，AR 占 prefill ~48%）把 AR 当作**串行**开销，实测不成立：in-kernel AR 的两个
+   内核是对称的，两卡各自 drifted 推进时，本卡自旋等对端的时间本来就被**对端仍在跑的 compute 掩盖**，
+   可重叠的余量远小于模型估计。
+2. 子块切分的代价是真实的：T 减半后 GEMM tile 变窄、**权重每层被流读两次**（prefill 是权重流敏感的形状），
+   A/B 实测这两项加起来盖过了 AR 的收益。
+3. 因此 ③ 在 TP-2 上不是有效优化：**保留最终方案为不带子块流水的单块 prefill**，`collective_stream`
+   与整套流水代码已回退（工作树干净回到 8f6a812e）。
+4. 若将来出现真正 compute-bound 的 prefill 形状（例如更宽 chunk、更快的权重路径），可重新评估；
+   届时本节的 64 对齐约束与 event 拓扑可直接复用。
+
+---
+
+### Round 13 — 清理 decode 循环的 [mtp] 刷屏打印（已完成）
+
+`tp2_generation_core.cpp` 的 decode 循环里有一条裸 `std::fprintf(stderr, "[mtp] round pos=…")`：
+不经 logger（所以 `--log-level error` 关不掉）、无 env 门控，每轮一行（≈26 行/秒）。
+实测写入成本 `2>NUL` 1.8 µs/行、文件 1.5 µs/行、**真实控制台 20–25 µs/行**
+⇒ 单轮 20 µs / 35.3 ms = **0.057%**，吞吐影响可忽略；真正的风险是 cmd 的 QuickEdit 选中会让控制台
+停止消费、阻塞生成线程（不是慢，是卡）。
+
+已删除该打印与仅供其使用的 `mtp_draft_checked_`/`mtp_draft_hit_` 两个计数器；
+接受率改由 `NINFER_TP2_TIMING=1` 的 `[tp2-time] decode rounds=R committed=C` 推导：
+接受 draft 数 = C−R，接受率 = (C−R)/(R·K)。`docs/tp2-dual-5060ti.md` 已同步。

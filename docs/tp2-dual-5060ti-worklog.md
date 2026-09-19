@@ -1414,3 +1414,73 @@ Windows 原生移植（走 WSL2）、新架构支持。
   内部无 host 同步、无 D2H（grep 实证）。实测 `mtp=3.70~3.75 ms` 是真实 GPU 工作（两次 T=1 的 MTP 层前向，权重流受限），
   且与 verify 串行（同一对流）。剩余机会只有「fold 与 MTP 链重叠」≤0.8 ms（≈2%；fold 走 `replay.cpp`，不含 allreduce，
   理论上可另开流），但要改 AR token 协议与流序，收益/风险比不划算 ⇒ 判定 ④ 已完成，不再改。下一项做 ③。
+
+---
+
+## Round 12 — ③ prefill AR∥MMA 子块流水：实现、实测、否决
+
+③ 是 PLAN §12 表格里 ①③④ 的最后一项（prefill 的 allreduce 与 compute 重叠）。本轮把它**完整实现并实测**，
+结论是**在 TP-2 上无收益、慢约 5%，已整体回退**，只留下本记录。
+
+### 实现（完整可用，未保留）
+
+- `DeviceContext` 加第二条流 `collective_stream`（与 `stream`/`transfer_stream` 同生命周期、同
+  move/dtor 语义）。
+- `forward_tp2_prefill` 在 `NINFER_TP2_PREFILL_OVERLAP` 打开、phase=Prefill、`pair.in_kernel_allreduce()`、
+  驱动卡 == `pair.a()`、tokens ≥ 256 时把 chunk 切成 A=[0,ta)、B=[ta,T) 两块，逐层交错推进：
+  A.mixer → arm(0) → B.mixer → arm(1) → AR(A.mixer)/AR(B.mixer)（collective 流）→ A.res+A.mlp → B.res+B.mlp
+  → A.res2 → B.res2。每个 AR 一对 event：`produced` 记在 compute 流、collective 流 wait，
+  AR 后 `done` 记在 collective 流、compute 流 wait —— 依赖链 L,A → L,B → L+1 保持，
+  GDN conv/递推状态与 KV 可见性由 compute 流自身的顺序保证。
+  子块绑定用嵌套 `ScopedPositions`/`ScopedEnvelope`：positions/rope 是外层 tensor 的 slice，
+  envelope 分别是 {first+ta,first+ta} 与 {visible_end,visible_end}。
+- **关键约束（踩坑，值得记住）**：切分点必须落在**激活调度块边界**上。初版 ta=tokens/2（300→150+150）
+  让 `ninfer_qwen3_5_tp2_forward_test` 的 chunk-split 不变量失败（`300 -> 128+172` 的
+  max_logit_diff=1.14~1.60，因为参照的「单块 300」现在内部走 150+150，落到了不同的 MMA/tile 调度类）；
+  改成 64 对齐（`ta = max(64, (tokens/2) & ~63)`，300→128+172）后**逐位一致**：
+  `300 -> 128+172: max_logit_diff=0`、`300 -> 64+236: 0`、`T=1024 one chunk vs 4x256: 0`，
+  且 300 与 1024 的 top5 与**未切分基线**逐个数值相同（`348=22.875 621=14.25 …`）。
+  即：**层间 A/B 交错 + 双流 AR 在数值上与单块顺序执行完全等价**，这是 ③ 唯一确定的技术收益。
+
+### 实测（2072 token 单请求 TTFT，同一二进制，前缀缓存不命中）
+
+| 配置 | run1 | run2 | run3 |
+|---|---|---|---|
+| `NINFER_TP2_PREFILL_OVERLAP=0` | 1249 ms | 1189 ms | — |
+| `NINFER_TP2_PREFILL_OVERLAP=1` | 1258 ms | 1314 ms | 1513 ms（冷启） |
+
+稳定态 ≈1219 ms vs ≈1286 ms ⇒ 子块流水**慢约 5%**（方向在两次独立测量里一致）。
+
+### 为什么模型错了
+
+1. PLAN:651 的成本模型把 AR 当**串行**开销（"AR 占 prefill 48%，重叠后 ≈2.6k tok/s"）。实测不成立：
+   in-kernel AR 的两个内核是对称的，两卡各自 drifted 推进时，本卡自旋等对端的时间本来就被**对端仍在跑的
+   compute 掩盖**，可重叠余量远小于模型估计。
+2. 子块切分的代价是真实的：T 减半后 GEMM tile 变窄，且**权重每层被流读两次**（prefill 是权重流敏感形状），
+   实测这两项加起来盖过 AR 收益。
+3. 因此 ③ 的最终形态就是**不带子块流水的单块 prefill**；`collective_stream` 与整套流水代码已回退，
+   工作树干净回到 ① 的提交 `8f6a812e`。若将来出现真正 compute-bound 的 prefill（更宽 chunk、更快权重路径），
+   可复用本节的 64 对齐约束与 event 拓扑重新评估。
+
+---
+
+### Round 13 — 删除 decode 循环里的 [mtp] 刷屏打印
+
+用户报告：推理时 cmd 窗口被 `[mtp] round pos=… anchors=… accepted=… rate=…/…` 刷屏，`--log-level error` 也关不掉。
+
+- **根因**：那行是 `tp2_generation_core.cpp` 里的裸 `std::fprintf(stderr, …)`，**直接写 stderr、不经 logger**，
+  也没有 env 门控（同文件的 `[tp2-time]` 由 `NINFER_TP2_TIMING=1` 门控）。每 decode 轮一行，
+  出厂配置 59.0 tok/s ÷ 2.3 token/轮 ≈ **26 行/秒**。它是历史 `NINFER_TP2_*` 探针清理的漏网之鱼，
+  留下只因 `r53_decode_analysis.sh` 还在解析它。
+- **实测写入成本**（同一格式行、无缓冲 `os.write(2, …)`、20000 行）：`2>NUL` 1.8 µs/行、
+  `2>文件` 1.5 µs/行、**真实控制台 20–25 µs/行**（Windows 控制台写入同步、要过 conhost 一跳）。
+  ⇒ 26 行/秒 × 20 µs ≈ 0.5 ms/秒 = **0.05%**；单轮 20 µs / 35.3 ms = **0.057%**。吞吐影响可忽略。
+- **真正的风险不是慢而是卡**：cmd 默认开 QuickEdit，在窗口里点击/选中会让控制台停止消费输出、
+  `fprintf` 阻塞在生成线程上，整个推理停顿到松手为止；stderr 接慢管道（`2>&1 | tee`）同样会背压。
+- **改动**：删除该 `fprintf` 与只服务于它的两个计数器 `mtp_draft_checked_`/`mtp_draft_hit_`
+  （`tp2_generation_core.{h,cpp}`，cpp −7 行 / h −7 +4 行）。接受率数据仍可得：
+  `NINFER_TP2_TIMING=1` 的 `[tp2-time] decode rounds=R committed=C` ⇒ 接受 draft 数 = C−R、
+  接受率 = (C−R)/(R·K)，K = `--draft-tokens`。
+- `docs/tp2-dual-5060ti.md` 中"接受率取自 `[mtp] round` 计数器"的说法已同步改为上式。
+  `tools/tp_bootstrap/r53_decode_analysis.sh` 是 Linux 时代的归档脚本（硬编码 `/home/zhuojun/prof/…` 日志路径），
+  **未改动**：它的 acceptance 列现在会退化成 `no mtp`，需要时应改从 `[tp2-time]` 取。

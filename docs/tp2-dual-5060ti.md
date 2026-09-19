@@ -234,8 +234,10 @@ configuration, two six-sample runs, one request at a time:
 | Python coding | full | 48.59 (45.62-51.07) | 58.6% (4532/7730) | budget-limited |
 | Python coding | `--lm-head-draft` | **49.58** (48.85-54.87) | 53.1% (4326/8142) | budget-limited |
 
-Acceptance is the engine's cumulative `[mtp] round ... rate=accepted/drafted` counter, which is the
-only reliable source on this route: the response's `timings.draft_n` stays zero. Both routes were
+Acceptance is derived from the `NINFER_TP2_TIMING=1` decode line
+(`[tp2-time] decode rounds=R committed=C`): accepted drafts are C - R out of R*K, where K is
+`--draft-tokens`. That is the only reliable source on this route: the response's `timings.draft_n`
+stays zero. Both routes were
 non-degenerate on the essay prompt (no repeated-token runs); the coding prompt exhausted the token
 budget in reasoning on every sample, so its content is not comparable.
 

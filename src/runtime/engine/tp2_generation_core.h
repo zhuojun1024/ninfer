@@ -237,9 +237,8 @@ private:
     std::uint32_t rewind_near_ = 9;
     bool cached_state_valid_ = false;
 
-    // Multi-token prediction (--spec mtp): the proposal window, and how often the MTP layer's
-    // first draft matched the target's own next token. That agreement rate is the direct measure of
-    // whether the MTP weights, KV context and positions are set up correctly.
+    // Multi-token prediction (--spec mtp): whether proposals are enabled, and the proposal window
+    // width (how many drafts the MTP layer proposes per decode round).
     // Vision (--vision) runs on the shard that materialized the Vision component: the same static
     // split that keeps the MTP layer on shard 0 puts the Vision tower and its encode/handoff arena
     // on shard 1. The plan and the arena are built once at startup; one session per multimodal
@@ -248,10 +247,8 @@ private:
     std::unique_ptr<DeviceArena> vision_arena_;
     std::size_t vision_handoff_peak_bytes_ = 0;
 
-    bool mtp_enabled_                     = false;
-    std::uint32_t mtp_drafts_             = 0;
-    std::uint64_t mtp_draft_checked_      = 0;
-    std::uint64_t mtp_draft_hit_          = 0;
+    bool mtp_enabled_         = false;
+    std::uint32_t mtp_drafts_ = 0;
     // The first draft of the previous decode step, and whether there is one to compare. A draft
     // proposed at position p predicts the token at p+2, so the target's argmax at the next step is
     // exactly the acceptance oracle for it.
