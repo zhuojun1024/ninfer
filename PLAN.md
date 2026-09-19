@@ -787,4 +787,175 @@ Ctrl+C 停止），只有 `-Background` 才用 `Start-Process`；自测服务时
   --components text`），若它按 config 驱动逐层映射即可零改动成功；② 不成功再写 tiny recipe/override；
   ③ 生成脚本放 `tools/win_port/tiny_model.py`（合成 tiny config + 随机 bf16 权重，HF 命名）。
 
+---
 
+## Round 11: ①③④ 的实现（TP-2 双卡优化）
+
+目标（用户明确要求）：在 `feat/windows-native-port` 上实现 PLAN §12 表格里的 ①③④ 三项，**不做 ②**（权重 NVFP4 化，
+它要求新 artifact + 逐形状 Op 准入，已判定为部署期变体而不是运行时开关）。
+
+三项定义与理论值（PLAN:640-667 的核算，基线 decode 38.2 ms/轮、2.166 committed、56.7 tok/s；prefill 1552 tok/s@28.5k）：
+
+| 项 | 内容 | decode 理论 | prefill 理论 |
+|---|---|---|---|
+| ① | TP-2 verify forward 上 exact-batch CUDA graph（现被 `model_instance.cpp:99` 关掉） | 发射间隙 2.91→0 ms：35.3 ms / 61.4 tok/s | 块内间隙摊薄 ≈ −0.4% |
+| ③ | collective 与 compute **重叠**（不是删 AR；删 AR 会亏，见 PLAN:655） | −1.7 ms（AR 与 draft 链重叠） | AR∥MMA：660→≈390 ms / ≈2.6k tok/s |
+| ④ | MTP draft 链下沉/重叠（每 draft 一次 cudaStreamSynchronize，见 tp2_generation_core.cpp:543） | −4.7 ms → 28.9 ms / **74.9 tok/s** | 不适用 |
+
+单轮预算拆账（PLAN:642-644）：权重流 25.6 ms（448 GB/s 地板 22.7）+ AR 1.7 ms（128 次）+ 发射间隙 2.91 ms
+（1009 kernel/forward）+ **MTP 链/accept/fold/host 同步 ≈ 8.0 ms**。prefill 每 1024-token 块 660 ms = AR ≈350 + MMA/其它 ≈310。
+
+显存账：合计 **+0.2–0.85 GiB/卡**；131072 配方（free 2002/1580 MiB）能放下，262144（free 0/196）放不下。
+
+### 已确认的接口事实（勿重复调研）
+
+- `forward_tp2_prefill`（src/models/qwen3_5/execution/text.cpp:1766）是 TP-2 唯一的分块前向入口，解码轮的 verify
+  也走它（Phase::Prefill，见 tp2_generation_core.cpp:999-1005）。它的 host 依赖只有三处：
+  `copy_i32(ids.data(), b.ids, stream)`（:1826）、`ops::fill_i32_positions(b.positions, first_position, stream)`（:1827）、
+  `b.envelope = {visible_end, visible_end}`（:1823）。device-driven/graph 化必须把前两者改成设备张量、
+  把 envelope 变成按桶捕获的常量。
+- 单卡路径的 graph 模式可直接照搬：src/models/qwen3_5/program/graph_execution.h（capture_graph/run_prepared）、
+  program/decode.cpp:24-63（captured body 首尾各一次 **pinned** host↔device memcpy，program_impl.cpp:62 分配
+  PinnedHostBuffer）、program/planning/graph_profiles.cpp:62-89 mtp_graph_profiles（capacity 131072、K=2 时
+  ends = 124/508/2044/4092/8194/16386/32764 → **8 个桶**，envelope 按桶最大值捕获，逐轮真实位置由设备张量携带）。
+- `DecodeGraphDefinition::capture` / `DecodeGraphExecutable::instantiate|launch` 在 src/core/decode_graph.cpp:59-146，
+  平台无关，TP-2 可直接用（每卡一份 definition/executable）。
+- AR 是 cudaHostAllocMapped|Portable 的 host pinned + 内核自旋（src/core/tp/device_pair.cu:90-143），
+  两卡各自 capture 后交替 launch 即可，不必改 AR 协议。
+- Windows 无 nsys/ncu（C:\Program Files\NVIDIA Corporation 下只有 App/FrameView），性能归因**只能用引擎内 CUDA event**。
+
+### 执行顺序（每步独立可测、可回退）
+
+1. **测量**：TP-2 解码轮加 env-gated 相位计时（host 时钟 + CUDA event），确认 8.0 ms 的 MTP 链/accept/fold 归属，
+   并复现基线 56.7 tok/s。
+2. **④**：draft 链去 host 化——drafts 留设备、window token 直接给设备版前向、去掉冗余 D2H/H2D 与逐 draft 同步。
+3. **①**：把整轮 capture 成两张图（每卡一张），pinned ingress/egress，按 mtp_graph_profiles 桶捕获；每轮只填 ingress + launch。
+4. **③**：prefill 的 AR 与 MMA 重叠（子块流水；需两套激活区与两份 GDN 状态快照，见 PLAN:663 的显存账）。
+5. 验证与文档：贪婪 A/B（与改造前逐 token 一致）+ bench_serve.ps1 实测 + 更新 docs/tp2-dual-5060ti.md / worklog。
+
+### 进度
+
+- [x] 计划落盘（本节）。
+- [ ] 步骤 1 测量。
+
+#### Round 11 侦察结论（子代理只读调研，勿重复）
+
+- **层循环**：\`run_layers_tp2\` 是 text.h:411-458 的模板（不在 text.cpp）。每层顺序固定：
+  \`tp_mixer_layer\`（双卡，行并行输出投影写 partial delta）→ **AR#1**（text.h:436）→ \`residual_add\`×2 →
+  \`tp_mlp_delta\` → **AR#2**（text.h:449）→ \`residual_add\`×2。层内**无任何 host 同步/回读**（\`src/ops\` 全目录
+  grep \`cudaStreamSynchronize|DeviceToHost\` 零匹配）。
+- **allreduce**（src/core/tp/device_pair.cu:289-395）：签名 \`allreduce(void* a, void* b, bytes, stream_a, stream_b)\`；
+  in-kernel 路径 host 侧只连续发两个 kernel、无同步；epoch \`token = ++ar_call_\`（单调不减，device_pair.h:64），
+  按 \`token&1\` 双缓冲（24 MiB/卡），block 间有 \`order_mine[b-1]==token\` 写序链，对端自旋 \`arrival_other[b]!=token\`。
+  **graph 危害**：token 是**内核参数**，capture 会把它固化，replay 复用旧 token 会让对端自旋提前通过（读到上一轮的旧数据）
+  → 上 graph 前必须把 token 改成**设备端计数器**（\`increment_i32_scalar\` 或内核内自增）。
+- **positions**：\`fill_i32_positions\` 只接受 host base（src/ops/kernel/position.cuh:7）；\`offset_i32_positions\`
+  支持 **[1] 设备 delta 广播到 [T]**（kernel: \`dst[i]=src[i]+delta[0]\`）→ 设备化路径 = 静态 arange + 设备 base。
+- **fold**：\`GdnReplayFoldPlan::execute(std::span<const GdnReplayFoldRow>, stream)\` 在 **host 校验并打包**，
+  \`commit_columns\` 进 \`__grid_constant__\` 内核参数（replay.cpp:266-325、recurrent.cu:104-128），
+  头文件自述「改变 host row 描述符必须重新 capture」→ **fold 不能带变异 commit 数进 graph**，本轮保持 eager。
+- **state 账**：state pool \`slot_count=1\`，live backing = **73.4 MiB**；PLAN 里 293.6 MiB = live + 3 份快照
+  （2 份 prefix-reuse + 1 份 round scratch）。每轮 snapshot+restore = 2×73.4 MiB D2D/卡（不是 293.6×2）。
+- **accept**：\`speculative_accept_greedy_drafts\` 已输出设备端 \`accepted\`，但**无人读取**；提交数始终来自 host 输出策略。
+- **forward_tp2_prefill 的 host 依赖**（text.cpp:1766-2021）：\`copy_i32(ids)\` H2D（:1826）、
+  \`fill_i32_positions(b.positions, first_position)\`（:1827）、\`envelope{visible_end,visible_end}\`（:1798/:1823，
+  host 端决定 attention 路由/chunk/split）；\`Phase::Verify\` 分支（:1931-1965）MTP 轮**不走**（走 Prefill）。
+- \`set_i32_scalar\` 只支持 host 值（scalar.cu:9）；\`assign_i32_scalar\` 是 D2D memcpy；\`increment_i32_scalar\` 设备端。
+- **verify 窗口的显存**：K=2 时 T=3，激活峰值只有几 MB（最大项 \`logits_columns\` [248320,3] BF16 = 1.5 MB），
+  所以 graph 私有 workspace **不需要** 192 MiB（PLAN:662 的最坏估计过于保守）。
+- **③ 的子块流水前提**：所有 op 形状泛化（T 任意），但 (a) token 范围由 forward_tp2_prefill 每 chunk 一次性绑定
+  （positions/envelope/kv_table_rows），(b) GDN conv/递推状态按 source/destination slot 顺序推进，
+  (c) full-attention 子块 2 的查询要能看到子块 1 已 append 的 K/V ⇒ 每层依赖链 L,A→L,B→L+1 必须保持，
+  能做的是**按 slot 的 A→B 流水**（AR 走链路时另一子块走 SM）。
+- **踩坑（已修）**：给解码轮加 CUDA event 计时时，事件在**创建时的当前设备**上绑定；若与
+  \`shard_a_.device.stream\` 不是同一设备，\`cudaEventRecord\` 会返回 \`cudaErrorInvalidResourceHandle\`，
+  而该错误会被**锁存**到下一次不相关的 \`cudaGetLastError()\`（表现为 \`scalar.cu:10\` 的 set_i32_scalar 崩溃）。
+  修法：在 shard A 设备绑定后再创建事件，且计时调用失败即丢弃错误并自我禁用。
+
+
+
+
+
+## Round 11 进度：① 已完成（已实测），并修掉一处真实跨卡竞态
+
+### 步骤 1 测量（已完成）
+
+在 tp2_generation_core.cpp 加 env-gated 相位计时（NINFER_TP2_TIMING=1，7 个 CUDA event + host 时钟）。
+基线（graph 关闭 = eager 路径，bench_serve.ps1 同一配方）：
+
+    decode rounds=52 committed=127 avg_round=38.90ms mtp=3.70 verify=34.23 accept=0.08 copy=0.09 sync_wait=0.01 fold=0.00
+
+即 38.9 ms/轮 = MTP 链 3.70 + verify 34.23 + accept 0.08 + copy 0.09 + host 策略/收尾（差额约 0.8 ms）。
+verify 占 88%，其发射/调度开销实测比 PLAN:642 的 2.91 ms 更大；MTP 链 3.70 ms 是第二大项。
+
+### 步骤 3 ① exact-batch CUDA Graph（已完成）
+
+实现位置：src/core/decode_graph.{h,cpp}、src/core/arena.{h,cu}、src/models/qwen3_5/execution/text.{h,cpp}、
+src/runtime/engine/tp2_generation_core.{h,cpp}。
+
+- DecodeGraphDefinition::capture_group(defs, streams, body)：多流同时 capture，每张图只记录本流上的 kernel；
+  跨卡仍只靠 in-kernel AR 自旋，host 不参与。
+- TextContext::forward_tp2_window(...)：prefill 前向的 capture 安全变体。每轮输入（ids/positions）走
+  可移植 pinned host 缓冲（capture 成 memcpy node，每次 replay 重读），attention envelope 变成捕获期常量。
+- 桶来自 mtp_graph_profiles(max_context, mtp_drafts_)（K=2、131072 时 8 个桶，按可见上界分派）。
+- arena 布局必须逐轮可复现：新增 DeviceArena::rewind(watermark) 与 position_arena(arena, floor, target)。
+  每轮先丢弃 proposal 链的 arena 占用、回到固定 watermark，图里固化的地址才成立；replay 时按捕获 watermark
+  对齐（更低 rewind，更高 alloc_bytes，低于本请求 watermark 直接报错）。已捕获桶的 watermark 若低于当前请求
+  则视为未捕获并重捕（warm-up 的 watermark 更小，因此首个真实请求会重捕一次）。
+- NINFER_TP2_VERIFY_GRAPH=0 关闭（A/B 用），默认开启；eager 参考路径与 capture 路径共用同一个 window 函数
+  与同一个桶 envelope，所以 A/B 只比较发射方式。
+
+实测（同一 bench 配方，graph 开/关）：
+
+| 指标 | ① 关（eager） | ① 开（graph） | 差 |
+|---|---|---|---|
+| avg_round | 39.6 ms | 35.3 ms | **−4.3 ms** |
+| verify | 35.0 ms | 30.6 ms | **−4.4 ms** |
+| decode_at_2048（两侧都是 64 token） | 65.6 tok/s | 76.5 tok/s | +16.6% |
+| prefill_512 | 1419 tok/s | 1419 tok/s | 持平 |
+| sync_wait | 0.01 ms | 0.01 ms | — |
+
+（tok/s 还受本轮文本决定的 draft 接受率影响，所以以轮时间与等输出的 2048 对照为准。）
+verify 少的 4.4 ms 全是发射/调度开销（两路径的 kernel 参数与输入完全相同）。
+数值正确性：5 个 prompt × 最多 256 token 的贪婪 A/B，eager 与 graph 逐字节一致（含 reasoning_content）；
+graph 路径对是否插桩不敏感、可复现。
+
+### 顺带修掉一处真实跨卡竞态（改动前就存在，非 ① 引入）
+
+排查中发现：未插桩的 eager 路径在 5 个 prompt 里有 3 个与 graph 不一致，而任何额外同步/回读
+（即使放在轮末）都会让它变成与 graph 一致 —— 即 eager 路径对时序敏感。根因是解码轮结束时只同步了 shard A
+（cudaStreamSynchronize(shard_a_.device.stream)），随后 host 立刻做 fold / state restore / 下一轮 window 与
+arena 复用，而 shard B 的 verify 尾部可能仍在跑；两卡之间唯一的顺序保证是 AR 自旋。
+修法：轮末同时同步 A、B（tp2_generation_core.cpp）；实测 sync_wait 仍为 0.01 ms（B 只落后极少）。
+修后 eager 与 graph 在全部 5 个 prompt 上逐字节一致。
+
+### 顺带修掉的第二处缺陷：in-kernel allreduce 的 token 归属（真实崩溃）
+
+带上 ① 的全量测试里 ninfer_qwen3_5_tp2_forward_test 报 cudaErrorIllegalAddress（第一层内），而 HEAD 的同一
+二进制通过。二分定位：把 allreduce 强制走 host-staging 路径即通过 ⇒ 本轮改成「设备端 token」的 in-kernel AR 引入。
+根因：token 计数器原先分配在各自设备的 device 堆上，但「哪个 shard 驱动 pair」由调用方决定（该测试会让两个 shard
+各驱动一次，于是 stream_a 属于 device 1），内核在 device 1 的 context 里解引用了 device 0 的裸指针。
+修法：token 改为 mapped pinned host memory（两个设备都可见），kernel 侧每 block 读一次并用 shared memory 广播
+（若每个线程都直接读系统内存，单次 allreduce 多 ~4 us、整轮多 ~0.5 ms）。修后 12 个相关测试全绿
+（含 tp2_load / tp2_forward），eager 与 graph 仍逐字节一致。
+
+### 未决（非本次范围）
+
+MTP 输出质量：与 plain decode（-Plain，单 token TP-2 路径）贪婪对照，5 个 prompt 中只有 1 个逐字节一致，
+其余在近似并列处翻转。这是 docs/tp2-dual-5060ti.md §MTP 已记录的**接受行为**：verify 窗口与单 token 解码是
+不同的执行形状（分块注意力/卷积路由），逐列 logits 必然有差异，llama.cpp 的 Qwen3.5 MTP 同样如此。
+**注意**：不要再用「Phase::Prefill 导致近似」解释它 —— 同一文档已记录那是被否定的旧诊断（Phase 在
+head-split 分片上无任何语义作用）。这不是 ① 的回归。
+
+### 下一步
+
+- [x] 步骤 1 测量。
+- [x] 步骤 3 ①（exact-batch graph）+ 轮末双卡同步。
+- [x] 步骤 2 ④ 复核：**该项按原描述已经不需要做**。PLAN 的 ④ 依据（"每 draft 一次 cudaStreamSynchronize"，
+  指旧版 tp2_generation_core.cpp:543）在当前代码里已不成立：mtp_propose_window 整个窗口只有 **1 次 D2H + 1 次
+  sync**，每 draft 只剩一次 D2D 拷贝 + 一次 increment 内核；mtp_forward_batch / mtp_forward_ar_step / mtp_forward_core
+  内无任何 host 同步或 D2H（grep 实证）。实测 mtp=3.70~3.75 ms 是**真实 GPU 工作**（两次 T=1 的 MTP 层前向，
+  权重流受限），且与 verify 串行。残余机会只有「fold 与 MTP 链重叠」≤0.8 ms（≈2%，fold 走 replay.cpp，不含
+  allreduce，理论上可另开流），但要动 AR token 协议/流序，收益风险比不划算 ⇒ 判定 ④ 已完成，不再改。
+- [ ] 步骤 4 ③：prefill AR 与 MMA 重叠（按 slot 的 A→B 子块流水）。
+- [ ] 步骤 5：③④ 完成后复测，更新 docs/tp2-dual-5060ti.md / worklog 并归档。

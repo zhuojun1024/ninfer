@@ -188,6 +188,19 @@ public:
                              Tensor* hidden_columns = nullptr, Phase phase = Phase::Prefill,
                              const Tp2VisionChunk* vision = nullptr);
 
+    // Tensor-parallel verify window with capture-safe inputs. It runs exactly forward_tp2_prefill's
+    // prefill phase over a small speculative window, but every per-round input is supplied as pinned
+    // host memory that the captured sequence copies with a memcpy node, and the attention envelope is
+    // a capture parameter instead of a per-round value. That makes the whole sequence replayable from
+    // a CUDA Graph: the caller rewrites ids/positions in place before each replay and launches the
+    // graph. ids and positions are [T] int32 arrays of window tokens and their absolute cache/RoPE
+    // positions; both must stay valid (and stable in address) for as long as the captured graph
+    // exists. envelope must cover the window's inclusive key extent.
+    void forward_tp2_window(TextContext& peer, tp::DevicePair& pair, const std::int32_t* ids,
+                            const std::int32_t* positions,
+                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits_columns,
+                            Tensor* hidden_columns = nullptr);
+
     // Registers the peer shard's context and the device pair. The tensor-parallel driver sets this
     // on both shards once, so operations that only run on one shard (the MTP stem) can still drive
     // the peer's half of a column-split weight.

@@ -189,6 +189,36 @@ site was likewise a red herring: `src/ops/launcher/rope.cu:189` is a `CUDA_CHECK
 checkpoint, and with two devices interleaved an asynchronous illegal address surfaces at whichever
 checkpoint runs first, not necessarily at the faulting kernel.
 
+
+### Verify CUDA graph
+
+The MTP verify window is captured as one CUDA graph per device (src/core/decode_graph.h, capture_group
+begins capture on both device streams and records each stream into its own definition), so a round's
+~1,000 kernels are replayed from ~10 host calls instead of being launched one by one. The window's host
+inputs (token ids, positions) are written into a portable pinned buffer that the graph's leading memcpy
+nodes re-read on every replay, and the attention envelope is baked per capture: the eight buckets come
+from mtp_graph_profiles(capacity, draft_tokens), so a round picks the bucket whose visible range covers
+it. The captured body allocates from the round's arena watermark, which DeviceArena::rewind restores
+before each round; a bucket captured at a lower watermark (the startup warm-up request) is re-captured
+at the first real request's.
+
+NINFER_TP2_VERIFY_GRAPH=0 runs the same window eagerly. Both routes call the same forward_tp2_window
+with the same bucket envelope, so the switch changes only how the kernels reach the GPU:
+
+| Metric (bench_serve.ps1, fp8 KV, context 131072, K=2) | eager | graph | delta |
+|---|---|---|---|
+| round time (NINFER_TP2_TIMING=1) | 39.6 ms | 35.3 ms | -4.3 ms |
+| of which verify | 35.0 ms | 30.6 ms | -4.4 ms |
+| 2048-token-context decode (64 tokens both) | 65.6 tok/s | 76.5 tok/s | +16.6% |
+| prefill, 512-token prompt | 1419 tok/s | 1419 tok/s | flat |
+
+Decode throughput also depends on the draft acceptance rate, which the round's own text decides, so the
+round time and the equal-output 2048-token run are the trustworthy comparisons. The whole 4.4 ms is
+launch and scheduling overhead: the verify's kernels, parameters and operands are identical in both
+routes, and five prompts x up to 256 greedy tokens are byte-identical between them.
+The graph's replay is also insensitive to added instrumentation, which is what made the round-boundary
+synchronization defect below visible in the first place.
+
 ## Proposal head
 
 `--lm-head-draft` switches the draft head from the weight-tied full output head (248,320 rows,
@@ -332,6 +362,21 @@ comparison meaningful; the served configuration samples (`0.7 / 20 / 0.80`).
   `--spec mtp` failed on every first quantized-KV request with `small_t_fp8.cu:56
   cudaErrorInvalidValue`. All four quantized/bf16 small-T routes now share one per-device opt-in
   authority (`src/ops/common/cuda_smem.h`).
+- The in-kernel allreduce's arrival tokens (the monotonic per-call counter that keeps a captured
+  sequence's handshake honest) now live in **mapped pinned host memory** instead of on a device heap.
+  The caller chooses which shard drives a pair, so an allreduce's stream is not necessarily device A's
+  -- the TP-2 forward test drives the same pair from either shard -- and a device allocation was then
+  dereferenced from the other device's context (`cudaErrorIllegalAddress` inside the first layer).
+  The kernel reads the token once per block and publishes it through shared memory, because a
+  per-thread read of a system-scope location costs ~4 us per allreduce, ~0.5 ms per round.
+- TP-2 decode rounds now synchronize **both** devices at the round boundary, not just shard A. The
+  host folds the verified columns, restores the pre-round GDN state and rebuilds the next round's
+  window right after that sync, while shard B's verify tail could still be running; the pair's
+  in-kernel allreduce is the only thing that orders the two devices' kernels against each other, so
+  the peer's tail was unordered against the host's next round. It was latent in the eager path (where
+  ~1,000 launches per round kept the host behind the GPU) and only became deterministic once the
+  verify turned into a graph replay. The added sync costs 0.01 ms because shard B trails by less than
+  one kernel, and eager and graph now agree byte for byte on every prompt.
 
 ## Work log
 

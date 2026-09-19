@@ -6,6 +6,7 @@
 #include "models/registry.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load.h"
+#include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/sampling.h"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <span>
@@ -28,6 +30,106 @@ namespace {
 using namespace ninfer;
 namespace qwen = ninfer::models::qwen3_5;
 using Clock = std::chrono::steady_clock;
+
+// Phase timing for the TP-2 prefill/decode walk, enabled with NINFER_TP2_TIMING=1. It exists to
+// attribute a decode round to its phases while the round is being optimised (see PLAN.md Round 11);
+// with the flag off every call is one branch on a cached bool. The marks are recorded on shard A's
+// stream and read back after that round's synchronization, so every event has completed and
+// cudaEventElapsedTime cannot report a partial interval.
+struct Tp2RoundTiming {
+    bool enabled = false;
+    bool events_ready = false;
+    bool created = false;
+    cudaEvent_t mark[7]{};
+    double mtp_ms     = 0.0;
+    double verify_ms  = 0.0;
+    double accept_ms  = 0.0;
+    double copy_ms    = 0.0;
+    double sync_ms    = 0.0;
+    double fold_ms    = 0.0;
+    double round_ms   = 0.0;
+    double prefill_ms = 0.0;
+    std::uint64_t rounds    = 0;
+    std::uint64_t committed = 0;
+
+    // The events are recorded on shard A's stream only, so they must be created with shard A's
+    // device current: an event from another device makes cudaEventRecord fail with
+    // cudaErrorInvalidResourceHandle, and because these paths do not check CUDA errors that latched
+    // failure would be reported by the next unrelated CUDA_CHECK in the round.
+    void init() {
+        if (created) { return; }
+        created = true;
+        const char* env = std::getenv("NINFER_TP2_TIMING");
+        enabled         = env != nullptr && env[0] == '1';
+        if (!enabled) { return; }
+        for (cudaEvent_t& event : mark) {
+            if (cudaEventCreateWithFlags(&event, cudaEventDefault) != cudaSuccess) {
+                (void)cudaGetLastError();
+                enabled = false;
+                return;
+            }
+        }
+        events_ready = true;
+    }
+
+    // Drop a latched failure from a timing call itself: this facility must never change what the
+    // engine reports, and every diagnostic call failure means "report nothing" for that interval.
+    static void discard_error() { (void)cudaGetLastError(); }
+
+    void reset() {
+        mtp_ms = verify_ms = accept_ms = copy_ms = sync_ms = fold_ms = round_ms = prefill_ms = 0.0;
+        rounds    = 0;
+        committed = 0;
+    }
+
+    void record(int index, cudaStream_t stream) {
+        if (!events_ready) { return; }
+        if (cudaEventRecord(mark[index], stream) != cudaSuccess) {
+            discard_error();
+            events_ready = false;
+        }
+    }
+
+    [[nodiscard]] double elapsed(int begin, int end) const {
+        if (!events_ready) { return 0.0; }
+        float ms = 0.0F;
+        if (cudaEventElapsedTime(&ms, mark[begin], mark[end]) != cudaSuccess) {
+            discard_error();
+            return 0.0;
+        }
+        return ms;
+    }
+
+    // Called once per round after that round's synchronization: every mark up to the licenced-token
+    // copy has completed, so the intervals are final. The fold runs after the synchronization and is
+    // accounted separately by the caller.
+    void close_round(double sync_wait_ms) {
+        if (!events_ready) { return; }
+        mtp_ms += elapsed(0, 1);
+        verify_ms += elapsed(1, 2);
+        accept_ms += elapsed(2, 3);
+        copy_ms += elapsed(3, 4);
+        sync_ms += sync_wait_ms;
+    }
+
+    void report(const char* label) const {
+        if (!enabled || rounds == 0) { return; }
+        const double n = static_cast<double>(rounds);
+        std::fprintf(stderr,
+                     "[tp2-time] %s rounds=%llu committed=%llu avg_round=%.2fms mtp=%.2f verify=%.2f "
+                     "accept=%.2f copy=%.2f sync_wait=%.2f fold=%.2f prefill=%.1fms\n",
+                     label, static_cast<unsigned long long>(rounds),
+                     static_cast<unsigned long long>(committed), round_ms / n, mtp_ms / n,
+                     verify_ms / n, accept_ms / n, copy_ms / n, sync_ms / n, fold_ms / n,
+                     prefill_ms);
+    }
+};
+
+Tp2RoundTiming& tp2_timing() {
+    static Tp2RoundTiming timing;
+    return timing;
+}
+
 
 // Workspace arena per shard. The single-token forward_tp2 peaks at ~600 KB (full-vocab logits
 // plus a handful of [N,1] activations), but a batched prefill chunk holds every intermediate of the
@@ -114,6 +216,21 @@ ops::SamplingConfig make_sampling_config(const ResolvedSamplingParameters& sourc
     return out;
 }
 
+// Moves a workspace arena to an exact offset. A verify graph bakes the addresses of the round's
+// scratch, so a replay must reproduce them rather than hope two rounds happened to allocate the
+// same amount. The arena never moves below `floor`, the watermark the current request keeps alive.
+void position_arena(WorkspaceArena& arena, std::size_t floor, std::size_t target) {
+    if (target < floor) {
+        throw std::logic_error("TP-2 verify CUDA Graph was captured below this request's workspace");
+    }
+    const std::size_t used = arena.used();
+    if (target < used) {
+        arena.rewind(target);
+    } else if (target > used) {
+        (void)arena.alloc_bytes(target - used);
+    }
+}
+
 } // namespace
 
 TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a, int device_b)
@@ -150,6 +267,32 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     // alone, so both contexts learn their peer and the pair once both shards exist.
     shard_a_.context->set_tp_peer(shard_b_.context.get(), &pair_);
     shard_b_.context->set_tp_peer(shard_a_.context.get(), &pair_);
+
+    if (mtp_enabled_ && pair_.in_kernel_allreduce()) {
+        const char* env        = std::getenv("NINFER_TP2_VERIFY_GRAPH");
+        verify_graph_enabled_  = env == nullptr || env[0] != '0';
+    }
+    if (mtp_enabled_) {
+        // The verify window is assembled in this portable pinned buffer every round: the capture
+        // path reads it through a memcpy node, and the eager path reads it directly.
+        const std::uint32_t width = mtp_drafts_ + 1U;
+        verify_window_host_ = std::make_unique<PinnedHostBuffer>(
+            static_cast<std::size_t>(2) * width * sizeof(std::int32_t), true);
+    }
+    if (mtp_enabled_) {
+        // The envelope buckets are the single-GPU MTP decode graph's split-policy boundaries, so a
+        // window always covers the same attention route and launch geometry. The bucket is keyed by
+        // the window's widest visible extent, which is what the envelope carries; both the capture
+        // and the eager reference use them, so the two differ only in how they are launched.
+        const std::uint32_t window_width = mtp_drafts_ + 1U;
+        for (const auto& profile :
+             qwen::detail::mtp_graph_profiles(options_.max_context, mtp_drafts_)) {
+            VerifyGraph graph;
+            graph.visible_begin = profile.min + 1U;
+            graph.visible_end = std::min(options_.max_context, profile.max + window_width);
+            verify_graphs_.push_back(std::move(graph));
+        }
+    }
 
     frontend_ = std::make_unique<qwen::Frontend>(
         qwen::make_frontend(shard_a_.model->resources(),
@@ -504,6 +647,116 @@ void TP2GenerationCore::mtp_prefill_priming(Shard& shard, const int* ids, std::u
     }
 }
 
+TP2GenerationCore::VerifyGraph* TP2GenerationCore::select_verify_graph(std::uint32_t visible_end) {
+    for (VerifyGraph& graph : verify_graphs_) {
+        if (graph.visible_begin <= visible_end && visible_end <= graph.visible_end) { return &graph; }
+    }
+    return nullptr;
+}
+
+TP2GenerationCore::VerifyGraph*
+TP2GenerationCore::reusable_verify_graph(std::uint32_t visible_end) {
+    VerifyGraph* graph = select_verify_graph(visible_end);
+    if (graph == nullptr || !graph->captured || graph->round_base[0] < shard_a_.round_base ||
+        graph->round_base[1] < shard_b_.round_base) {
+        return nullptr;
+    }
+    return graph;
+}
+
+void TP2GenerationCore::capture_verify_graph(VerifyGraph& graph, const std::int32_t* ids,
+                                             const std::int32_t* positions, Tensor& logits_columns,
+                                             Tensor& hidden_columns) {
+    Shard& shard_a = shard_a_;
+    Shard& shard_b = shard_b_;
+    const ops::CausalAttentionExecutionEnvelope envelope{graph.visible_begin, graph.visible_end};
+    shard_a.device.bind_to_current_thread();
+    graph.round_base[0]  = shard_a.round_base;
+    graph.round_base[1]  = shard_b.round_base;
+    graph.arena_begin[0] = shard_a.workspace->used();
+    graph.arena_begin[1] = shard_b.workspace->used();
+    // The verify's state transitions are recorded, not applied: the fold replays the committed
+    // columns from the pre-round snapshot. The action is a launch-time choice, so the capture must
+    // run with it set and a replay picks it up from the recorded kernels.
+    shard_a.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
+                                          &shard_a.records);
+    shard_b.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
+                                          &shard_b.records);
+    DecodeGraphDefinition* definitions[2] = {&graph.definition[0], &graph.definition[1]};
+    cudaStream_t streams[2] = {shard_a.device.stream, shard_b.device.stream};
+    DecodeGraphDefinition::capture_group(definitions, streams, [&] {
+        shard_a.context->forward_tp2_window(*shard_b.context, pair_, ids, positions, envelope,
+                                           logits_columns, &hidden_columns);
+    });
+    graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
+    graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
+    shard_a.device.bind_to_current_thread();
+    graph.executable[0].instantiate(graph.definition[0]);
+    shard_b.device.bind_to_current_thread();
+    graph.executable[1].instantiate(graph.definition[1]);
+    shard_a.device.bind_to_current_thread();
+    graph.captured = true;
+}
+
+void TP2GenerationCore::run_verify_window(const std::int32_t* ids, std::int32_t first_position,
+                                          Tensor& logits_columns, Tensor& hidden_columns) {
+    Shard& shard_a = shard_a_;
+    Shard& shard_b = shard_b_;
+    const auto width    = static_cast<std::size_t>(logits_columns.ne[1]);
+    const auto* positions = ids + width;
+    const std::uint32_t visible_end =
+        static_cast<std::uint32_t>(first_position) + static_cast<std::uint32_t>(width);
+    if (!verify_graph_enabled_) {
+        // The eager route runs the same window and the same envelope; only the launch differs. That
+        // keeps NINFER_TP2_VERIFY_GRAPH=0 a true A/B of the captured sequence rather than a
+        // comparison of two different attention routes.
+        const VerifyGraph* bucket = select_verify_graph(visible_end);
+        if (bucket == nullptr) {
+            throw std::logic_error("TP-2 verify window coverage is incomplete");
+        }
+        const ops::CausalAttentionExecutionEnvelope envelope{bucket->visible_begin,
+                                                             bucket->visible_end};
+        shard_a.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
+                                              &shard_a.records);
+        shard_b.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
+                                              &shard_b.records);
+        shard_a.context->forward_tp2_window(*shard_b.context, pair_, ids, positions, envelope,
+                                            logits_columns, &hidden_columns);
+    } else {
+        VerifyGraph* graph = select_verify_graph(visible_end);
+        if (graph == nullptr) {
+            throw std::logic_error("TP-2 verify CUDA Graph coverage is incomplete");
+        }
+        if (reusable_verify_graph(visible_end) == nullptr) {
+            // Capturing records the sequence without executing it, so the capture round still has to
+            // run the window it just captured (with the operands the capture itself allocated).
+            capture_verify_graph(*graph, ids, positions, logits_columns, hidden_columns);
+            shard_a.device.bind_to_current_thread();
+            graph->executable[0].launch(shard_a.device.stream);
+            shard_b.device.bind_to_current_thread();
+            graph->executable[1].launch(shard_b.device.stream);
+            shard_a.device.bind_to_current_thread();
+        } else {
+            if (shard_a.workspace->used() != graph->arena_begin[0] ||
+                shard_b.workspace->used() != graph->arena_begin[1]) {
+                throw std::logic_error(
+                    "TP-2 verify CUDA Graph replay found a different workspace layout");
+            }
+            shard_a.device.bind_to_current_thread();
+            graph->executable[0].launch(shard_a.device.stream);
+            shard_b.device.bind_to_current_thread();
+            graph->executable[1].launch(shard_b.device.stream);
+            shard_a.device.bind_to_current_thread();
+            // The captured body allocated its operands during capture; a replay does not run that
+            // host code, so advance both arenas by what the capture consumed.
+            (void)shard_a.workspace->alloc_bytes(graph->arena_bytes[0]);
+            (void)shard_b.workspace->alloc_bytes(graph->arena_bytes[1]);
+        }
+    }
+    shard_a.context->set_gdn_state_action(qwen::execution::GdnStateAction::UpdateInPlace, nullptr);
+    shard_b.context->set_gdn_state_action(qwen::execution::GdnStateAction::UpdateInPlace, nullptr);
+}
+
 std::vector<TokenId> TP2GenerationCore::mtp_propose_window(Shard& shard, Tensor& mtp_input,
                                                            const Tensor& anchor,
                                                            std::uint32_t position,
@@ -607,6 +860,11 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     result.prompt = request.summary;
     result.timings.prepare_seconds = request.prepare_seconds;
     const Clock::time_point start = Clock::now();
+    // The timing events belong to shard A's device, so bind it before creating them.
+    shard_a_.device.bind_to_current_thread();
+    Tp2RoundTiming& timing = tp2_timing();
+    timing.init();
+    timing.reset();
 
     // Prompt-prefix reuse. The KV pages hold the K/V of every position the last completed prefill
     // wrote, and the state snapshots hold the matching GDN states, so a prompt that extends the
@@ -915,6 +1173,13 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     // final-norm hidden of the column before it (the bridge's hidden input).
     std::int32_t mtp_anchor    = current;
     std::uint32_t mtp_position = position;
+    // Per-round scratch starts here: the per-request tensors above (the sampling buffers, the
+    // logical positions) must survive every round, and the prefix ends at the request's first
+    // round. Every decode round allocates and frees its own scratch above this watermark, so a
+    // round that discards its speculative chain by rewinding to it gets the same allocation
+    // layout every time - which is what a captured verify graph bakes into its kernel arguments.
+    shard_a_.round_base = ws_a.used();
+    shard_b_.round_base = ws_b.used();
     bool finished = false;
     const std::int32_t public_tokens =
         static_cast<std::int32_t>(shard_a_.model->resources().public_token_count);
@@ -937,21 +1202,33 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
         auto scope_b = ws_b.scope();
         std::vector<TokenId> step;
         Tensor round_hidden;
+        // Phase marks: 0 round start, 1 after the MTP proposal chain, 2 after the verify forward,
+        // 3 after the licensing kernels, 4 after the licenced-token readback, 5/6 around the state
+        // fold. The plain loop has no proposal chain and no fold, so it collapses 1 onto 0.
+        const Clock::time_point round_start = Clock::now();
+        timing.record(0, shard_a_.device.stream);
+        if (!mtp_enabled_) { timing.record(1, shard_a_.device.stream); }
         if (!mtp_enabled_) {
             Tensor logits_a = ws_a.alloc(DType::BF16, {vocab, 1});
             Tensor logits_b = ws_b.alloc(DType::BF16, {vocab, 1});
             ctx_a.forward_tp2(ctx_b, pair_, current, static_cast<std::int32_t>(position), logits_a,
                               logits_b);
+            timing.record(2, shard_a_.device.stream);
             ops::set_i32_scalar(logical_pos_a, static_cast<std::int32_t>(position + 1),
                                 shard_a_.device.stream);
             Tensor sampled_a = ws_a.alloc(DType::I32, {1});
             ops::sample(logits_a, sampled_a, vocab, sampling_a, logical_pos_a,
                         ops::kSamplePurposeDecode, ws_a, shard_a_.device.stream);
+            timing.record(3, shard_a_.device.stream);
             std::int32_t next = 0;
             shard_a_.device.bind_to_current_thread();
             CUDA_CHECK(cudaMemcpyAsync(&next, sampled_a.data, sizeof(std::int32_t),
                                        cudaMemcpyDeviceToHost, shard_a_.device.stream));
+            timing.record(4, shard_a_.device.stream);
+            const Clock::time_point sync_start = Clock::now();
             CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+            timing.close_round(
+                std::chrono::duration<double, std::milli>(Clock::now() - sync_start).count());
             step.assign(1, static_cast<TokenId>(next));
         } else {
             // One window: [anchor, d0, ..., d_{K-1}] at consecutive positions from the anchor's. The
@@ -962,12 +1239,32 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             const std::vector<TokenId> drafts =
                 mtp_propose_window(shard_a_, shard_a_.mtp_anchor_hidden, anchor_dev,
                                    mtp_position - 1, ws_a);
+            timing.record(1, shard_a_.device.stream);
             const std::int32_t width = static_cast<std::int32_t>(mtp_drafts_) + 1;
-            std::vector<int> window_host(static_cast<std::size_t>(width), mtp_anchor);
+            // Every per-round input to the verify goes through the pinned window: the capture path
+            // reads it with a memcpy node, and the eager path passes it straight to the forward.
+            auto* window_ids       = static_cast<std::int32_t*>(verify_window_host_->data());
+            auto* window_positions = window_ids + width;
+            window_ids[0]          = static_cast<std::int32_t>(mtp_anchor);
+            window_positions[0]    = static_cast<std::int32_t>(mtp_position);
             for (std::int32_t i = 1; i < width; ++i) {
-                window_host[static_cast<std::size_t>(i)] =
-                    static_cast<int>(drafts[static_cast<std::size_t>(i - 1)]);
+                window_ids[i] =
+                    static_cast<std::int32_t>(drafts[static_cast<std::size_t>(i - 1)]);
+                window_positions[i] = static_cast<std::int32_t>(mtp_position) + i;
             }
+            // The proposal chain's operands are dead now - the window is assembled on the host and
+            // the chain's own arena footprint varies with the round's attention route - so both
+            // workspaces go back to where this round's fixed scratch belongs. A captured window
+            // fixes that place: everything the verify and the accept path allocate is then a
+            // function of the round's fixed sequence alone, which is what the graph bakes into its
+            // kernel arguments.
+            const std::uint32_t visible_end =
+                static_cast<std::uint32_t>(mtp_position) + static_cast<std::uint32_t>(width);
+            const VerifyGraph* reusable = reusable_verify_graph(visible_end);
+            position_arena(ws_a, shard_a_.round_base,
+                           reusable != nullptr ? reusable->round_base[0] : shard_a_.round_base);
+            position_arena(ws_b, shard_b_.round_base,
+                           reusable != nullptr ? reusable->round_base[1] : shard_b_.round_base);
             Tensor window_logits   = ws_a.alloc(DType::BF16, {vocab, width});
             round_hidden           = ws_a.alloc(DType::BF16, {hidden, width});
             Tensor window_drafts =
@@ -980,7 +1277,9 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             Tensor licensed_counts = ws_a.alloc(DType::I32, {1});
             Tensor accepted        = ws_a.alloc(DType::I32, {1});
             shard_a_.device.bind_to_current_thread();
-            CUDA_CHECK(cudaMemcpyAsync(window_drafts.data, drafts.data(),
+            // From the pinned window, not from the proposal chain's arena: that region has been
+            // reused by the allocations above.
+            CUDA_CHECK(cudaMemcpyAsync(window_drafts.data, window_ids + 1,
                                        sizeof(TokenId) * mtp_drafts_, cudaMemcpyHostToDevice,
                                        shard_a_.device.stream));
             ops::set_i32_scalar(current_extents, static_cast<std::int32_t>(mtp_drafts_),
@@ -992,26 +1291,20 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             // pre-verify state is snapshotted and the fold replays only the committed columns from it.
             snapshot_state(shard_a_, kRoundScratchSlot);
             snapshot_state(shard_b_, kRoundScratchSlot);
-            shard_a_.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
-                                                  &shard_a_.records);
-            shard_b_.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
-                                                  &shard_b_.records);
-            ctx_a.forward_tp2_prefill(
-                ctx_b, pair_,
-                std::span<const int>(window_host.data(), window_host.size()),
-                static_cast<std::int32_t>(mtp_position), nullptr, nullptr, nullptr,
-                // The verify window runs Phase::Prefill: the Phase::Verify (decode-equivalent) variant is a
-                // known-incomplete TP-2 path (batched GDN/attention faults), so MTP stays approximate.
-                &window_logits, &round_hidden);
-            shard_a_.context->set_gdn_state_action(qwen::execution::GdnStateAction::UpdateInPlace,
-                                                  nullptr);
-            shard_b_.context->set_gdn_state_action(qwen::execution::GdnStateAction::UpdateInPlace,
-                                                  nullptr);
+            // The verify window runs Phase::Prefill through the capture-safe window path: the
+            // Phase::Verify (decode-equivalent) variant is a known-incomplete TP-2 path (batched
+            // GDN/attention faults), so MTP stays approximate. run_verify_window owns the GDN
+            // record/replay action around the launch, and replays a captured graph of the whole
+            // window when one covers this round's extent.
+            run_verify_window(window_ids, static_cast<std::int32_t>(mtp_position), window_logits,
+                              round_hidden);
+            timing.record(2, shard_a_.device.stream);
             ops::argmax(window_logits, target_tokens, vocab, shard_a_.device.stream);
             ops::speculative_accept_greedy_drafts(
                 target_tokens, window_logits, window_drafts, current_extents, round_lengths,
                 round_anchors, licensed, licensed_counts, accepted, vocab, sampling_a, ws_a,
                 shard_a_.device.stream);
+            timing.record(3, shard_a_.device.stream);
             std::vector<TokenId> licensed_host(static_cast<std::size_t>(width), 0);
             std::int32_t licensed_count = 0;
             CUDA_CHECK(cudaMemcpyAsync(licensed_host.data(), licensed.data,
@@ -1019,7 +1312,18 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                                        shard_a_.device.stream));
             CUDA_CHECK(cudaMemcpyAsync(&licensed_count, licensed_counts.data, sizeof(std::int32_t),
                                        cudaMemcpyDeviceToHost, shard_a_.device.stream));
+            timing.record(4, shard_a_.device.stream);
+            const Clock::time_point sync_start = Clock::now();
             CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+            // Both devices must be idle before the host moves the round on: the fold, the state
+            // restore and the next round's window all rewrite buffers the peer's verify may still be
+            // reading, and the pair's allreduce is the only thing that orders the two devices'
+            // kernels against each other.
+            shard_b_.device.bind_to_current_thread();
+            CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
+            shard_a_.device.bind_to_current_thread();
+            timing.close_round(
+                std::chrono::duration<double, std::milli>(Clock::now() - sync_start).count());
             if (licensed_count < 1 || licensed_count > width) {
                 throw std::logic_error("TP-2 MTP round produced an invalid licensed prefix");
             }
@@ -1049,6 +1353,7 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             // The output policy licenses a prefix of the round's tokens. The state advances by exactly
             // those columns: their transitions were recorded, not applied.
             const std::uint32_t committed = decision.accepted_tokens;
+            timing.record(5, shard_a_.device.stream);
             // Undo the verify's advance: restore the pre-round state, then fold the committed columns.
             for (Shard* shard : {&shard_a_, &shard_b_}) {
                 shard->device.bind_to_current_thread();
@@ -1078,6 +1383,8 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                         static_cast<std::size_t>(hidden) * sizeof(std::uint16_t),
                 shard_a_.mtp_anchor_hidden.bytes(), cudaMemcpyDeviceToDevice,
                 shard_a_.device.stream));
+            timing.record(6, shard_a_.device.stream);
+            timing.fold_ms += timing.elapsed(5, 6);
             mtp_draft_checked_ += mtp_drafts_;
             mtp_draft_hit_ += committed > 1 ? committed - 1 : 0;
             std::fprintf(stderr,
@@ -1088,6 +1395,10 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
         }
         finished = decision.finished();
         if (finished) { result.finish_reason = decision.finish_reason; }
+        timing.committed += decision.accepted_tokens;
+        ++timing.rounds;
+        timing.round_ms +=
+            std::chrono::duration<double, std::milli>(Clock::now() - round_start).count();
     }
 
     result.generated_token_ids = std::move(request.generated);
@@ -1103,6 +1414,8 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     result.timings.first_token_seconds =
         result.timings.prepare_seconds + result.timings.prompt_wall_seconds;
     result.timings.total_seconds = std::chrono::duration<double>(finished_at - start).count();
+    timing.prefill_ms = result.timings.prefill_seconds * 1000.0;
+    timing.report("decode");
     return result;
 }
 

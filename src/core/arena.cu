@@ -231,6 +231,13 @@ DeviceArena::Scope DeviceArena::scope() noexcept { return Scope(*this); }
 
 void DeviceArena::reset() noexcept { off_ = 0; }
 
+void DeviceArena::rewind(std::size_t watermark) {
+    if (watermark > off_) {
+        throw std::invalid_argument("arena rewind watermark lies past the bump pointer");
+    }
+    off_ = watermark;
+}
+
 void* DeviceArena::base() const noexcept { return base_; }
 
 std::size_t DeviceArena::used() const noexcept { return off_; }
@@ -241,13 +248,15 @@ std::size_t DeviceArena::peak_used() const noexcept { return peak_; }
 
 void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
-PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, bool portable) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
 
-    void* ptr             = nullptr;
-    const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
+    void* ptr = nullptr;
+    const cudaError_t err =
+        portable ? cudaHostAlloc(&ptr, size_bytes, cudaHostAllocPortable | cudaHostAllocMapped)
+                 : cudaMallocHost(&ptr, size_bytes);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
+        throw std::runtime_error(cuda_error_message("pinned host allocation failed", err));
     }
 
     data_ = ptr;

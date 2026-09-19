@@ -2020,6 +2020,107 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
     }
 }
 
+void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
+                                     const std::int32_t* ids, const std::int32_t* positions,
+                                     ops::CausalAttentionExecutionEnvelope envelope,
+                                     Tensor& logits_columns, Tensor* hidden_columns) {
+    const std::int32_t hidden = dimension(config_.hidden_size);
+    const std::int32_t vocab  = dimension(config_.vocab_size);
+    if (ids == nullptr || positions == nullptr) {
+        throw std::invalid_argument("forward_tp2_window requires pinned host ids and positions");
+    }
+    if (logits_columns.dtype != DType::BF16 || logits_columns.ne[0] != vocab) {
+        throw std::invalid_argument("forward_tp2_window: logits columns must be [V,T] BF16");
+    }
+    const std::int32_t tokens = logits_columns.ne[1];
+    if (tokens <= 0) { throw std::invalid_argument("forward_tp2_window requires tokens"); }
+    if (envelope.min_visible_keys == 0 || envelope.max_visible_keys < envelope.min_visible_keys) {
+        throw std::invalid_argument("forward_tp2_window: envelope does not cover the window");
+    }
+    if (hidden_columns != nullptr &&
+        (hidden_columns->dtype != DType::BF16 || hidden_columns->ne[0] != hidden ||
+         hidden_columns->ne[1] != tokens)) {
+        throw std::invalid_argument("forward_tp2_window: hidden columns must be [hidden,T] BF16");
+    }
+
+    struct BindState {
+        Tensor ids;
+        Tensor positions;
+        Tensor kv_table_rows;
+        Tensor state_source;
+        Tensor state_destination;
+        ops::CausalAttentionExecutionEnvelope envelope{1, 1};
+    };
+    // Both shards bind their own copies of the window: the pair has no peer access, and a captured
+    // sequence needs fixed addresses, so each shard's arena owns its [T] buffers and the only
+    // per-round input is the pinned host source the memcpy node reads.
+    auto make_bind = [&](TextContext& card, WorkspaceArena& arena) {
+        card.ctx_.bind_to_current_thread();
+        BindState bind;
+        bind.envelope          = envelope;
+        bind.ids               = arena.alloc(DType::I32, {tokens});
+        bind.positions         = arena.alloc(DType::I32, {tokens});
+        bind.kv_table_rows     = arena.alloc(DType::I32, {1});
+        bind.state_source      = arena.alloc(DType::I32, {1});
+        bind.state_destination = arena.alloc(DType::I32, {1});
+        copy_i32(ids, bind.ids, card.ctx_.stream);
+        copy_i32(positions, bind.positions, card.ctx_.stream);
+        ops::set_i32_scalar(bind.kv_table_rows, 0, card.ctx_.stream);
+        ops::set_i32_scalar(bind.state_source, 0, card.ctx_.stream);
+        ops::set_i32_scalar(bind.state_destination, 0, card.ctx_.stream);
+        return bind;
+    };
+    const BindState bind0 = make_bind(*this, work_);
+    const BindState bind1 = make_bind(peer, peer.work_);
+    // The window is a contiguous append at consecutive absolute positions, so its cache and RoPE
+    // positions coincide: this path carries no RoPE delta and no multimodal position table.
+    ScopedPositions cache0(active_cache_positions_, bind0.positions);
+    ScopedPositions rope0(active_rope_positions_, bind0.positions);
+    ScopedEnvelope envelope0(active_causal_attention_envelope_, bind0.envelope);
+    ScopedValue<const Tensor*> kv0(active_kv_table_rows_, &bind0.kv_table_rows);
+    ScopedValue<const Tensor*> source0(active_linear_state_source_slots_, &bind0.state_source);
+    ScopedValue<const Tensor*> destination0(active_linear_state_destination_slots_,
+                                            &bind0.state_destination);
+    ScopedPositions cache1(peer.active_cache_positions_, bind1.positions);
+    ScopedPositions rope1(peer.active_rope_positions_, bind1.positions);
+    ScopedEnvelope envelope1(peer.active_causal_attention_envelope_, bind1.envelope);
+    ScopedValue<const Tensor*> kv1(peer.active_kv_table_rows_, &bind1.kv_table_rows);
+    ScopedValue<const Tensor*> source1(peer.active_linear_state_source_slots_,
+                                       &bind1.state_source);
+    ScopedValue<const Tensor*> destination1(peer.active_linear_state_destination_slots_,
+                                            &bind1.state_destination);
+
+    ctx_.bind_to_current_thread();
+    Tensor x      = work_.alloc(DType::BF16, {hidden, tokens});
+    peer.ctx_.bind_to_current_thread();
+    Tensor x_peer = peer.work_.alloc(DType::BF16, {hidden, tokens});
+    ctx_.bind_to_current_thread();
+    embedding_tp2(peer, pair, bind0.ids, &bind1.ids, x, &x_peer);
+
+    NullTap tap;
+    run_layers_tp2(peer, pair, x, x_peer, Phase::Prefill, tap);
+
+    ctx_.bind_to_current_thread();
+    Tensor xf      = work_.alloc(DType::BF16, {hidden, tokens});
+    peer.ctx_.bind_to_current_thread();
+    Tensor xf_peer = peer.work_.alloc(DType::BF16, {hidden, tokens});
+    ctx_.bind_to_current_thread();
+    ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    ops::rmsnorm(x_peer, *peer.final_norm_, config_.rms_norm_eps, true, xf_peer, peer.ctx_.stream);
+    // Every column is scored, because column j judges the draft placed at j+1; the last column is
+    // exactly the last column's logits, so no second lm_head read is needed.
+    ctx_.bind_to_current_thread();
+    Tensor logits_columns_peer = peer.work_.alloc(DType::BF16, {vocab, tokens});
+    project_head_tp2(peer, pair, xf, xf_peer, logits_columns, logits_columns_peer);
+    if (hidden_columns != nullptr) {
+        // The next round's MTP bridge consumes the final-norm hidden of the accepted column.
+        ctx_.bind_to_current_thread();
+        CUDA_CHECK(cudaMemcpyAsync(hidden_columns->data, xf.data, xf.bytes(),
+                                   cudaMemcpyDeviceToDevice, ctx_.stream));
+    }
+}
+
 template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,

@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <functional>
+#include <span>
 
 namespace ninfer {
 
@@ -17,6 +18,13 @@ public:
     DecodeGraphDefinition& operator=(DecodeGraphDefinition&& other) noexcept;
 
     void capture(cudaStream_t stream, const std::function<void()>& body);
+    // Captures a body that launches work on several streams at once - a tensor-parallel step spans
+    // two devices, so its allreduce is a paired launch on both compute streams. Every stream must
+    // already be capturing while the body runs, because a launch onto a stream that is not capturing
+    // cannot be recorded into another stream's graph. Each definition receives the graph of the work
+    // launched on its own stream, and the streams must be in one-to-one correspondence.
+    static void capture_group(std::span<DecodeGraphDefinition*> definitions,
+                              std::span<cudaStream_t> streams, const std::function<void()>& body);
     [[nodiscard]] bool ready() const noexcept;
     void reset() noexcept;
 

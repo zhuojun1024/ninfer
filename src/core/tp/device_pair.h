@@ -26,6 +26,10 @@ public:
     const DeviceContext& a() const noexcept { return a_; }
     const DeviceContext& b() const noexcept { return b_; }
     bool p2p_available() const noexcept { return p2p_; }
+    // True when allreduce runs entirely in-kernel over mapped pinned host staging with no host
+    // synchronization. Only this transport may be captured into a CUDA Graph: the P2P and
+    // host-staging fallbacks synchronize the caller's streams.
+    bool in_kernel_allreduce() const noexcept { return in_kernel_available_; }
 
     // In-place all-reduce of count_bytes (multiple of 16): on return both
     // buffers contain a + b elementwise. stream_a/stream_b are the compute
@@ -61,7 +65,16 @@ private:
     int*  arrival_b_ = nullptr; // device-side pointer (device b) for its arrival token
     void* arrival_host_a_ = nullptr; // cudaFreeHost handle for arrival_a_
     void* arrival_host_b_ = nullptr; // cudaFreeHost handle for arrival_b_
-    std::uint64_t ar_call_ = 0; // monotonically increasing arrival token
+    // Arrival tokens, one per allreduce caller side. Each allreduce call bumps its own side's token
+    // with a one-thread kernel and the allreduce reads it back, so the token is replayable inside a
+    // CUDA Graph: a value-baked kernel argument would be replayed unchanged and let a peer that is a
+    // call ahead satisfy its spin from the previous replay. They live in mapped pinned host memory
+    // rather than on a device heap because the caller decides which shard drives a pair: the stream
+    // an allreduce runs on is not necessarily a_, and a device allocation would then be dereferenced
+    // from the other device's context.
+    int* token_host_ = nullptr; // cudaFreeHost handle
+    int* token_a_    = nullptr; // device pointer into token_host_
+    int* token_b_    = nullptr; // device pointer into token_host_
 };
 
 // Non-owning view of one shard of a tensor split along dim. The local tensor

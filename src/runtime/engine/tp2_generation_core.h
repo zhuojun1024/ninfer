@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
@@ -125,6 +126,10 @@ private:
         std::array<DeviceSpan, kReuseSnapshotCount + 1> state_snapshots{};
         std::unique_ptr<DeviceArena> workspace;
         Tensor prefill_hidden;
+        // Workspace offset after the tensors that must survive every round scope (prefill_hidden and
+        // the MTP bridge hidden). A decode round discards its speculative proposal chain by rewinding
+        // to this watermark, so the verify's allocation layout is the same in every round.
+        std::size_t round_base = 0;
         models::qwen3_5::RoundState io;
         std::unique_ptr<models::qwen3_5::execution::TextContext> context;
         std::vector<DeviceKVPageLease> kv_pages;
@@ -178,6 +183,47 @@ private:
     Shard shard_a_;
     Shard shard_b_;
     tp::DevicePair pair_;
+
+    // Captured verify windows. The speculative verify forward is the same launch sequence every
+    // round - about a thousand kernels in lockstep on both devices - and its only per-round inputs
+    // are the window tokens, their absolute positions and the attention envelope. One CUDA Graph per
+    // device is captured per envelope bucket and replayed, which removes the whole verify's launch
+    // cost from the round (the round was enqueue-limited: the device stream idled for roughly the
+    // last few percent of every kernel). See run_verify_window.
+    struct VerifyGraph {
+        // Inclusive range of visible key extents this bucket covers. The captured envelope is the
+        // bucket's widest extent; the per-round positions still come from device memory, exactly as
+        // the single-GPU MTP graph relies on.
+        std::uint32_t visible_begin = 0;
+        std::uint32_t visible_end   = 0;
+        bool captured               = false;
+        DecodeGraphDefinition definition[2];
+        DecodeGraphExecutable executable[2];
+        // Workspace watermark the capture ran at, per shard, and the arena offsets it recorded. A
+        // replay positions the arenas back at that watermark before the round allocates its fixed
+        // scratch, so the scratch lands on the addresses the graph baked; it then advances the
+        // arenas by the captured amount, because the captured body ran its host-side arena
+        // allocations during capture but a replay does not.
+        std::size_t round_base[2]  = {0, 0};
+        std::size_t arena_begin[2] = {0, 0};
+        std::size_t arena_bytes[2] = {0, 0};
+    };
+    [[nodiscard]] VerifyGraph* select_verify_graph(std::uint32_t visible_end);
+    // The captured graph covering this window that the current request can still use, or nullptr
+    // when the window has to be captured (again). A capture bakes the workspace watermark it ran at,
+    // so a request whose own watermark is higher has to capture afresh: the graphs therefore track
+    // the highest watermark seen rather than the first one.
+    [[nodiscard]] VerifyGraph* reusable_verify_graph(std::uint32_t visible_end);
+    void capture_verify_graph(VerifyGraph& graph, const std::int32_t* ids,
+                              const std::int32_t* positions, Tensor& logits_columns,
+                              Tensor& hidden_columns);
+    void run_verify_window(const std::int32_t* ids, std::int32_t first_position,
+                           Tensor& logits_columns, Tensor& hidden_columns);
+
+
+    std::vector<VerifyGraph> verify_graphs_;
+    std::unique_ptr<PinnedHostBuffer> verify_window_host_;
+    bool verify_graph_enabled_ = false;
 
     // Total seconds spent loading and materializing both shards (for LoadSummary).
     double load_seconds_ = 0.0;

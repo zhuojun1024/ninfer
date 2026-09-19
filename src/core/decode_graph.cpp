@@ -80,6 +80,41 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
     graph_ = graph;
 }
 
+void DecodeGraphDefinition::capture_group(std::span<DecodeGraphDefinition*> definitions,
+                                          std::span<cudaStream_t> streams,
+                                          const std::function<void()>& body) {
+    if (definitions.empty() || definitions.size() != streams.size()) {
+        throw std::invalid_argument("capture_group requires one definition per stream");
+    }
+    nvtx::ScopedRange capture_range(nvtx::Name::CudaGraphCapture, nvtx::Category::Graph);
+    std::size_t begun = 0;
+    for (; begun < streams.size(); ++begun) {
+        definitions[begun]->reset();
+        const cudaError_t err =
+            cudaStreamBeginCapture(streams[begun], cudaStreamCaptureModeThreadLocal);
+        if (err != cudaSuccess) {
+            for (std::size_t i = 0; i < begun; ++i) { discard_capture(streams[i]); }
+            CUDA_CHECK(err);
+        }
+    }
+    try {
+        body();
+    } catch (...) {
+        for (const cudaStream_t stream : streams) { discard_capture(stream); }
+        throw;
+    }
+    for (std::size_t i = 0; i < streams.size(); ++i) {
+        cudaGraph_t graph      = nullptr;
+        const cudaError_t err  = cudaStreamEndCapture(streams[i], &graph);
+        if (err != cudaSuccess) {
+            destroy_graph(graph);
+            for (std::size_t j = i + 1; j < streams.size(); ++j) { discard_capture(streams[j]); }
+            CUDA_CHECK(err);
+        }
+        definitions[i]->graph_ = graph;
+    }
+}
+
 bool DecodeGraphDefinition::ready() const noexcept { return graph_ != nullptr; }
 
 void DecodeGraphDefinition::reset() noexcept { destroy_graph(graph_); }

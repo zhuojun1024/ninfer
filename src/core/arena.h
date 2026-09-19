@@ -75,6 +75,12 @@ public:
     Tensor alloc(DType dtype, std::initializer_list<std::int32_t> shape, std::size_t align = 256);
     [[nodiscard]] Scope scope() noexcept;
     void reset() noexcept;
+    // Rewinds the bump pointer to a watermark recorded earlier with used(). A caller whose own
+    // allocations are dead (a speculative proposal chain, say) uses this to place the allocations
+    // that follow at offsets that do not depend on how much the dead sequence consumed - which is
+    // what a captured CUDA Graph bakes into its kernel arguments. The watermark must not lie past
+    // the current pointer.
+    void rewind(std::size_t watermark);
 
     void* base() const noexcept;
     std::size_t used() const noexcept;
@@ -92,7 +98,10 @@ private:
 
 class PinnedHostBuffer {
 public:
-    explicit PinnedHostBuffer(std::size_t size_bytes);
+    // A portable allocation is visible as pinned memory from every CUDA context, which a captured
+    // sequence spanning two devices needs: cudaMallocHost alone pins the memory only for the context
+    // that allocated it, and a memcpy node reading it from the other device would not be capturable.
+    explicit PinnedHostBuffer(std::size_t size_bytes, bool portable = false);
     ~PinnedHostBuffer();
 
     PinnedHostBuffer(const PinnedHostBuffer&)            = delete;
