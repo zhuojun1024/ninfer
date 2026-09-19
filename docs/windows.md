@@ -125,8 +125,11 @@ The suite is the Linux suite. Two platform notes:
 
 - The CLI is single-GPU. This 27B NVFP4 artifact needs about 20.2 GiB of resident weights (10.1 GiB per
   TP-2 shard), so it cannot be loaded onto one 16 GiB card; use `ninfer-serve --devices 0,1` on this
-  machine. The CLI binary itself builds and runs (its `--help` is exercised above), and it needs a card
-  large enough for the whole model.
+  machine. The CLI's own Windows paths are covered: the binary builds, parses arguments and reports usage
+  errors correctly, and `ninfer_cli_options_test` passes, while everything below the CLI (artifact load,
+  engine, KV, graphs, sampling) is the engine verified end to end by the TP-2 server. What this machine
+  cannot demonstrate is a single-card generation run: forcing it would not fail cleanly, because WDDM would
+  page the missing ~4 GiB into system memory instead of rejecting the allocation.
 - The bundled libcurl is a mingw import library. It links and runs, but a native MSVC build (vcpkg) or a
   WinHTTP implementation would remove that dependency.
 - Windows performance equals Linux here; the port's value is deployment convenience, not speed.

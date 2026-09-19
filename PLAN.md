@@ -680,5 +680,15 @@ Ctrl+C 停止），只有 `-Background` 才用 `Start-Process`；自测服务时
 - 全量 Windows 套件（124 项）修复前 121 通过/3 失败，现 a4 已修；`ninfer_context_kv_materialize_test` 在整轮
   串行运行时撞 300 s 超时、单独运行通过（判为干扰，非缺陷）；`ninfer_qwen3_5_frontend_test` 与 Linux 同样
   存在的既有模板白名单问题。
+**进度（Round 54 第 7 轮）：单卡 CLI 条款的取证与判定**
+
+- 事实：Windows 侧 `ninfer.exe` 可运行、参数处理正确（`ninfer_cli_options_test` 在该平台 **exit 0**），CLI 之下
+  的加载/引擎/KV/graph/采样全部是已被 TP-2 服务端到端验证过的同一套引擎（Windows 与 Linux 性能持平）。
+- 判据：本机唯一 artifact（27B NVFP4）单卡需 ~20.2 GiB 常驻权重 vs 16.3 GiB 显存，且**没有预分配容量检查**
+  （grep 未发现 "does not fit" 类前置校验），强行单卡运行会被 WDDM 把缺的 ~4 GiB 换页到主存而不是干净报错——
+  正是用户要求避免的风险，故**不执行**。
+- 结论：该条款属硬件约束（不是移植缺口）。若要字面满足，需要另造小 artifact：Windows 侧无 torch（miniconda
+  3.13 未装），WSL 侧有项目 py311 环境可转换，但还需写一个 tiny 模型的 recipe —— 属独立子任务，等用户决定
+  是否投入。
 
 
