@@ -1022,6 +1022,26 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     const bool batched_verify =
         (ph == Phase::Verify) && (active_sequence_batch_ > 1 || active_sequence_width_ > 1) &&
         shard_config_ == nullptr;
+    // Replay recording. The full model records through the fused width>1 ops above. A head-split
+    // shard cannot: those ops are registered for the full 16384-row fused parent only, which is
+    // why this route used to skip recording entirely. It records through the recurrent record op
+    // instead, which is registered for the shard geometry (8 key heads, 24 value heads) and is the
+    // geometry the fold plan is built for.
+    const bool recording = gdn_state_action_ == GdnStateAction::RecordForReplay;
+    if (recording && replay_records_ == nullptr) {
+        throw std::logic_error("Replay-record GDN has no record storage");
+    }
+    if (recording && T < 2) {
+        throw std::logic_error("Replay-record GDN requires at least two window columns");
+    }
+    const std::int32_t record_rows = active_sequence_batch_ > 0 ? active_sequence_batch_ : 1;
+    GdnReplayRecordLayer records{};
+    if (recording && shard_config_ != nullptr) {
+        if (record_rows != 1) {
+            throw std::logic_error("Replay-record GDN on a shard requires one record row");
+        }
+        records = replay_records_->layer(gidx, record_rows);
+    }
     if (batched_verify) {
         if (active_sequence_batch_ == 0 || active_linear_state_source_slots_ == nullptr) {
             throw std::logic_error(
@@ -1124,6 +1144,16 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
         ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
                                       s);
+        if (recording && shard_config_ != nullptr) {
+            // The fold rebuilds the convolution history as tail_3(old_history || record[0:committed]),
+            // so the record is the raw pre-convolution window. This route already materializes that
+            // buffer contiguously as [q|k|v], which is the record plane's channel order and layout.
+            if (records.conv.data == nullptr || records.conv.bytes() != qkv.bytes()) {
+                throw std::logic_error("GDN convolution record does not match the shard window");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(records.conv.data, qkv.data, qkv.bytes(),
+                                       cudaMemcpyDeviceToDevice, s));
+        }
     }
 
     Tensor q_recurrent = qc.view({dimension(cfg.gdn->linear_key_head_dim),
@@ -1192,6 +1222,35 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
                 *active_linear_state_destination_slots_, out_batch, s);
         }
+    } else if (recording && shard_config_ != nullptr) {
+        // Head-split shard, replay recording. The record op reads the initial state from an absolute
+        // slot and leaves every state slot untouched, so the window's advance is performed only by
+        // the fold that replays the committed prefix. Its outputs are defined to be bit-identical to
+        // the normalized gated_delta_net below, so the window's own columns keep the same logits.
+        Tensor recurrent_states  = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
+        const std::int32_t width = T;
+        Tensor q_batch           = q_recurrent.view({dimension(cfg.gdn->linear_key_head_dim),
+                                                      dimension(cfg.gdn->linear_num_key_heads), width,
+                                                      record_rows});
+        Tensor k_batch           = k_recurrent.view({dimension(cfg.gdn->linear_key_head_dim),
+                                                      dimension(cfg.gdn->linear_num_key_heads), width,
+                                                      record_rows});
+        Tensor v_batch           = vv.view({dimension(cfg.gdn->linear_value_head_dim),
+                                            dimension(cfg.gdn->linear_num_value_heads), width,
+                                            record_rows});
+        Tensor g_batch =
+            g_local.view({dimension(cfg.gdn->linear_num_value_heads), width, record_rows});
+        Tensor beta_batch =
+            beta_local.view({dimension(cfg.gdn->linear_num_value_heads), width, record_rows});
+        Tensor out_batch = o.view({dimension(cfg.gdn->linear_value_head_dim),
+                                   dimension(cfg.gdn->linear_num_value_heads), width, record_rows});
+        Tensor initial_slots = work_.alloc(DType::I32, {record_rows});
+        ops::set_i32_scalar(initial_slots, linear_state_source_slot_, s);
+        ops::gated_delta_net_replay_record(
+            q_batch, k_batch, v_batch, g_batch, beta_batch,
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(cfg.gdn->linear_key_head_dim))),
+            recurrent_states, Tensor{}, initial_slots, records.key, records.value, records.gate,
+            out_batch, s);
     } else {
         Tensor recurrent_state_in =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);

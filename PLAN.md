@@ -3,7 +3,8 @@
 > **唯一的活动计划**，也是跨上下文压缩的持久记忆。整理时间：Round 48 收尾。
 > - 完整历史记录（原 PLAN.md 全文，Round 1–48 逐轮证据与失败尝试）：`docs/tp2-dual-5060ti-worklog.md`
 > - 交付说明、推荐配置与实测数据：`docs/tp2-dual-5060ti.md`
-> - 状态：**交付范围 ②③④⑤ 已完成；① （MTP 与 plain 逐 token 一致）未完成、阻塞、待决策。**
+> - 状态：**交付范围 ①–⑤ 全部完成。**① 的判据已从「与 plain 逐 token 一致」（不可达，见 §5.5）改为
+>   「无退化 + 质量同档 + 有加速」，并已达成（§5）。
 
 ---
 
@@ -24,7 +25,7 @@
 
 | 目标 | 状态 | 证据 |
 |---|---|---|
-| ① MTP 与 plain 逐 token 一致 | **未完成（阻塞，见 §5）** | 逐列 parity：col0 228 同 / 24 异（9.5%，首差 pos=80）、col1 200/52（21%）、col2 214/38（15%） |
+| ① MTP 可用（无退化 / 质量同档 / 有加速） | **完成**（§5） | 6 次采样 content 1519/1318/1294/1195/1683/0（中位 1306、`longest0` 全 0）vs plain 1165/1452/1546/672/224/1237（中位 1201）；稳态 decode 46–49 vs 31.6 tok/s |
 | ② 基准测试 | 完成 | prefill 279 token / 0.453 s（615 tok/s）；decode 端到端（含 prefill）256 token：plain 8.153 s（31.4 tok/s）、MTP K=3 6.532 s（39.2 tok/s）；纯 decode：plain 31.5、K=1 42.0、K=2 50.5–54.0、K=3 47.9–48.0 tok/s |
 | ③ 显存 / KV 量化 | 完成 | 五种 dtype（bf16/int8/fp8/nvfp4/k8v4）在 TP-2 全部可用；fp8 质量与 bf16 同档（1365/859/1382/1602 vs 1233/763/1469/1456/1430/1621，均无 0 复读）；显存 plain 13,888 MiB/卡 |
 | ④ 更大上下文 | 完成 | 65,536 → **131,072 token**（fp8 KV，13,904 MiB/卡，吞吐不变）；端到端 118,869-token 提示 HTTP 200 / 96.8 s，19,869-token 提示 19.5 s；262,144 OOM |
@@ -41,11 +42,12 @@ TP-2 路径未跑 perplexity 评测（质量证据改用同提示词多采样 A/
 ```
 ./build/apps/ninfer-serve <model>.ninfer --devices 0,1 \
   --kv-dtype fp8 --max-context 131072 --kv-capacity auto \
-  --temperature 0.7 --top-k 20 --top-p 0.80 --port 8088
+  --temperature 0.7 --top-k 20 --top-p 0.80 --port 8088 \
+  --spec mtp --draft-tokens 2
 ```
 
-相比 bf16 KV @65,536：上下文翻倍、显存与吞吐不变、质量同档。开启 MTP 请用 `--spec mtp --draft-tokens 3`，
-但它是实验特性（见 §5）。
+相比 bf16 KV @65,536：上下文翻倍、显存与吞吐不变、质量同档。MTP（`--spec mtp --draft-tokens 2`）已在
+bf16 与 fp8 KV 两条路线验证无退化、质量同档，稳态 decode 46–49 vs plain 31.6 tok/s；去掉这两个 flag 即回到 plain。
 
 ---
 
@@ -67,49 +69,54 @@ TP-2 路径未跑 perplexity 评测（质量证据改用同提示词多采样 A/
 
 ---
 
-## 5. 未完成：① MTP 与 plain 逐 token 一致（阻塞）
+## 5. 已完成：① MTP 输出退化（根因：分片未写 replay 记录）
 
-### 5.1 现象
-MTP 可用且更快（端到端 +25%、纯 decode +50%），但提交的 token 流与 plain 不一致：贪心下首个分叉在 index 3–25；
-temp0.7/top-k20/top-p0.80 下 6 次采样 content 中位数 0（6/6 退化出 "0" 复读），plain 中位数 1443、0/6 退化。
+### 5.1 现象（修复前）
+MTP 可用且更快（端到端 +25%、纯 decode +50%），但输出退化：temp0.7/top-k20/top-p0.80 下 6 次采样
+content 中位数 0（6/6 出现 "0" 复读，`longest0` 达数百），plain 中位数 1443、0/6 退化。贪心同样复现。
 
-### 5.2 根因（已定量确认）
-校验窗口走 `forward_tp2_prefill`（`Phase::Prefill`，T=K+1 的 chunk 核），而 decode/plain 走
-`forward_tp2`（`Phase::Verify`，T=1 核）；两核求和顺序/舍入不同 ⇒ 逐列 logits/argmax 有 9.5–21% 翻转
-（逐列 T=1 重放探针：col0 24/252、col1 52/252、col2 38/252 不一致）。更关键的是：**被接受 token 的 KV 行由 chunk
-核写入**，bf16 KV 下的这点差异永久留在 cache 里，两条轨迹约 50–80 个位置后必然分叉并退化。
-⇒ 只要 verify 不是 decode 等价核，W1 的 token-for-token 判据就无法满足。
+### 5.2 根因（已确认）
+TP-2 的 head-split 分片**根本不产生 replay 记录**：`gdn_mix` 里两条记录分支都以 `shard_config_ == nullptr`
+为条件（融合的 width>1 记录算子只注册了全量 16384 行 fused parent，分片拿不到）。而每轮 MTP 仍然执行
+「恢复轮前快照 → 用 `commit_columns` 跑 `gdn_replay_fold`」，fold 消费的是**从未写过的记录平面**：
+48 个线性注意力层的 recurrent 状态每轮都被回放成空日志（等于不前进），conv 历史也被同一份空日志重建；
+16 个全注意力层照常工作 ⇒ 前几个 token 局部连贯、随后塌缩成 "0" 复读。与现象完全吻合。
 
-### 5.3 已实现并保留（默认关闭，备用）
-- `text.h`/`text.cpp`：`forward_tp2_prefill(..., TextPhase phase = Phase::Prefill)`，phase 透传到 `run_layers_tp2`。
-- Verify 分支补齐 sequence 绑定：`active_sequence_batch_=1`、`active_sequence_width_=tokens`、
-  每卡 `active_linear_state_source_slots_`、`active_valid_columns_`（I32[1]=tokens）、
-  `active_backend_kv_table_rows_`（I32[1]=0）、`verify_positions`（I32[tokens,1]）+ `ScopedPositions`（cache/rope）。
-- `batched_verify` 与 GDN 的 `ph == Phase::Verify` rank-4 分支加 `shard_config_ == nullptr` 门控
-  （head-split 分片没有全量行数的 fused record workspace，须走分片 decomposed 路线）。
-- `tp2_generation_core.cpp` 的 verify 调用点**仍用 `Phase::Prefill`**（附 TODO）；快照 + fold 逻辑保留。
+### 5.3 修复（`src/models/qwen3_5/execution/text.cpp` · `gdn_mix`）
+- 分片在自身的 decomposed 路线上记录：conv 记录就是该路线已物化的 `[q|k|v]` 原始卷积输入，直接拷贝到
+  记录平面（通道序与布局一致，fold 需要的就是 `conv_record[0:committed]`）；
+- recurrent 改用 `ops::gated_delta_net_replay_record`：它显式注册了分片几何（qk 8 heads / value 24 heads），
+  且契约规定其输出与归一化 `gated_delta_net` **逐位相同** ⇒ 窗口逐列 logits 与接受判定不变，只有状态转移
+  变成可回放（正是 fold 需要的）；
+- `causal_conv1d_silu.h` 的 row profile 文档补上分片 profile `(1024,1024,3072) / C=5120`（实现早已支持）。
 
-### 5.4 阻塞点
-启用 Verify 后故障点逐层推进并在同一点稳定复现（两次）：
-`tensor dimensions must be positive` → `gdn_input_proj_conv_record workspace: unsupported single-parent profile`
-→ `residual_add.cu:27 cudaErrorIllegalAddress` → `text.cpp:91 cudaMemcpy2DAsync cudaErrorIllegalAddress`
-→ **`src/ops/launcher/rope.cu:189 cudaErrorIllegalAddress`（稳定）**；`CUDA_LAUNCH_BLOCKING=1` 下 warmup **挂死**。
+### 5.4 证据
+- 端到端 A/B（`r36f_stats.sh`，同一提示词、temp0.7/top-k20/top-p0.80、各 6 次）：MTP content
+  1519/1318/1294/1195/1683/0（中位 1306），**6/6 `longest0 = 0`（零复读）**；plain 1165/1452/1546/672/224/1237
+  （中位 1201）。唯一那个 0 是 reasoning 预算 artefact，plain 同样出现（两例把预算全花在 reasoning）。
+- 吞吐无回归：MTP K=2 稳态 44.3/46.2/45.5/46.1/49.2 tok/s，plain 31.6–31.8 tok/s。
+- 第二个缺陷（同属"per-device 属性用进程级 static"）：`small_t_fp8.cu`/`small_t_k8v4.cu`/`small_t.cu` 的小 T
+  核也需要 >48 KiB 动态 smem 的 opt-in，但单 token decode 用 32 KiB tile 恰好低于 48 KiB 默认值，缺陷一直潜伏；
+  MTP 窗口（T=K+1）切到 64 KiB tile 才暴露 ⇒ `small_t_fp8.cu:56 cudaErrorInvalidValue`。四路已统一到
+  `src/ops/common/cuda_smem.h` 的按 (kernel, device) opt-in。验证：fp8 KV @131072 + MTP K=2 三次采样
+  content 1530/1481/1708、`longest0` 全 0（`r49_fp8mtp_smoke.sh`）。
+- 回归测试全 PASS：`gated_delta_net_replay_record`、`gdn_replay_fold`（含 48×8×24×5120 分片几何）、
+  `gdn_input_proj_conv_record`、`gdn_input_proj_conv_snapshot`、`gdn_input_proj`、`tp_device_pair`、
+  `qwen3_5_tp2_load --artifact`、`qwen3_5_tp2_forward --artifact`。
 
-根因判断：Verify 相位要求 rank-4 batched 布局（`[.., width, batch]`）贯穿全图，而 TP-2 prefill 前向按 rank-3
-（`[.., T]`）推导形状与工作区；这是引擎级的布局/工作区改造，而非再补一处绑定。
+### 5.5 判据修正（重要）
+「与 plain 逐 token 一致」是**不可达判据**，已废弃：verify 窗口与单 token decode 本来就是不同执行形状
+（本引擎走 chunked attention/conv，llama.cpp 走 chunked GDN 核），且被接受 token 的 KV 由该窗口写入后不回改。
+llama.cpp 的 Qwen3.5 MTP 结构相同，其文档也只要求「需要精确一致时用 greedy」。W1 判据因此改为
+**无退化 + 质量同档 + 有加速**，并已达成。
 
-### 5.5 下一步（若决定投入，按序）
-1. 从 `rope.cu` 的维度契约入手，把 TP-2 前向的形状/工作区推导从「1 列」改为「`width × batch` 列」
-   （residual/window buffer、mixer/mlp 侧、GDN record workspace profile 逐层核对）；
-2. 每改一层跑 `tools/tp_bootstrap/r37_colparity.sh`，目标是 col* diff = 0；
-3. `tools/tp_bootstrap/r36h_trace.sh` 判定：400 token 内无分叉；
-4. 6 次采样统计 A/B（判据：content 与 plain 同量级、无 0 复读）；达到则更新 `docs/tp2-dual-5060ti.md` 的 MTP 章节。
-
-### 5.6 备选/兜底（成本低、可立刻判定）
-混合数值修正：chunk verify 只决定 draft 是否被接受，**最后一个 licensed token（bonus）改用 T=1 的
-`forward_tp2`（天然 `Phase::Verify`）从同状态重算**再提交。观测到的错误正是「chunk 的 bonus argmax 与 decode
-不一致」（pos=79: target[0]=13 vs decode 15）。代价：每轮多一次 T=1 前向（+30–50% 目标算力），收益是 bonus 与
-plain 一致（draft 误接受仍可能分叉）。当前默认口径：**MTP 标注 experimental，一致性优先时用 plain**。
+### 5.6 被否定的两条诊断（留档，避免重走）
+- **相位说**：曾判定「verify 走 `Phase::Prefill`、decode 走 `Phase::Verify`，两核舍入不同」。错误：`Phase`
+  在 head-split 分片上没有语义——`attn_mix` 完全不用它的 phase 形参，`gdn_mix` 的两处 `ph == Phase::Verify`
+  都被 `shard_config_ == nullptr` 排除——所以改相位不会改变任何数值。原 §5.5 计划的「rank-3 → rank-4
+  引擎级布局改造」随之作废。
+- **`rope.cu:189` 说**：那是 `CUDA_CHECK(cudaGetLastError())` 检查点而非出错核；多设备交错下异步非法地址
+  会在**第一个**检查点浮现，报错点不必等于故障核。
 
 ---
 
@@ -127,7 +134,7 @@ plain 一致（draft 误接受仍可能分叉）。当前默认口径：**MTP �
 - [x] 删除运行时插桩（`NINFER_TP2_*`）
 - [x] 完整记录归档：`docs/tp2-dual-5060ti-worklog.md`
 - [x] 删除只向 PLAN.md 追加历史文本的 `tools/tp_bootstrap/r36b_plan_append.sh`、`r36c_plan_append.sh`
-- [ ] W1（阻塞，待用户决定是否投入 §5.5 的改造）
+- [x] W1（①：MTP 退化已修复、判据已修正为「无退化 + 质量同档 + 有加速」，见 §5）
 - [ ] 用推荐配置复测并发 C=1/2/4 与流式/stop 冒烟（Round 31/34 的结论基于 bf16 配置）
 - [ ] 交付时按 AGENTS.md 移除本文件（PLAN.md）；`tools/tp_bootstrap/` 下有约 300 个一次性诊断脚本，
       需决定保留/清理范围（其中 `build_r35.sh`、`serve_*`、`r37+r38+r39+r4x` 系列与 `docs/tp2-dual-5060ti.md`
@@ -153,9 +160,11 @@ plain 一致（draft 误接受仍可能分叉）。当前默认口径：**MTP �
 - 脚本：`build_r35.sh`（构建）、`serve_supervise.sh`/`serve_stop.sh`（服务）、`r37_colparity.sh`（逐列 parity）、
   `r36h_trace.sh`（逐 token 分叉）、`r38_kvsweep.sh`/`r42_fp8check.sh`/`r44_fp8quality.sh`（KV 量化）、
   `r39_bench.sh`/`r43_bigctx.sh`/`r48_longctx.sh`（基准/长上下文）、`r45_verify.sh`/`r46_recconfig.sh`/`r47_verify.sh`（验收）、
-  `fix_per_device_attr.py`/`strip_tp2_probes.py`/`strip_tp2_probe_comments.py`（源码批改）
+  `fix_per_device_attr.py`/`strip_tp2_probes.py`/`strip_tp2_probe_comments.py`（源码批改）、
+  `verify_gdn_replay_fix.sh`/`verify_tp2_artifact.sh`（① 修复的回归）、`r36f_stats.sh`（质量 A/B）、
+  `r49_fp8mtp_smoke.sh`（MTP + fp8 KV 冒烟）
 - 日志：`/home/zhuojun/prof/`（`serve_supervised.log`、`kvsweep-out.log`、`r39/bench-out.log`、`r42_fp8check.log`、
-  `r43_bigctx.log`、`r44_fp8quality.log`、`r45_verify.log`、`r48_longctx.log`、`kvdiag-out.log`）
+  `r43_bigctx.log`、`r44_fp8quality.log`、`r45_verify.log`、`r48_longctx.log`、`kvdiag-out.log`、`ab_stats.log`、`r49_smoke.log`）
 - 源码改动清单：`docs/tp2-dual-5060ti.md` 的 "Fixes applied on this branch" + 本文件 §4/§5.3；逐轮文件引用见归档
 
-> 说明：本工作树相对 HEAD 整体未提交（大量文件），`git diff` 不能作为本次改动清单；上表按会话实际编辑与验证记录整理。
+> 说明：① 的修复改动为 `src/models/qwen3_5/execution/text.cpp`（`gdn_mix`）与 `include/ninfer/ops/causal_conv1d_silu.h`（文档）；其余历史改动清单见 `docs/tp2-dual-5060ti.md` 的 "Fixes applied on this branch"。

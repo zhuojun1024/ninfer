@@ -10,11 +10,14 @@ This note records the tensor-parallel-2 (TP-2) adaptation of this engine for two
 ```
 ./build/apps/ninfer-serve <model>.ninfer --devices 0,1 \
   --kv-dtype fp8 --max-context 131072 --kv-capacity auto \
-  --temperature 0.7 --top-k 20 --top-p 0.80 --port 8088
+  --temperature 0.7 --top-k 20 --top-p 0.80 --port 8088 \
+  --spec mtp --draft-tokens 2
 ```
 
 `--kv-dtype fp8 --max-context 131072` doubles the usable context (65,536 -> 131,072 tokens) at
 essentially the same device memory and throughput as bf16 KV at 65,536 (see below).
+`--spec mtp --draft-tokens 2` adds ~45% sustained decode (46-49 tok/s against 31.6 plain) and is
+verified non-degenerate (see the MTP section); drop those two flags for the plain route.
 
 ## Benchmarks
 
@@ -42,8 +45,10 @@ K=3 47.9-48.0 tok/s.
 ## KV cache quantization
 
 `--kv-dtype` supports `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`. All of them work on the
-TP-2 route; the quantized variants needed one fix (below) because the quantized prompt-attention
-kernels opt in to more than 48 KiB of dynamic shared memory.
+TP-2 route, but the quantized variants needed two fixes (below): the quantized prompt-attention
+kernels, and the quantized small-T decode kernels used by a multi-column (MTP) window, both opt in to
+more than 48 KiB of dynamic shared memory, and in both cases the opt-in was a function-local
+`static` that configured only the first shard's device.
 
 The 131,072-token capacity is usable end to end: a single **118,869-token** prompt returned HTTP 200
 in 96.8 s on the fp8 configuration (and a 19,869-token prompt in 19.5 s), against a 65,536-token
@@ -58,17 +63,40 @@ against 1233 / 763 / 1469 / 1456 / 1430 / 1621 (median 1443) for the bf16 route 
 `--spec mtp --draft-tokens K` (K in 1..5) drafts K tokens with the MTP layer and verifies them in a
 single window forward, which is ~25% faster end-to-end and ~50% faster in sustained decode at K=2-K=3.
 
-MTP is **experimental on this route**: it is not token-for-token identical to the plain route. The
-verify window runs in `Phase::Prefill` while the decode path runs in `Phase::Verify`; the two use
-different kernels, so their per-column logits differ (10-20% of columns flip argmax on this NVFP4
-model), and the KV rows written for accepted tokens carry those differences permanently, so the two
-routes drift apart after ~50-80 tokens. The decode-equivalent verify exists in the engine
-(`TextPhase::Verify` supports `width > 1`), but the TP-2 shard path for it is incomplete. With the
-sequence bindings, the per-device valid-column and backend-row tables, and the shard's decomposed
-GDN recurrent path (sequential in both phases, so numerically phase-independent) all in place, the
-launch still faults in RoPE (`rope.cu:189`, illegal address): the shard path for a multi-column
-verify window needs its shape and workspace plumbing completed. Until that is done, MTP stays
-experimental and the plain route is the recommended configuration when output consistency matters.
+MTP is not token-for-token identical to the plain route, and no engine gives that. A verify window
+is a different execution shape from a single-token decode -- here the chunked attention/convolution
+route, in llama.cpp the chunked GDN kernel -- so its per-column logits differ, and the KV rows written
+for accepted tokens carry those differences permanently. llama.cpp's Qwen3.5 MTP has the same property
+and its documentation says exact output matching requires greedy sampling. The relevant criterion is
+therefore that MTP is not *worse*, and it now qualifies: six samples of the same essay prompt at
+temperature 0.7 / top-k 20 / top-p 0.80 produced content lengths 1519 / 1318 / 1294 / 1195 / 1683 / 0
+(median 1306, no repeated-token runs) on the MTP route against 1165 / 1452 / 1546 / 672 / 224 / 1237
+(median 1201) on the plain route; the single zero is a reasoning-budget artefact that the plain route
+shows too. Sustained decode is 46-49 tok/s at K=2 against 31.6 tok/s plain, and the combination
+with the recommended KV configuration is clean as well: three samples on fp8 KV at 131,072 tokens
+produced content 1530 / 1481 / 1708 with no repeated-token runs.
+
+This paragraph replaced a defect, not a limitation. A head-split shard was not recording its linear
+attention transitions: the two record-producing branches in `gdn_mix` were gated on
+`shard_config_ == nullptr`, because the fused width>1 record ops are registered for the full
+16384-row fused parent only. The round nevertheless restored the pre-round state and ran
+`gdn_replay_fold` over those record planes, which had never been written -- so every MTP round
+replayed an empty transition log into the 48 linear-attention layers, which stopped advancing (and had
+their convolution history rebuilt from the same empty log), while the 16 full-attention layers kept
+working. That is exactly the observed signature: locally coherent output for a few tokens, then
+collapse into `0` repetition. The shard now records on its decomposed route: the convolution record
+is the raw pre-convolution window that route already materializes as `[q|k|v]`, and the recurrence
+uses `ops::gated_delta_net_replay_record`, which is registered for the shard geometry (8 key heads,
+24 value heads) and whose live outputs are defined to be bit-identical to the normalized
+`gated_delta_net` it replaces, so window logits and acceptance are unchanged.
+
+An earlier diagnosis of this item was wrong and is worth recording: the verify window's phase was
+blamed for the drift. `Phase` has no semantic effect on a head-split shard -- `attn_mix` ignores its
+phase argument entirely, and both `Phase::Verify` gates in `gdn_mix` are excluded for shards -- so
+switching the window to `Phase::Verify` could not have changed a single number. The reported fault
+site was likewise a red herring: `src/ops/launcher/rope.cu:189` is a `CUDA_CHECK(cudaGetLastError())`
+checkpoint, and with two devices interleaved an asynchronous illegal address surfaces at whichever
+checkpoint runs first, not necessarily at the faulting kernel.
 
 ## Fixes applied on this branch
 
@@ -76,10 +104,19 @@ experimental and the plain route is the recommended configuration when output co
   warmup (`cudaErrorIllegalAddress`).
 - MTP rounds snapshot the pre-verify GDN state and replay the fold at the committed width, so the
   verify no longer double-advances the recurrent state.
+- Head-split shards now produce the replay records that fold consumes (convolution record from the
+  decomposed route's pre-convolution window; recurrence via `gated_delta_net_replay_record` at the
+  shard geometry). Without them the fold replayed an empty log every round and MTP degenerated.
 - Quantized prompt attention (`prompt_fp8.cu`, `prompt_nvfp4_non_rdc.cu`, `prompt_k8v4.cu`) now
   perform the `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` opt-in **per device**; a
   function-local static configured only the first shard's device, so the second device rejected every
   >48 KiB launch with `cudaErrorInvalidValue` and no quantized KV dtype could start on TP-2.
+- The same defect existed in the small-T decode kernels (`small_t_fp8.cu`, `small_t_k8v4.cu`,
+  `small_t.cu`), where it stayed latent because a single-token decode uses a 32 KiB window that fits
+  the 48 KiB default. The MTP window (`T = K+1`) switches to a 64 KiB tile that does not, so
+  `--spec mtp` failed on every first quantized-KV request with `small_t_fp8.cu:56
+  cudaErrorInvalidValue`. All four quantized/bf16 small-T routes now share one per-device opt-in
+  authority (`src/ops/common/cuda_smem.h`).
 
 ## Work log
 

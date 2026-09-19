@@ -8,6 +8,7 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "ops/common/cuda_smem.h"
 #include "ninfer/ops/softmax_attention.h"
 
 #include <cstdint>
@@ -137,12 +138,12 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         constexpr std::size_t kDynamicBytes =
             DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kCausalHeadDim) : 0u;
         if constexpr (DynamicArena) {
-            static const cudaError_t attr = cudaFuncSetAttribute(
-                causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
-                                                         MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                         MultiBatch, Masked, CacheInput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
-            CUDA_CHECK(attr);
+            ensure_max_dynamic_shared_memory(
+                reinterpret_cast<const void*>(
+                    causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
+                                                             MinBlocksPerSm, KeyBlock, DynamicArena,
+                                                             MultiBatch, Masked, CacheInput>),
+                static_cast<int>(kDynamicBytes));
         }
         causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
                                                  KeyBlock, DynamicArena, MultiBatch, Masked,

@@ -1249,3 +1249,41 @@ Windows 原生移植（走 WSL2）、新架构支持。
 - 下一步（决定性的判定实验）：对同一个窗口，逐列比较 verify 的 argmax（window_logits）与 plain 路径
   按 token 逐个 decode 的 argmax；首个不一致的列即定位点。
 - 当前服务状态：8088 已切回 plain（无 MTP），MTP 在输出质量修复前不建议用于测试。
+
+### Round 49 — W1 结案：根因是分片未写 replay 记录（已修复并验证）
+- 方法：对照 `C:\llama.cpp` 的 Qwen3.5 MTP（`src/models/qwen35.cpp` 的 `graph_mtp`、`common/speculative.cpp:1324` 的
+  `common_speculative_impl_draft_mtp`、`src/llama-memory-recurrent.cpp:193-203` 的快照回卷）来定判据与结构。
+- 门控重估（推翻 36c/36g 的相位假说）：`Phase` 在 head-split 分片上**没有语义**——`attn_mix` 的 phase 形参未被使用
+  （`text.cpp:871-989`），`gdn_mix` 的两处 `ph == Phase::Verify` 都被 `shard_config_ == nullptr` 排除
+  （全文件 `shard_config_` 只有 1024/1069/1159 三处命中），`mixer_layer`/`mlp_layer`/`tp_mlp_delta` 的 `prefill`
+  只用于 NVTX 名与异常文本 ⇒ 改相位不改变任何数值，36c 的「decode 等价 Verify 相位」计划作废。
+- 判据重估：llama.cpp 的 verify 也不是 decode 等价核（`n_seq_tokens > 1` 走 chunked `GDN_CH`，`==1` 走 `GDN_AR`，
+  `delta-net-base.cpp:433-446`）；被接受 token 的 KV 由该窗口写入后不回改（`server-context.cpp:3992-3998` 只截尾）；
+  bonus token 取自同一次 K+1 verify（`sampling.cpp:697-702`）；`docs/speculative.md:213` 明确「需要精确一致时用 greedy」。
+  ⇒ 「与 plain 逐 token 一致」为不可达判据，替换为「无退化 + 质量同档 + 有加速」。
+- **根因**：TP-2 的 head-split 分片不产生 replay 记录。`gdn_mix` 的两条记录分支都以 `shard_config_ == nullptr`
+  为条件（融合 width>1 记录算子只注册全量 16384 行 fused parent，`gdn_input_proj.cpp:860-864` 的 workspace 查询
+  正是 36c 报出的 `unsupported single-parent profile`），而 `tp2_generation_core.cpp:872-886` 每轮仍然执行
+  「恢复轮前快照 + `gdn_replay_fold(commit_columns=committed)`」，fold 消费的是**从未写过的记录平面** ⇒
+  48 个线性注意力层每轮被回放成空日志（recurrent 不前进、conv 历史被同一份空日志重建），16 个全注意力层正常
+  ⇒ 前几 token 连贯、随后 "0" 复读。与 36f/36g 现象吻合。
+- **修复 1**（`text.cpp` 的 `gdn_mix`）：分片在自身 decomposed 路线上记录——conv 记录 = 该路线已物化的 `[q|k|v]`
+  原始卷积输入（直接拷贝；通道序与布局同记录平面）；recurrent 改用 `ops::gated_delta_net_replay_record`
+  （`replay.cpp:107-110` 显式注册分片几何 `qk_heads=8, value_heads=24`；契约规定其输出与归一化 `gated_delta_net`
+  逐位相同）⇒ 窗口 logits/接受判定不变，只有状态转移变得可回放。另补 `causal_conv1d_silu.h` 的 row profile 文档
+  （`(1024,1024,3072)/C=5120` 实现早已支持）。
+- 副产物（避免重走弯路）：`src/ops/launcher/rope.cu:189` 是 `CUDA_CHECK(cudaGetLastError())` 检查点而非出错核，
+  多设备交错下报错点不必等于故障核 ⇒ 36c 的「rope 维度契约 → 引擎级 rank-3→rank-4 改造」前提不成立。
+- 验证 1：端到端 A/B（`r36f_stats.sh`，同提示词、temp0.7/top-k20/top-p0.80、各 6 次）MTP content
+  1519/1318/1294/1195/1683/0（中位 1306、6/6 `longest0=0`）vs plain 1165/1452/1546/672/224/1237（中位 1201）；
+  吞吐 MTP K=2 稳态 44.3–49.2 vs plain 31.6–31.8 tok/s（无回归）。唯一那个 0 是 reasoning 预算 artefact，plain 同样出现。
+- **修复 2**（新发现的同族缺陷）：`small_t_fp8.cu`/`small_t_k8v4.cu`/`small_t.cu` 的小 T 核同样需要 >48 KiB
+  动态 smem opt-in，但用的是**进程级 `static`**。单 token decode 用 32 KiB tile（低于 48 KiB 默认值）所以缺陷潜伏；
+  MTP 窗口 T=K+1 切到 64 KiB tile 才暴露 ⇒ MTP + 量化 KV 的每个首请求都 `small_t_fp8.cu:56 cudaErrorInvalidValue`
+  （kCausalHeadDim=256：4*64*256=64 KiB）。四路统一到 `src/ops/common/cuda_smem.h` 的按 (kernel, device) opt-in。
+- 验证 2：fp8 KV @131072 + MTP K=2 三次采样 content 1530/1481/1708、`longest0` 全 0、finish=stop（`r49_fp8mtp_smoke.sh`）。
+- 回归测试全 PASS：`gated_delta_net_replay_record`、`gdn_replay_fold`（含 48×8×24×5120 分片几何）、
+  `gdn_input_proj_conv_record`、`gdn_input_proj_conv_snapshot`、`gdn_input_proj`、`tp_device_pair`、
+  `softmax_attention`、`kv_cache_append`、`context_kv_materialize`、`sliding_window_attention`、
+  `qwen3_5_tp2_load/forward --artifact`；`BUILD_EXIT=0`。
+- 服务状态：8088 = 推荐配置（fp8 KV @131072 + MTP K=2 + temp0.7/top-k20/top-p0.80）。
