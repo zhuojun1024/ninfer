@@ -248,6 +248,26 @@ int main() {
     failures += check(!semantics.reasoning_effort &&
                           semantics.effective_reasoning_effort == ninfer::ReasoningEffort::XHigh,
                       "omitted reasoning effort did not resolve to the template default");
+
+    // --reasoning-effort is the process default for requests that omit an effort, an explicit
+    // request field still wins, and a level the loaded template cannot render is rejected at parse
+    // time instead of silently degrading.
+    const ServeOptions effort_default =
+        parse({"ninfer-serve", "model.ninfer", "--reasoning-effort", "medium"});
+    failures += check(effort_default.default_reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "--reasoning-effort did not reach serving options");
+    ninfer::PromptCapabilities medium_capabilities    = prompt_capabilities;
+    medium_capabilities.reasoning_effort.medium       = true;
+    const auto medium_semantics =
+        resolve_prompt_semantics(request, effort_default, medium_capabilities);
+    failures += check(medium_semantics.effective_reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "server reasoning-effort default was not resolved");
+    bool unsupported_effort_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--reasoning-effort", "high"});
+    } catch (const std::invalid_argument&) { unsupported_effort_rejected = true; }
+    failures += check(unsupported_effort_rejected,
+                      "--reasoning-effort accepted a level outside low|medium|xhigh");
     failures +=
         check(to_request_options(request, defaults, semantics, true).execution.allow_prefix_reuse,
               "resolved read-write cache policy did not reach Engine options");
@@ -284,6 +304,9 @@ int main() {
         check(explicit_effort.reasoning_effort == ninfer::ReasoningEffort::Low &&
                   explicit_effort.effective_reasoning_effort == ninfer::ReasoningEffort::Low,
               "explicit reasoning effort did not remain the effective effort");
+    failures += check(resolve_prompt_semantics(request, effort_default, medium_capabilities)
+                              .effective_reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "request reasoning effort did not win over the server default");
     request.reasoning_effort.reset();
     failures +=
         check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
@@ -307,6 +330,9 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--default-thinking-budget") !=
                           std::string::npos,
                       "serve help omits --default-thinking-budget");
+    failures += check(serve_usage_text("ninfer-serve").find("--reasoning-effort low|medium|xhigh") !=
+                          std::string::npos,
+                      "serve help omits --reasoning-effort");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
     failures +=

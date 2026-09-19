@@ -1766,7 +1766,8 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
                                       std::span<const int> ids, std::int32_t first_position,
                                       Tensor* logits, Tensor* logits_peer,
                                       Tensor* mtp_input_hidden, Tensor* logits_columns,
-                                      Tensor* hidden_columns, Phase phase) {
+                                      Tensor* hidden_columns, Phase phase,
+                                      const Tp2VisionChunk* vision) {
     const std::int32_t hidden = dimension(config_.hidden_size);
     const std::int32_t vocab  = dimension(config_.vocab_size);
     const std::int32_t tokens = static_cast<std::int32_t>(ids.size());
@@ -1795,9 +1796,17 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
     // is exactly the binding the validated single-device prefill chunk uses.
     const std::uint32_t visible_end =
         static_cast<std::uint32_t>(first_position) + static_cast<std::uint32_t>(tokens);
+    if (vision != nullptr &&
+        (vision->positions == nullptr ||
+         vision->prompt_tokens < static_cast<std::size_t>(first_position) +
+                                   static_cast<std::size_t>(tokens))) {
+        throw std::invalid_argument(
+            "forward_tp2_prefill: multimodal chunk has no prompt position table");
+    }
     struct BindState {
         Tensor ids;
         Tensor positions;
+        Tensor rope_positions;
         Tensor kv_table_rows;
         Tensor state_source;
         Tensor state_destination;
@@ -1815,6 +1824,24 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
         b.positions   = arena.alloc(DType::I32, {tokens});
         copy_i32(ids.data(), b.ids, c.ctx_.stream);
         ops::fill_i32_positions(b.positions, first_position, c.ctx_.stream);
+        if (vision != nullptr) {
+            // A multimodal prompt carries its own 3-axis (temporal, height, width) RoPE table for
+            // every token; the cache position stays the plain absolute index, so the two bindings
+            // stop coinciding for this request.
+            // [tokens, 3]: the token index is contiguous, matching the single-device route's
+            // [tokens, axes] binding (neo[1] == 3 is what makes the RoPE op read the MRoPE table).
+            b.rope_positions = arena.alloc(DType::I32, {tokens, 3});
+            std::vector<std::int32_t> host(static_cast<std::size_t>(3) * tokens);
+            for (int axis = 0; axis < 3; ++axis) {
+                std::copy_n(vision->positions +
+                                static_cast<std::size_t>(axis) * vision->prompt_tokens +
+                                static_cast<std::size_t>(first_position),
+                            tokens, host.data() + static_cast<std::size_t>(axis) * tokens);
+            }
+            copy_i32(host.data(), b.rope_positions, c.ctx_.stream);
+        } else {
+            b.rope_positions = b.positions;
+        }
         b.kv_table_rows = arena.alloc(DType::I32, {1});
         ops::set_i32_scalar(b.kv_table_rows, 0, c.ctx_.stream);
         b.state_source = arena.alloc(DType::I32, {1});
@@ -1825,17 +1852,18 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
     };
     const BindState bind0 = make_bind(*this, work_);
     const BindState bind1 = make_bind(peer, peer.work_);
-    // Cache and RoPE positions coincide here: the TP-2 path runs without vision or a RoPE delta, so
-    // the cache position of every chunk token is its own absolute position.
+    // Cache and RoPE positions coincide for a text prompt: the TP-2 path runs without a RoPE delta,
+    // so the cache position of every chunk token is its own absolute position. A multimodal prompt
+    // binds the prompt's 3-axis table instead (see make_bind).
     ScopedPositions cache0(active_cache_positions_, bind0.positions);
-    ScopedPositions rope0(active_rope_positions_, bind0.positions);
+    ScopedPositions rope0(active_rope_positions_, bind0.rope_positions);
     ScopedEnvelope envelope0(active_causal_attention_envelope_, bind0.envelope);
     ScopedValue<const Tensor*> kv0(active_kv_table_rows_, &bind0.kv_table_rows);
     ScopedValue<const Tensor*> source0(active_linear_state_source_slots_, &bind0.state_source);
     ScopedValue<const Tensor*> destination0(active_linear_state_destination_slots_,
                                             &bind0.state_destination);
     ScopedPositions cache1(peer.active_cache_positions_, bind1.positions);
-    ScopedPositions rope1(peer.active_rope_positions_, bind1.positions);
+    ScopedPositions rope1(peer.active_rope_positions_, bind1.rope_positions);
     ScopedEnvelope envelope1(peer.active_causal_attention_envelope_, bind1.envelope);
     ScopedValue<const Tensor*> kv1(peer.active_kv_table_rows_, &bind1.kv_table_rows);
     ScopedValue<const Tensor*> source1(peer.active_linear_state_source_slots_,
@@ -1847,6 +1875,55 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
     Tensor x      = work_.alloc(DType::BF16, {hidden, tokens});
     Tensor x_peer = peer.work_.alloc(DType::BF16, {hidden, tokens});
     embedding_tp2(peer, pair, bind0.ids, &bind1.ids, x, &x_peer);
+    if (vision != nullptr && vision->has_item()) {
+        const auto& control = *vision->control;
+        const auto scatter  = std::span<const std::int32_t>(control.scatter_indices);
+        const auto begin    = std::lower_bound(scatter.begin(), scatter.end(), first_position);
+        const auto stop     = std::lower_bound(begin, scatter.end(), first_position + tokens);
+        const auto count    = static_cast<std::int32_t>(stop - begin);
+        if (count != 0) {
+            const std::int32_t merged = static_cast<std::int32_t>(control.merged_count);
+            if (vision->embeddings == nullptr || vision->embeddings->dtype != DType::BF16 ||
+                vision->embeddings->ne[0] != hidden || vision->embeddings->ne[1] != merged) {
+                throw std::invalid_argument(
+                    "forward_tp2_prefill: vision embeddings do not match the encoded item");
+            }
+            const std::int32_t visual_begin = static_cast<std::int32_t>(begin - scatter.begin());
+            if (visual_begin + count > merged) {
+                throw std::invalid_argument(
+                    "forward_tp2_prefill: vision scatter runs past the encoded item");
+            }
+            std::vector<std::int32_t> local(static_cast<std::size_t>(count));
+            for (std::int32_t i = 0; i < count; ++i) {
+                local[static_cast<std::size_t>(i)] = begin[i] - first_position;
+            }
+            const std::size_t row_bytes = static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+            const std::size_t bytes     = row_bytes * static_cast<std::size_t>(count);
+            // The Vision shard owns the encoded item, so only its side reads the handoff tensor: the
+            // pair copies this chunk's contiguous column range into both arenas with one in-place
+            // all-reduce over a zeroed text-shard buffer. That is exact (a sum with zero), keeps the
+            // resident cost bounded by the chunk rather than by the item, and needs no second tower.
+            ctx_.bind_to_current_thread();
+            Tensor staging = work_.alloc(DType::BF16, {hidden, count});
+            CUDA_CHECK(cudaMemsetAsync(staging.data, 0, bytes, ctx_.stream));
+            peer.ctx_.bind_to_current_thread();
+            Tensor source = peer.work_.alloc(DType::BF16, {hidden, count});
+            CUDA_CHECK(cudaMemcpyAsync(source.data,
+                                       vision->embeddings->data +
+                                           static_cast<std::size_t>(visual_begin) * row_bytes,
+                                       bytes, cudaMemcpyDeviceToDevice, peer.ctx_.stream));
+            pair.allreduce(staging.data, source.data, bytes, ctx_.stream, peer.ctx_.stream);
+            ctx_.bind_to_current_thread();
+            Tensor indices = work_.alloc(DType::I32, {count});
+            copy_i32(local.data(), indices, ctx_.stream);
+            ops::scatter(staging, indices, x, ctx_.stream);
+            peer.ctx_.bind_to_current_thread();
+            Tensor indices_peer = peer.work_.alloc(DType::I32, {count});
+            copy_i32(local.data(), indices_peer, peer.ctx_.stream);
+            ops::scatter(source, indices_peer, x_peer, peer.ctx_.stream);
+            ctx_.bind_to_current_thread();
+        }
+    }
     NullTap tap;
     if (phase == Phase::Verify) {
         // The verify window runs the phase the single-token decode path runs, so its per-column

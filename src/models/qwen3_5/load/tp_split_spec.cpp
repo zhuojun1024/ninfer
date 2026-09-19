@@ -50,7 +50,7 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
     std::map<std::size_t, std::set<std::string>> names_by_object;
     for (const auto& [name, binding] : directory.bindings) {
         if (name.rfind("text/", 0) != 0 && name.rfind("mtp/", 0) != 0 &&
-            name.rfind("proposal/", 0) != 0) {
+            name.rfind("proposal/", 0) != 0 && name.rfind("vision/", 0) != 0) {
             continue;
         }
         for (const auto& p : binding.parts) { names_by_object[p.object.index].insert(name); }
@@ -69,13 +69,32 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
     TPSplitSpec spec;
     for (std::size_t idx = 0; idx < directory.objects.size(); ++idx) {
         const auto* tensor = std::get_if<TensorObject>(&directory.objects[idx]);
-        if (tensor == nullptr || tensor->shape.size() < 2) { continue; }
-        const std::int32_t n = as_i32(tensor->shape[0]);
-        const std::int32_t k = as_i32(tensor->shape[1]);
+        if (tensor == nullptr) { continue; }
 
         const auto names_it = names_by_object.find(idx);
         const auto& names   = names_it != names_by_object.end() ? names_it->second
                                                                  : std::set<std::string>{};
+        const auto has_prefix = [&](std::string_view prefix) {
+            for (const auto& nm : names) {
+                if (nm.rfind(prefix, 0) == 0) { return true; }
+            }
+            return false;
+        };
+
+        // Shard-local towers are placed before every shape rule so that their 1-D norms and biases
+        // travel with the matrices; their weights are tiny (one layer each) and no execution path on
+        // the other shard reads them, so splitting them would only add a second all-reduce.
+        if (has_prefix("mtp/") || has_prefix("vision/")) {
+            TPObjectSplit local;
+            local.object.index = idx;
+            local.kind         = WeightSplitKind::Replicated;
+            local.shards       = has_prefix("mtp/") ? 0x1U : 0x2U;
+            spec.splits.push_back(std::move(local));
+            continue;
+        }
+        if (tensor->shape.size() < 2) { continue; }
+        const std::int32_t n = as_i32(tensor->shape[0]);
+        const std::int32_t k = as_i32(tensor->shape[1]);
         const auto has_name = [&](std::string_view suffix) {
             for (const auto& nm : names) {
                 if (nm.size() >= suffix.size() &&
@@ -86,23 +105,10 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
             return false;
         };
 
-        const auto has_mtp_name = [&] {
-            for (const auto& nm : names) {
-                if (nm.rfind("mtp/", 0) == 0) { return true; }
-            }
-            return false;
-        };
-
         TPObjectSplit split;
         split.object.index = idx;
 
-        if (has_mtp_name()) {
-            // The MTP proposal runs entirely on shard 0: its weights are tiny (one layer, ~0.2 GiB)
-            // and the proposal's input is bit-identical on both shards (the residual stream is
-            // all-reduced, the embedding replicated), so splitting them would buy sub-millisecond
-            // savings at the cost of a second lockstep all-reduce path. Keep them whole everywhere.
-            split.kind = WeightSplitKind::Replicated;
-        } else if (has_name("token_embedding")) {
+        if (has_name("token_embedding")) {
             // Row-parallel (hidden dimension): each shard holds the whole vocabulary with half the
             // hidden columns, so no token id can fall outside a shard's rows and the gather needs
             // no per-shard bounds handling. The engine assembles the full hidden state from the

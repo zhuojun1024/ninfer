@@ -103,15 +103,27 @@ std::uint64_t object_shard_bytes(const artifact::Reader& reader,
 }
 
 // Total device bytes one shard arena must hold for the whole plan, plus per-object alignment slack.
+// An object placed on the other shard alone contributes nothing to this shard's arena.
 std::uint64_t shard_capacity_bytes(const artifact::Reader& reader,
                                    const artifact::MaterializationPlan& plan,
-                                   const TPSplitSpec& spec) {
+                                   const TPSplitSpec& spec, int shard) {
     std::uint64_t bytes = 0;
     for (const auto& placement : plan.device_objects) {
+        if (!spec.on_shard(placement.object, shard)) { continue; }
         bytes += object_shard_bytes(reader, placement, spec);
         bytes += 256; // per-object alignment headroom
     }
     return bytes;
+}
+
+// Device objects this shard actually materializes (shard-local components are excluded elsewhere).
+std::uint64_t shard_object_count(const artifact::MaterializationPlan& plan, const TPSplitSpec& spec,
+                                 int shard) {
+    std::uint64_t count = 0;
+    for (const auto& placement : plan.device_objects) {
+        if (spec.on_shard(placement.object, shard)) { ++count; }
+    }
+    return count;
 }
 
 // Build a complete Weight descriptor for the full parent, so split_weight can slice it.
@@ -154,15 +166,16 @@ std::pair<artifact::MaterializedArtifact, artifact::MaterializedArtifact> materi
     // Each shard arena holds only its own shard bytes (the full-model capacity would over-allocate
     // ~13GB per GPU and OOM on 16GB cards). DeviceArena's cudaMalloc lands on the current device,
     // so bind each shard's device before its arena is created.
-    const std::uint64_t shard_capacity = shard_capacity_bytes(reader, plan, spec);
+    const std::uint64_t capacity0 = shard_capacity_bytes(reader, plan, spec, 0);
+    const std::uint64_t capacity1 = shard_capacity_bytes(reader, plan, spec, 1);
     device0.bind_to_current_thread();
-    a0.tp_init(plan.object_count, shard_capacity);
+    a0.tp_init(plan.object_count, capacity0);
     device1.bind_to_current_thread();
-    a1.tp_init(plan.object_count, shard_capacity);
+    a1.tp_init(plan.object_count, capacity1);
     a0.tp_stats().file_bytes          = reader.file_bytes();
     a1.tp_stats().file_bytes          = reader.file_bytes();
-    a0.tp_stats().device_object_count = plan.device_objects.size();
-    a1.tp_stats().device_object_count = plan.device_objects.size();
+    a0.tp_stats().device_object_count = shard_object_count(plan, spec, 0);
+    a1.tp_stats().device_object_count = shard_object_count(plan, spec, 1);
     auto& a0_objects = a0.tp_objects();
     auto& a1_objects = a1.tp_objects();
     auto& a0_arena   = a0.tp_arena();
@@ -183,6 +196,7 @@ std::pair<artifact::MaterializedArtifact, artifact::MaterializedArtifact> materi
         const auto kind = spec.kind(placement.object);
         if (kind == WeightSplitKind::Replicated) {
             for (int shard = 0; shard < 2; ++shard) {
+                if (!spec.on_shard(placement.object, shard)) { continue; }
                 DeviceArena& arena  = shard == 0 ? a0_arena : a1_arena;
                 auto& storage =
                     shard == 0 ? a0_objects.at(placement.object.index)
@@ -240,6 +254,7 @@ std::pair<artifact::MaterializedArtifact, artifact::MaterializedArtifact> materi
         }
         const auto shard_geo = shard_geometry(geometry, shard_n, shard_k);
         for (int shard = 0; shard < 2; ++shard) {
+            if (!spec.on_shard(placement.object, shard)) { continue; }
             DeviceArena& arena  = shard == 0 ? a0_arena : a1_arena;
             auto& storage =
                 shard == 0 ? a0_objects.at(placement.object.index)

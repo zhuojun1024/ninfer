@@ -38,6 +38,10 @@ using Clock = std::chrono::steady_clock;
 // exactly: at 262,144 tokens the 128 MiB a 384 MiB arena would hold is the difference between
 // fitting the card and not, and the oversized arena overflow is a reported error, not corruption.
 constexpr std::size_t kWorkspaceBytes = 192ULL << 20;
+// Smallest Vision item ceiling the route will fall back to when the full envelope does not fit
+// beside the KV pool: below this an ordinary photo would no longer fit in one item, so the route
+// reports the failure instead of silently admitting only thumbnails.
+constexpr std::uint32_t kVisionItemTokenFloor = 2048;
 
 // Bounds on the adaptive rewind depth (see rewind_near_).
 constexpr std::uint32_t kReuseRewindMinimum = 4;
@@ -296,6 +300,54 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         shard.mtp_anchor_hidden =
             shard.workspace->alloc(DType::BF16, {qwen::execution::dimension(config.hidden_size), 1});
     }
+    // Vision (--vision) runs on the shard that materialized the Vision component: the static split
+    // that keeps the MTP layer on shard 0 puts the Vision tower and its encode/handoff workspace on
+    // shard 1. The workspace is planned by the same planner the single-device route uses, with this
+    // shard's text workspace capacity as the general extent so the item handoff region lands above
+    // every text activation, and it is owned by a dedicated arena that outlives every request.
+    std::size_t vision_bytes = 0;
+    if (options_.enable_vision && shard_index == 1) {
+        if (!shard.model->config().vision || !shard.parameters->vision) {
+            throw std::invalid_argument("TP-2 vision shard has no Vision component parameters");
+        }
+        // The Vision workspace is the one resident block whose extent follows the largest image the
+        // route admits, and it is what decides whether the tower fits beside the 262,144-token KV
+        // pool. Its item ceiling is therefore selected by what this device actually accepts: the plan
+        // is rebuilt at a halved ceiling until cudaMalloc succeeds. The driver's own free-memory
+        // reading is not usable here (on this WSL2 host cudaMemGetInfo under-reports free bytes by
+        // about a gigabyte), so a refused allocation is the only honest signal. The ceiling that
+        // survives is reported below and bounds what a request may ask for.
+        const auto& vision_config     = *shard.model->config().vision;
+        const auto& vision_parameters = *shard.parameters->vision;
+        std::uint32_t max_item        = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(capacity, qwen::kMaximumVisionItemTokens));
+        for (;;) {
+            vision_workspace_ = qwen::execution::VisionContext::plan_workspace(
+                vision_config, vision_parameters, max_item, kWorkspaceBytes);
+            shard.device.bind_to_current_thread();
+            try {
+                vision_arena_ = std::make_unique<DeviceArena>(vision_workspace_->capacity_bytes);
+                break;
+            } catch (const std::runtime_error&) {
+                vision_arena_.reset();
+                vision_workspace_.reset();
+                // A refused cudaMalloc leaves cudaErrorMemoryAllocation latched in the runtime's
+                // last-error slot, where the next kernel launch's check would report it as that
+                // launch's own failure. Read it once here so the retry starts from a clean state.
+                (void)cudaGetLastError();
+                if (max_item <= kVisionItemTokenFloor) { throw; }
+                max_item = std::max<std::uint32_t>(kVisionItemTokenFloor, max_item / 2);
+            }
+        }
+        vision_bytes = vision_workspace_->capacity_bytes;
+        std::fprintf(stderr,
+                     "[mem] vision shard %d item ceiling %u | encode peak %.1f | handoff %.1f | "
+                     "arena %.1f MiB\n",
+                     shard_index, max_item,
+                     static_cast<double>(vision_workspace_->encode_peak_bytes) / 1048576.0,
+                     static_cast<double>(vision_workspace_->handoff_capacity_bytes) / 1048576.0,
+                     static_cast<double>(vision_bytes) / 1048576.0);
+    }
     // One startup ledger line per shard: every resident block is allocated before the first
     // request, so this is the whole device budget at the requested context ceiling.
     {
@@ -303,13 +355,15 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         cudaMemGetInfo(&free_bytes, &total_bytes);
         std::fprintf(stderr,
                      "[mem] shard %d capacity %u | weights+ctx %.1f | kv %.1f | state %.1f | "
-                     "record %.1f | round %.1f | workspace %u.0 | free %.1f of %.1f MiB\n",
+                     "record %.1f | round %.1f | workspace %u.0 | vision %.1f | free %.1f of %.1f "
+                     "MiB\n",
                      shard_index, capacity, resident_bytes,
                      static_cast<double>(kv_bytes) / 1048576.0,
                      static_cast<double>((2 + kReuseSnapshotCount) * state_bytes) / 1048576.0,
                      static_cast<double>(record_bytes) / 1048576.0,
                      static_cast<double>(round_bytes) / 1048576.0,
                      static_cast<unsigned>(kWorkspaceBytes >> 20),
+                     static_cast<double>(vision_bytes) / 1048576.0,
                      static_cast<double>(free_bytes) / 1048576.0,
                      static_cast<double>(total_bytes) / 1048576.0);
     }
@@ -535,8 +589,14 @@ GenerationResult TP2GenerationCore::Submission::wait(OutputSink* sink,
 GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                                             const CancellationView& cancellation) {
     const bool streaming = request.consumer_mode == OutputConsumerMode::Streaming;
-    const auto& data = qwen::PreparedPromptAccess::view(request.prompt);
+    auto& data = qwen::PreparedPromptAccess::mutable_view(request.prompt);
     const auto& token_ids = data.token_ids;
+    // A multimodal request runs its Vision prefill on the Vision shard and then decodes through the
+    // same speculative window as a text request. A chat turn that carries an image keeps that image
+    // in every later turn's history, so treating "has media" as "no speculation" would cost the whole
+    // conversation its MTP rounds; the request-level flag stays a property of the session, not of the
+    // prompt.
+    const bool media = data.has_media();
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(token_ids.size());
     const std::int32_t vocab =
         qwen::execution::dimension(shard_a_.model->config().text.vocab_size);
@@ -575,6 +635,64 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
         }
     }
     const std::array<std::uint32_t, kReuseSnapshotCount> rewind_depths{0, rewind_near_};
+
+    // Multimodal request: one Vision session owns the items this request still has to encode, on top
+    // of the startup plan. An item that lies entirely inside a reused prefix is already in the KV -
+    // its embeddings were scattered when that prefix was first prefilled - so the session covers only
+    // the suffix, and a request whose reused prefix covers every item (the common case for a chat
+    // turn that carries an image in its history) runs with no session at all. Its chunks still bind
+    // the prompt's 3-axis RoPE table, which is a property of the prompt rather than of the encoding.
+    qwen::execution::VisionPrefillPlan vision_plan;
+    std::unique_ptr<qwen::execution::VisionPrefillSession> vision_session;
+    if (media) {
+        if (!vision_workspace_ || vision_arena_ == nullptr) {
+            throw std::invalid_argument("multimodal request without a Vision workspace plan");
+        }
+        const auto& vision_config = shard_b_.model->config().vision.value();
+        auto control_plan = std::make_shared<qwen::VisionControlPlan>(
+            qwen::plan_vision_control(data, vision_config));
+        std::size_t max_merged  = 0;
+        std::size_t first_item  = control_plan->items.size();
+        vision_plan.uses.reserve(control_plan->items.size());
+        for (std::size_t index = 0; index < control_plan->items.size(); ++index) {
+            const qwen::VisionItemControlPlan& item = control_plan->items[index];
+            if (item.merged_count > vision_workspace_->max_merged_tokens) {
+                throw std::invalid_argument(
+                    "image needs " + std::to_string(item.merged_count) +
+                    " vision tokens but this TP-2 route admitted only " +
+                    std::to_string(vision_workspace_->max_merged_tokens) +
+                    " at startup (see the [mem] vision ledger line)");
+            }
+            if (item.token_end <= reuse) {
+                // Already encoded by the prefill that owns the reused prefix; the patch payload is
+                // not needed again, so drop it instead of holding it for the request's lifetime.
+                data.media_payloads[index].reset();
+                continue;
+            }
+            if (first_item == control_plan->items.size()) { first_item = index; }
+            vision_plan.uses.push_back(qwen::execution::VisionUseSpan{
+                .begin               = item.token_begin,
+                .end                 = item.token_end,
+                .prepared_item_index = static_cast<std::uint32_t>(index),
+                .control_index       = 0,
+            });
+            max_merged = std::max(max_merged, item.merged_count);
+        }
+        if (!vision_plan.uses.empty()) {
+            const auto first = static_cast<std::uint32_t>(first_item);
+            vision_plan.max_merged_count = max_merged;
+            vision_plan.control          = std::make_shared<const qwen::VisionControl>(
+                qwen::build_vision_control(data, *control_plan, first));
+            for (qwen::execution::VisionUseSpan& use : vision_plan.uses) {
+                use.control_index = use.prepared_item_index - first;
+            }
+            shard_b_.device.bind_to_current_thread();
+            vision_session = std::make_unique<qwen::execution::VisionPrefillSession>(
+                shard_b_.device, *shard_b_.parameters,
+                DeviceSpan{vision_arena_->base(), vision_arena_->capacity()}, *vision_workspace_,
+                data, vision_plan, vision_handoff_peak_bytes_);
+        }
+    }
 
     // Reset per-request state on both shards. The KV pages and execution row 0 are materialized
     // once at startup (build_shard) and reused in place, so a reused prefix needs no KV work at
@@ -684,9 +802,27 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             return result;
         }
         std::uint32_t length = std::min(prefill_chunk, prompt_tokens - t0);
+        // A multimodal chunk is capped at the boundary of the item it overlaps, so the encoder hands
+        // out one item at a time and the scatter below stays one contiguous column range of it. The
+        // snapshot clamp still comes last: the boundary a rewind slot must freeze on wins over the
+        // Vision cap, and the next chunk simply re-enters the same item.
+        qwen::execution::VisionChunk vision_chunk;
+        if (vision_session) {
+            vision_chunk = vision_session->prepare_chunk(t0, length);
+            length       = static_cast<std::uint32_t>(vision_chunk.length);
+        }
         for (std::size_t slot = 1; slot < kReuseSnapshotCount; ++slot) {
             const std::uint32_t target = snapshot_at[slot];
             if (target > t0 && target < t0 + length) { length = target - t0; }
+        }
+        qwen::execution::Tp2VisionChunk media_chunk;
+        const qwen::execution::Tp2VisionChunk* media_ptr = nullptr;
+        if (media) {
+            media_chunk.control       = vision_chunk.control;
+            media_chunk.embeddings    = &vision_chunk.embeddings;
+            media_chunk.positions     = data.positions.data();
+            media_chunk.prompt_tokens = data.token_ids.size();
+            media_ptr                 = &media_chunk;
         }
         // Scope both shards' workspaces so each chunk starts from a clean arena. The batched
         // forward allocates all of its intermediate activations in each shard's workspace; without
@@ -702,7 +838,8 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
         }
         ctx_a.forward_tp2_prefill(ctx_b, pair_, std::span<const int>(token_ids.data() + t0, length),
                                   static_cast<std::int32_t>(t0), &logits_a, &logits_b,
-                                  mtp_enabled_ ? &mtp_input_a : nullptr);
+                                  mtp_enabled_ ? &mtp_input_a : nullptr, nullptr, nullptr,
+                                  qwen::TextPhase::Prefill, media_ptr);
         if (mtp_enabled_ && t0 + length != prompt_tokens) {
             mtp_prefill_priming(shard_a_, token_ids.data() + t0, length, t0, mtp_input_a, nullptr,
                                 false);
@@ -737,6 +874,12 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
         t0 += length;
     }
     computed_prefill_tokens_ += prompt_tokens - reuse;
+    if (vision_session) {
+        // Every item the walk overlapped is encoded and its embeddings are in the KV now, so release
+        // the host patch payloads and the handoff binding: the decode loop never revisits them.
+        vision_session->release_encoded_media_payloads();
+        vision_session->retire_handoff();
+    }
 
     // Freeze the GDN state at every boundary this request can offer the next one. Slot 0 is the
     // prefill end the walk just reached; the rewind slots were captured at their chunk boundaries.
@@ -755,8 +898,13 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     // is read back on shard A after both shards finished the forward), matching the single-device
     // Engine's phase accounting. Generation wall time covers the decode rounds.
     const Clock::time_point first_token_time = Clock::now();
-    result.timings.prefill_seconds = std::chrono::duration<double>(first_token_time - start).count();
-    result.timings.prompt_wall_seconds    = result.timings.prefill_seconds;
+    const double prompt_seconds = std::chrono::duration<double>(first_token_time - start).count();
+    // The Vision encode is reported separately from the text walk, matching the single-device route;
+    // prompt wall time (the response's TTFT) is the whole span either way.
+    result.timings.vision_seconds = vision_session ? vision_session->elapsed_seconds() : 0.0;
+    result.timings.prefill_seconds =
+        std::max(0.0, prompt_seconds - result.timings.vision_seconds);
+    result.timings.prompt_wall_seconds = prompt_seconds;
 
     // Decode: with MTP each round verifies a K-draft window on both shards, records its
     // linear-attention transitions instead of committing them, and folds only the prefix the target

@@ -16,11 +16,23 @@
 
 namespace ninfer::tp {
 
+// Bit per shard: bit 0 = shard 0 (device0), bit 1 = shard 1 (device1). Objects that only one
+// shard consumes are placed on that shard alone instead of being duplicated: the MTP layer runs on
+// shard 0, the Vision tower on shard 1, and neither is read by the other shard.
+inline constexpr std::uint8_t kBothShards = 0x3;
+
 struct TPObjectSplit {
     artifact::ObjectHandle object;
     WeightSplitKind kind;
     // Row blocks for GatherRows (fused parents); empty otherwise.
     std::vector<RowPart> parts;
+    // Shards that hold this object's bytes. A shard outside the mask gets no allocation, no upload
+    // and an empty device view, so its resident set never pays for the object.
+    std::uint8_t shards = kBothShards;
+
+    [[nodiscard]] bool on_shard(int shard) const noexcept {
+        return shard >= 0 && shard < 2 && ((shards >> shard) & 1U) != 0;
+    }
 };
 
 struct TPSplitSpec {
@@ -38,11 +50,19 @@ struct TPSplitSpec {
         }
         return nullptr;
     }
+
+    // Objects without an entry are replicated to both shards.
+    [[nodiscard]] bool on_shard(artifact::ObjectHandle object, int shard) const {
+        const auto* s = find(object);
+        return s == nullptr ? true : s->on_shard(shard);
+    }
 };
 
 // Materializes the plan onto two GPUs. device0 receives shard 0, device1 receives shard 1.
 // The split spec maps splittable weight objects to ColumnParallel (row slice) or RowParallel
-// (column slice); all other device objects are replicated.
+// (column slice); all other device objects are replicated. An object whose spec entry lists a
+// single shard is placed on that shard only, so each shard arena is sized for exactly what it
+// holds.
 std::pair<artifact::MaterializedArtifact, artifact::MaterializedArtifact> materialize_tp2(
     const artifact::Reader& reader, const artifact::MaterializationPlan& plan,
     DeviceContext& device0, DeviceContext& device1, const TPSplitSpec& spec,

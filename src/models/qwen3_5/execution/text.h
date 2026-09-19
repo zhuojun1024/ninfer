@@ -16,6 +16,7 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/program/vision_control.h"
 
 #include <array>
 #include <cstddef>
@@ -28,6 +29,26 @@
 namespace ninfer::models::qwen3_5::execution {
 
 using Phase = qwen3_5::TextPhase;
+
+// Vision sidecar for one tensor-parallel prefill chunk. A multimodal prompt carries the 3-axis
+// (temporal, height, width) RoPE table the Vision tower produced, for every chunk, and the chunks
+// that overlap an encoded item additionally scatter that item's embeddings into the residual
+// stream.
+//
+// `embeddings` is bound into the Vision shard's workspace (that shard owns the tower), so only the
+// peer side of the forward reads it: the pair copies this chunk's contiguous column range into both
+// shards' arenas with one in-place all-reduce over a zeroed text-shard buffer, which is exact (a
+// sum with zero) and keeps the transfer bounded by the chunk rather than by the item.
+struct Tp2VisionChunk {
+    // Encoded item overlapping this chunk, or null for a chunk with no image tokens.
+    const qwen3_5::VisionItemControl* control = nullptr;
+    [[nodiscard]] bool has_item() const noexcept { return control != nullptr; }
+    // [hidden, merged_count] BF16 on the Vision (peer) shard.
+    const Tensor* embeddings = nullptr;
+    // Prompt-wide [3, prompt_tokens] RoPE positions, row-major per axis.
+    const std::int32_t* positions = nullptr;
+    std::size_t prompt_tokens     = 0;
+};
 
 enum class GdnStateAction : std::uint8_t {
     UpdateInPlace,
@@ -158,10 +179,14 @@ public:
     // `phase` selects the layer loop the window runs in. A speculative verify window must use
     // Phase::Verify: that is the phase the single-token decode path runs, so its per-column logits
     // agree with the token the decode path would commit instead of drifting on near-ties.
+    // `vision` (optional) switches the chunk to the multimodal bindings: the mixer reads the prompt's
+    // 3-axis RoPE table instead of its plain absolute positions, and a chunk overlapping an encoded
+    // item scatters that item's embeddings into the residual stream before the layer loop.
     void forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair, std::span<const int> ids,
                              std::int32_t first_position, Tensor* logits, Tensor* logits_peer,
                              Tensor* mtp_input_hidden = nullptr, Tensor* logits_columns = nullptr,
-                             Tensor* hidden_columns = nullptr, Phase phase = Phase::Prefill);
+                             Tensor* hidden_columns = nullptr, Phase phase = Phase::Prefill,
+                             const Tp2VisionChunk* vision = nullptr);
 
     // Registers the peer shard's context and the device pair. The tensor-parallel driver sets this
     // on both shards once, so operations that only run on one shard (the MTP stem) can still drive

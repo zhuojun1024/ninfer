@@ -9,7 +9,9 @@
 //     TpSplitOptions asks for it.
 //   - token_embedding: RowParallel (hidden columns split; both shards keep every vocabulary row).
 //   - norms and GDN gating: Replicated.
-// Objects not classified are replicated.
+//   - mtp/* and vision/*: Replicated but shard-local - the MTP layer is placed on shard 0 alone and
+//     the Vision tower on shard 1 alone, because no execution path on the other shard reads them.
+// Objects not classified are replicated to both shards.
 
 #include "artifact/schema.h"
 #include "core/tp/tp_materialize.h"

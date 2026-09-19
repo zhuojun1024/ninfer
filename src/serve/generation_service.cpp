@@ -254,6 +254,11 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.startup_observer         = std::move(startup_observer);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
+    if (options_.default_reasoning_effort &&
+        !prompt_capabilities_.reasoning_effort.supports(*options_.default_reasoning_effort)) {
+        throw std::invalid_argument(
+            "--reasoning-effort is not supported by the loaded chat template");
+    }
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }

@@ -202,6 +202,11 @@ option because a protocol request can explicitly enable thinking. Anthropic
 `thinking:{"type":"enabled","budget_tokens":N}` supplies a request-specific budget instead of
 this process default.
 
+`--reasoning-effort low|medium|xhigh` sets the process default for requests that leave the effort
+unset, which otherwise follows the template's declared default. A request field
+(`reasoning_effort`, or `chat_template_kwargs`) still wins, a request resolved to non-thinking
+receives no effort, and startup rejects a level the loaded template does not expose.
+
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
 
@@ -783,6 +788,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
+| `--reasoning-effort low\|medium\|xhigh` | process default effort for thinking-enabled requests that omit one | template default |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |

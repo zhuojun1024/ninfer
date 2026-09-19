@@ -54,6 +54,9 @@ struct ServeOptions {
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
+    // Process-level default reasoning effort for thinking-enabled requests that do not select one.
+    // Unset keeps the loaded chat template's own default; --reasoning-effort names one explicitly.
+    std::optional<ninfer::ReasoningEffort> default_reasoning_effort;
     std::optional<std::uint32_t> default_thinking_budget;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs

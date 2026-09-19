@@ -93,7 +93,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             options.speculative.backend == SpeculativeBackend::DFlash2) {
             throw std::invalid_argument("TP-2 generation supports --spec mtp only");
         }
-        options.enable_vision        = false;
+        // Vision is available on the TP-2 route: the artifact's static shard split places the
+        // Vision tower on the shard that holds the vision component (shard 1) and the MTP layer on
+        // shard 0, so both fit under the 262,144-token KV ceiling.
         options.use_cuda_graph       = false;
         options.context_cache        = ContextCacheOptions{.enabled = false};
     }

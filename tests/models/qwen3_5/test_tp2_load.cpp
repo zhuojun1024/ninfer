@@ -38,27 +38,60 @@ std::pair<int, int> pick_devices() {
 
 void check_shard_shapes(const qwen::execution::Parameters& parameters, const qwen::Model& model,
                         int shard, bool expect_mtp, bool expect_split_head,
-                        bool expect_proposal_split) {
+                        bool expect_proposal_split, bool expect_vision) {
     const auto& weights = model.weights();
+    if (expect_vision) {
+        // The Vision tower is the other shard-local component: the static split keeps it on shard 1,
+        // where the encode/handoff workspace is also allocated, and shard 0 must not pay for its
+        // bytes. Where it is present it stays replicated whole, because the tower's activations are
+        // consumed as a full-width embedding by both shards.
+        if (!weights.vision.has_value()) {
+            throw std::runtime_error("shard " + std::to_string(shard) +
+                                     " has no Vision weights under --vision");
+        }
+        const auto& vision = *weights.vision;
+        if (shard == 1) {
+            if (!model.has_weight(vision.patch_embedding)) {
+                throw std::runtime_error("shard 1 did not materialize the Vision tower");
+            }
+            const auto& embedding = model.weight(vision.patch_embedding).view;
+            if (embedding.shape[0] != 1152) {
+                throw std::runtime_error(
+                    "shard 1 Vision patch embedding is not replicated [1152,patch_width]");
+            }
+            if (!model.has_weight(vision.merger_fc2)) {
+                throw std::runtime_error("shard 1 did not materialize the Vision merger");
+            }
+        } else if (model.has_weight(vision.patch_embedding)) {
+            throw std::runtime_error("shard 0 materialized the shard-local Vision tower");
+        }
+    }
     if (expect_mtp) {
-        // MTP weights are replicated whole on both shards: the proposal runs on shard 0 alone (its
-        // input is bit-identical on both shards), so no part of the MTP layer may be halved.
+        // The MTP layer is a shard-local component: it drafts on shard 0 alone and no execution path
+        // on the other shard reads it, so shard 1 must not pay for its bytes. Where it is present it
+        // stays replicated whole - the proposal's input is bit-identical on both shards, so halving
+        // it would only add a second lockstep all-reduce.
         if (!weights.mtp.has_value()) {
             throw std::runtime_error("shard " + std::to_string(shard) +
                                      " has no MTP weights under --spec mtp");
         }
-        const auto& mtp  = *weights.mtp;
-        const auto& proj = model.weight(mtp.input_projection).view;
-        if (proj.shape[0] != 5120 || proj.shape[1] != 10240) {
-            throw std::runtime_error("shard " + std::to_string(shard) +
-                                     " MTP input_projection is not replicated [5120,10240]");
-        }
-        const auto* mixer = std::get_if<qwen::AttentionWeights>(&mtp.layer.mixer);
-        if (mixer == nullptr) { throw std::runtime_error("MTP layer mixer is not attention"); }
-        const auto& q = model.weight(mixer->query).view;
-        if (q.shape[0] != 6144 || q.shape[1] != 5120) {
-            throw std::runtime_error("shard " + std::to_string(shard) +
-                                     " MTP attention query is not replicated [6144,5120]");
+        if (shard == 0) {
+            const auto& mtp = *weights.mtp;
+            if (!model.has_weight(mtp.input_projection)) {
+                throw std::runtime_error("shard 0 did not materialize the MTP layer");
+            }
+            const auto& proj = model.weight(mtp.input_projection).view;
+            if (proj.shape[0] != 5120 || proj.shape[1] != 10240) {
+                throw std::runtime_error("shard 0 MTP input_projection is not replicated [5120,10240]");
+            }
+            const auto* mixer = std::get_if<qwen::AttentionWeights>(&mtp.layer.mixer);
+            if (mixer == nullptr) { throw std::runtime_error("MTP layer mixer is not attention"); }
+            const auto& q = model.weight(mixer->query).view;
+            if (q.shape[0] != 6144 || q.shape[1] != 5120) {
+                throw std::runtime_error("shard 0 MTP attention query is not replicated [6144,5120]");
+            }
+        } else if (model.has_weight(weights.mtp->input_projection)) {
+            throw std::runtime_error("shard 1 materialized the shard-local MTP layer");
         }
     }
     const auto layer0   = weights.text.layers[0];
@@ -150,8 +183,10 @@ int main(int argc, char** argv) {
                 }
             } else if (arg == "--lm-head-draft") {
                 options.proposal_head = ProposalHead::Optimized;
+            } else if (arg == "--vision") {
+                options.vision = true;
             } else if (arg == "--help") {
-                std::cout << "--artifact PATH [--spec mtp] [--lm-head-draft]\n";
+                std::cout << "--artifact PATH [--spec mtp] [--lm-head-draft] [--vision]\n";
                 return 0;
             } else {
                 throw std::invalid_argument("unknown argument " + arg);
@@ -178,8 +213,10 @@ int main(int argc, char** argv) {
         const bool expect_mtp   = options.speculative == SpeculativeBackend::Mtp;
         const bool expect_split = !expect_mtp || options.proposal_enabled();
         const bool expect_proposal_split = options.proposal_enabled();
-        check_shard_shapes(parameters0, *model0, 0, expect_mtp, expect_split, expect_proposal_split);
-        check_shard_shapes(parameters1, *model1, 1, expect_mtp, expect_split, expect_proposal_split);
+        check_shard_shapes(parameters0, *model0, 0, expect_mtp, expect_split, expect_proposal_split,
+                           options.vision);
+        check_shard_shapes(parameters1, *model1, 1, expect_mtp, expect_split, expect_proposal_split,
+                           options.vision);
         std::cout << path.filename().string() << ": TP-2 dual-shard load passed "
                   << "devices=" << dev0 << "," << dev1 << " layers="
                   << model0->weights().text.layers.size() << " shard_gate=[8704,5120] "

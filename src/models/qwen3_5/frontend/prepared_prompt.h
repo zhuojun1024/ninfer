@@ -168,6 +168,10 @@ struct PreparedPromptData {
 class PreparedPromptAccess {
 public:
     [[nodiscard]] static const PreparedPromptData& view(const PreparedPrompt& prompt);
+    // Mutable view for the routes that own the prompt for the request's lifetime. The tensor-parallel
+    // generation core hands it to the Vision prefill session, which releases each media payload as
+    // soon as the tower has encoded that item.
+    [[nodiscard]] static PreparedPromptData& mutable_view(PreparedPrompt& prompt);
     [[nodiscard]] static PreparedPromptData take(PreparedPrompt&& prompt);
 };
 

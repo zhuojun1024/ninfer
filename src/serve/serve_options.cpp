@@ -80,6 +80,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
+           "[--reasoning-effort low|medium|xhigh] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -109,6 +110,10 @@ std::string serve_usage_text(const char* argv0) {
            "--host-kv-mib uses MiB\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
+           "       --reasoning-effort is the process default for thinking-enabled requests; a "
+           "request\n"
+           "       field or chat_template_kwargs overrides it, and an unsupported value is "
+           "rejected\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -280,6 +285,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
             default_max_tokens_explicit = true;
+        } else if (arg == "--reasoning-effort") {
+            const std::string value = require_value("--reasoning-effort");
+            const std::optional<ReasoningEffort> effort =
+                value == "low"    ? std::optional<ReasoningEffort>(ReasoningEffort::Low)
+                : value == "medium" ? std::optional<ReasoningEffort>(ReasoningEffort::Medium)
+                : value == "xhigh"  ? std::optional<ReasoningEffort>(ReasoningEffort::XHigh)
+                                    : std::nullopt;
+            if (!effort) {
+                throw std::invalid_argument("--reasoning-effort must be low, medium, or xhigh");
+            }
+            options.default_reasoning_effort = *effort;
         } else if (arg == "--default-thinking-budget") {
             const std::uint64_t budget =
                 parse_u64(require_value("--default-thinking-budget"), "default-thinking-budget");

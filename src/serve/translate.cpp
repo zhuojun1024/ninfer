@@ -124,9 +124,13 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
                                   "messages", "assistant_prefill_not_supported");
         }
         if (result.enable_thinking) {
-            result.effective_reasoning_effort = result.reasoning_effort
-                                                    ? result.reasoning_effort
-                                                    : capabilities.reasoning_effort.default_effort;
+            // A request field wins, then the process default, then the loaded chat template's own
+            // default effort.
+            result.effective_reasoning_effort =
+                result.reasoning_effort
+                    ? result.reasoning_effort
+                    : (server.default_reasoning_effort ? server.default_reasoning_effort
+                                                       : capabilities.reasoning_effort.default_effort);
         }
         return result;
     };

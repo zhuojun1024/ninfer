@@ -268,10 +268,13 @@ Parameters::Parameters(const Model& source) : model(source) {
         text.layers.push_back(with_context("text/layers/" + std::to_string(i),
                                            [&] { return prepare.block(w.text.layers[i]); }));
     }
-    if (w.mtp) {
+    // Shard-local components: the MTP layer is materialized on shard 0 alone and the Vision tower on
+    // shard 1 alone, so the shard that runs neither builds no parameter block for it (the model's
+    // logical bindings are shared, the device bytes are not).
+    if (w.mtp && source.has_weight(w.mtp->input_projection)) {
         mtp = with_context("mtp", [&] { return prepare.mtp(*w.mtp); });
     }
-    if (w.vision) {
+    if (w.vision && source.has_weight(w.vision->patch_embedding)) {
         vision = with_context("vision", [&] { return prepare.vision(*w.vision); });
     }
     if (w.draft) {

@@ -38,6 +38,13 @@ public:
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 
+    // True when this shard holds the weight's device bytes. Shard-local components (the MTP layer on
+    // shard 0, the Vision tower on shard 1) are absent from the other shard, so a shard-local
+    // consumer must test this instead of dereferencing an empty view.
+    [[nodiscard]] bool has_weight(WeightId id) const noexcept {
+        return !bound_.at(id.index).view.parts.empty();
+    }
+
     [[nodiscard]] ops::WeightInput input(WeightUseId id) const;
     [[nodiscard]] ops::WeightInput input(WeightId id) const;
 

@@ -39,6 +39,26 @@ std::vector<BoundWeight> shard_views(std::span<const PendingWeight> pending,
         if (item.reference.residency != artifact::Residency::Device) {
             throw std::invalid_argument("shard view: only device-resident weights are supported");
         }
+        // Shard-local components (the MTP layer on shard 0, the Vision tower on shard 1) are absent
+        // from the other shard. Keep the entry so WeightId indices stay aligned with the parameter
+        // array, but leave the view empty: consumers test Model::has_weight before dereferencing it,
+        // and a weight that mixes shard-local and shared objects would be a split-spec bug.
+        std::size_t present_parts = 0;
+        for (const auto& part : item.reference.binding.parts) {
+            present_parts += spec.on_shard(part.object, shard) ? 1U : 0U;
+        }
+        if (present_parts != item.reference.binding.parts.size()) {
+            if (present_parts != 0) {
+                throw std::invalid_argument(
+                    "shard view: weight mixes objects placed on different shards");
+            }
+            BoundWeight absent;
+            absent.name           = item.reference.name;
+            absent.source_objects = item.source_objects;
+            absent.uses           = item.uses;
+            out.push_back(std::move(absent));
+            continue;
+        }
         BoundWeight bw;
         bw.name           = item.reference.name;
         bw.source_objects = item.source_objects;

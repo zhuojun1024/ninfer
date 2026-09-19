@@ -8,6 +8,7 @@
 #include "core/tp/device_pair.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/text.h"
+#include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/program/runtime_types.h"
@@ -21,6 +22,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace ninfer::runtime {
@@ -192,6 +194,14 @@ private:
     // Multi-token prediction (--spec mtp): the proposal window, and how often the MTP layer's
     // first draft matched the target's own next token. That agreement rate is the direct measure of
     // whether the MTP weights, KV context and positions are set up correctly.
+    // Vision (--vision) runs on the shard that materialized the Vision component: the same static
+    // split that keeps the MTP layer on shard 0 puts the Vision tower and its encode/handoff arena
+    // on shard 1. The plan and the arena are built once at startup; one session per multimodal
+    // request owns the encoding of that request's items on top of them.
+    std::optional<models::qwen3_5::execution::VisionWorkspacePlan> vision_workspace_;
+    std::unique_ptr<DeviceArena> vision_arena_;
+    std::size_t vision_handoff_peak_bytes_ = 0;
+
     bool mtp_enabled_                     = false;
     std::uint32_t mtp_drafts_             = 0;
     std::uint64_t mtp_draft_checked_      = 0;
