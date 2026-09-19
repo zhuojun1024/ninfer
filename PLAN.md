@@ -623,5 +623,26 @@ Ctrl+C 停止），只有 `-Background` 才用 `Start-Process`；自测服务时
 工具与文档：`tools/win_port/` 现全部为 PowerShell（`vcvars/build/serve/spike/fetch_ffmpeg/fetch_curl`，
 旧 `.bat` 已删）；新增 `docs/windows.md` 并在 `docs/README.md` 登记；`docs/windows.md` 含构建、运行、
 平台差异、实测数据与限制（单卡 CLI 需 ≥20.2 GiB 显存，本机 16 GiB 卡只能走 TP-2）。
+**进度（Round 54 第 4 轮）：提交与回归验证**
+
+- 提交：`453aaa6a feat: build and serve natively on Windows with VS2022 and CUDA 13.3`（分支
+  `feat/windows-native-port`）。
+- Linux 回归：`build_r35.sh` → `BUILD_EXIT=0`（全量重建 + 测试目标）。修复了一处**测试基建问题**：
+  `build_r35.sh` 的 rsync 列表缺 `cmake` 与顶层 `CMakeLists.txt`，导致 WSL 树仍用旧的
+  `cmake/Dependencies.cmake`（`PkgConfig::FFMPEG` vs 新的 `ninfer::ffmpeg`）而配置失败；现已补上
+  （注意：该脚本会同步自身，改动要**跑第二次**才生效）。
+- 受影响的 Linux 测试：`context_cost`、`resource_manager`、`pretty_logging`、`context_cost_measure`
+  全部通过；`artifact|nvfp4|qwen3_5` 共 26 项 25 通过。
+- **唯一失败为既有问题（与本分支无关）**：`ninfer_qwen3_5_frontend_test` 抛
+  `unsupported frontend/chat_template.jinja (sha256 821b1c036748885c26b552d2a174878fe06199c390ccf612a6169326338cbaa5)`
+  —— 即 53c 引入的模板摘要白名单拒绝了测试夹具；`src/models/qwen3_5/chat_template.cpp` 与 `tests/`
+  在本分支均未改动，故 HEAD 上同样失败。
+- 教训：Windows 上重新链接 exe 前必须先停服务（运行中的 exe 会锁住文件 → `LNK1104`）。
+
+**剩余缺口（需用户判断）**：目标里的「跑通单卡 ninfer CLI」在本机无法字面完成——CLI 仅支持单卡，而该
+27B NVFP4 artifact 需要约 20.2 GiB 常驻权重（10.1 GiB/shard × 2），16 GiB 卡装不下（已写入
+`docs/windows.md` 限制节）。要真正跑到端到端，需要另造一个小的 `.ninfer` 测试 artifact（转换工具链 +
+合成小 checkpoint），属额外工作；当前 CLI 二进制本身已验证可运行（`--help`），且与 serve 共用同一套
+引擎/加载器（已端到端跑通）。
 
 
