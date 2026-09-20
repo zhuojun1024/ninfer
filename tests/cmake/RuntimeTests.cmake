@@ -13,3 +13,6 @@ ninfer_add_test(ninfer_kv_capacity_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../te
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_sampling_defaults.cpp"
   LIBRARIES ninfer_engine ninfer_core)
+ninfer_add_test(ninfer_engine_options_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_options.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
