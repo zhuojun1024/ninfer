@@ -274,7 +274,10 @@ OperationalRecord render_request_done(const RequestLogContext& context,
     if (metrics.prefill_seconds > 0.0) {
         out << " | prefill "
             << product::format_pretty_rate(computed_prefill_tokens / metrics.prefill_seconds,
-                                           "tok");
+                                           "tok")
+            << " (" << product::format_pretty_count(
+                            static_cast<std::uint64_t>(computed_prefill_tokens))
+            << " tok)";
     }
     if (metrics.decode_seconds > 0.0) {
         out << " | decode "
