@@ -97,7 +97,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // Vision tower on the shard that holds the vision component (shard 1) and the MTP layer on
         // shard 0, so both fit under the 262,144-token KV ceiling.
         options.use_cuda_graph       = false;
-        options.context_cache        = ContextCacheOptions{.enabled = false};
+        // The generation core keeps its own prefix-reuse checkpoints in pinned host memory rather
+        // than building a context cache, so the host state-image budget survives this reset; every
+        // other cache option is irrelevant here. See TP2GenerationCore's host checkpoint ring.
+        const std::uint32_t host_state_slots = options.context_cache.host_state_slots;
+        options.context_cache =
+            ContextCacheOptions{.enabled = false, .host_state_slots = host_state_slots};
     }
     switch (options.purpose) {
     case EnginePurpose::Generation:
@@ -130,7 +135,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             throw std::invalid_argument("disabled context cache accepts only root-only capacities");
         }
         cache.device_state_slots                = 0;
-        cache.host_state_slots                  = 0;
+        // The TP-2 generation core stores its prefix-reuse checkpoints as pinned host state images
+        // even though it runs without a context cache, so that route keeps this budget. Any other
+        // disabled-cache route has no user for it and drops it.
+        if (!(options.device_b >= 0 && options.purpose == EnginePurpose::Generation)) {
+            cache.host_state_slots = 0;
+        }
         cache.host_kv_capacity_bytes            = 0;
         cache.max_private_continuations         = concurrency;
         cache.max_shared_prefixes               = 0;

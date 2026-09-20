@@ -37,11 +37,14 @@ namespace ninfer::runtime {
 // independently and the two agree exactly.
 class TP2GenerationCore {
 public:
-    // Prefix-reuse state snapshots per shard: slot 0 is the prefill end, the others are rewinds
-    // behind it. Chat templates render the previous assistant turn and the generation tail
+    // Prefix-reuse device state snapshots per shard: slot 0 is the prefill end, the others are
+    // rewinds behind it. Chat templates render the previous assistant turn and the generation tail
     // differently, so two consecutive prompts share everything up to a point a little before the
     // earlier prompt's end. One rewind behind the prefill end covers that gap; every extra slot is
-    // another 73 MiB of resident state per shard, which this context ceiling cannot spare.
+    // another 73 MiB of resident state per shard, which this context ceiling cannot spare. A prompt
+    // that diverges *deeper* inside the previous prompt - a client that re-renders a shorter
+    // history at a turn boundary - is served by the host checkpoint ring instead, which holds the
+    // same states in pinned host memory and therefore costs no device memory.
     static constexpr std::size_t kReuseSnapshotCount = 2;
     // Extra state slot (beyond the reuse snapshots) holding the pre-verify state of the current MTP
     // round: RecordForReplay advances the live state by the whole window, so the fold must replay the
@@ -124,6 +127,29 @@ private:
         // GDN state at reuse boundaries of the last completed prefill (see kReuseSnapshot* in the
         // implementation), used to skip a shared prompt prefix on the next request.
         std::array<DeviceSpan, kReuseSnapshotCount + 1> state_snapshots{};
+        // Prefix-reuse checkpoints in pinned host memory, one ring per shard. They carry the state
+        // of the frontier they were taken at, so a prompt whose shared prefix ends *inside* the
+        // previous prompt restarts at the deepest checkpoint at or before that prefix instead of
+        // recomputing from zero. The ring is sized from the host state-image budget
+        // (--host-state-slots) and costs no device memory.
+        struct HostCheckpoint {
+            std::unique_ptr<PinnedHostBuffer> buffer;
+            std::uint32_t position   = 0;
+            // The prefill that wrote this checkpoint. A prefill that never completed (cancelled)
+            // leaves its slots invalid instead of usable state.
+            std::uint64_t prefill_id = 0;
+            // Set when that prefill completes and cleared as soon as a later request's shared prefix
+            // stops covering this frontier: the state is only the state of *this* prompt's prefix
+            // while the whole lineage agrees on the tokens before it.
+            bool valid = false;
+        };
+        // The ring is split in two: [0, grid_slots) holds the position grid, which keeps the whole
+        // context covered and is never evicted by the tail anchors; [grid_slots, size) holds the
+        // tail anchors, refreshed every prefill, which land within one chunk of a prompt end.
+        std::vector<HostCheckpoint> host_checkpoints;
+        std::size_t host_checkpoint_grid_slots = 0;
+        std::size_t host_checkpoint_next       = 0;
+        std::size_t host_checkpoint_tail_next  = 0;
         std::unique_ptr<DeviceArena> workspace;
         Tensor prefill_hidden;
         // Workspace offset after the tensors that must survive every round scope (prefill_hidden and
@@ -236,6 +262,18 @@ private:
     // prompts' shared-prefix gap.
     std::uint32_t rewind_near_ = 9;
     bool cached_state_valid_ = false;
+
+    // Host checkpoint ring: the token stride between checkpoints (0 disables the ring, which is
+    // what a zero host state-image budget selects), the id the running prefill tags its new
+    // checkpoints with, and the next id to hand out. Which checkpoints are usable is decided per
+    // request by Shard::HostCheckpoint::valid, not by the id.
+    std::uint32_t host_checkpoint_stride_     = 0;
+    std::uint32_t host_checkpoint_tail_slots_ = 0;
+    std::uint64_t host_checkpoint_live_id_    = 0;
+    std::uint64_t host_checkpoint_next_id_    = 1;
+    // Set by the reuse scan when the winning boundary is a host checkpoint rather than a device
+    // snapshot, so the state restore knows which memory it copies from.
+    bool reuse_from_host_ = false;
 
     // Multi-token prediction (--spec mtp): whether proposals are enabled, and the proposal window
     // width (how many drafts the MTP layer proposes per decode round).

@@ -155,6 +155,22 @@ constexpr std::uint32_t kReuseRewindMaximum = 4096;
 // the chunk, so widening the chunk trades only the weight term against the per-chunk activation
 // peak. The engine option (--prefill-chunk) picks the actual width.
 constexpr std::uint32_t kPrefillChunkMaximum = 1024;
+// Finest spacing between prefix-reuse checkpoints in pinned host memory, in prompt tokens. It
+// matches the checkpoint step llama.cpp uses by default. A ring of N slots widens it to
+// ceil(max_context / N) so that N * stride always covers the whole context; a prompt that diverges
+// inside the previous prompt then restarts at most one stride behind its shared prefix.
+constexpr std::uint32_t kReuseCheckpointStride = 8192;
+// The last few chunk ends of a walk are checkpointed on top of the stride grid. A chat client
+// re-renders the assistant turn it is about to continue, so the divergence a turn boundary shows
+// sits just behind the previous prompt's end - observed gaps run from ~150 tokens to tens of
+// thousands. The grid alone only guarantees a checkpoint within one stride of it; this window
+// makes the common small gap land within one chunk. llama.cpp calls the same idea a "near prompt
+// end" checkpoint (its checkpoint-min-step does not apply there either).
+constexpr std::uint32_t kReuseTailWindow = 8192;
+// Host ring slots reserved for those tail anchors. Without the reservation a long session fills the
+// ring with them (each prefill leaves up to one per chunk) and evicts the position grid, which is
+// exactly the coverage a divergence deep inside the history needs.
+constexpr std::uint32_t kReuseTailCheckpointCount = 8;
 
 std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
     return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -260,6 +276,23 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
 
     shard_a_.parameters = std::make_unique<qwen::execution::Parameters>(*shard_a_.model);
     shard_b_.parameters = std::make_unique<qwen::execution::Parameters>(*shard_b_.model);
+
+    // Prefix-reuse checkpoints in pinned host memory: the same budget the single-device context
+    // cache uses for its complete host state images. Each checkpoint is one state image per shard
+    // (~73 MiB), so the ring is enough to cover the whole context at kReuseCheckpointStride or
+    // coarser; a zero budget keeps the ring disabled, which is what --no-prefix-reuse selects.
+    {
+        const std::uint32_t host_slots = options_.context_cache.host_state_slots;
+        if (host_slots != 0) {
+            host_checkpoint_tail_slots_ =
+                std::max(1U, std::min(kReuseTailCheckpointCount, host_slots / 2U));
+            const std::uint32_t grid_slots =
+                std::max(1U, host_slots - host_checkpoint_tail_slots_);
+            const std::uint32_t per_slot = (options_.max_context + grid_slots - 1U) / grid_slots;
+            const std::uint32_t rounded  = (per_slot + 127U) / 128U * 128U;
+            host_checkpoint_stride_      = std::max(kReuseCheckpointStride, rounded);
+        }
+    }
 
     build_shard(shard_a_, 0);
     build_shard(shard_b_, 1);
@@ -395,6 +428,19 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     }
     CUDA_CHECK(cudaMemset(shard.state_backing.data, 0, state_bytes));
     shard.state = std::make_unique<LinearAttentionStatePool>(shard.state_backing, state_layout);
+    if (host_checkpoint_stride_ != 0) {
+        // Portable pinned memory, like the MTP verify window: every checkpoint is read and written
+        // through this shard's own device, but a portable allocation keeps that true if the
+        // execution context ever binds the peer first.
+        const std::uint32_t slots         = options_.context_cache.host_state_slots;
+        shard.host_checkpoint_grid_slots  = slots - host_checkpoint_tail_slots_;
+        shard.host_checkpoints.reserve(slots);
+        for (std::uint32_t index = 0; index < slots; ++index) {
+            Shard::HostCheckpoint checkpoint;
+            checkpoint.buffer = std::make_unique<PinnedHostBuffer>(shard.state_backing.bytes, true);
+            shard.host_checkpoints.push_back(std::move(checkpoint));
+        }
+    }
 
     std::size_t record_bytes = 0;
     std::size_t round_bytes  = 0;
@@ -509,6 +555,17 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                      static_cast<double>(vision_bytes) / 1048576.0,
                      static_cast<double>(free_bytes) / 1048576.0,
                      static_cast<double>(total_bytes) / 1048576.0);
+        if (!shard.host_checkpoints.empty()) {
+            std::fprintf(stderr,
+                         "[mem] host-checkpoints shard %d slots %zu (grid %zu + tail %u) x %.1f "
+                         "MiB | stride %u tok | pinned %.1f MiB\n",
+                         shard_index, shard.host_checkpoints.size(),
+                         shard.host_checkpoint_grid_slots, host_checkpoint_tail_slots_,
+                         static_cast<double>(shard.state_backing.bytes) / 1048576.0,
+                         host_checkpoint_stride_,
+                         static_cast<double>(shard.state_backing.bytes *
+                                             shard.host_checkpoints.size()) / 1048576.0);
+        }
     }
 
     // The execution context is constructed at the end of this function: the MTP layer needs its KV
@@ -872,27 +929,86 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     // route gets this from the context cache; TP-2 runs with that cache disabled, so the core keeps
     // the boundaries it already owns. The deepest boundary at or before the shared prefix wins; the
     // final prompt token is always forwarded, because its logits drive the first sample.
-    std::uint32_t reuse    = 0;
-    std::size_t reuse_slot = 0;
+    // NINFER_TP2_REUSE_TRACE=1 prints what the boundaries offered and what the prompt actually
+    // matched. It is the difference between a client that resends its history verbatim and one that
+    // re-renders it, which decides whether a boundary past the previous prompt can ever be used.
+    const bool reuse_trace = [] {
+        const char* env = std::getenv("NINFER_TP2_REUSE_TRACE");
+        return env != nullptr && env[0] == '1';
+    }();
+    std::uint32_t reuse       = 0;
+    std::size_t reuse_slot    = 0;
+    std::size_t shared_prefix = 0;
+    reuse_from_host_          = false;
     if (cached_state_valid_ && !cached_prompt_tokens_.empty()) {
-        std::size_t lcp = 0;
         const std::size_t common = std::min(cached_prompt_tokens_.size(), token_ids.size());
-        while (lcp < common && cached_prompt_tokens_[lcp] == token_ids[lcp]) { ++lcp; }
+        while (shared_prefix < common &&
+               cached_prompt_tokens_[shared_prefix] == token_ids[shared_prefix]) {
+            ++shared_prefix;
+        }
         for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
             const std::uint32_t boundary = cached_boundaries_[slot];
-            if (boundary <= lcp && boundary < prompt_tokens && boundary > reuse) {
-                reuse      = boundary;
-                reuse_slot = slot;
+            if (boundary <= shared_prefix && boundary < prompt_tokens && boundary > reuse) {
+                reuse           = boundary;
+                reuse_slot      = slot;
+                reuse_from_host_ = false;
             }
+        }
+        // A host checkpoint is a state plus the KV before it, and both are only this prompt's while
+        // the lineage agrees on the tokens before it: the state was taken over the tokens of the
+        // prompt that wrote it, and every prefill since kept the KV consistent only up to the prefix
+        // it reused. The shared prefix of the last pair is therefore the bound for every older
+        // frontier, and a checkpoint past it can never become usable again - a later prompt would
+        // have to match a token this one already diverged from. Prune on that bound, then take the
+        // deepest survivor. Older checkpoints matter: a prefill that only walked the last few tokens
+        // of a fully reused prompt leaves no checkpoint of its own.
+        Shard* const shards[2] = {&shard_a_, &shard_b_};
+        for (Shard* shard : shards) {
+            for (auto& checkpoint : shard->host_checkpoints) {
+                if (checkpoint.position > shared_prefix) { checkpoint.valid = false; }
+            }
+        }
+        for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
+            const auto& checkpoint = shard_a_.host_checkpoints[index];
+            if (!checkpoint.valid || checkpoint.position <= reuse ||
+                checkpoint.position > shared_prefix || checkpoint.position >= prompt_tokens) {
+                continue;
+            }
+            reuse            = checkpoint.position;
+            reuse_slot       = index;
+            reuse_from_host_ = true;
         }
         // Predict the next prefill's rewind depths from the gap this pair of prompts showed: the
         // snapshot that captures the next shared prefix should sit just inside it.
-        const std::uint32_t gap = static_cast<std::uint32_t>(cached_prompt_tokens_.size() - lcp);
+        const std::uint32_t gap =
+            static_cast<std::uint32_t>(cached_prompt_tokens_.size() - shared_prefix);
         if (gap != 0) {
             rewind_near_ = std::clamp(gap + 2, kReuseRewindMinimum, kReuseRewindMaximum);
         }
     }
+    if (reuse_trace) {
+        std::size_t valid_checkpoints = 0;
+        for (const auto& checkpoint : shard_a_.host_checkpoints) {
+            valid_checkpoints += checkpoint.valid ? 1U : 0U;
+        }
+        std::fprintf(stderr,
+                     "[tp2-reuse] prompt=%u cached=%zu shared=%zu prefill_end=%u rewind=%u "
+                     "host=%zu/%zu stride=%u -> reuse=%u slot=%zu src=%s\n",
+                     prompt_tokens, cached_prompt_tokens_.size(), shared_prefix,
+                     cached_boundaries_[0], cached_boundaries_[1], valid_checkpoints,
+                     shard_a_.host_checkpoints.size(), host_checkpoint_stride_, reuse, reuse_slot,
+                     reuse_from_host_ ? "host" : "device");
+    }
     const std::array<std::uint32_t, kReuseSnapshotCount> rewind_depths{0, rewind_near_};
+    // Tag the checkpoints this walk leaves behind and start the ring at the first stride multiple
+    // past the reused boundary: a checkpoint at the boundary itself would only duplicate the device
+    // snapshot the walk starts from. The new checkpoints become usable when this prefill completes.
+    host_checkpoint_live_id_           = host_checkpoint_next_id_++;
+    std::uint32_t next_host_checkpoint = 0;
+    if (host_checkpoint_stride_ != 0) {
+        next_host_checkpoint = host_checkpoint_stride_;
+        while (next_host_checkpoint <= reuse) { next_host_checkpoint += host_checkpoint_stride_; }
+    }
 
     // Multimodal request: one Vision session owns the items this request still has to encode, on top
     // of the startup plan. An item that lies entirely inside a reused prefix is already in the KV -
@@ -958,10 +1074,14 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     auto begin_gdn_state = [&](Shard& shard) {
         shard.device.bind_to_current_thread();
         if (reuse != 0) {
-            CUDA_CHECK(cudaMemcpyAsync(shard.state_backing.data,
-                                       shard.state_snapshots[reuse_slot].data,
-                                       shard.state_backing.bytes, cudaMemcpyDeviceToDevice,
-                                       shard.device.stream));
+            const void* source  = shard.state_snapshots[reuse_slot].data;
+            cudaMemcpyKind kind = cudaMemcpyDeviceToDevice;
+            if (reuse_from_host_) {
+                source = shard.host_checkpoints[reuse_slot].buffer->data();
+                kind   = cudaMemcpyHostToDevice;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(shard.state_backing.data, source, shard.state_backing.bytes,
+                                       kind, shard.device.stream));
             return;
         }
         CUDA_CHECK(cudaMemsetAsync(shard.state_backing.data, 0, shard.state_backing.bytes,
@@ -1020,6 +1140,25 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                                    shard.state_backing.bytes, cudaMemcpyDeviceToDevice,
                                    shard.device.stream));
     };
+    // The same copy into the host ring, tagged with the frontier it captures. It rides the shard
+    // stream, so it sees exactly the tokens the enclosing loop has enqueued and none of the later
+    // ones, and the ring slot it lands in is only revisited by a later prefill's checkpoint at the
+    // same index.
+    auto snapshot_host_checkpoint = [&](Shard& shard, std::uint32_t frontier, bool tail) {
+        if (shard.host_checkpoints.empty()) { return; }
+        const std::size_t begin = tail ? shard.host_checkpoint_grid_slots : 0;
+        const std::size_t count = tail ? shard.host_checkpoints.size() - begin : begin;
+        if (count == 0) { return; }
+        shard.device.bind_to_current_thread();
+        std::size_t& cursor = tail ? shard.host_checkpoint_tail_next : shard.host_checkpoint_next;
+        Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[begin + cursor];
+        checkpoint.position   = frontier;
+        checkpoint.prefill_id = host_checkpoint_live_id_;
+        CUDA_CHECK(cudaMemcpyAsync(checkpoint.buffer->data(), shard.state_backing.data,
+                                   shard.state_backing.bytes, cudaMemcpyDeviceToHost,
+                                   shard.device.stream));
+        cursor = (cursor + 1) % count;
+    };
 
     // Prefill: batched forwards over chunk-sized slices of the prompt suffix, accumulating KV and
     // GDN state in place. A reused prefix starts the walk at its boundary; those positions keep
@@ -1035,6 +1174,12 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     const std::uint32_t prefill_chunk =
         std::min<std::uint32_t>(std::max<std::uint32_t>(options_.prefill_chunk, 64),
                                 kPrefillChunkMaximum);
+    // The tail anchors cover the last few chunk ends of the walk. Their count is bounded by the tail
+    // sub-ring, so a narrow chunk cannot flood the ring with anchors that all sit within one chunk of
+    // the prompt end.
+    const std::uint32_t tail_span =
+        std::min<std::uint32_t>(kReuseTailWindow,
+                                prefill_chunk * std::max(1U, host_checkpoint_tail_slots_));
     std::array<std::uint32_t, kReuseSnapshotCount> snapshot_at{};
     snapshot_at[0] = prompt_tokens;
     for (std::size_t slot = 1; slot < kReuseSnapshotCount; ++slot) {
@@ -1051,6 +1196,19 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     }
     for (std::uint32_t t0 = reuse; t0 < prompt_tokens;) {
         if (cancellation.requested()) {
+            // The walk wrote KV of a prompt this request never finished, so the device cache no
+            // longer holds a prefix that matches cached_prompt_tokens_. Drop reuse until the next
+            // prefill republishes, and with it the host checkpoints: their whole validity chain runs
+            // through that prefix.
+            cached_state_valid_ = false;
+            {
+                Shard* const shards[2] = {&shard_a_, &shard_b_};
+                for (Shard* shard : shards) {
+                    for (auto& checkpoint : shard->host_checkpoints) {
+                        checkpoint.valid = false;
+                    }
+                }
+            }
             (void)request.output.preview_terminal(FinishReason::Cancelled);
             publish_preview(false);
             result.finish_reason = FinishReason::Cancelled;
@@ -1108,6 +1266,25 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                 snapshot_state(shard_b_, slot);
             }
         }
+        if (host_checkpoint_stride_ != 0) {
+            // One checkpoint per stride, tagged with the frontier this chunk actually reached, so a
+            // chunk width that does not divide the stride cannot mislabel a state; plus the dense
+            // tail window. The end of the prompt is skipped either way: the device snapshot below
+            // holds that same state already.
+            const std::uint32_t frontier = t0 + length;
+            const bool on_grid           = frontier >= next_host_checkpoint;
+            const bool in_tail           = frontier != prompt_tokens &&
+                                 static_cast<std::uint64_t>(frontier) + tail_span > prompt_tokens;
+            if (on_grid) {
+                snapshot_host_checkpoint(shard_a_, frontier, false);
+                snapshot_host_checkpoint(shard_b_, frontier, false);
+                next_host_checkpoint =
+                    (frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
+            } else if (in_tail) {
+                snapshot_host_checkpoint(shard_a_, frontier, true);
+                snapshot_host_checkpoint(shard_b_, frontier, true);
+            }
+        }
         if (t0 + length == prompt_tokens) {
             // First token: sample from the last chunk's last-column logits.
             ops::set_i32_scalar(logical_pos_a, static_cast<std::int32_t>(prompt_tokens),
@@ -1150,6 +1327,16 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
         cached_boundaries_[slot] = snapshot_at[slot];
     }
     cached_state_valid_ = true;
+    // Only now are this prefill's checkpoints usable: their state is one the walk reached and their
+    // KV prefix is one the walk wrote.
+    {
+        Shard* const shards[2] = {&shard_a_, &shard_b_};
+        for (Shard* shard : shards) {
+            for (auto& checkpoint : shard->host_checkpoints) {
+                if (checkpoint.prefill_id == host_checkpoint_live_id_) { checkpoint.valid = true; }
+            }
+        }
+    }
 
     // Prompt wall time spans prefill and the first-sample step: the first accepted token is
     // produced by the last prefill iteration. That is a stable commit boundary (the sampled token
