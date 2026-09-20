@@ -105,6 +105,9 @@ if ($Background) {
     # Foreground is the default: the shell that starts the server keeps ownership of it, the log streams
     # to the console, and Ctrl+C stops it.
     Write-Host "running $Binary (context $Context); Ctrl+C stops it"
-    & $Binary @arguments 2>&1 | Tee-Object -FilePath $LogFile
+    # ninfer-serve 的诊断（含显存账本）全部走 stderr；2>&1 把它并进成功流后 PowerShell 会把每一行
+    # 包成 ErrorRecord，控制台就按错误流渲染成红色（与日志级别无关）。先转成字符串再做 Tee，颜色
+    # 才和内容相符。
+    & $Binary @arguments 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $LogFile
     exit $LASTEXITCODE
 }
