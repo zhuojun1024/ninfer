@@ -75,6 +75,16 @@ private:
     int* token_host_ = nullptr; // cudaFreeHost handle
     int* token_a_    = nullptr; // device pointer into token_host_
     int* token_b_    = nullptr; // device pointer into token_host_
+    // Size-keyed transport policy for the in-kernel route. A decode-sized payload is a latency
+    // problem: one block, one launch, and its own compact staging so the two parity slots never
+    // alias the prefill-sized ones. A prefill-sized payload is a bandwidth problem and keeps the
+    // sliced transport, which is already at the link floor.
+    bool ar_size_keyed_   = true;
+    bool small_available_ = false;
+    void* small_host_a_ = nullptr; // cudaFreeHost handle for device a's decode-sized staging
+    void* small_host_b_ = nullptr; // cudaFreeHost handle for device b's decode-sized staging
+    void* small_dev_a_  = nullptr; // device-side pointer (device a) for small_host_a_
+    void* small_dev_b_  = nullptr; // device-side pointer (device b) for small_host_b_
 };
 
 // Non-owning view of one shard of a tensor split along dim. The local tensor

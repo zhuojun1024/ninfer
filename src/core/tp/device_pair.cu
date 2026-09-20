@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -94,12 +95,23 @@ __device__ __forceinline__ uint4 add_bf16x8(uint4 a, uint4 b) {
 __global__ void ar_inplace_bf16(const __nv_bfloat16* local, __nv_bfloat16* out,
                                 char* host_mine_base, const char* host_other_base, int count,
                                 int* arrival_mine, int* arrival_other, int* order_mine,
-                                const int* token_ptr, int slot_bytes, int groups) {
+                                int* token_ptr, int slot_bytes, int groups, int fuse_bump) {
     // The token lives in mapped host memory (either device may run this call), where a per-thread
     // load would be a system-scope read per thread. One read per block is enough: the value is fixed
-    // for the whole call, so publish it through shared memory.
+    // for the whole call, so publish it through shared memory. The single-block decode-sized call
+    // (fuse_bump) advances the counter from that same thread instead of running bump_ar_token first:
+    // a second launch is pure latency at this payload, and only this device reads its own counter.
     __shared__ int shared_token;
-    if (threadIdx.x == 0) { shared_token = *(const volatile int*)token_ptr; }
+    if (threadIdx.x == 0) {
+        if (fuse_bump != 0) {
+            const int next            = *(volatile int*)token_ptr + 1;
+            *(volatile int*)token_ptr = next;
+            __threadfence_system();
+            shared_token = next;
+        } else {
+            shared_token = *(const volatile int*)token_ptr;
+        }
+    }
     __syncthreads();
     const int token  = shared_token;
     const int stride = blockDim.x;
@@ -167,6 +179,12 @@ constexpr int kArMaxSlices             = 8;
 constexpr std::size_t kArSlotBytes     = 128; // one cache line per slot array (kArMaxSlices ints)
 constexpr std::size_t kArTokenBytes    = 2 * kArSlotBytes; // arrival array, then write-order chain
 
+// Decode-sized staging for the size-keyed transport. A single token's [hidden, 1] delta is a few
+// KiB: the 24 MiB prefill slots are almost all waste, and sharing them would let a small call's
+// parity slot alias a prefill payload the peer is still reading. This buffer holds one small
+// payload per parity instead.
+constexpr std::size_t kArSmallBytes = 64ULL << 10; // staging per device, per parity
+
 // Advances one device's arrival token. Launched immediately before the allreduce kernel on the
 // same stream, so the allreduce's device read sees the new value. Both devices run one bump per
 // allreduce call from the same starting value, which keeps their tokens equal at every call.
@@ -199,6 +217,10 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
     if (device_a == device_b) {
         throw std::invalid_argument("tp DevicePair: devices must be distinct");
     }
+    const char* ar_strategy = std::getenv("NINFER_TP2_AR_STRATEGY");
+    // NINFER_TP2_AR_STRATEGY=kernel pins every payload to the sliced transport, which is the A/B
+    // reference for the size-keyed policy.
+    ar_size_keyed_ = ar_strategy == nullptr || std::strcmp(ar_strategy, "kernel") != 0;
     int can_a_to_b = 0;
     int can_b_to_a = 0;
     const cudaError_t err_a = cudaDeviceCanAccessPeer(&can_a_to_b, device_a, device_b);
@@ -258,6 +280,24 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
                 }
             }
         }
+        // Decode-sized staging, sized so its two parity slots never alias the prefill-sized ones.
+        if (in_kernel_available_ && ar_size_keyed_) {
+            a_.bind_to_current_thread();
+            if (cudaHostAlloc(&small_host_a_, 2 * kArSmallBytes,
+                              cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
+                cudaHostGetDevicePointer(&small_dev_a_, small_host_a_, 0) == cudaSuccess) {
+                b_.bind_to_current_thread();
+                if (cudaHostAlloc(&small_host_b_, 2 * kArSmallBytes,
+                                  cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
+                    cudaHostGetDevicePointer(&small_dev_b_, small_host_b_, 0) == cudaSuccess) {
+                    small_available_ = true;
+                }
+            }
+        }
+        if (!small_available_) {
+            if (small_host_a_) { cudaFreeHost(small_host_a_); small_host_a_ = nullptr; small_dev_a_ = nullptr; }
+            if (small_host_b_) { cudaFreeHost(small_host_b_); small_host_b_ = nullptr; small_dev_b_ = nullptr; }
+        }
         // On any failure, free whatever was allocated and stay on host staging.
         if (!in_kernel_available_) {
             if (host_a_) { cudaFreeHost(host_a_); host_a_ = nullptr; dev_a_ = nullptr; }
@@ -283,6 +323,8 @@ DevicePair::~DevicePair() {
     if (arrival_host_a_) { cudaFreeHost(arrival_host_a_); }
     if (arrival_host_b_) { cudaFreeHost(arrival_host_b_); }
     if (token_host_) { cudaFreeHost(token_host_); }
+    if (small_host_a_) { cudaFreeHost(small_host_a_); }
+    if (small_host_b_) { cudaFreeHost(small_host_b_); }
 }
 
 DevicePair::DevicePair(DevicePair&& other) noexcept
@@ -292,9 +334,17 @@ DevicePair::DevicePair(DevicePair&& other) noexcept
       dev_a_(other.dev_a_), dev_b_(other.dev_b_), arrival_a_(other.arrival_a_),
       arrival_b_(other.arrival_b_), arrival_host_a_(other.arrival_host_a_),
       arrival_host_b_(other.arrival_host_b_), token_host_(other.token_host_),
-      token_a_(other.token_a_), token_b_(other.token_b_) {
+      token_a_(other.token_a_), token_b_(other.token_b_), ar_size_keyed_(other.ar_size_keyed_),
+      small_available_(other.small_available_), small_host_a_(other.small_host_a_),
+      small_host_b_(other.small_host_b_), small_dev_a_(other.small_dev_a_),
+      small_dev_b_(other.small_dev_b_) {
     other.p2p_              = false;
     other.in_kernel_available_ = false;
+    other.small_available_  = false;
+    other.small_host_a_     = nullptr;
+    other.small_host_b_     = nullptr;
+    other.small_dev_a_      = nullptr;
+    other.small_dev_b_      = nullptr;
     other.host_a_           = nullptr;
     other.host_b_           = nullptr;
     other.arrival_host_a_   = nullptr;
@@ -323,6 +373,12 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     token_host_          = other.token_host_;
     token_a_             = other.token_a_;
     token_b_             = other.token_b_;
+    ar_size_keyed_       = other.ar_size_keyed_;
+    small_available_     = other.small_available_;
+    small_host_a_        = other.small_host_a_;
+    small_host_b_        = other.small_host_b_;
+    small_dev_a_         = other.small_dev_a_;
+    small_dev_b_         = other.small_dev_b_;
     other.p2p_              = false;
     other.in_kernel_available_ = false;
     other.host_a_           = nullptr;
@@ -332,6 +388,11 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     other.token_host_       = nullptr;
     other.token_a_          = nullptr;
     other.token_b_          = nullptr;
+    other.small_available_  = false;
+    other.small_host_a_     = nullptr;
+    other.small_host_b_     = nullptr;
+    other.small_dev_a_      = nullptr;
+    other.small_dev_b_      = nullptr;
     return *this;
 }
 
@@ -363,10 +424,29 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
         // require_bytes already bounds the payload to whole 16-byte groups; the pointer check only
         // decides whether the vectorized group loops may be used.
         const int groups = (address % 16 == 0) ? count / 8 : 0;
-        const int slices     = ar_slices(count_bytes);
-        const int slot_bytes = static_cast<int>(kInKernelArBytes);
         int*      order_a = reinterpret_cast<int*>(reinterpret_cast<char*>(arrival_a_) + kArSlotBytes);
         int*      order_b = reinterpret_cast<int*>(reinterpret_cast<char*>(arrival_b_) + kArSlotBytes);
+        if (ar_size_keyed_ && small_available_ && count_bytes <= kArSmallBytes) {
+            // Decode-sized: one block, one launch. Folding the token bump into the kernel takes one
+            // launch off every call, and 128 calls ride each decode round. The thread count stays at
+            // kArThreads: a smaller block regressed, because the payload's cost is the mapped-host
+            // round trip and the group loops want the parallelism.
+            a_.bind_to_current_thread();
+            ar_inplace_bf16<<<1, kArThreads, 0, stream_a>>>(
+                reinterpret_cast<const __nv_bfloat16*>(data_a),
+                reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(small_dev_a_),
+                static_cast<const char*>(small_dev_b_), count, arrival_a_, arrival_b_, order_a,
+                token_a_, static_cast<int>(kArSmallBytes), groups, 1);
+            b_.bind_to_current_thread();
+            ar_inplace_bf16<<<1, kArThreads, 0, stream_b>>>(
+                reinterpret_cast<const __nv_bfloat16*>(data_b),
+                reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(small_dev_b_),
+                static_cast<const char*>(small_dev_a_), count, arrival_b_, arrival_a_, order_b,
+                token_b_, static_cast<int>(kArSmallBytes), groups, 1);
+            return;
+        }
+        const int slices     = ar_slices(count_bytes);
+        const int slot_bytes = static_cast<int>(kInKernelArBytes);
         // Each device advances its own token before running the kernel, and the kernel derives its
         // double-buffer parity from that value, so a captured sequence needs no host-side counter.
         a_.bind_to_current_thread();
@@ -375,14 +455,14 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
             reinterpret_cast<const __nv_bfloat16*>(data_a),
             reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(dev_a_),
             static_cast<const char*>(dev_b_), count, arrival_a_, arrival_b_, order_a, token_a_,
-            slot_bytes, groups);
+            slot_bytes, groups, 0);
         b_.bind_to_current_thread();
         bump_ar_token<<<1, 1, 0, stream_b>>>(token_b_);
         ar_inplace_bf16<<<slices, kArThreads, 0, stream_b>>>(
             reinterpret_cast<const __nv_bfloat16*>(data_b),
             reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(dev_b_),
             static_cast<const char*>(dev_a_), count, arrival_b_, arrival_a_, order_b, token_b_,
-            slot_bytes, groups);
+            slot_bytes, groups, 0);
         return;
     }
     if (p2p_) {
