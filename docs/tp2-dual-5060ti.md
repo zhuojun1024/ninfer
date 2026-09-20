@@ -132,11 +132,17 @@ larger `-ub` was not tried and could move its prefill numbers.
 
 ## KV cache quantization
 
-`--kv-dtype` supports `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`. All of them work on the
+`--kv-dtype` supports `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`. All of them work on the plain
 TP-2 route, but the quantized variants needed two fixes (below): the quantized prompt-attention
 kernels, and the quantized small-T decode kernels used by a multi-column (MTP) window, both opt in to
 more than 48 KiB of dynamic shared memory, and in both cases the opt-in was a function-local
 `static` that configured only the first shard's device.
+
+`bf16` KV does not combine with `--spec mtp` on this build. The first prefill dies in the bf16
+prompt-attention kernel (`src/ops/softmax_attention/dense/causal_cache/prompt.cu:63`,
+`cudaErrorInvalidValue`) on both cards. It reproduces at `--max-context` 2,048 and 8,192, and with
+the cross-session pool switched off, so it is independent of that feature; fp8 KV, the shipped
+recipe, runs MTP correctly, which is the route `ninfer_qwen3_5_tp2_sessions_test` exercises it on.
 
 The capacity is usable end to end: a **65k-token** prompt returned HTTP 200 after 48.1 s on the
 shipped 262,144-token fp8 configuration, and a **118,869-token** prompt took 96.8 s at the earlier
@@ -263,6 +269,52 @@ and no admitted shape had an admitted half, so `select_q4_n65536_k5120` was adde
 `ninfer_linear_tp2_split_grouped_head_test` runs both shard halves against the full-weight Op at
 exactly this shape (T=1 and T=2) and compares them bit for bit.
 
+## Cross-session KV pool
+
+TP-2 keeps exactly one conversation in the device KV pool. A request that belongs to another
+conversation copies the resident session's KV, GDN state and MTP cache into pinned host memory and
+copies the returning session back, so an alternating chat client pays one PCIe round trip instead
+of a full prefill. The catalog holds the resident conversation plus `--max-private-continuations - 1`
+host-resident ones (six entries by default) and evicts the least recently used when it is full.
+
+Enable it by giving the host KV budget, which is split evenly between the two shards:
+
+```
+./build/apps/ninfer-serve <model>.ninfer --devices 0,1 <...> \
+  --host-kv-mib 32768 --max-private-continuations 6
+```
+
+`--host-kv-mib 32768` is 16 GiB per card, enough for five 204,800-token fp8 conversations at
+16.125 KiB/token/card, and the startup ledger states that arithmetic back
+(`[tp2-session] host budget 16384.0 MiB/shard holds 5 of 5 full-context sessions (3225.0 MiB each)`).
+The arena is pinned on the first eviction, so a single-conversation workload never pays for the
+budget; `--host-kv-mib 0` disables the pool entirely and restores the previous behaviour.
+
+Observable behaviour:
+
+- A returning conversation reports `reused_prompt_tokens == frontier` (its whole stored history) and
+  the prefill only walks the new suffix. The frontier is one token short of the history, because the
+  last sampled token is not forwarded until the next round.
+- The recalled answer is token-for-token identical to a from-scratch prefill of the same prompt: the
+  KV bytes, and therefore the attention, are the same.
+- A conversation the LRU budget evicted reports `reused_prompt_tokens == 0` and is prefilled from
+  zero again.
+- `NINFER_TP2_SESSION_TRACE=1` prints every recall and eviction with its frontier.
+
+Constraints and limits:
+
+- Pinned host memory: the KV budget, plus one GDN state image per host-resident session per shard
+  (~73 MiB each), plus the existing prefix-reuse checkpoint ring. Confirm at least 48 GiB of physical
+  memory before asking for 32 GiB, and lower `--host-kv-mib` when in doubt: at 204,800 tokens a
+  full-context fp8 conversation is 3,225 MiB per shard, so 32768 holds the five host-resident
+  conversations the default catalog admits and 16384 holds two.
+- Shard 0's arena also carries the MTP layer's own KV (~2 KiB/token), so a symmetric split spends a
+  little of shard 0's budget on it.
+- A client that re-renders its history so it no longer starts with the stored token sequence cannot
+  be recalled; that request falls back to a full prefill, exactly as before.
+- Session switching happens at request boundaries only. A request that arrives while another is
+  generating waits for it, because TP-2 runs one request at a time.
+
 ## Device memory budget
 
 Measured by starting the engine under controlled configurations and reading
@@ -333,6 +385,7 @@ The context cache is disabled on this route -- the core owns the prefix-reuse sn
 | Half-width FP8 embedding | `ninfer_embedding_test` | full sweep at `[248320,2560]` |
 | NVFP4 split Linear | `ninfer_linear_tp2_split_nvfp4_test` | passes |
 | Collective staging | `ninfer_tp_device_pair_test` | passes |
+| Cross-session KV retention | `ninfer_qwen3_5_tp2_sessions_test` (`NINFER_TEST_ARTIFACT`) | plain and MTP routes both pass: a returning conversation recalled 71 prompt tokens and matched the oracle token for token; the LRU-evicted one reported `reused_prompt_tokens == 0`. The MTP round's shard-0 arena reports `2 layouts` against shard 1's `1`, so its own KV slab travels with the session |
 
 "Exact" is bit for bit: the split Op output equals the same Op run with the full weight on the same
 device, which is the property the merge relies on. `temperature 0, top_k 1` is what makes the greedy

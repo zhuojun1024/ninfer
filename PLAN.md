@@ -10,8 +10,9 @@
 >   详细数据见 `docs/tp2-dual-5060ti.md` 与本文件 §10。
 > - **Round 53（进行中）**：TP-2 视觉识别 —— 「静态分片分工」（MTP 只 shard 0 / vision 只 shard 1），
 >   见 §11。用户已批准；目标是显存足够时不引入单图 token 上限配置。
-> - **§13（设计定稿，未开工）**：TP-2 多会话 KV 池 —— host KV 换入换出，显存始终只有一份激活 KV，
->   内存最多存 5 份非激活会话（LRU 淘汰最旧），会话回来时整体召回、只 prefill 新后缀。
+> - **§13（已完成并实测通过）**：TP-2 多会话 KV 池 —— host KV 换入换出，
+>   显存始终只有一份激活 KV，内存最多存 5 份非激活会话（LRU 淘汰最旧），会话回来时整体召回、
+>   只 prefill 新后缀。见 §13 进度小节。
 
 ---
 
@@ -1130,7 +1131,7 @@ TP-2 核心本来就在用 `PinnedHostBuffer`（`tp2_generation_core.cpp:279`）
 
 ---
 
-## 13. 进行中：TP-2 多会话 KV 池（host KV 换入换出）
+## 13. 已完成：TP-2 多会话 KV 池（host KV 换入换出）
 
 **目标**：多个聊天会话（A/B/C…）交替使用同一个 TP-2 引擎。任意时刻显存里只有一份激活会话的 KV；
 最多 5 份非激活会话的 KV + 状态保存在 pinned host 内存，会话回来时整体召回（H2D），只 prefill 新后缀；
@@ -1189,7 +1190,7 @@ TP-2 核心本来就在用 `PinnedHostBuffer`（`tp2_generation_core.cpp:279`）
 - 回归：现有 TP-2 用例全过（`qwen3_5_tp2_forward --artifact` 等）；`git diff --check` 干净。
 - 资源：显存零新增（nvidia-smi 台账不变）；pinned host ≈ 32 GiB（KV）+ 0.7 GiB（状态）+ 现有环
   4.7 GiB。**启动前确认物理内存 ≥ 48 GiB**（本机 WMI 读不出内存总量，用任务管理器核对）；
-  不足则 `--host-kv-mib` 降档（16384 = 3 个满上下文会话）。
+  不足则 `--host-kv-mib` 降档（204,800 token 口径下 16384 = 2 个满上下文会话）。
 
 **风险与注意**
 
@@ -1208,7 +1209,83 @@ TP-2 核心本来就在用 `PinnedHostBuffer`（`tp2_generation_core.cpp:279`）
 `src/models/qwen3_5/program/transactions/materialization.cpp` 的 D2H/H2D 事务，但 TP-2 核心是独立
 代码路径，属移植而非启用。
 
-**进度**：（未开工，随工作更新）
+**进度（Round 55，已完成并实测通过）**
+
+已落地（工作项 1–10 的代码部分）：
+
+- **主机 KV arena**：复用既有 `HostKVArena`（`src/core/host_kv_arena.h`）与
+  `DeviceKVPagePool::copy_to_host/copy_from_host`，TP-2 不自己写 D2H 分页循环。每 shard 一个
+  arena，容量 = `--host-kv-mib / 2`，**首次换出时才构造**（单会话负载永不 pin）。shard 0 的
+  arena 同时注册 text 与 MTP 两套 geometry。会话 slab 按该会话 frontier 页数分配
+  （`pages_for_tokens(frontier)`），不按 max_context 预分配。device KV 池保持启动时全量物化
+  且页表不变，换入换出只覆盖数据，显存零新增。
+- **会话目录**：`TP2GenerationCore::SessionEntry` = tokens（prompt + 已提交生成）、frontier、
+  device/host 驻留标志、每 shard host KV slab、每 shard GDN 状态镜像、MTP slab、LRU 时钟。
+- **匹配**：`session_recall` 在 execute 开头、prefix scan 之前运行。对每条目录项算精确 LCP；
+  host 条目要求 `LCP >= frontier`（整体召回语义）；候选按 frontier 深浅比较，只换比**驻留谱系
+  可复用深度**更深的。驻留深度由 live frontier / device snapshot / host 检查点三者求出，与 scan
+  同源；深度为 0 时驻留会话先换出再新建（否则目录项会被新会话内容静默顶替）。
+- **换出/换入事务**：`session_store_active` / `session_restore`。两个 shard 各自在本地 stream 上
+  D2H/H2D KV + GDN 状态 + MTP KV，随后同步两卡才改驻留标志。换出失败（预算不足）时丢弃该条目
+  并降级为全量 prefill；换入失败由 `execute` 的 catch 使驻留条目失效。
+- **LRU**：目录容量 = `--max-private-continuations`（TP-2 默认 6，含驻留），满时淘汰最旧非驻留项。
+- **prefill 集成**：scan 新增 **LiveState** 候选（reuse = 会话 frontier，state 不拷贝）；
+  `ReuseSource{None,DeviceSnapshot,HostCheckpoint,LiveState}` 取代 `reuse_from_host_`；
+  `cached_prompt_tokens_` 现在含已提交生成 token（decode 结束 publish），因此同会话续轮也能从
+  frontier 复用。注意 frontier = prompt + generated − 1：最后采样的 token 尚未 forward。
+- **正确性边界**：① 换入/新建会话时使 host 检查点环失效（环的状态属于被置换的谱系，位置可能
+  仍落在召回历史内）；② 任何从 walk 抛出的异常由 `execute` 的 catch 使驻留条目失效并清
+  `cached_state_valid_`；③ prefill 取消同样（保留其他 host 条目）。
+- **选项打通**：`normalize_engine_options` 的 TP-2 分支保留 `host_kv_capacity_bytes` 与
+  `max_private_continuations`，disabled-cache 校验对该路线跳过；`--host-kv-mib 0` 关闭会话保留。
+  启动台账新增 `[mem] host sessions capacity ...`；`NINFER_TP2_SESSION_TRACE=1` 打印
+  recall / evict 决策。`tools/win_port/serve.ps1` 暴露 `-HostKvMiB`（默认 32768）与
+  `-PrivateContinuations`（默认 6）。
+- **测试**：`tests/models/qwen3_5/test_tp2_sessions.cpp`（已注册，`SKIP_RETURN_CODE 77`）。
+  需 `NINFER_TEST_ARTIFACT` + 两张同名 sm_120a 卡。场景：oracle（关闭保留）全量 prefill 对齐 →
+  A/B/A 召回并断言 `reused_prompt_tokens == frontier` → 输出与 oracle 逐 token 一致 → 填满目录
+  触发 LRU 淘汰 A → A 回来断言 `reused_prompt_tokens == 0` 且输出仍一致。设备扫描只在 sm_120a
+  设备里挑同名对（本机 CUDA 还会枚举到 Tesla T10），foreign 设备不再让测试永久 skip。
+
+**实测（Round 55）**
+
+- 端到端测试 `ninfer_qwen3_5_tp2_sessions_test`：artifact `D:\LLM\qwen3_8_27b_w4a4_w8a8.ninfer`，
+  两张 5060 Ti（CUDA 0/2），`max_context 2048`、`prefill_chunk 256`、greedy，跑两条路线：
+  plain + bf16 KV，以及 MTP + fp8 KV（serve 推荐配置）。退出码 0，耗时 200 s，输出
+  `TP-2 session retention (plain|mtp) passed: recall reused 71 prompt tokens bit-identically;
+  LRU eviction forced a full prefill`。MTP 轮 shard 0 的 arena 打印 `2 layouts`（shard 1 为 `1`），
+  证明 MTP 自己的 KV slab 随会话换入换出。`NINFER_TP2_SESSION_TRACE=1` 的决策链与目录状态自洽：
+  `new session entries=0`（A）→ `new session entries=1`（B，A 换出）→
+  `recall frontier=71 resident_depth=0 tokens=72 entries=2`（A 召回）→ `new session entries=2`（C）→
+  `new session entries=3` + `evict frontier=55 tokens=56`（淘汰 B）→ `new session entries=3` +
+  `evict frontier=95 tokens=96`（淘汰 A）→ A 回来走 `new session`（全量 prefill）。首次换出时才出现
+  `host KV arena shard N: 64.0 MiB pinned, 1 layouts`，证实单会话负载不 pin。
+- pinned 内存台账：`ninfer-serve --devices 0,1 --max-context 204800 --kv-dtype fp8 --host-kv-mib 32768
+  --max-private-continuations 6` 实测启动
+  `[mem] host sessions capacity 6 | host KV 16384.0 MiB/shard | retention enabled` +
+  `[tp2-session] host budget 16384.0 MiB/shard holds 5 of 5 full-context sessions (3225.0 MiB each)`。
+  204,800 × 16.125 KiB = 3225.0 MiB/shard，与文档公式逐位吻合；`--host-kv-mib 32768` + 默认目录 6
+  （1 驻留 + 5 host）即推荐档。全程显存占用 0（arena 未 pin），停机后 GPU 归零。
+- 数值一致性由测试的逐 token 对齐承担：召回 walk 与 oracle 全量 prefill 的 greedy 输出完全相同，
+  说明 KV 字节与 GDN 状态镜像都被正确换入；LRU 淘汰后重新 prefill 也回到同一序列。
+
+**已知边界**
+
+- 预算口径：shard 0 的 arena 同时承载 text 与 MTP slab，对称切分下 MTP 会吃掉 shard 0 的一部分
+  预算；容量不足时按 LRU 淘汰，必要时调大 `--host-kv-mib`。
+- 客户端重渲染导致 `LCP < frontier` 的会话不召回（优雅降级为全量 prefill）；同一谱系内的部分
+  复用仍由 Round 16 环 + device snapshot 承担。
+- 运行模型测试需要 ffmpeg 与 libcurl 的 `bin` 在 PATH（`ninfer-serve` 同样），否则进程以
+  `STATUS_DLL_NOT_FOUND`(0xC0000135) 退出；`tools/win_port/serve.ps1` 已代为设置。
+- **既有 artifact 差异（非 §13 引入）**：`test_tp2_forward` 在 `qwen3_8_27b_w4a4_w8a8.ninfer` 上
+  chunk-split 不变性不成立（300 -> 256+44，top5 gap 1.0625、max logit diff 11.53），在
+  `qwen3_8_27b_nvfp4.ninfer`（文档记录的 artifact）上逐位一致（gap 0、diff 0）。该测试只用底层
+  shard fixture、不构造 `ninfer::Engine`，与 §13 无关。`ninfer_qwen3_5_tp2_load_test` 在新
+  artifact 上通过。
+- **既有缺陷（非 §13 引入，未修）**：TP-2 路线 `bf16` KV + `--spec mtp` 在第一次 prefill 就崩
+  （`prompt.cu:63` `cudaErrorInvalidValue`）。在 `--max-context` 2048 与 8192、且启动台账为
+  `host sessions capacity 0`（会话保留关闭）时均复现，故与会话池改动无关；`fp8` + MTP 正常，
+  测试的 MTP 轮因此走 fp8。排查入口是 bf16 prompt-attention 的 launch 参数（`prompt.cu`）。
 
 ---
 
