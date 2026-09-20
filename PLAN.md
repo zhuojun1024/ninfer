@@ -1178,6 +1178,10 @@ NInfer 设计（轻量版，先做「工具名前缀树 + 参数名掩码」）�
   penalty 非零时在请求 workspace 建 `I32[public_tokens]` 计数数组、`cudaMemsetAsync` 清零后挂到 `sampling_config`；
   `ops::sample` 与 `speculative_accept_greedy_drafts` 自行累加产出的 token。未配 penalty 时不建数组、`c_v` 恒为 0，
   与单卡路径一致。
+  实测（同 seed 12345、同 prompt、同参数，两份二进制各起一次服务）：pre-fix 的 zero / presence=2.0 / frequency=2.0 三次输出
+  **逐字节相同**（penalty 完全无效）；post-fix 的无 penalty 输出与 pre-fix **逐字节相同**（修复不触碰无 penalty 路径），
+  而 presence / frequency 输出与它不同：frequency=2.0 时重复词从 `apple x30`、最长连续 15 降到 `apple x9`、最长连续 2，
+  去重词数 57→99。
 - 环境注记：DSH 沙箱处于 `workspace-write` 时 ninja **无法执行任何子进程**（连平凡工程都挂，`ninja -t/-n` 正常），
   构建须在 `danger-full-access` 下进行；另外 `pwsh` 的后台作业若用 `Tee-Object` 把输出写进管道会因管道写满而在中途卡死。
 
