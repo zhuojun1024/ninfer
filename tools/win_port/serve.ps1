@@ -3,6 +3,7 @@
 #   pwsh -File tools/win_port/serve.ps1                  # start with the shipped recipe
 #   pwsh -File tools/win_port/serve.ps1 -Context 32768   # larger KV capacity
 #   pwsh -File tools/win_port/serve.ps1 -Plain           # no MTP/vision, plain decode
+#   pwsh -File tools/win_port/serve.ps1 -HostKvMiB 0     # no cross-session KV retention
 #   pwsh -File tools/win_port/serve.ps1 -Status          # processes, health, VRAM
 #   pwsh -File tools/win_port/serve.ps1 -Stop            # stop every ninfer-serve process
 #
@@ -19,6 +20,8 @@ param(
     [int] $Port = 8099,
     [int] $Context = 131072,
     [int] $DraftTokens = 2,
+    [int] $HostKvMiB = 32768,
+    [int] $PrivateContinuations = 6,
     [switch] $Plain,
     [switch] $Background,
     [string] $LogFile = "",
@@ -75,6 +78,11 @@ $arguments = @(
     "--port", "$Port",
     "--host", "127.0.0.1",
     "--kv-dtype", "fp8",
+    # Cross-session KV retention: 32 GiB of pinned host KV (16 GiB/card = five 204,800-token fp8
+    # conversations) with the default six-entry catalog. The arena is pinned on the first eviction,
+    # so a single-conversation workload never pays for it; -HostKvMiB 0 turns retention off.
+    "--host-kv-mib", "$HostKvMiB",
+    "--max-private-continuations", "$PrivateContinuations",
     "--log-level", "info"
 )
 if (-not $Plain) {
