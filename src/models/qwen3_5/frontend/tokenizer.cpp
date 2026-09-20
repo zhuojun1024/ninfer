@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -601,10 +600,14 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
     if (normalized.empty()) { return true; }
     if (ids.size() == max_tokens) { return false; }
 
+    // Both buffers outlive a single word. A pre-tokenizer word is only a few bytes, so allocating a
+    // node array and a candidate heap per word dominated the cost of tokenizing a long prompt.
+    std::vector<BpeNode> nodes;
+    std::vector<BpeCandidate> heap;
     for (std::size_t begin = 0; begin < normalized.size();) {
         const std::size_t end = qwen_word_end(normalized, begin);
         const std::string_view word(normalized.data() + begin, end - begin);
-        std::vector<BpeNode> nodes(word.size());
+        nodes.resize(word.size());
         for (std::size_t index = 0; index < word.size(); ++index) {
             const unsigned char byte = static_cast<unsigned char>(word[index]);
             const int symbol         = byte_token_ids[byte];
@@ -619,7 +622,7 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
                         .end      = index + 1};
         }
 
-        std::priority_queue<BpeCandidate, std::vector<BpeCandidate>, LaterBpeCandidate> queue;
+        heap.clear();
         const auto push_candidate = [&](int left) {
             if (left < 0 || !nodes[static_cast<std::size_t>(left)].live) { return; }
             const int right = nodes[static_cast<std::size_t>(left)].next;
@@ -628,7 +631,7 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
                 merge_rules.find(merge_pair_key(nodes[static_cast<std::size_t>(left)].symbol,
                                                 nodes[static_cast<std::size_t>(right)].symbol));
             if (rule == nullptr) { return; }
-            queue.push(BpeCandidate{
+            heap.push_back(BpeCandidate{
                 .rank             = rule->rank,
                 .left             = left,
                 .right            = right,
@@ -636,13 +639,15 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
                 .left_generation  = nodes[static_cast<std::size_t>(left)].generation,
                 .right_generation = nodes[static_cast<std::size_t>(right)].generation,
             });
+            std::push_heap(heap.begin(), heap.end(), LaterBpeCandidate{});
         };
         for (std::size_t index = 0; index + 1 < nodes.size(); ++index) {
             push_candidate(static_cast<int>(index));
         }
-        while (!queue.empty()) {
-            const BpeCandidate candidate = queue.top();
-            queue.pop();
+        while (!heap.empty()) {
+            const BpeCandidate candidate = heap.front();
+            std::pop_heap(heap.begin(), heap.end(), LaterBpeCandidate{});
+            heap.pop_back();
             BpeNode& left  = nodes[static_cast<std::size_t>(candidate.left)];
             BpeNode& right = nodes[static_cast<std::size_t>(candidate.right)];
             if (!left.live || !right.live || left.next != candidate.right ||

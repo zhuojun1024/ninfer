@@ -1931,3 +1931,105 @@ C 命中的是 `slot=8`，即 **divergence 子环**（grid 0-3、tail 4-7、dive
 - 端到端如上表；服务端追踪 + 启动账本双重佐证，无需对比旧二进制。
 - TP-2 的 ring **仍无自动化测试覆盖**：`test_tp2_forward` 只测 `forward_tp2`，不构造 `TP2GenerationCore`。
   要覆盖它需要真工件 + 双卡，故本轮仍以端到端实测为准。
+
+## Round 17 — TTFT 地板拆解：0.28-0.35 s 不是"固定开销"，一半随 prompt 长度增长
+
+Round 16b 之后剩下的疑问是"每请求 0.28-0.35 s 的固定开销在哪"。结论：它不是一个常数。在 100k context 下它的构成是
+~32 ms 的 Engine 常量 + ~81 ms 随 context 线性增长的前向 + ~10 ms 的 host 状态恢复（仅新会话）+ ~70 ms 的服务端
+渲染/分词 + ~100 ms 的 HTTP/JSON/序列化/客户端。
+
+### 定位手段：`NINFER_TP2_TIMING` 的 prefill 分段计时
+
+TP-2 路由上 `engine_timing` 完全未填充（`host_exposed_seconds`、`units` 全 0），`prefill_seconds` 又是
+`execute()` 顶部（1090 行）到首 token 的整段宿主墙钟，无法归因。因此在 `NINFER_TP2_TIMING=1` 下加了
+scan / state / walk / post 四段（段间插设备同步，仅该环境变量开启时生效）：`scan` 覆盖复用扫描与 pruning，
+`state` 覆盖 GDN 状态恢复，`walk` 覆盖走查与首 token 采样，`post` 覆盖快照与 publish。
+
+12-token suffix、默认 `--host-state-slots`、同源对比（复用来源由 `NINFER_TP2_REUSE_TRACE` 标注）：
+
+| context | src | scan | state | walk | post |
+|---|---|---|---|---|---|
+| 15.3k | device | 0.02 | 0.55 | 53.83 | 0.03 |
+| 15.3k | host | 0.02 | **10.95** | 53.24 | 0.03 |
+| 30.5k | device | 0.03 | 0.55 | 65.43 | 0.05 |
+| 30.5k | host | 0.02 | **10.94** | 65.36 | 0.05 |
+| 45.3k | device | 0.04 | 0.54 | 77.51 | 0.05 |
+| 45.3k | host | 0.03 | **11.06** | 77.49 | 0.05 |
+
+- **scan 只有 0.01-0.04 ms**：那个 O(context) 的宿主复用扫描（52k 次整数比较）不是问题；先前按截距外推怀疑它是错的。
+- **state 的 host 路径固定贵 10.4 ms**（0.55 → 10.95），与 context 无关。147 MiB H2D 被 GPU1 的 Gen4 x4
+  （约 7 GB/s）卡住，是链路地板。
+- **walk = 31.9 ms + 0.81 µs/token × context + 0.79 ms/token × suffix**。三个 context 点线性，且与复用来源无关。
+- post 0.03-0.05 ms，可忽略。
+
+### 0.81 µs/token 落在 walk 里，是窄 query 块对长 KV 的遍历
+
+走查只处理 12 个 token，前向却随 context 线性增长。多出 30k context 时每卡多读约 557 MB KV，耗时 23.7 ms，即
+**有效带宽约 23 GB/s**（该卡 448 GB/s 峰值的 5%）。只有 12 个 query，并行度不足以掩盖 KV 读延迟。这是 kernel
+效率问题，不是宿主开销——item 2 的目标。
+
+### host 恢复的 10.4 ms 不值得换 device 平面
+
+divergence 锚点迁到 device 快照只需 **+73.4 MiB/卡**（一个状态平面；`state_arena` 由 4 平面变 5，
+293.6 → 367.0 MiB/卡；紧的那张卡剩余 1580 MiB 的 4.6%），同时可省掉 host ring 的第 9 槽（−73.4 MiB pinned/卡）。
+但收益只有 **9.9 ms × 每会话一次**：host 恢复只在复用边界既非 prefill end、也非自适应 rewind 点时发生。Round 17
+扫描里 3 次稳态探测有 2 次 `src=host` 是探测形状的产物——三轮 prompt 等长，pair 间 gap 恒为 12，预测的下一共享
+前缀 15304-12-2 比实际共享前缀 15292 低 2 个 token，被可达性守卫 `prompt_tokens - depth >= reuse` 判为"本轮没
+走到"而丢弃（trace 中 p2 留下 `rewind=0`，p3/p4 落到 host 槽 6）。真实聊天每轮 prompt 在增长、共享前缀还伸进
+助手回复，守卫通常成立，走 device。**结论：放弃该杠杆。**
+
+### 服务端渲染/分词：98-99.7% 是分词，渲染只有 0.1-0.3 ms
+
+`preparation_seconds` 写在 **`request_start`** 事件里（在准备完成之后写出），不是缺失也不是全 0——按
+`request_done` 找会误判。7 个样本的 `total` 与 `tokenize` 之差只有 0.04-0.34 ms：
+
+| prompt_tokens | prepare total | tokenize | 其余 |
+|---|---|---|---|
+| 15299 | 5.922 | 5.806 | 0.116 |
+| 45299 | 29.884 | 29.545 | 0.338 |
+
+即 `chat_template.render()` 不是成本，**每个请求重新分词整段历史**才是。`--request-log-jsonl` 的
+`timings_seconds.prepare` 与 `preparation_seconds.total` 在 chat 路径上一致（差 0.02 ms），所以主路径只有一次
+分词——`Frontend::count_tokens` 只服务 Anthropic `/v1/messages/count_tokens`。
+
+### 修复：BPE 每个词两次堆分配
+
+`append_normalized_bpe_ids`（`tokenizer.cpp`）对每个 pre-tokenizer 词都新建一个 `std::vector<BpeNode>`
+与一个 `std::priority_queue`。长 prompt 约 3-4 万词，即 10 万次以上堆分配。改为把两个缓冲提到词循环之外复用
+（`nodes.resize` / `heap.clear()`），并把 `std::priority_queue` 换成同一个 vector 上的 `std::push_heap` /
+`std::pop_heap` 加 `LaterBpeCandidate`。
+
+这**不改变语义**：`std::priority_queue::push` 的规定实现就是 `c.push_back(v); std::push_heap(...)`，
+`pop` 就是 `std::pop_heap(...); c.pop_back()`，`top()` 就是 `c.front()`——插入序列与比较器完全相同，
+因此弹出顺序逐位一致。顺带淘汰了 `#include <queue>`。
+
+固定内容探针、同一真实工件、两次服务进程（改动前/后）：
+
+| cache_n + prompt_n | tokenize 前 (ms) | tokenize 后 (ms) | 加速 |
+|---|---|---|---|
+| 1211 | 0.330 | 0.226 | 1.46x |
+| 5851 | 1.178 | 0.766 | 1.54x |
+| 1812 | 0.856 | 0.439 | 1.95x |
+| 7037 | 2.715 | 1.613 | 1.68x |
+| 27913 | 13.623 | 6.178 | 2.20x |
+| 39213 | 14.568 | 8.329 | 1.75x |
+| 67 | 0.064 | 0.056 | 1.13x |
+
+合计 33.3 → 17.6 ms（**1.89x**）。100k context 下这一项从约 38 ms 降到约 22 ms。
+
+### 验证
+
+- **逐位等价**：同一探针改动前后，7 个请求的 `cache_n + prompt_n` 全部相同（含 CJK、组合字符
+  e+U+0301 与 a+U+0300、emoji 的 mixed 用例），`prompt_ms` 不受影响。
+- `ctest -R qwen3_5_frontend` **通过**（含 `test_bpe_merge_order`、`test_boundary_aware_tokenization`）。
+- 顺带修掉一个既有环境问题：`tests/fixtures/frontend/` 下的 *.jinja 在本 checkout 里是 CRLF，而 `.gitattributes`
+  声明 `*.jinja text eol=lf`，于是模板 sha256 不在白名单里，前端测试以 `0xC0000409`（未捕获异常 fastfail）
+  退出且**无任何输出**——`main` 不接异常，失败点不可见。把两个 fixture 归一化为 LF（对 git 不可见，`git status`
+  仍干净）后整栈通过。此崩溃在 stash 掉分词改动后同样复现，与本轮改动无关。
+
+### 遗留
+
+- 分词剩余约 0.22 µs/token（100k 约 22 ms）。彻底消除需要按 added-token 段缓存 `BoundaryEncodedText` 前缀
+  （`encode_with_boundaries` 已按特殊 token 分段、段间归一化本就独立，因此按段切分可证等价），代价是 Frontend 里
+  引入带并发保护的缓存与一段前缀拼接——相对约 22 ms 收益风险偏高，本轮未做。
+- 地板大头仍是 walk 的 0.81 µs/token（100k 约 81 ms），即 item 2。
