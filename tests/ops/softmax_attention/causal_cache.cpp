@@ -3,6 +3,7 @@
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/op_tester.h"
+#include "ops/softmax_attention/dense/causal_cache/launch.h"
 #include "ops/softmax_attention/oracle.h"
 
 #include <algorithm>
@@ -113,6 +114,9 @@ struct Geometry {
 constexpr Geometry kGeometries[] = {
     {"d256-h24-kv4", 24, 4},
     {"d256-h16-kv2", 16, 2},
+    // Tensor-parallel-2 shard of the 24/4 model. Its narrow chunks have half the query rows, so the
+    // route they take is not the full geometry's.
+    {"d256-h12-kv2", 12, 2},
 };
 
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
@@ -2243,6 +2247,34 @@ int run_batch_cases() {
     return failures;
 }
 
+int verify_route_selection() {
+    using Route = ninfer::ops::detail::CausalAttentionRoute;
+    const auto expect = [](const char* name, std::int32_t q_heads, std::int32_t width,
+                           std::uint32_t max_keys, Route want) {
+        const ninfer::ops::CausalAttentionExecutionEnvelope envelope{.min_visible_keys = 1,
+                                                                    .max_visible_keys = max_keys};
+        const Route route = ninfer::ops::detail::causal_attention_resolve_route(
+            q_heads, width, 1, KvCacheStorage::Fp8E4M3Row256, envelope);
+        if (route == want) { return 0; }
+        std::cerr << "[route] " << name << " q" << q_heads << " w" << width << " keys" << max_keys
+                  << ": expected " << ninfer::ops::detail::causal_attention_route_name(want)
+                  << ", got " << ninfer::ops::detail::causal_attention_route_name(route) << '\n';
+        return 1;
+    };
+    int failures = 0;
+    // A shard's narrow chunk must reach split-KV once the context outgrows the prompt route's
+    // chunking; at or below the frontier the prompt route still owns it.
+    failures += expect("shard, long context", 12, 7, 513, Route::ChunkedSmallT);
+    failures += expect("shard, long context", 12, 12, 513, Route::ChunkedSmallT);
+    failures += expect("shard, long context", 12, 16, 1025, Route::ChunkedSmallT);
+    failures += expect("shard, long context", 16, 7, 513, Route::ChunkedSmallT);
+    failures += expect("shard, short context", 12, 7, 512, Route::Prompt);
+    failures += expect("shard, short context", 12, 16, 1024, Route::Prompt);
+    failures += expect("shard, six tokens", 12, 6, 513, Route::SmallT);
+    failures += expect("full geometry", 24, 12, 513, Route::ChunkedSmallT);
+    return failures;
+}
+
 int run_geometry(const Geometry& geometry) {
     int failures = 0;
     for (const KvCacheStorage storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64}) {
@@ -2269,7 +2301,7 @@ int run_geometry(const Geometry& geometry) {
             failures += run_a3_case(geometry, storage, test_case, MappingPattern::Identity);
         }
 
-        if (geometry.q_heads == 16) {
+        if (geometry.q_heads != 24) {
             // Loose execution envelopes straddle the two registered host-resource frontiers.
             // Device positions, not these bounds, continue to define the oracle result.
             failures +=
@@ -2457,7 +2489,8 @@ int run_softmax_attention_causal_cache_tests() {
         return 77;
     }
 
-    int failures = verify_workspace_capacity_contract();
+    int failures = verify_route_selection();
+    failures += verify_workspace_capacity_contract();
     failures += run_nvfp4_cases();
     failures += run_quantized_batch_cases(KvCacheStorage::Nvfp4Group16, 720u);
     failures += report_quantization_quality(KvCacheStorage::Nvfp4Group16, 724u);

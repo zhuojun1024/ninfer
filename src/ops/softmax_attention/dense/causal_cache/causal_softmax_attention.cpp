@@ -374,7 +374,12 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
     if (batch_size > 1) return CausalAttentionRoute::ChunkedSmallT;
     const std::uint32_t prompt_visible_keys =
         width <= 12 ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
-    if (q_heads == 16 && width <= kMaximumVerifyTokens &&
+    // A tensor-parallel shard carries half the query heads, so a narrow prefill chunk offers the
+    // prompt kernel half the rows to parallelize a full context over. Every shard geometry therefore
+    // needs the split-KV route once the context outgrows the prompt route's chunking. Leaving the
+    // 12/2 shard out sent it to the prompt kernel, whose key loop is not parallel enough for a
+    // dozen query rows: a 12-token chunk over 45k keys moved the KV at ~20 GB/s.
+    if ((q_heads == 12 || q_heads == 16) && width <= kMaximumVerifyTokens &&
         envelope.max_visible_keys > prompt_visible_keys)
         return CausalAttentionRoute::ChunkedSmallT;
     return CausalAttentionRoute::Prompt;

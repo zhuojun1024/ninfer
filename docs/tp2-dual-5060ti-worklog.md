@@ -2033,3 +2033,48 @@ divergence 锚点迁到 device 快照只需 **+73.4 MiB/卡**（一个状态平�
   （`encode_with_boundaries` 已按特殊 token 分段、段间归一化本就独立，因此按段切分可证等价），代价是 Frontend 里
   引入带并发保护的缓存与一段前缀拼接——相对约 22 ms 收益风险偏高，本轮未做。
 - 地板大头仍是 walk 的 0.81 µs/token（100k 约 81 ms），即 item 2。
+
+## Round 18 — TP-2 窄 chunk 的注意力路由遗漏：walk 的 0.81 µs/token 来自"用 prompt 内核跑十几行 query"（已修）
+
+Round 17 把 walk 的随 context 项（0.81 µs/token，100k 约 81 ms）记为 item 2。本轮定位到根因：**不是访存带宽不够，而是路由把 TP-2 分片的窄 chunk 交给了 prompt 内核**，后者的 KV 方向并行度不足以喂满显存。
+
+### 根因
+
+`ops::causal_softmax_attention`（`src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp`）按 `q_heads`/`width`/`max_visible_keys` 在三条私有路线里选一条：`SmallT`、`ChunkedSmallT`（都是 flash-decoding 式 split-KV，先出 partial_acc/m/l 再合并）、`Prompt`（大 T 内核，沿 query 行并行，KV 方向基本串行）。
+
+- 单卡（24 q 头）在 `width <= 16` 时由第一分支接管：fp8 存储下 `width >= 9` 的 prompt 上限只有 320 keys，超过就落到 `ChunkedSmallT`。
+- `q_heads == 16`（另一款分片）在 `max_visible_keys > prompt_visible_keys` 时同样落到 `ChunkedSmallT`。
+- **`q_heads == 12`（Qwen3.8-27B 的 TP-2 分片：24q/4kv/head_dim256 的一半）没有任何分支**，`width <= 6` 之外全部落到末尾的 `return Prompt`。
+
+三条路线的实现早已存在且对 12 头实例化完毕：`causal_attention_chunk_tokens` 对非 24 头返回 6、`causal_attention_split_capacity` 有 `CausalD256H12Kv2` 分支（`small_t.cu:249`）、bf16/i8/fp8/nvfp4/k8v4 五个 small-T 启动器都带 12 头分派。12 头几何由 `548a426a feat(tp2)` 引入，而路由条件来自更早的 `a7818988`——**没同步扩展，是遗漏**，不是设计取舍。12 行 query 沿 KV 串行走 45k keys，实测约 20 GB/s，即 0.81 µs/token。
+
+### 改动
+
+- `causal_softmax_attention.cpp`：把长 context 的 split-KV 条件从 `q_heads == 16` 放宽到 `(q_heads == 12 || q_heads == 16)`。`width <= kMaximumVerifyTokens(16)` 的守卫保留，因此大 chunk 仍走 prompt 内核。工作区容量函数本就按宽度逐个重跑 `causal_attention_resolve_route`，规划侧无需改动。
+- `tests/ops/softmax_attention/causal_cache.cpp`：把 `d256-h12-kv2` 注册进 `kGeometries`（此前只有 24/4 与 16/2），长包络用例的 `q_heads == 16` 门限放宽到 `!= 24`，并新增 `verify_route_selection()` 直接断言路线选择（12 头长 context → ChunkedSmallT、12 头短 context → Prompt、12 头 6 token → SmallT、24 头 → ChunkedSmallT）。
+
+### 实测
+
+同一探针（12-token suffix，`NINFER_TP2_TIMING=1` 的 `[tp2-prefill]` 分段），单位 ms：
+
+| context | walk 前 | walk 后 | prompt_ms 前 | prompt_ms 后 |
+|---|---|---|---|---|
+| 15.3k | 53.83 | 44.12 | 64.3 | 55.2 |
+| 30.5k | 65.43 | 45.71 | 76.4 | 56.7 |
+| 45.3k | 77.51 | 47.46 | 88.7 | 59.0 |
+
+- 随 context 项 **0.81 → 0.111 µs/token（7.3x）**：每 30k context 从 +23.7 ms 降到 +3.3 ms。
+- 常量项没有变差：`chunks=1`，权重仍是每个 prefill chunk 流一次，split-KV 只在注意力算子内部按 6 token 再分两段。
+- 外推 100k：walk 从约 113 ms 降到约 44 ms，**约 −69 ms**。
+- 1028-token suffix 同步受益（35k：891.7→851.7；45.3k：985.1→926.1），但该段主要是每 token 权重流。
+
+### 验证
+
+- `ninfer_softmax_attention_test` **通过**：12/2 几何现已在全部存储（BF16/INT8/FP8/NVFP4/K8V4）、三种 block-table 映射、A1/A3（有/无 mask）用例下对**独立 FP64 oracle** 校验，新增的长包络用例正是新路线。该 Op 的公开契约明确要求"每条 cache 路线直接对独立数学 oracle 校验，路线间一致性只算旁证"，把分片几何注册进测试矩阵是这一契约的一部分。
+- 端到端生成冒烟：`17*23` 得 391、Peru 首都 Lima，正常。
+- 全量 `ctest -j 2`：**126/127 通过**，4 个缺真实产物跳过，唯一失败是既有的 `ninfer_request_log_test`（`bfec5c03` 改了 pretty 行但未同步 `tests/test_request_log.cpp:487`，与本轮无关）；该过期期望已顺手补齐 `(300 tok)`，补后通过。
+
+### 剩余
+
+- walk 的常量项（约 32.9 ms）与 suffix 项（0.79 ms/token）未动；100k 下 walk 约 44 ms 已是地板的小头。
+- 分片几何的 `prompt_visible_keys`（512/1024 keys）沿用 16 头分片的调参，本轮只测了 ≥15.3k context，更短 context 的交叉点未测（收益量级也小）。
