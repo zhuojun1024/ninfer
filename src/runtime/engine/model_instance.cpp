@@ -13,6 +13,15 @@
 
 namespace ninfer::runtime {
 namespace {
+
+// TP-2 keeps one resident conversation plus this many host-resident ones by default. The host KV
+// budget is the real bound on how many fit; this cap only stops the catalog metadata from growing
+// without limit, and --max-private-continuations overrides it.
+constexpr std::uint32_t kTp2DefaultSessions = 6;
+
+bool is_tp2_generation(const EngineOptions& options) noexcept {
+    return options.device_b >= 0 && options.purpose == EnginePurpose::Generation;
+}
 using Clock = std::chrono::steady_clock;
 
 void validate_options(const EngineOptions& options) {
@@ -98,11 +107,17 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // shard 0, so both fit under the 262,144-token KV ceiling.
         options.use_cuda_graph       = false;
         // The generation core keeps its own prefix-reuse checkpoints in pinned host memory rather
-        // than building a context cache, so the host state-image budget survives this reset; every
-        // other cache option is irrelevant here. See TP2GenerationCore's host checkpoint ring.
+        // than building a context cache, so the host state-image budget survives this reset. The
+        // host KV budget and the session count are the inputs of its cross-session retention, so
+        // they survive too: a zero host KV budget disables that retention.
         const std::uint32_t host_state_slots = options.context_cache.host_state_slots;
-        options.context_cache =
-            ContextCacheOptions{.enabled = false, .host_state_slots = host_state_slots};
+        const std::size_t host_kv_capacity   = options.context_cache.host_kv_capacity_bytes;
+        const std::uint32_t session_capacity =
+            options.context_cache.max_private_continuations.value_or(kTp2DefaultSessions);
+        options.context_cache = ContextCacheOptions{.enabled        = false,
+                                                    .host_state_slots = host_state_slots,
+                                                    .host_kv_capacity_bytes = host_kv_capacity,
+                                                    .max_private_continuations = session_capacity};
     }
     switch (options.purpose) {
     case EnginePurpose::Generation:
@@ -126,23 +141,26 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
+    // TP-2 runs without a context cache but uses two of its budgets: the host state-image ring for
+    // its prefix-reuse checkpoints, and the host KV budget plus the session count for its
+    // cross-session retention. Those three survive the disabled-cache normalization; every other
+    // disabled-cache route has no user for them and drops them.
+    const bool tp2_generation = is_tp2_generation(options);
     if (!cache.enabled) {
         if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
-            (cache.max_private_continuations && *cache.max_private_continuations != concurrency) ||
+            (!tp2_generation && cache.max_private_continuations &&
+             *cache.max_private_continuations != concurrency) ||
             (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
             (cache.max_long_anchors_per_continuation &&
              *cache.max_long_anchors_per_continuation != 0)) {
             throw std::invalid_argument("disabled context cache accepts only root-only capacities");
         }
-        cache.device_state_slots                = 0;
-        // The TP-2 generation core stores its prefix-reuse checkpoints as pinned host state images
-        // even though it runs without a context cache, so that route keeps this budget. Any other
-        // disabled-cache route has no user for it and drops it.
-        if (!(options.device_b >= 0 && options.purpose == EnginePurpose::Generation)) {
-            cache.host_state_slots = 0;
+        cache.device_state_slots = 0;
+        if (!tp2_generation) {
+            cache.host_state_slots       = 0;
+            cache.host_kv_capacity_bytes = 0;
+            cache.max_private_continuations = concurrency;
         }
-        cache.host_kv_capacity_bytes            = 0;
-        cache.max_private_continuations         = concurrency;
         cache.max_shared_prefixes               = 0;
         cache.max_long_anchors_per_continuation = 0;
         return options;

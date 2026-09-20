@@ -22,6 +22,14 @@ set_tests_properties(
   ninfer_qwen3_5_tp2_forward_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_test(ninfer_qwen3_5_tp2_sessions_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tp2_sessions.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
+
+set_tests_properties(
+  ninfer_qwen3_5_tp2_sessions_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
 set_tests_properties(
   ninfer_qwen3_5_loading_real_test
   PROPERTIES SKIP_RETURN_CODE 77)

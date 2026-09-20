@@ -4,6 +4,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/host_kv_arena.h"
 #include "core/linear_attention_state.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "core/tp/device_pair.h"
@@ -24,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace ninfer::runtime {
@@ -178,8 +180,38 @@ private:
         Tensor mtp_anchor_hidden;
     };
 
+    // Cross-session KV retention. Exactly one session's KV and GDN state live in the device pools,
+    // so a request that belongs to another conversation evicts the resident session to pinned host
+    // memory and pulls the returning one back instead of prefilling it again. An entry owns the
+    // token history the device pools must reproduce, the frontier that history reaches, and - once
+    // evicted - its host slabs. Entries are the replacement for the single-lineage reuse trio:
+    // the resident entry *is* the device lineage, and its tokens are what a prefix scan compares
+    // against.
+    struct SessionEntry {
+        // Prompt plus every committed generated token, in order. The device KV at [0, frontier)
+        // holds exactly this prefix, which is what lets a returning prompt prefill only its suffix.
+        std::vector<TokenId> tokens;
+        std::uint32_t frontier = 0;
+        // True while this entry's KV and GDN state are the ones in the device pools.
+        bool device_resident = false;
+        // Host copies, one KV slab per shard (shard B carries no MTP slab) and one GDN state image
+        // per shard. A slab is sized to the frontier that was evicted, never to max_context.
+        std::array<std::unique_ptr<HostKVAllocation>, 2> host_kv;
+        std::array<std::unique_ptr<PinnedHostBuffer>, 2> host_state;
+        std::unique_ptr<HostKVAllocation> host_mtp_kv;
+        std::uint32_t host_pages     = 0;
+        std::uint32_t host_mtp_pages = 0;
+        bool host_valid              = false;
+        std::uint64_t lru_clock      = 0;
+    };
+    static constexpr std::size_t kNoSession = static_cast<std::size_t>(-1);
+
     [[nodiscard]] GenerationResult execute(Request& request, OutputSink* sink,
                                            const CancellationView& cancellation);
+    // The walk itself. execute wraps it so that an exception cannot leave the catalog claiming a
+    // live frontier the device no longer holds.
+    [[nodiscard]] GenerationResult execute_walk(Request& request, OutputSink* sink,
+                                                const CancellationView& cancellation);
 
     void build_shard(Shard& shard, int shard_index);
 
@@ -274,6 +306,37 @@ private:
     // Total seconds spent loading and materializing both shards (for LoadSummary).
     double load_seconds_ = 0.0;
 
+    // Session retention. session_recall runs at the head of execute, before the prefix scan
+    // decides how deep this prompt can start: it displaces the resident session when the incoming
+    // prompt belongs to another conversation, so the device pools hold the recalled session by the
+    // time the scan reads them.
+    void session_recall(std::span<const TokenId> prompt_tokens);
+    // Copies the resident session into its host slabs. Returns false when the host budget cannot
+    // hold it, in which case the entry is dropped instead: the next prefill overwrites the device
+    // pools, and an entry must never claim state that no longer exists.
+    bool session_store_active();
+    // Copies an entry's host slabs back into the device pools and makes it the resident session.
+    void session_restore(SessionEntry& entry);
+    // Frees an entry's host slabs, drops it from the catalog, and keeps the active index valid.
+    void session_drop(std::size_t index);
+    // Gives entry host KV slabs of at least 'pages' pages per shard, reusing larger existing ones.
+    [[nodiscard]] bool session_ensure_host_slabs(SessionEntry& entry, std::uint32_t pages);
+    // Evicts the least recently used non-resident entry; false when only the resident one remains.
+    bool session_evict_one();
+    // Publishes a walk's full history as the resident catalog entry. `frontier` is how far the
+    // device KV and GDN state actually reach: the sampled token that ends the prompt is not
+    // forwarded until the first decode round, so a finished response's frontier is one token short
+    // of its history.
+    void session_publish(const std::vector<TokenId>& history, std::uint32_t frontier);
+    // Retires the prefix-reuse checkpoint ring. A checkpoint is only usable while every prompt that
+    // followed the prefill that wrote it agreed on the tokens before its position; once the device
+    // pools hold another session, that chain is broken even though the ring's positions may still
+    // sit inside the recalled history.
+    void invalidate_host_checkpoints();
+    // Drops only the resident entry and invalidates the device lineage: the paths that abort a
+    // walk leave the device pools holding a prefix no catalog entry describes, while every
+    // host-resident entry stays valid.
+    void session_invalidate_active();
     // Prefix-reuse bookkeeping: the token ids of the last completed prefill, the absolute token
     // positions its state snapshots correspond to, and whether those snapshots are usable.
     std::vector<TokenId> cached_prompt_tokens_;
@@ -282,6 +345,28 @@ private:
     // prompts' shared-prefix gap.
     std::uint32_t rewind_near_ = 9;
     bool cached_state_valid_ = false;
+    // Session catalog. sessions_ holds the resident entry plus the host-resident ones; the
+    // resident entry is the device lineage, so cached_prompt_tokens_ mirrors its history while
+    // the GDN state sits at its frontier (live_state_valid_).
+    std::vector<SessionEntry> sessions_;
+    std::size_t active_session_      = kNoSession;
+    std::uint64_t session_lru_clock_ = 0;
+    // Entries the catalog accepts, resident one included. Zero disables session retention, which
+    // is what a zero host KV budget selects.
+    std::size_t session_capacity_    = 0;
+    std::size_t host_kv_shard_bytes_ = 0;
+    // One pinned host KV arena per shard, built lazily on the first eviction so a single-session
+    // workload never pins the budget. Shard A's arena also carries the MTP layer geometry.
+    std::array<std::unique_ptr<HostKVArena>, 2> host_kv_arena_;
+    // Set while the device GDN state sits exactly at the resident entry's frontier, so a prompt
+    // that extends that history can reuse it in place with no state copy at all. Every path that
+    // aborts a walk clears it before the catalog can be read again.
+    bool live_state_valid_ = false;
+    // Diagnostics counters, reported by NINFER_TP2_SESSION_TRACE and the runtime ledger.
+    std::uint64_t session_recalls_       = 0;
+    std::uint64_t session_stores_        = 0;
+    std::uint64_t session_evictions_     = 0;
+    std::uint64_t session_full_prefills_ = 0;
 
     // Host checkpoint ring: the token stride between checkpoints (0 disables the ring, which is
     // what a zero host state-image budget selects), the id the running prefill tags its new
@@ -296,9 +381,11 @@ private:
     // position grid, and carving them out of the grid would coarsen the stride that covers the
     // whole context. They cost pinned host memory only.
     std::uint32_t host_checkpoint_divergence_slots_ = 0;
-    // Set by the reuse scan when the winning boundary is a host checkpoint rather than a device
-    // snapshot, so the state restore knows which memory it copies from.
-    bool reuse_from_host_ = false;
+    // Which memory the prefix scan's winning boundary restores its GDN state from. LiveState means
+    // the device state already sits at that boundary - the resident session's frontier restored by
+    // a recall, or the tail of a conversation that just decoded - so nothing is copied at all.
+    enum class ReuseSource : std::uint8_t { None, DeviceSnapshot, HostCheckpoint, LiveState };
+    ReuseSource reuse_source_ = ReuseSource::None;
 
     // Multi-token prediction (--spec mtp): whether proposals are enabled, and the proposal window
     // width (how many drafts the MTP layer proposes per decode round).

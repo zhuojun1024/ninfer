@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -146,6 +147,10 @@ constexpr std::size_t kWorkspaceBytes = 192ULL << 20;
 // beside the KV pool: below this an ordinary photo would no longer fit in one item, so the route
 // reports the failure instead of silently admitting only thumbnails.
 constexpr std::uint32_t kVisionItemTokenFloor = 2048;
+
+// TP-2 keeps one resident conversation plus this many host-resident ones unless
+// --max-private-continuations overrides it. The host KV budget is the real bound on how many fit.
+constexpr std::uint32_t kTp2DefaultSessions = 6;
 
 // Bounds on the adaptive rewind depth (see rewind_near_).
 constexpr std::uint32_t kReuseRewindMinimum = 4;
@@ -314,8 +319,42 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         }
     }
 
+    // Cross-session retention budget. --host-kv-mib is the whole pinned KV budget, split evenly
+    // between the two shards; the arenas that back it are built on the first eviction, so a
+    // workload that never leaves one conversation never pins it. A zero budget keeps the catalog
+    // empty, which is exactly the pre-retention behaviour.
+    {
+        const std::size_t host_kv_bytes = options_.context_cache.host_kv_capacity_bytes;
+        const std::uint32_t sessions =
+            options_.context_cache.max_private_continuations.value_or(kTp2DefaultSessions);
+        // One entry is the resident conversation; retention needs room for at least one more.
+        if (host_kv_bytes / 2 != 0 && sessions > 1) {
+            host_kv_shard_bytes_ = host_kv_bytes / 2;
+            session_capacity_    = sessions;
+        }
+        std::fprintf(stderr,
+                     "[mem] host sessions capacity %zu | host KV %.1f MiB/shard | retention %s\n",
+                     session_capacity_, static_cast<double>(host_kv_shard_bytes_) / 1048576.0,
+                     session_capacity_ == 0 ? "disabled" : "enabled");
+    }
+
     build_shard(shard_a_, 0);
     build_shard(shard_b_, 1);
+    if (session_capacity_ != 0) {
+        // Report the budget in the unit an operator sizes against: full-context conversations per
+        // shard. The MTP layer's own slab is not counted, so shard 0 holds slightly fewer.
+        const HostKVPageLayout layout =
+            plan_host_kv_page_layout(shard_a_.decoder->text_kv.page_pool().geometry());
+        const std::size_t full_session =
+            layout.page_stride * pages_for_tokens(options_.max_context);
+        const std::size_t fits = full_session == 0 ? 0 : host_kv_shard_bytes_ / full_session;
+        std::fprintf(stderr,
+                     "[tp2-session] host budget %.1f MiB/shard holds %zu of %zu full-context "
+                     "sessions (%.1f MiB each)\n",
+                     static_cast<double>(host_kv_shard_bytes_) / 1048576.0, fits,
+                     session_capacity_ - 1,
+                     static_cast<double>(full_session) / 1048576.0);
+    }
     // Column-split weights (the token embedding) are consumed by operations that run on one shard
     // alone, so both contexts learn their peer and the pair once both shards exist.
     shard_a_.context->set_tp_peer(shard_b_.context.get(), &pair_);
@@ -390,7 +429,11 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     load_seconds_ = std::chrono::duration<double>(Clock::now() - load_start).count();
 }
 
-TP2GenerationCore::~TP2GenerationCore() = default;
+TP2GenerationCore::~TP2GenerationCore() {
+    // The catalog's host KV slabs are suballocations of the host arenas, so the entries have to be
+    // released before the arenas they were taken from.
+    sessions_.clear();
+}
 
 void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     const auto& config = shard.model->config().text;
@@ -1042,8 +1085,381 @@ GenerationResult TP2GenerationCore::Submission::wait(OutputSink* sink,
     return owner_->execute(*request_, sink, cancellation);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Cross-session KV retention
+//
+// The device KV page pool is materialized once at startup and reused in place, so it holds exactly
+// one session at a time. Turning a client to another conversation therefore copies the resident
+// session's KV and GDN state into pinned host slabs and copies the returning session back, which
+// costs one PCIe round trip instead of a full prefill. The catalog below owns both the token
+// history that describes what the device pools must reproduce and the host slabs that hold it while
+// another conversation is resident.
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+bool session_trace_enabled() {
+    const char* env = std::getenv("NINFER_TP2_SESSION_TRACE");
+    return env != nullptr && env[0] == '1';
+}
+
+} // namespace
+
+void TP2GenerationCore::invalidate_host_checkpoints() {
+    Shard* const shards[2] = {&shard_a_, &shard_b_};
+    for (Shard* shard : shards) {
+        for (auto& checkpoint : shard->host_checkpoints) { checkpoint.valid = false; }
+    }
+}
+
+void TP2GenerationCore::session_invalidate_active() {
+    if (active_session_ != kNoSession) { session_drop(active_session_); }
+    active_session_     = kNoSession;
+    live_state_valid_   = false;
+    cached_state_valid_ = false;
+    cached_prompt_tokens_.clear();
+    invalidate_host_checkpoints();
+    reuse_source_ = ReuseSource::None;
+}
+
+void TP2GenerationCore::session_drop(std::size_t index) {
+    if (index >= sessions_.size()) { return; }
+    sessions_.erase(sessions_.begin() + static_cast<std::ptrdiff_t>(index));
+    if (active_session_ == index) {
+        active_session_ = kNoSession;
+    } else if (active_session_ != kNoSession && active_session_ > index) {
+        --active_session_;
+    }
+}
+
+bool TP2GenerationCore::session_evict_one() {
+    std::size_t victim     = kNoSession;
+    std::uint64_t oldest   = 0;
+    for (std::size_t index = 0; index < sessions_.size(); ++index) {
+        if (sessions_[index].device_resident) { continue; }
+        if (victim == kNoSession || sessions_[index].lru_clock < oldest) {
+            victim = index;
+            oldest = sessions_[index].lru_clock;
+        }
+    }
+    if (victim == kNoSession) { return false; }
+    if (session_trace_enabled()) {
+        std::fprintf(stderr, "[tp2-session] evict frontier=%u tokens=%zu\n",
+                     sessions_[victim].frontier, sessions_[victim].tokens.size());
+    }
+    session_drop(victim);
+    ++session_evictions_;
+    return true;
+}
+
+bool TP2GenerationCore::session_ensure_host_slabs(SessionEntry& entry, std::uint32_t pages) {
+    if (pages == 0) { return false; }
+    Shard* const shards[2] = {&shard_a_, &shard_b_};
+    for (std::size_t index = 0; index < 2; ++index) {
+        Shard& shard = *shards[index];
+        // The arena pins its whole budget on construction, so a workload that never leaves one
+        // conversation never pays for the capability.
+        if (host_kv_arena_[index] == nullptr) {
+            std::vector<HostKVPageLayout> layouts;
+            layouts.push_back(plan_host_kv_page_layout(shard.decoder->text_kv.page_pool().geometry()));
+            if (index == 0 && mtp_enabled_) {
+                const qwen::PagedKVCache* mtp = shard.decoder->mtp_cache();
+                if (mtp == nullptr) { return false; }
+                layouts.push_back(plan_host_kv_page_layout(mtp->page_pool().geometry()));
+            }
+            shard.device.bind_to_current_thread();
+            try {
+                host_kv_arena_[index] =
+                    std::make_unique<HostKVArena>(host_kv_shard_bytes_, layouts);
+            } catch (const std::exception&) {
+                // A refused pinned allocation leaves cudaErrorMemoryAllocation latched, where the
+                // next unrelated CUDA_CHECK would report it as that call's own failure.
+                (void)cudaGetLastError();
+                host_kv_arena_[index].reset();
+                return false;
+            }
+            std::fprintf(stderr,
+                         "[tp2-session] host KV arena shard %zu: %.1f MiB pinned, %zu layouts\n",
+                         index, static_cast<double>(host_kv_shard_bytes_) / 1048576.0,
+                         layouts.size());
+        }
+        const HostKVPageLayout* layout =
+            host_kv_arena_[index]->layout_for(shard.decoder->text_kv.page_pool().geometry());
+        if (layout == nullptr) { return false; }
+        // The GDN state image is independent of the KV extent: it is always one full state per
+        // shard, and it survives a frontier that a later eviction grows.
+        if (entry.host_state[index] == nullptr) {
+            shard.device.bind_to_current_thread();
+            try {
+                entry.host_state[index] =
+                    std::make_unique<PinnedHostBuffer>(shard.state_backing.bytes, true);
+            } catch (const std::exception&) {
+                (void)cudaGetLastError();
+                return false;
+            }
+        }
+        if (entry.host_kv[index] != nullptr && entry.host_kv[index]->page_count() >= pages) {
+            // A slab that already covers this frontier is reused as it is; only the first `pages`
+            // pages carry the session, and the rest is stale.
+            continue;
+        }
+        entry.host_kv[index].reset();
+        std::optional<HostKVAllocation> allocation = host_kv_arena_[index]->allocate(*layout, pages);
+        if (!allocation.has_value()) { return false; }
+        entry.host_kv[index] = std::make_unique<HostKVAllocation>(std::move(*allocation));
+    }
+    if (mtp_enabled_) {
+        const qwen::PagedKVCache* mtp = shard_a_.decoder->mtp_cache();
+        const HostKVPageLayout* layout =
+            host_kv_arena_[0]->layout_for(mtp->page_pool().geometry());
+        if (layout == nullptr) { return false; }
+        if (entry.host_mtp_kv == nullptr || entry.host_mtp_kv->page_count() < pages) {
+            entry.host_mtp_kv.reset();
+            std::optional<HostKVAllocation> allocation =
+                host_kv_arena_[0]->allocate(*layout, pages);
+            if (!allocation.has_value()) { return false; }
+            entry.host_mtp_kv = std::make_unique<HostKVAllocation>(std::move(*allocation));
+        }
+        entry.host_mtp_pages = pages;
+    }
+    entry.host_pages = pages;
+    return true;
+}
+
+bool TP2GenerationCore::session_store_active() {
+    if (active_session_ == kNoSession) { return true; }
+    SessionEntry& entry = sessions_[active_session_];
+    if (!entry.device_resident) { return true; }
+    const std::uint32_t pages = pages_for_tokens(entry.frontier);
+    if (pages == 0) {
+        entry.device_resident = false;
+        entry.host_valid      = false;
+        return true;
+    }
+    if (!session_ensure_host_slabs(entry, pages)) { return false; }
+    Shard* const shards[2] = {&shard_a_, &shard_b_};
+    for (std::size_t index = 0; index < 2; ++index) {
+        Shard& shard = *shards[index];
+        shard.device.bind_to_current_thread();
+        const std::span<const DeviceKVPageHandle> source(shard.kv_page_handles.data(), pages);
+        const HostKVAllocationView view =
+            host_kv_arena_[index]->writable_view(*entry.host_kv[index]).subview(0, pages);
+        shard.decoder->text_kv.page_pool().copy_to_host(source, view, shard.device.stream);
+        CUDA_CHECK(cudaMemcpyAsync(entry.host_state[index]->data(), shard.state_backing.data,
+                                   shard.state_backing.bytes, cudaMemcpyDeviceToHost,
+                                   shard.device.stream));
+    }
+    if (mtp_enabled_) {
+        shard_a_.device.bind_to_current_thread();
+        const std::span<const DeviceKVPageHandle> source(shard_a_.mtp_page_handles.data(),
+                                                         entry.host_mtp_pages);
+        const HostKVAllocationView view =
+            host_kv_arena_[0]->writable_view(*entry.host_mtp_kv).subview(0, entry.host_mtp_pages);
+        shard_a_.decoder->mtp_cache()->page_pool().copy_to_host(source, view, shard_a_.device.stream);
+    }
+    // A copy still in flight is not state: the entry only becomes host-resident once both devices
+    // have finished their D2H, so an error here leaves the session on the device instead.
+    for (std::size_t index = 0; index < 2; ++index) {
+        shards[index]->device.bind_to_current_thread();
+        CUDA_CHECK(cudaStreamSynchronize(shards[index]->device.stream));
+    }
+    shard_a_.device.bind_to_current_thread();
+    entry.device_resident = false;
+    entry.host_valid      = true;
+    entry.lru_clock       = ++session_lru_clock_;
+    ++session_stores_;
+    return true;
+}
+
+void TP2GenerationCore::session_restore(SessionEntry& entry) {
+    const std::uint32_t pages = entry.host_pages;
+    if (pages == 0) {
+        entry.device_resident = true;
+        entry.host_valid      = false;
+        return;
+    }
+    Shard* const shards[2] = {&shard_a_, &shard_b_};
+    for (std::size_t index = 0; index < 2; ++index) {
+        Shard& shard = *shards[index];
+        shard.device.bind_to_current_thread();
+        const std::span<const DeviceKVPageHandle> destination(shard.kv_page_handles.data(), pages);
+        const HostKVAllocationConstView view =
+            host_kv_arena_[index]->view(*entry.host_kv[index]).subview(0, pages);
+        shard.decoder->text_kv.page_pool().copy_from_host(view, destination, shard.device.stream);
+        CUDA_CHECK(cudaMemcpyAsync(shard.state_backing.data, entry.host_state[index]->data(),
+                                   shard.state_backing.bytes, cudaMemcpyHostToDevice,
+                                   shard.device.stream));
+    }
+    if (mtp_enabled_) {
+        shard_a_.device.bind_to_current_thread();
+        const std::span<const DeviceKVPageHandle> destination(shard_a_.mtp_page_handles.data(),
+                                                              entry.host_mtp_pages);
+        const HostKVAllocationConstView view =
+            host_kv_arena_[0]->view(*entry.host_mtp_kv).subview(0, entry.host_mtp_pages);
+        shard_a_.decoder->mtp_cache()->page_pool().copy_from_host(view, destination,
+                                                                  shard_a_.device.stream);
+    }
+    for (std::size_t index = 0; index < 2; ++index) {
+        shards[index]->device.bind_to_current_thread();
+        CUDA_CHECK(cudaStreamSynchronize(shards[index]->device.stream));
+    }
+    shard_a_.device.bind_to_current_thread();
+    entry.device_resident = true;
+    entry.host_valid      = false;
+    entry.lru_clock       = ++session_lru_clock_;
+    ++session_recalls_;
+}
+
+void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
+    if (session_capacity_ == 0) { return; }
+    // How deep the resident lineage can start this prompt, mirroring what the reuse scan below
+    // finds: the live state at its frontier, a device snapshot, or a host checkpoint. Zero means
+    // the prompt shares nothing the device can reuse, and keeping the resident session would leave
+    // the catalog describing a conversation the device no longer holds.
+    std::size_t active_shared = 0;
+    if (active_session_ != kNoSession) {
+        const SessionEntry& entry = sessions_[active_session_];
+        const std::size_t common  = std::min(entry.tokens.size(), prompt_tokens.size());
+        while (active_shared < common &&
+               entry.tokens[active_shared] == prompt_tokens[active_shared]) {
+            ++active_shared;
+        }
+    }
+    std::uint32_t resident_depth = 0;
+    if (cached_state_valid_) {
+        if (live_state_valid_ && active_session_ != kNoSession) {
+            const std::uint32_t frontier = sessions_[active_session_].frontier;
+            if (frontier != 0 && frontier <= active_shared) { resident_depth = frontier; }
+        }
+        for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
+            const std::uint32_t boundary = cached_boundaries_[slot];
+            if (boundary <= active_shared && boundary > resident_depth) {
+                resident_depth = boundary;
+            }
+        }
+        for (const auto& checkpoint : shard_a_.host_checkpoints) {
+            if (checkpoint.valid && checkpoint.position <= active_shared &&
+                checkpoint.position > resident_depth) {
+                resident_depth = checkpoint.position;
+            }
+        }
+    }
+
+    // A host-resident entry is recalled whole: its slabs carry one GDN state, at its frontier, so
+    // every token before that frontier has to be a prefix of this prompt. The deepest frontier that
+    // still beats the resident lineage wins; a shallower one would spend a PCIe round trip to save
+    // fewer tokens than staying where the device already is.
+    std::size_t best_host       = kNoSession;
+    std::uint32_t best_frontier = 0;
+    for (std::size_t index = 0; index < sessions_.size(); ++index) {
+        const SessionEntry& entry = sessions_[index];
+        if (index == active_session_ || entry.device_resident || entry.tokens.empty()) { continue; }
+        const std::size_t common = std::min(entry.tokens.size(), prompt_tokens.size());
+        std::size_t shared       = 0;
+        while (shared < common && entry.tokens[shared] == prompt_tokens[shared]) { ++shared; }
+        if (shared < entry.frontier) { continue; }
+        if (best_host == kNoSession || entry.frontier > best_frontier) {
+            best_host     = index;
+            best_frontier = entry.frontier;
+        }
+    }
+    if (best_host != kNoSession && best_frontier > resident_depth) {
+        const std::size_t previous = active_session_;
+        const bool drop_previous   = previous != kNoSession && !session_store_active();
+        // Restoring before dropping keeps the recalled entry's index valid: nothing has been erased
+        // yet, and the drop below only shifts indices the restore is already done with.
+        session_restore(sessions_[best_host]);
+        active_session_       = best_host;
+        live_state_valid_     = true;
+        cached_prompt_tokens_ = sessions_[best_host].tokens;
+        // A recalled session has no device state snapshots of its own: those belong to the lineage
+        // it displaces. Its frontier state is in the device pool already, which is what LiveState
+        // means to the scan below. The checkpoint ring belongs to that lineage too, and its
+        // positions can sit inside the recalled history while its states do not.
+        cached_boundaries_.fill(0);
+        invalidate_host_checkpoints();
+        cached_state_valid_ = true;
+        reuse_source_       = ReuseSource::None;
+        if (drop_previous) { session_drop(previous); }
+        if (session_trace_enabled()) {
+            std::fprintf(
+                stderr,
+                "[tp2-session] recall frontier=%u resident_depth=%u tokens=%zu entries=%zu\n",
+                sessions_[active_session_].frontier, resident_depth,
+                sessions_[active_session_].tokens.size(), sessions_.size());
+        }
+        return;
+    }
+    if (resident_depth > 0) {
+        // The resident conversation already serves this prompt better than any host slab; the reuse
+        // scan below turns its depth into a prefill start point.
+        return;
+    }
+    // Nothing can be recalled: this prompt starts a conversation of its own. Preserve the resident
+    // one when the budget allows; the prefill below overwrites the device pools either way.
+    const std::size_t previous = active_session_;
+    const bool drop_previous   = previous != kNoSession && !session_store_active();
+    active_session_     = kNoSession;
+    live_state_valid_   = false;
+    cached_state_valid_ = false;
+    cached_prompt_tokens_.clear();
+    invalidate_host_checkpoints();
+    reuse_source_ = ReuseSource::None;
+    if (drop_previous) { session_drop(previous); }
+    ++session_full_prefills_;
+    if (session_trace_enabled()) {
+        std::fprintf(stderr, "[tp2-session] new session (no recallable entry), entries=%zu\n",
+                     sessions_.size());
+    }
+}
+
+void TP2GenerationCore::session_publish(const std::vector<TokenId>& history,
+                                        std::uint32_t frontier) {
+    if (session_capacity_ == 0) { return; }
+    if (active_session_ != kNoSession && sessions_[active_session_].device_resident) {
+        SessionEntry& entry = sessions_[active_session_];
+        entry.tokens.assign(history.begin(), history.end());
+        entry.frontier   = frontier;
+        entry.lru_clock  = ++session_lru_clock_;
+        entry.host_valid = false;
+        // The reuse scan compares against the resident history, so it has to carry the generated
+        // tail too: that is what lets a continued turn start at the committed frontier instead of
+        // replaying the previous answer.
+        cached_prompt_tokens_ = entry.tokens;
+        live_state_valid_     = true;
+        return;
+    }
+    if (sessions_.size() >= session_capacity_ && !session_evict_one()) {
+        // The catalog is full of entries the device cannot help with right now. This conversation
+        // still runs - the device pools hold it - it just has no recalling entry.
+        return;
+    }
+    SessionEntry entry;
+    entry.tokens.assign(history.begin(), history.end());
+    entry.frontier        = frontier;
+    entry.device_resident = true;
+    entry.lru_clock       = ++session_lru_clock_;
+    sessions_.push_back(std::move(entry));
+    active_session_       = sessions_.size() - 1;
+    cached_prompt_tokens_ = sessions_[active_session_].tokens;
+    live_state_valid_     = true;
+}
+
 GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                                             const CancellationView& cancellation) {
+    // The live-frontier shortcut is only sound while the device GDN state sits exactly where the
+    // catalog says it does. A walk that throws leaves it somewhere the catalog cannot name, so the
+    // guard retires both the claim and the resident entry before the next request reads them.
+    try {
+        return execute_walk(request, sink, cancellation);
+    } catch (...) {
+        session_invalidate_active();
+        throw;
+    }
+}
+
+GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* sink,
+                                                 const CancellationView& cancellation) {
     const bool streaming = request.consumer_mode == OutputConsumerMode::Streaming;
     auto& data = qwen::PreparedPromptAccess::mutable_view(request.prompt);
     const auto& token_ids = data.token_ids;
@@ -1106,6 +1522,12 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     Clock::time_point state_done      = start;
     Clock::time_point walk_done       = start;
 
+    // Cross-session recall, before the prefix scan reads the device lineage. A prompt that belongs
+    // to another conversation makes the resident session swap out here, so by the time the scan
+    // below compares against cached_prompt_tokens_ the pools already hold the conversation this
+    // prompt continues. A prompt that continues the resident conversation is left untouched.
+    session_recall(token_ids);
+
     // Prompt-prefix reuse. The KV pages hold the K/V of every position the last completed prefill
     // wrote, and the state snapshots hold the matching GDN states, so a prompt that extends the
     // previous prompt can skip the shared prefix and prefill only its suffix. The single-device
@@ -1122,19 +1544,32 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     std::uint32_t reuse       = 0;
     std::size_t reuse_slot    = 0;
     std::size_t shared_prefix = 0;
-    reuse_from_host_          = false;
+    reuse_source_             = ReuseSource::None;
     if (cached_state_valid_ && !cached_prompt_tokens_.empty()) {
         const std::size_t common = std::min(cached_prompt_tokens_.size(), token_ids.size());
         while (shared_prefix < common &&
                cached_prompt_tokens_[shared_prefix] == token_ids[shared_prefix]) {
             ++shared_prefix;
         }
+        // The live GDN state is the deepest boundary a continued conversation can offer: it sits
+        // exactly at the resident entry's frontier, and the device KV holds the whole history
+        // before it. Reusing it copies nothing at all - but only a prompt that extends it has a
+        // column to forward, and the final prompt token must still be forwarded to produce the
+        // logits that drive the first sample.
+        if (live_state_valid_ && active_session_ != kNoSession) {
+            const std::uint32_t frontier = sessions_[active_session_].frontier;
+            if (frontier != 0 && frontier <= shared_prefix && frontier < prompt_tokens &&
+                frontier > reuse) {
+                reuse        = frontier;
+                reuse_source_ = ReuseSource::LiveState;
+            }
+        }
         for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
             const std::uint32_t boundary = cached_boundaries_[slot];
             if (boundary <= shared_prefix && boundary < prompt_tokens && boundary > reuse) {
-                reuse           = boundary;
-                reuse_slot      = slot;
-                reuse_from_host_ = false;
+                reuse        = boundary;
+                reuse_slot   = slot;
+                reuse_source_ = ReuseSource::DeviceSnapshot;
             }
         }
         // A host checkpoint is a state plus the KV before it, and both are only this prompt's while
@@ -1157,9 +1592,9 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                 checkpoint.position > shared_prefix || checkpoint.position >= prompt_tokens) {
                 continue;
             }
-            reuse            = checkpoint.position;
-            reuse_slot       = index;
-            reuse_from_host_ = true;
+            reuse         = checkpoint.position;
+            reuse_slot    = index;
+            reuse_source_ = ReuseSource::HostCheckpoint;
         }
         // Predict the next prefill's rewind depths from the gap this pair of prompts showed: the
         // snapshot that captures the next shared prefix should sit just inside it.
@@ -1175,13 +1610,17 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
         for (const auto& checkpoint : shard_a_.host_checkpoints) {
             valid_checkpoints += checkpoint.valid ? 1U : 0U;
         }
+        const char* source = reuse_source_ == ReuseSource::HostCheckpoint ? "host"
+                             : reuse_source_ == ReuseSource::LiveState    ? "live"
+                             : reuse_source_ == ReuseSource::DeviceSnapshot ? "device"
+                                                                            : "none";
         std::fprintf(stderr,
                      "[tp2-reuse] prompt=%u cached=%zu shared=%zu prefill_end=%u rewind=%u "
                      "host=%zu/%zu stride=%u -> reuse=%u slot=%zu src=%s\n",
                      prompt_tokens, cached_prompt_tokens_.size(), shared_prefix,
                      cached_boundaries_[0], cached_boundaries_[1], valid_checkpoints,
                      shard_a_.host_checkpoints.size(), host_checkpoint_stride_, reuse, reuse_slot,
-                     reuse_from_host_ ? "host" : "device");
+                     source);
     }
     const std::array<std::uint32_t, kReuseSnapshotCount> rewind_depths{0, rewind_near_};
     // Tag the checkpoints this walk leaves behind and start the ring at the first stride multiple
@@ -1257,19 +1696,28 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     // all; only the GDN state must be restored to (or reset at) the prefill frontier.
     auto begin_gdn_state = [&](Shard& shard) {
         shard.device.bind_to_current_thread();
-        if (reuse != 0) {
-            const void* source  = shard.state_snapshots[reuse_slot].data;
-            cudaMemcpyKind kind = cudaMemcpyDeviceToDevice;
-            if (reuse_from_host_) {
-                source = shard.host_checkpoints[reuse_slot].buffer->data();
-                kind   = cudaMemcpyHostToDevice;
-            }
-            CUDA_CHECK(cudaMemcpyAsync(shard.state_backing.data, source, shard.state_backing.bytes,
-                                       kind, shard.device.stream));
+        switch (reuse_source_) {
+        case ReuseSource::None:
+            CUDA_CHECK(cudaMemsetAsync(shard.state_backing.data, 0, shard.state_backing.bytes,
+                                       shard.device.stream));
+            return;
+        case ReuseSource::LiveState:
+            // The device state already sits at this boundary: a restored session put it there, or
+            // the conversation that just decoded left it exactly at its frontier. Nothing to copy.
+            return;
+        case ReuseSource::DeviceSnapshot:
+            CUDA_CHECK(cudaMemcpyAsync(shard.state_backing.data,
+                                       shard.state_snapshots[reuse_slot].data,
+                                       shard.state_backing.bytes, cudaMemcpyDeviceToDevice,
+                                       shard.device.stream));
+            return;
+        case ReuseSource::HostCheckpoint:
+            CUDA_CHECK(cudaMemcpyAsync(shard.state_backing.data,
+                                       shard.host_checkpoints[reuse_slot].buffer->data(),
+                                       shard.state_backing.bytes, cudaMemcpyHostToDevice,
+                                       shard.device.stream));
             return;
         }
-        CUDA_CHECK(cudaMemsetAsync(shard.state_backing.data, 0, shard.state_backing.bytes,
-                                   shard.device.stream));
     };
     begin_gdn_state(shard_a_);
     begin_gdn_state(shard_b_);
@@ -1474,19 +1922,11 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                                    !has_valid_host_checkpoint_at(shard_b_, anchor_position);
     for (std::uint32_t t0 = reuse; t0 < prompt_tokens;) {
         if (cancellation.requested()) {
-            // The walk wrote KV of a prompt this request never finished, so the device cache no
-            // longer holds a prefix that matches cached_prompt_tokens_. Drop reuse until the next
-            // prefill republishes, and with it the host checkpoints: their whole validity chain runs
-            // through that prefix.
-            cached_state_valid_ = false;
-            {
-                Shard* const shards[2] = {&shard_a_, &shard_b_};
-                for (Shard* shard : shards) {
-                    for (auto& checkpoint : shard->host_checkpoints) {
-                        checkpoint.valid = false;
-                    }
-                }
-            }
+            // The walk wrote KV of a prompt this request never finished, so neither the device
+            // cache nor the resident session still holds a prefix the catalog describes. Drop both,
+            // and with them the host checkpoints: their whole validity chain runs through that
+            // prefix. Every host-resident session stays: the walk never touched its memory.
+            session_invalidate_active();
             (void)request.output.preview_terminal(FinishReason::Cancelled);
             publish_preview(false);
             result.finish_reason = FinishReason::Cancelled;
@@ -1618,6 +2058,10 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
         cached_boundaries_[slot] = snapshot_at[slot];
     }
     cached_state_valid_ = true;
+    // The pools now hold exactly this prompt and the live GDN state sits at its end, so the
+    // resident catalog entry describes what the walk just wrote. A conversation that had no entry
+    // yet gets one here, before decode extends its history.
+    session_publish(token_ids, prompt_tokens);
     // Only now are this prefill's checkpoints usable: their state is one the walk reached and their
     // KV prefix is one the walk wrote.
     {
@@ -1922,6 +2366,20 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             std::chrono::duration<double, std::milli>(Clock::now() - round_start).count();
     }
 
+    // Publish the finished conversation: the pools hold prompt plus committed output and the live
+    // GDN state sits at that frontier, which is exactly what a returning turn extends and what an
+    // eviction copies out.
+    {
+        std::vector<TokenId> history = token_ids;
+        history.insert(history.end(), request.generated.begin(), request.generated.end());
+        // The last sampled token is not forwarded yet, so the device state stops one token short
+        // of the history the next turn will send back. A walk that produced no token at all is
+        // already a logic error elsewhere; publishing the prompt end keeps the catalog honest.
+        const std::uint32_t sampled = static_cast<std::uint32_t>(request.generated.size());
+        const std::uint32_t frontier =
+            sampled == 0 ? prompt_tokens : prompt_tokens + sampled - 1U;
+        session_publish(history, frontier);
+    }
     result.generated_token_ids = std::move(request.generated);
     result.tool_calls          = request.output.take_tool_calls();
     result.tool_call_parse     = request.output.tool_call_parse_diagnostics();
