@@ -1172,8 +1172,12 @@ NInfer 设计（轻量版，先做「工具名前缀树 + 参数名掩码」）�
   是全域最大；采样要求它进 top-20 且活过 top_p/min_p），正常分布下几乎不会发生。
   风险：`token_domain` 在核里只作遍历上界（`sampling.cuh:33/41/127`），两域的 `cap` 都是 `min(20,domain)`，RNG 抽取
   发生在截断后的候选集上 ⇒ 修复只在本该触发的那些步改变结果，正常步逐位不变。
-- 顺带观察（未改）：`make_sampling_config` 把 `token_counts` 置空（`tp2_generation_core.cpp:233`），故 TP-2 路径的
-  presence/frequency penalty 实际不生效（惩罚项 `c_v` 恒为 0）。
+- **另一既有缺陷，已修（同日）**：`make_sampling_config` 把 `token_counts` 置空，而惩罚项只从该数组取 `c_v`
+  （`sampling_device.cuh:252`），故 TP-2 路径的 presence/frequency penalty 对**跨轮**重复完全无效——只剩 MTP verify
+  的轮内 overlay（同一窗口内的 draft）还起作用。现按单卡 `install_sampling`（`decode.cpp:145-149`）的做法：仅当
+  penalty 非零时在请求 workspace 建 `I32[public_tokens]` 计数数组、`cudaMemsetAsync` 清零后挂到 `sampling_config`；
+  `ops::sample` 与 `speculative_accept_greedy_drafts` 自行累加产出的 token。未配 penalty 时不建数组、`c_v` 恒为 0，
+  与单卡路径一致。
 - 环境注记：DSH 沙箱处于 `workspace-write` 时 ninja **无法执行任何子进程**（连平凡工程都挂，`ninja -t/-n` 正常），
   构建须在 `danger-full-access` 下进行；另外 `pwsh` 的后台作业若用 `Tee-Object` 把输出写进管道会因管道写满而在中途卡死。
 

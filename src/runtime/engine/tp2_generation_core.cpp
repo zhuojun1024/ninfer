@@ -1123,7 +1123,7 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     result.reused_prompt_tokens = reuse;
 
     // Sampling config, device-resident, for ops::sample.
-    const ops::SamplingConfig sampling_config = make_sampling_config(request.sampling);
+    ops::SamplingConfig sampling_config = make_sampling_config(request.sampling);
     auto sampling_scope = shard_a_.workspace->scope();
     auto& ws_a = *shard_a_.workspace;
     auto& ws_b = *shard_b_.workspace;
@@ -1132,6 +1132,16 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     const std::size_t sampling_ws = ops::sampling_workspace_capacity_bytes(vocab, 1, 1);
     auto sampling_buf_a = ws_a.alloc_bytes(sizeof(ops::SamplingConfig) + sampling_ws, 256);
     auto sampling_buf_b = ws_b.alloc_bytes(sizeof(ops::SamplingConfig) + sampling_ws, 256);
+    // A configured penalty reads the request's committed-token counts through this array, and both
+    // ops::sample and the speculative accept kernel add to it as they produce every token. Reset it:
+    // the arena hands back the previous request's bytes. With no penalty the op reads no counts at
+    // all, so the array is only created when a request actually asks for one.
+    if (sampling_config.presence_penalty != 0.0F || sampling_config.frequency_penalty != 0.0F) {
+        const Tensor counts = ws_a.alloc(DType::I32, {public_tokens});
+        shard_a_.device.bind_to_current_thread();
+        CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), shard_a_.device.stream));
+        sampling_config.token_counts = static_cast<std::int32_t*>(counts.data);
+    }
     shard_a_.device.bind_to_current_thread();
     CUDA_CHECK(cudaMemcpyAsync(sampling_buf_a.data, &sampling_config,
                                sizeof(ops::SamplingConfig), cudaMemcpyHostToDevice,
