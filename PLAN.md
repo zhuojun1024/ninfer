@@ -10,6 +10,8 @@
 >   详细数据见 `docs/tp2-dual-5060ti.md` 与本文件 §10。
 > - **Round 53（进行中）**：TP-2 视觉识别 —— 「静态分片分工」（MTP 只 shard 0 / vision 只 shard 1），
 >   见 §11。用户已批准；目标是显存足够时不引入单图 token 上限配置。
+> - **§13（设计定稿，未开工）**：TP-2 多会话 KV 池 —— host KV 换入换出，显存始终只有一份激活 KV，
+>   内存最多存 5 份非激活会话（LRU 淘汰最旧），会话回来时整体召回、只 prefill 新后缀。
 
 ---
 
@@ -1125,3 +1127,129 @@ TP-2 核心本来就在用 `PinnedHostBuffer`（`tp2_generation_core.cpp:279`）
 **验收**：同一会话连续两轮，第二轮 prompt 比第一轮短且分叉在中段 ⇒ `[tp2-reuse]` 报 `reuse > 0` 且来自 host
 检查点，`cache` 命中从 0% 升到 `shared` 量级，TTFT 从 ~57 s 降到 `(prompt − checkpoint)/1.3k + 固定开销`；
 回归：现有 TP-2 用例 + 新增「短 prompt 命中 host 检查点」场景；`git diff --check` 干净。
+
+---
+
+## 13. 进行中：TP-2 多会话 KV 池（host KV 换入换出）
+
+**目标**：多个聊天会话（A/B/C…）交替使用同一个 TP-2 引擎。任意时刻显存里只有一份激活会话的 KV；
+最多 5 份非激活会话的 KV + 状态保存在 pinned host 内存，会话回来时整体召回（H2D），只 prefill 新后缀；
+超出 5 份时淘汰最旧（LRU）。
+
+**背景与现状（证据）**
+
+- TP-2 核心（`src/runtime/engine/tp2_generation_core.{h,cpp}`）绕过单卡路线的整套 context cache
+  （Program/ResourceManager/checkpoint/资源事务）；`model_instance.cpp` 的 `normalize_engine_options`
+  在 `device_b >= 0` 时把 `context_cache` 重置为 disabled（只保留 `host_state_slots`）⇒
+  `--max-private-continuations` / `--host-kv-mib` 当前在 TP-2 路线**静默无效**（不报错）。
+- TP-2 核心自维护的状态：单行 paged KV（`kv_table_rows = 1`，池按 max_context 建，**上一次 prefill 的
+  KV 常驻显存**，新请求直接回收页）、2 个 GDN 状态快照（显存，prefill 末尾 + 1 个 rewind）、
+  host 检查点环（Round 16：只存 GDN 状态、单谱系、步长 8192）。
+- Round 16 的环解决「同一会话内客户端重渲染较短历史」（GDN 状态召回 + KV 从检查点位置 interval 重算）；
+  本计划解决「**跨会话** KV 保留」（KV + 状态整体召回、零重算）。两者正交，环保留。
+- 量化（Qwen3.8-27B：16 full-attention 层 × 4 KV heads × head_dim 256，另有 48 层 GDN）：
+  文本 KV 16.125 KiB/token/卡（FP8，TP-2 显存台账）；GDN 状态 73.4 MiB/卡/会话；MTP KV 2 KiB/token（shard 0）。
+  换入/换出耗时（PCIe 4.0，~25 GB/s 实测口径）：32K 会话 ≈ 40 ms；128K ≈ 160 ms；
+  相对全量 prefill（200k ≈ 90–160 s）可忽略。
+
+**关键设计决策**
+
+1. **不做抢占（v1）**：换入换出只发生在**请求边界**——激活会话的响应已完整生成并流式发完，
+   新会话请求到达时才换。A 的客户端零停顿；B 的 TTFT 只多一次换入。
+   「B 打断 A 生成到一半」需要暂停 lockstep decode 循环、保存部分输出、之后恢复 A，列为 v2。
+2. **显存零新增**：device KV 池与 GDN 状态池不变（仍只服务一个激活会话）。
+3. **精确 token 匹配**：incoming prompt 分词后扫目录（≤6 条）取最长精确前缀匹配；
+   渲染不一致 ⇒ 全量 prefill（优雅降级，与今天一致）。
+4. **保留 Round 16 环**：它服务同一会话的 in-prefill 检查点；内存紧张时可把 32 槽调小
+   （8 槽 ≈ 1.2 GiB，步长变粗、重算变多）。
+5. **两阶段换入换出 + 校验**：D2H（双卡）→ 校验 → 释放显存页 → H2D（双卡）→ 校验 → 映射。
+   任一阶段失败时系统处于一致状态（各会话在显存或内存之一），报错后下一请求可重试。
+   参照单卡路线 ResourcePlan 的 commit/abort 语义，TP-2 版简化为两阶段 + 校验。
+
+**工作项（按依赖顺序）**
+
+| # | 工作项 | 位置 | 规模 |
+|---|---|---|---|
+| 1 | **Host KV arena**（每 shard 一份）：pinned host 存储，镜像 device KV 页几何（page-major `[X,P,H,N]`，P=64）；每会话一块 slab，按该会话实际 frontier 页数分配（不按 max_context 预分配满）。预算：5 会话 × 204800 token × 16.125 KiB/token/卡 ≈ 16 GiB/卡、共 32 GiB（即 `--host-kv-mib 32768`）；另 GDN 状态 5 × 73.4 MiB × 2 卡 ≈ 0.7 GiB | `tp2_generation_core.cpp` | ~1–1.5k LOC |
+| 2 | **会话目录**：替换 `cached_prompt_tokens_`/`cached_boundaries_`/`cached_state_valid_` 单谱系三件套。≤6 条（1 激活 + 5 非激活），每条：token 历史（204800 × 4 B ≈ 0.8 MiB，可忽略）、frontier、驻留标志（device/host）、host KV slab、host GDN 状态、MTP KV（shard 0）、LRU 时钟 | 同上 | ~500 LOC |
+| 3 | **会话匹配**：扩展现有 reuse scan（`tp2_generation_core.cpp:953` 起）——对单个 `cached_prompt_tokens_` 的线性 token 比较泛化为扫目录取最长精确前缀 | 同上 | ~200 LOC |
+| 4 | **换出事务（D2H）**：请求边界触发（新会话准入时）。双卡 KV 页 D2H → 校验 → GDN 状态 D2H（复用现有 `PinnedHostBuffer` 机制）→ MTP KV D2H → 释放显存页 → 标记 host-resident。先拷后放，峰值显存不增加 | 同上 | ~500 LOC |
+| 5 | **换入事务（H2D）**：反向。映射显存页 → KV H2D → GDN 状态 H2D → MTP KV H2D → 校验 → 标记 device-resident | 同上 | ~500 LOC |
+| 6 | **LRU 淘汰**：目录满（5 非激活）且来新会话时，释放最旧会话的 host KV + 状态 + 历史 | 同上 | ~200 LOC |
+| 7 | **prefill 集成**：换入后从会话 frontier 起只 prefill 新后缀。现有 prefill 已支持从 reuse 点开始（`reuse` token），把「reuse 点 = 会话 frontier + 已映射的恢复页」接上 | 同上 | ~300 LOC |
+| 8 | **选项打通**：`model_instance.cpp` 把 `host_kv_capacity_bytes` / `max_private_continuations` 透传给 TP2GenerationCore（或加 TP-2 专用选项）；启动校验（arena ≥ 会话数 × 容量 × 页字节）+ `[mem]` 台账加一行 | `model_instance.cpp`、`serve_options` | ~300 LOC |
+| 9 | **测试**：新增 `tests/models/qwen3_5/test_tp2_sessions.cpp`（参照 `test_tp2_forward.cpp` 的小模型 fixture）：A prefill→完成 → B prefill→完成 → **A 续轮**（断言命中召回、非全量 prefill；输出与从零 prefill 的 oracle **逐 bit 一致**——KV 字节相同则 attention 相同）→ C/D/E/F（断言 A 被 LRU 淘汰）→ A 再来（断言全量 prefill） | `tests/` | ~800–1k LOC |
+| 10 | **文档**：`docs/tp2-dual-5060ti.md`（产品语义 + 推荐配置）+ 启动脚本注释 | `docs/` | — |
+
+**验收标准**
+
+- 功能：多会话交替场景下 `[tp2-session]` 诊断报命中/未命中/淘汰；命中时 TTFT ≈ 换入耗时 + 新后缀
+  prefill（32K 会话 ≈ 40 ms + 后缀），而非全量 prefill。
+- 数值：召回会话的输出与从零 prefill 的 oracle 逐 bit 一致（KV 字节相同 ⇒ attention 相同）。
+- 回归：现有 TP-2 用例全过（`qwen3_5_tp2_forward --artifact` 等）；`git diff --check` 干净。
+- 资源：显存零新增（nvidia-smi 台账不变）；pinned host ≈ 32 GiB（KV）+ 0.7 GiB（状态）+ 现有环
+  4.7 GiB。**启动前确认物理内存 ≥ 48 GiB**（本机 WMI 读不出内存总量，用任务管理器核对）；
+  不足则 `--host-kv-mib` 降档（16384 = 3 个满上下文会话）。
+
+**风险与注意**
+
+- 32 GiB pinned 内存：WDDM/Windows 的 `cudaHostAlloc` 有实际上限；现有环已 pin 4.7 GiB 且工作正常，
+  32 GiB 需实测确认。
+- `max_pending_requests = 1`（TP-2 强制）：同一时刻只有一个等待请求，聊天场景无影响。
+- vision workspace 是 per-request 临时 arena，不属于会话状态，不参与换入换出。
+- 会话 token 历史 ≤ 0.8 MiB/会话，可忽略。
+
+**分期**
+
+- **v1**：上表 1–10 全部（请求边界换入换出 + 5 会话 LRU + 精确匹配）。
+- **v2（可选）**：生成中抢占（暂停/恢复 lockstep decode、部分输出续流）。
+
+**工作量估计**：~4–5k LOC C++ + 测试，数周量级。物理传输可参照单卡路线
+`src/models/qwen3_5/program/transactions/materialization.cpp` 的 D2H/H2D 事务，但 TP-2 核心是独立
+代码路径，属移植而非启用。
+
+**进度**：（未开工，随工作更新）
+
+---
+
+## Round 17：plain decode 上图 + AR 按张量大小切传输策略（进行中）
+
+**目标（用户明确要求）**：把下面两项列入计划并实现，每项做完做 A/B 并汇报。
+
+| # | 项 | 理论收益 | 现状与依据 |
+|---|---|---|---|
+| ① | plain（`--spec` 缺省）单 token decode 轮上 exact-batch CUDA Graph | 去掉每轮 ~1000 个 kernel 的发射/调度开销。Round 11 在 MTP verify（同规模 kernel 数）上实测 `verify` 少 4.4 ms/轮 | plain 路由（`tp2_generation_core.cpp:1463-1494`）完全 eager；`forward_tp2` 用 `set_i32_scalar` 传 host token/position，**不可捕获**。MTP verify 已有图（Round 11 ①） |
+| ② | `DevicePair::allreduce` 按 payload 大小切传输策略 | decode 侧每轮 128 次 AR、每次 9–18 µs（1.2–2.3 ms，占轮 4–7%）；prefill 侧单次 AR 已经贴链路地板 | 现状只有一条 in-kernel mapped-pinned 自旋路径（`device_pair.cu:338-444`），仅切片数按大小自适应（`ar_slices`） |
+
+### 关键前置结论（勿重复调研）
+
+1. **envelope 桶在数值上是精确的**。`small_t_fp8.cuh:147-179`：`window = last_pos + 1` 由**设备端 positions**算出；`active_split_count = min(default_splits(window), split_count)`，split 的 key 区间也全部由 `window` 推导；host 侧 `logical_capacity = envelope.max_visible_keys` 只用于越界保护（`last_pos >= logical_capacity ⇒ write_neutral`）。`causal_small_t_launch_capacity`（`small_t.cu:78-94`，配合 `small_t.cuh:81-94` 的 tier 末端 `{128,160,512,4096,5000,8198,16390}`）取 envelope 区间内 `default_splits` 的上确界，因此只要 host 的 `splits ≥ default_splits(window)`，桶 envelope 与精确 envelope **逐位一致** ⇒ 单卡 `ordinary_graph_profiles` 的桶做法可以照搬到 TP-2。
+2. **TP-2 分片上 `Phase` 无数值作用**：`text.cpp:1233`、`:1399` 的 Verify 分支都被 `shard_config_ == nullptr` 挡住；`attn_mix`/`gdn_mix` 里 `ph` 只用于 nvtx 名字。
+3. **但 `active_sequence_batch_` 有数值作用**：`text.cpp:1154` 起，`active_sequence_batch_ != 0` 才走 batched attention 路由。`forward_tp2`（plain decode）设 batch=1/width=1，而 `forward_tp2_window`（MTP verify 用）**没有**设 batch/width ⇒ **plain decode 上图不能直接复用 `forward_tp2_window`**，必须复刻 `forward_tp2` 的绑定。
+4. `model_instance.cpp:99` 的 `use_cuda_graph=false` 只影响单卡 Program 路线，与 TP-2 无关。
+5. `--spec` 缺省即 `SpeculativeBackend::None`（`speculative_options.h:11-16` 只解析显式传值）；`tools/win_port/serve.ps1 -Plain` 就是 plain 路线。
+
+### ① 实现设计
+
+- 新增 `TextContext::forward_tp2_decode_window(...)`（`models/qwen3_5/execution/text.{h,cpp}`）：与 `forward_tp2` 逐行同构，只有可捕获化改动 —— `ids` 与 `cache/rope positions` 从 pinned host 用 `copy_i32` 的 memcpy node 读入（不再是 `set_i32_scalar` 的 host 值），envelope 变成捕获参数；其余绑定（batch=1、width=1、`kv_table_rows=0`、state slots=0、`Phase::Verify`、终范数、`project_head_tp2`）完全照抄。
+- `TP2GenerationCore`：`VerifyGraph` 改名 `WindowGraph` 并复用同一套 `round_base/arena_begin/arena_bytes` 簿记；新增 `decode_graphs_`（桶来自 `qwen::detail::ordinary_graph_profiles(max_context)`，`visible_begin = min+1`、`visible_end = min(max_context, max+1)`，与单卡 ordinary decode 图同源）与 `decode_window_host_`（pinned `[token, position]`）。
+- 只有 `pair_.in_kernel_allreduce()` 时上图（P2P / host-staging 会同步 host，不可捕获）。
+- 环境开关 `NINFER_TP2_DECODE_GRAPH`：未设/其它 = 捕获图；`0` = eager + **桶** envelope（纯发射机制 A/B）；`exact` = eager + 精确 envelope（= HEAD 行为，envelope A/B）。
+- 采样留在图外（sampling 参数逐请求变化，`logical_pos_a` 与 tool mask 都是 host 驱动），图只覆盖 forward；logits 缓冲由调用方在图前按固定顺序分配，复刻 verify 图的位置约定。
+- 验收：三个配置的贪婪逐 token 一致性 + `bench_serve.ps1` 实测 tok/s + `NINFER_TP2_TIMING=1` 的 `avg_round`。
+
+### ② 实现设计
+
+- 大小键控的传输策略（`NINFER_TP2_AR_STRATEGY`：`size` 默认按大小 / `kernel` 强制现路径并作为 A/B 参照）：
+  - **小载荷（≤ 64 KiB，decode 的 10 KiB、verify 的 40 KiB 属此档）**：in-kernel 路径 + 把 `bump_ar_token` 融进 AR kernel（单 block 时线程 0 自增、`__threadfence_system()` 发布、经 shared memory 广播），省掉每次 AR 的一次 launch；staging 换成独立的 2×64 KiB mapped-pinned 区，parity slot 不再与 prefill 槽别名。线程数保持 `kArThreads`。
+  - **大载荷（> 64 KiB，prefill 的 10 MiB 属此档）**：保持切片路径不动（实测已贴链路地板）。
+- **未实现的 copy-engine 大载荷臂**（D2H → `cudaEventRecord` → 对端 `cudaStreamWaitEvent` → H2D 到 scratch → 设备端 add）：放弃理由有二 —— 一是其跨卡定序必须依赖跨设备 `cudaStreamWaitEvent`（`device_pair.cu:352-357` 的「copy engine 更慢」测得的是旧 host-staging 路径，不足以据此否决，但带宽口径下 copy engine 与 SM 写用的是同一根 PCIe）；二是本项的真实杠杆不在传输方式，而在**每轮 128 次调用的次数**，prefill 对照臂全程未动即证明了这一点。
+- 数值契约不变：BF16 逐元素 `__hadd`，加法顺序不变（实测 7/7 逐位一致）。
+
+### 进度
+
+- [x] 计划落盘（本节）
+- [x] ① 实现（forward_tp2_decode_window + DecodeStepMode + decode_graphs_）
+- [x] ① 构建 + 数值比对 + A/B：decode +12.6% @1K / +12.1% @32K（31.11→35.03、29.79→33.39 tok/s，每轮省约 3.6 ms）；prefill 不变；graph vs 桶 7/7 逐位一致。详见 profiles/bench/tp2_decode_graph/report.md
+- [x] ② 实现（payload ≤ 64 KiB 单 block + bump 融合进 AR kernel + 独享 2×64 KiB staging；> 64 KiB 走原切片路径；NINFER_TP2_AR_STRATEGY=size|kernel）
+- [x] ② 构建 + 数值比对 + A/B：decode +0.63% @1K / +0.51% @32K（35.12→35.34、33.48→33.65 tok/s，avg_round 29.86→29.70 ms）；prefill 是天然对照，三臂均不变；token 7/7 逐位一致。线程数必须保持 kArThreads（256 线程版本是 −0.2%/−0.4% 回归）。详见 profiles/bench/tp2_decode_graph/report.md
