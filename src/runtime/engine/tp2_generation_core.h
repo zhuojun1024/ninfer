@@ -210,13 +210,14 @@ private:
     Shard shard_b_;
     tp::DevicePair pair_;
 
-    // Captured verify windows. The speculative verify forward is the same launch sequence every
-    // round - about a thousand kernels in lockstep on both devices - and its only per-round inputs
-    // are the window tokens, their absolute positions and the attention envelope. One CUDA Graph per
-    // device is captured per envelope bucket and replayed, which removes the whole verify's launch
-    // cost from the round (the round was enqueue-limited: the device stream idled for roughly the
-    // last few percent of every kernel). See run_verify_window.
-    struct VerifyGraph {
+    // Captured single-step windows, one graph per device per envelope bucket. The speculative verify
+    // forward and the plain one-token decode step are the same launch sequence every round - about a
+    // thousand kernels in lockstep on both devices - and their only per-round inputs are the window
+    // tokens, their absolute positions and the attention envelope, so capturing the sequence removes
+    // the whole step's launch cost from the round (the round was enqueue-limited: the device stream
+    // idled for roughly the last few percent of every kernel). See run_verify_window and
+    // run_plain_decode_step.
+    struct WindowGraph {
         // Inclusive range of visible key extents this bucket covers. The captured envelope is the
         // bucket's widest extent; the per-round positions still come from device memory, exactly as
         // the single-GPU MTP graph relies on.
@@ -234,22 +235,41 @@ private:
         std::size_t arena_begin[2] = {0, 0};
         std::size_t arena_bytes[2] = {0, 0};
     };
-    [[nodiscard]] VerifyGraph* select_verify_graph(std::uint32_t visible_end);
+    // The captured graph covering an envelope bucket, or nullptr when no bucket does.
+    [[nodiscard]] static WindowGraph* select_window_graph(std::vector<WindowGraph>& graphs,
+                                                          std::uint32_t visible_end);
     // The captured graph covering this window that the current request can still use, or nullptr
     // when the window has to be captured (again). A capture bakes the workspace watermark it ran at,
     // so a request whose own watermark is higher has to capture afresh: the graphs therefore track
     // the highest watermark seen rather than the first one.
-    [[nodiscard]] VerifyGraph* reusable_verify_graph(std::uint32_t visible_end);
-    void capture_verify_graph(VerifyGraph& graph, const std::int32_t* ids,
+    [[nodiscard]] WindowGraph* reusable_window_graph(std::vector<WindowGraph>& graphs,
+                                                     std::uint32_t visible_end);
+    // Launches one captured window on both devices, leaving shard A's device current.
+    void launch_window_graph(WindowGraph& graph);
+    void capture_verify_graph(WindowGraph& graph, const std::int32_t* ids,
                               const std::int32_t* positions, Tensor& logits_columns,
                               Tensor& hidden_columns);
     void run_verify_window(const std::int32_t* ids, std::int32_t first_position,
                            Tensor& logits_columns, Tensor& hidden_columns);
 
+    // One plain (non-speculative) decode step at the given position. The launch mechanism is the
+    // decode step mode: a captured graph by default, the eager forward for either A/B partner.
+    // Returns this shard's [V,1] logits, allocated where the captured layout expects it.
+    Tensor run_plain_decode_step(std::int32_t token, std::uint32_t position);
+    void capture_decode_graph(WindowGraph& graph, const std::int32_t* token,
+                              const std::int32_t* position, Tensor& logits);
 
-    std::vector<VerifyGraph> verify_graphs_;
+    std::vector<WindowGraph> verify_graphs_;
     std::unique_ptr<PinnedHostBuffer> verify_window_host_;
     bool verify_graph_enabled_ = false;
+
+    // Plain decode steps. A captured step bakes a bucket-wide attention envelope, so the eager
+    // partners stay reachable: EagerBucket isolates the launch mechanism from the envelope, and
+    // EagerExact reproduces the pre-graph behaviour of an exact visible extent.
+    enum class DecodeStepMode { Graph, EagerBucket, EagerExact };
+    std::vector<WindowGraph> decode_graphs_;
+    std::unique_ptr<PinnedHostBuffer> decode_window_host_;
+    DecodeStepMode decode_step_mode_ = DecodeStepMode::Graph;
 
     // Total seconds spent loading and materializing both shards (for LoadSummary).
     double load_seconds_ = 0.0;

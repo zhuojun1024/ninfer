@@ -155,6 +155,17 @@ public:
     void forward_tp2(TextContext& peer, tp::DevicePair& pair, std::int32_t token,
                      std::int32_t position, Tensor& logits, Tensor& logits_peer,
                      Tensor* mtp_input_hidden = nullptr);
+    // The plain (non-speculative) decode step, shaped for CUDA Graph capture. It runs exactly the
+    // sequence forward_tp2 runs - same bindings, same Phase::Verify - but the two per-round host
+    // values (the decoded token and its absolute cache/RoPE position) are read from pinned host
+    // memory instead of being baked into a set_i32_scalar kernel argument, so a captured graph
+    // records a memcpy node that every replay re-reads. `envelope` is the capture parameter: only
+    // its bounds matter, because the small-T route derives the active split count and the key
+    // partition from the device-side positions. The peer's logits buffer is allocated internally
+    // (the caller only samples from this shard's), so the captured layout is self-contained.
+    void forward_tp2_decode_window(TextContext& peer, tp::DevicePair& pair,
+                                   const std::int32_t* token, const std::int32_t* position,
+                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits);
     // Tensor-parallel single-token forward at `position` returning the argmax token id on this
     // shard's device. Both shards hold the complete logits, so their argmax must agree; a
     // disagreement is a shard divergence.

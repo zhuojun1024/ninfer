@@ -1728,6 +1728,94 @@ void TextContext::forward_tp2(TextContext& peer, tp::DevicePair& pair, std::int3
     project_head_tp2(peer, pair, hidden_out, hidden_out_peer, logits, logits_peer);
 }
 
+void TextContext::forward_tp2_decode_window(TextContext& peer, tp::DevicePair& pair,
+                                            const std::int32_t* token, const std::int32_t* position,
+                                            ops::CausalAttentionExecutionEnvelope envelope,
+                                            Tensor& logits) {
+    const std::int32_t hidden = dimension(config_.hidden_size);
+    const std::int32_t vocab  = dimension(config_.vocab_size);
+    if (token == nullptr || position == nullptr) {
+        throw std::invalid_argument(
+            "forward_tp2_decode_window requires pinned host token and position");
+    }
+    if (vocab % 2 != 0 || logits.ne[0] != vocab || logits.ne[1] != 1) {
+        throw std::invalid_argument("forward_tp2_decode_window: logits must be [V,1]");
+    }
+    if (envelope.min_visible_keys == 0 || envelope.max_visible_keys < envelope.min_visible_keys) {
+        throw std::invalid_argument("forward_tp2_decode_window: envelope is invalid");
+    }
+    // Same sequence as forward_tp2, with only its two per-round host values made capturable: the
+    // decoded token and its absolute position now arrive through a memcpy node out of pinned host
+    // memory, and the attention envelope is a capture parameter instead of the exact extent. The
+    // envelope is a bound rather than a decision - the small-T route reads the real window from the
+    // device-side positions and derives the active split count and the key partition from it, so a
+    // bucket-wide envelope reduces to the same kernels and the same key ranges.
+    struct BindState {
+        Tensor ids;
+        Tensor cache_positions;
+        Tensor rope_positions;
+        Tensor kv_table_rows;
+        Tensor state_source;
+        Tensor state_destination;
+    };
+    auto make_bind = [&](TextContext& card, WorkspaceArena& arena) {
+        card.ctx_.bind_to_current_thread();
+        BindState bind;
+        bind.ids = arena.alloc(DType::I32, {1});
+        copy_i32(token, bind.ids, card.ctx_.stream);
+        bind.cache_positions = arena.alloc(DType::I32, {1});
+        copy_i32(position, bind.cache_positions, card.ctx_.stream);
+        bind.rope_positions = arena.alloc(DType::I32, {1});
+        copy_i32(position, bind.rope_positions, card.ctx_.stream);
+        bind.kv_table_rows = arena.alloc(DType::I32, {1});
+        ops::set_i32_scalar(bind.kv_table_rows, 0, card.ctx_.stream);
+        bind.state_source = arena.alloc(DType::I32, {1});
+        ops::set_i32_scalar(bind.state_source, 0, card.ctx_.stream);
+        bind.state_destination = arena.alloc(DType::I32, {1});
+        ops::set_i32_scalar(bind.state_destination, 0, card.ctx_.stream);
+        return bind;
+    };
+    const BindState bind0 = make_bind(*this, work_);
+    const BindState bind1 = make_bind(peer, peer.work_);
+    ScopedPositions cache0(active_cache_positions_, bind0.cache_positions);
+    ScopedPositions rope0(active_rope_positions_, bind0.rope_positions);
+    ScopedEnvelope envelope0(active_causal_attention_envelope_, envelope);
+    ScopedValue<const Tensor*> kv0(active_kv_table_rows_, &bind0.kv_table_rows);
+    ScopedValue<const Tensor*> source0(active_linear_state_source_slots_, &bind0.state_source);
+    ScopedValue<const Tensor*> destination0(active_linear_state_destination_slots_,
+                                            &bind0.state_destination);
+    ScopedValue<std::int32_t> batch0(active_sequence_batch_, 1);
+    ScopedValue<std::int32_t> width0(active_sequence_width_, 1);
+    ScopedPositions cache1(peer.active_cache_positions_, bind1.cache_positions);
+    ScopedPositions rope1(peer.active_rope_positions_, bind1.rope_positions);
+    ScopedEnvelope envelope1(peer.active_causal_attention_envelope_, envelope);
+    ScopedValue<const Tensor*> kv1(peer.active_kv_table_rows_, &bind1.kv_table_rows);
+    ScopedValue<const Tensor*> source1(peer.active_linear_state_source_slots_, &bind1.state_source);
+    ScopedValue<const Tensor*> destination1(peer.active_linear_state_destination_slots_,
+                                            &bind1.state_destination);
+    ScopedValue<std::int32_t> batch1(peer.active_sequence_batch_, 1);
+    ScopedValue<std::int32_t> width1(peer.active_sequence_width_, 1);
+
+    ctx_.bind_to_current_thread();
+    Tensor x      = work_.alloc(DType::BF16, {hidden, 1});
+    Tensor x_peer = peer.work_.alloc(DType::BF16, {hidden, 1});
+    embedding_tp2(peer, pair, bind0.ids, &bind1.ids, x, &x_peer);
+    NullTap tap;
+    run_layers_tp2(peer, pair, x, x_peer, Phase::Verify, tap);
+
+    ctx_.bind_to_current_thread();
+    Tensor hidden_out      = work_.alloc(DType::BF16, {hidden, 1});
+    peer.ctx_.bind_to_current_thread();
+    Tensor hidden_out_peer = peer.work_.alloc(DType::BF16, {hidden, 1});
+    ctx_.bind_to_current_thread();
+    ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden_out, ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    ops::rmsnorm(x_peer, *peer.final_norm_, config_.rms_norm_eps, true, hidden_out_peer,
+                 peer.ctx_.stream);
+    Tensor logits_peer = peer.work_.alloc(DType::BF16, {vocab, 1});
+    project_head_tp2(peer, pair, hidden_out, hidden_out_peer, logits, logits_peer);
+}
+
 std::int32_t TextContext::forward_tp2_token(TextContext& peer, tp::DevicePair& pair,
                                             std::int32_t token, std::int32_t position) {
     const std::int32_t vocab = dimension(config_.vocab_size);
