@@ -2,10 +2,11 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
-NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
-single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
-resident model, and a startup-fixed capacity of one to eight active requests.
+NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on an
+NVIDIA GeForce RTX 5090, or on a pair of RTX 5060 Ti cards run as a tensor-parallel-2 (TP-2)
+server. It runs text, image, and video prompts through a local CLI or OpenAI-/Anthropic-compatible
+HTTP APIs. The runtime is deliberately specialized: one GPU (or one TP-2 pair), one resident
+model, and a startup-fixed capacity of one to eight active requests.
 
 Five official artifacts are available. The quick-start commands use Qwen3.8-27B NVFP4.
 
@@ -28,11 +29,14 @@ the weights again.
 
 ## Quick start
 
-NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, a CUDA toolkit supporting `sm_120a`,
-CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
-(`libavformat`, `libavcodec`, `libavutil`, and `libswscale`), and `libcurl >= 7.85`.
-CUDA 13.1 is the validated development toolkit; CMake does not impose a CUDA version floor.
-The build rejects CUDA architectures other than `sm_120a`.
+NInfer runs on 64-bit Linux or native Windows, on an NVIDIA GeForce RTX 5090 or on two identical
+RTX 5060 Ti cards (TP-2, server route only). The build requires a CUDA toolkit supporting
+`sm_120a`, CMake 3.28 or newer, a C++20 host compiler, and Ninja. On Linux it also needs
+`pkg-config`, FFmpeg development libraries (`libavformat`, `libavcodec`, `libavutil`, and
+`libswscale`), and `libcurl >= 7.85`; CUDA 13.1 is the validated development toolkit. On Windows it
+needs Visual Studio 2022 (MSVC 19.44), CUDA 13.3, and FFmpeg/libcurl development prefixes; see the
+[Windows native build](docs/windows.md) guide. CMake does not impose a CUDA version floor, and the
+build rejects CUDA architectures other than `sm_120a`.
 
 Build the product binaries:
 
@@ -240,10 +244,12 @@ and either full or optimized proposal heads.
 
 The product boundary remains intentionally small:
 
-- one RTX 5090 and one resident model per Engine;
-- a startup-fixed capacity of one to eight active requests with bounded FIFO ingress;
-- no request preemption, priority/QoS, active-request swapping, weight offload, multi-GPU, or
-  distributed serving;
+- one RTX 5090 (or one TP-2 pair of identical RTX 5060 Ti cards on the server route) and one
+  resident model per Engine;
+- a startup-fixed capacity of one to eight active requests with bounded FIFO ingress (the TP-2
+  route runs one request at a time);
+- no request preemption, priority/QoS, active-request swapping, weight offload, or distributed
+  serving; multi-GPU is limited to the two-card TP-2 server route;
 - one shared startup-fixed KV pool across active requests and retained prefixes;
 - model architectures and format/shape combinations use explicitly implemented native paths;
 - parsed tool calls are returned to the client; NInfer does not execute tools;
@@ -259,6 +265,8 @@ capacities remain fixed for the process lifetime.
 - [Documentation index](docs/README.md)
 - [CLI](docs/cli.md)
 - [HTTP serving](docs/serving.md)
+- [Windows native build](docs/windows.md)
+- [Dual RTX 5060 Ti TP-2](docs/tp2-dual-5060ti.md)
 - [Performance](docs/performance.md)
 - [Perplexity evaluation](docs/perplexity.md)
 - [Weight conversion and custom recipes](docs/weight-conversion.md)

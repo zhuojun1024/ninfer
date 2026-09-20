@@ -1484,3 +1484,242 @@ Windows 原生移植（走 WSL2）、新架构支持。
 - `docs/tp2-dual-5060ti.md` 中"接受率取自 `[mtp] round` 计数器"的说法已同步改为上式。
   `tools/tp_bootstrap/r53_decode_analysis.sh` 是 Linux 时代的归档脚本（硬编码 `/home/zhuojun/prof/…` 日志路径），
   **未改动**：它的 acceptance 列现在会退化成 `no mtp`，需要时应改从 `[tp2-time]` 取。
+
+---
+
+### Round 14 — “续写边界”（方案 2）：实现、真实流量证伪、撤回
+
+用户在 agent 会话里暴露的问题：稳态 `cache` 命中 99% 但 TTFT 仍不低，且周期性出现 `cache 0`。
+先按方案 2 实现“把复用边界推到上一轮生成序列末尾”：新增状态槽持有 decode 结束时的 GDN 状态，
+`cached_tokens_` 记 prompt + `generated[0..G-2]`、boundary = `prompt + G - 1`（最后那个生成 token 是下一轮
+anchor，transition 故意未折叠），每卡 +73 MiB（`state` 293.6 → 367.0 MiB），并加 `NINFER_TP2_REUSE_TRACE=1` 诊断。
+
+**实测（DSH agent 真实流量，36 条请求）**：`slot=0`（上一条 prompt 末尾）命中 35 次、`slot=1`（rewind）1 次、
+**续写槽 0 次**；`continuation > shared` 36/36 成立，其中 33/36 条 `shared == prefill_end` **精确相等** ——
+客户端下一条 prompt 与上一条 prompt 逐 token 相同直到末尾，然后在**第一个生成 token 处**分叉。
+旁证：req#1 生成 499 token，而 req#2 的 prompt 只比 req#1 长 203 token（渲染出的 assistant 回合明显短于生成流）。
+即 DSH 不回传模型生成的 token 流，而是重新渲染 assistant 回合，“续上上一轮输出”在协议层不成立。
+
+**决定：撤回**（`tp2_generation_core.{h,cpp}` 回到 `1cdfab97`），保留 `NINFER_TP2_REUSE_TRACE` ——
+它是判断“客户端是否原样回传历史”的唯一手段（每请求打印 `prompt/cached/shared/prefill_end/rewind -> reuse/slot`），
+`state` 台账回到 293.6 MiB/卡。
+
+**同轮定位到、但尚未做的三件事**：
+
+1. 新会话/上下文压缩后的第一轮：req#16 prompt 63,182 只与缓存共享 14,768（= system prompt + 工具定义），
+   而缓存的两个边界都在 106k 附近 ⇒ `reuse=0`、TTFT **46.9 s** 全量重算；约 11 s 是白丢的
+   （在前缀末尾之后再加一个 system+tools 结束位置的锚点即可）。
+2. 工具返回的大段新内容：req#4/5/6 的 suffix 8,966 / 14,634 / 8,895 token，前推只有 0.95–1.13k tok/s ⇒
+   TTFT 8.0 / 13.7 / 8.9 s，且缓存已命中 82–90%，剩下的是**必须新算**的 ⇒ 这是 prefill 吞吐问题，不是缓存问题
+   （冷启也只有 1.35–1.38k tok/s）。
+3. 每请求 ~0.28–0.35 s 固定开销：18 token 的 suffix → TTFT 272 ms，519 token 的 suffix → 657 ms（边际只需 0.38 s），
+   这是 TTFT 的地板。
+
+**日志口径**：`| prefill X tok/s` 是 `(prompt − cache)/prefill_seconds`，在近乎全命中的请求上分子只有十几 token、
+分母被固定开销主导，用户据此把 `prefill 70.6 tok/s` 误读成“从头 prefill”。`operational_log.cpp` 现在同时打印分子
+（`prefill 70.6 tok/s (18 tok)`）。
+
+## Round 15 —— 工具调用被当成文本：A/B 判定与量化无关
+
+**现象**：agent 会话里模型偶尔把工具调用当正文吐出（`<tool_call> <function=todo_write> …`），前端提示
+“工具调用方式不对”；有时被纠正后恢复。
+
+**定位**：ninfer 的 `WARN req#N tool markup returned as text | <reason>` 给出四类原因
+（`invalid tool name` / `undeclared tool` / `malformed structure` / `trailing content`）。逐字复述探针
+（把截图里的标记原样喂回模型，换行版与空格版各一次）都被正确解析成 `tool_calls`；namespace 分组往返也正确
+（声明 `namespace=dsh` 的 `todo_write` → 模型答出模板渲染的 `dsh__todo_write`，响应还原为
+`name=todo_write, namespace=dsh`）⇒ 解析器与 chat_template 均无问题。
+
+**根因（模型侧）**：请求只声明 **1 个**可直接调用的函数（日志 `tools 1`；口径已验证：1 个 namespace 包 2 个
+函数时日志写 `tools 2`），而系统提示以 `tools.read` / `tools.pwsh` / `tools.todo_write` … 列出整套 SDK 工具。
+模型有时直接对这些“能读到、不能直接调”的名字发结构化调用，或照抄成带点的 `tools.read`，被
+`enforce_declared_names` 拒收后原样返回文本。
+
+**A/B（判断 HF → ninfer 转换是否造成退化）**：3 个诱导 prompt（todo / read / pwsh）+ 1 个对照，
+`temperature 0.7`，每臂两轮共 75 条工具请求：
+
+| 模型 | 工具请求 ok | 标记类失败 | 撞输出上限 |
+| --- | --- | --- | --- |
+| 官方 `qwen3_8_27b_nvfp4.ninfer` | 38/75 | 27/75（21 个 `tools.*` + 6 malformed） | 10 |
+| 转换 `qwen3_8_27b_w4a4_w8a8.ninfer` | 50/75 | 19/75（17 个 `tools.*`/`read` + 1 malformed + 1 undeclared） | 7 |
+
+标记类失败率 36% vs 25%，差异不显著（两比例 z≈1.4，p≈0.16），**失败形态完全相同**（都是照抄 `tools.read`
+这类带点名字）；对照 prompt 两臂都 10/10 ⇒ 转换没有造成工具调用能力退化。另一条轴是“思考过长撞输出上限”，
+探针只有 300 token 上限放大了它，真实会话 32k 不会触发。
+
+**结论**：不是 ninfer bug、不是 chat_template、不是量化；是“唯一可调用工具是 run_code、提示里却列出整套 SDK
+工具名”这一提示结构下的模型侧照抄行为。ninfer 严格拒绝未声明调用是正确行为——放行等于让模型绕过 run_code
+直接触发 pwsh/write。
+
+**可复用探针**：`%TEMP%\ab_probe.ps1` + `%TEMP%\probe_t0..t3.json`，
+`pwsh -File %TEMP%\ab_probe.ps1 -Tag <name> -Repeats 15`；脚本自取 `/v1/models` 的 id，
+按 ok / bad-name / malformed / empty 分类并导出 `%TEMP%\ab_<tag>.csv`。
+
+**顺带查明**：ninfer-serve 在 PATH 缺少 ffmpeg/libcurl 的 `bin` 目录时以 `0xC0000135`（DLL not found）
+静默退出、零输出；从工具环境启动必须先把这两个目录加进 PATH（见 `tools/win_port/serve.ps1:69`）。
+
+---
+
+## Round 16 — TP-2 host 侧状态检查点（已实现，待端到端验证）
+
+**问题**（Round 15 之后两次实测）：客户端在 turn 边界重渲染历史，新 prompt 比上一条**短**，分叉点落在历史中段。
+TP-2 核心只有 2 个**显存**边界（上一条 prompt 末尾 + 一个 rewind 点），判据 `boundary <= shared_prefix` 都不满足
+⇒ `reuse=0` ⇒ 整条 prompt 全量重算：
+
+| 请求 | prompt | cached | shared | reuse | TTFT |
+| --- | --- | --- | --- | --- | --- |
+| req#24 | 12,143 | 12,362 | 11,872 | 0 | 7.8 s |
+| req#43 | 57,378 | 58,611 | 43,239 | 0 | 42.0 s |
+| req#51 | 74,536 | 90,424 | 57,376 | 0 | 57.6 s |
+
+req#51 那段用 250 ms NVML 采样确认：两卡全程 98–100%，**不存在「只有一块卡在跑」，也没有真空期**
+（采样里唯一一直 0% 的是 `gpu1` = Tesla T10，NInfer 不用它）；`done` 行的 `prefill 1.30k tok/s (74,536 tok)`
+与 TTFT 57.6 s 一致。注意 `throughput` 窗口行的 `prefill 14.9k tok/s (74,536 tok)` 是另一套口径
+（窗口内结算的 token ÷ 窗口长度 5.0 s，`src/serve/operational_log.cpp:340`），不是真实 prefill 吞吐；
+真实值在 `done` 行（`operational_log.cpp:274-279`，除以 `prefill_seconds`）。
+
+**根因**：不是 KV。walk 从边界开始、边界之前的 KV 页本来就不重算（`tp2_generation_core.cpp` 的注释）。
+缺的是 **GDN（线性注意力）状态**——循环累积量，既不能从 KV 反推也不能平移；全注意力层可以按 LCP 随便截断
+（llama.cpp 的 `n_past = slot.prompt.tokens.get_common_prefix(input_tokens)`，`tools/server/server-context.cpp:3103`，
+只解决这一半），hybrid 模型必须靠上下文检查点兜底：llama.cpp `--ctx-checkpoints` 默认 32、
+`--checkpoint-min-step` 默认 8192（`common/common.h:611-615`），创建在 `llama_decode()` 之前
+（`server-context.cpp:3508-3518`），恢复时从新到旧找 `<= LCP` 的检查点，找不到才 `do_reset` 全量重算（`:3236-3249`）。
+
+**实现**（显存 0 增量，检查点全部放 pinned host 内存）：
+
+- 沿用引擎既有的 host state-image 预算 `--host-state-slots`（`ContextCacheOptions::host_state_slots`，
+  `include/ninfer/types.h:136`）：TP-2 分支不动这个预算，其它 disabled-cache 路由照旧清零
+  （`src/runtime/engine/model_instance.cpp:100`、`:135-142`）。
+- `tp2_generation_core.h/.cpp`：`Shard::HostCheckpoint` 环（`PinnedHostBuffer`，一份 = `state_backing.bytes` ≈ 73.4 MiB/卡）；
+  步长 `kReuseCheckpointStride = 8192` 起步，按 `ceil(max_context / 槽数)` 放大到 128 的倍数，保证
+  `槽数 × 步长 ≥ max_context`（默认 8 槽 / 131072 → 16384；脚本里配 16 槽 → 8192）。
+- prefill 每跨过一个步长，在同一个 shard stream 上 D2H 一份状态，记下 frontier 与 prefill id；
+  复用扫描在原有 2 个显存边界之外，再取「**上一次 prefill** 的、位置最深且 ≤ `shared_prefix`」的主机检查点；
+  `begin_gdn_state` 相应走 H2D 分支；KV 路径完全不动（前缀页本来就保留，suffix 照旧重算）。
+- 正确性规则：只用**上一次完成的 prefill** 产生的检查点（prefill id 标记）——它的 `[0, shared)` 与本条逐 token
+  相同，和显存边界是同一套论证；更老的检查点不保证同一位置上是同一批 token。被取消的 prefill
+  （`cancellation.requested()` 提前 `return`）不发布 id，它写进环里的检查点自然被排除。
+- 启动账本新增一行：`[mem] host-checkpoints shard N slots S x 73.4 MiB | stride X tok | pinned Y MiB`；
+  `NINFER_TP2_REUSE_TRACE=1` 的 `[tp2-reuse]` 行多了 `host=<槽数> stride=<步长> ... src=host|device`。
+
+**验证状态**：`ninfer_engine` 目标编译通过（`cmake --build build-win --target ninfer_engine`，BUILD_EXIT=0），
+`git diff --check` 干净。**未做端到端验证**：需要重新链接 `ninfer-serve.exe` 并重启服务，而当前服务在跑、exe 被占用。
+
+**待做的验证**：重启后起新一轮会话，让第二轮 prompt 比第一轮短且分叉在中段，确认 `[tp2-reuse]` 出现
+`reuse>0` 且 `src=host`，`done` 行的 `cache` 从 0% 变成 `shared` 量级，TTFT 从 ~57.6 s 降到
+`(prompt − checkpoint) / 1.3k + 固定开销`（16 槽 / 步长 8192 下 req#51 预计 ~13-15 s）。
+
+### Round 16.1 — 第一次重启没生效 + 尾部检查点窗口
+
+**用户把 `--max-context` 改成 204800 并重启后仍很慢。日志检查结论：跑的是旧二进制。**
+
+| 证据 | 值 |
+| --- | --- |
+| `build-win/apps/ninfer-serve.exe` 时间戳 | `01:39:37` |
+| `tp2_generation_core.cpp` 修改时间 | `02:58:20` |
+| 日志里 `host-checkpoints` 行数 | 0 |
+| 日志里 `src=host` 行数 | 0 |
+| `[tp2-reuse]` 格式 | 旧的（没有 `host=/stride=/src=`） |
+
+即：改了上下文、重启了服务，但没有重新链接 exe，所以 Round 16 的修复完全没跑起来。
+只有**最终链接**会被运行中的 exe 挡住（Windows 锁定正在运行的映像，`link.exe` 报 LNK1104）；
+编译与 `ninfer_engine.lib` 一直正常，所以库里是新代码、exe 还是旧的。停掉服务后完整构建一次通过。
+
+**日志里的铁证**（旧二进制，`NINFER_TP2_REUSE_TRACE=1`）：
+
+| 请求 | prompt | cached | shared | reuse | TTFT | 说明 |
+| --- | --- | --- | --- | --- | --- | --- |
+| req#9 | 53,167 | 56,462 | 11,872 | 0 | 39.0 s | 只共享 22% |
+| req#12 | 53,763 | 53,750 | **53,592** | **0** | **39.0 s** | **只差 171 token 也全量重算** |
+
+req#12 的两个显存边界是 `prefill_end=53,750`、`rewind=53,746`，都**在分叉点 53,592 之后**，
+`boundary <= shared_prefix` 不满足 ⇒ `reuse=0`。rewind 槽停在末尾−4 的原因：`rewind_near_` 由**上一对**
+prompt 的 gap 预测，而 req#11 那对的 `gap == 0`（完全命中，`if (gap != 0)` 不更新），更早的 req#10 那对 gap=2
+被 `kReuseRewindMinimum=4` 夹到 4。**当前 gap 只有算完 LCP 才知道，结构上无法预测** ⇒ 检查点位置必须与预测无关。
+
+**新增：尾部检查点窗口**（`kReuseTailWindow = 8192`）。除步长网格外，walk 的最后 8192 token 内**每个 chunk 末尾**
+都存一份 host 检查点（对齐 llama.cpp 的 `near_prompt_end` 例外，它同样不受 `checkpoint-min-step` 限制）。
+效果（`--prefill-chunk 1024`、32 槽 / 步长 8192）：req#12 的上一条 prompt 是 53,750，chunk 末尾为 1024·k 与 53,750；
+尾部窗口给出 46,080 … **53,248** 这 8 份 ⇒ 下一条 `shared=53,592` 命中 53,248，只需重算
+53,763 − 53,248 = **515 token ≈ 0.4 s**（原 39.0 s）。
+
+**诚实的边界**：这只对「共享前缀长、只有尾巴被重渲染」有效。req#12 型（99.7% 共享）→ 0.4 s；
+req#51 型（77% 共享，上一条 90,424）→ 命中 57,344，重算 17,192 ≈ 13 s（原 57.6 s）；
+req#43 型（75% 共享）→ 命中 40,960，重算 16,418 ≈ 12 s（原 42 s）；
+而 req#9 型（只共享 22%，客户端删掉 44k 历史）命中 8,192，仍要重算 44,975 ≈ 35 s ——
+那 41k 后缀是真正的新内容，**物理上必须算**。
+
+**200k 的显存余量提醒**（本次重启的 `[mem]`）：
+
+```
+[mem] shard 0 capacity 204800 | ... kv 3628.3 | ... free 176.0 of 16310.6 MiB
+[mem] shard 1 capacity 204800 | ... kv 3225.0 | vision 826.5 | free 0.0 of 16310.6 MiB
+```
+
+B 卡余量 0.0 MiB（vision 塔也在 B 卡），任何额外显存分配（大图、图捕获）都可能 OOM；
+host 检查点只占主机内存，不加重这一点。131072 时 B 卡还有 ~1 GB 余量。
+
+**构建结果**：停掉 ninfer-serve 后 `cmake --build build-win -j 12` 一次通过，
+`ninfer-serve.exe` / `ninfer.exe` / `ninfer-perplexity.exe` 全部重新链接（03:13），修复已进二进制。
+
+### Round 16.2 — 有效性规则改正（谱系剪枝）+ 取消即失效
+
+**发现**：Round 16 原来的「只认**上一次** prefill 产生的检查点」规则会砸掉最常见的那种场景。看 req#11 →
+req#12：req#11 的 prompt 是 53,750、`reuse=53,594`，**它自己只走了 156 个 token** ⇒ 那一次 prefill 只会写出
+一个 chunk 末尾（还是被跳过的 prompt 末尾）⇒ **它根本不会留下任何检查点**；而 req#10 那次留下了 46,080…53,248
+这些尾部检查点，却被「只认上一次」的 id 规则整体排掉 ⇒ req#12 依旧 `reuse=0`。也就是说旧规则下这个修复在最关键的
+场景里是空转的。
+
+**改法：谱系有效性（lineage validity）**。每个检查点带 `valid`，规则两条：
+
+1. **选择前剪枝**：`position > shared_prefix` 的检查点一律置 `valid = false`。论证：检查点的状态是「写它的那次
+   prefill 在前 p 个 token 上的状态」，只有当整条谱系（上一次 prefill → 当前 prompt）对 p 之前的 token 一致时它
+   才是当前 prompt 的状态；而 `shared_prefix = lcp(cached_prompt_tokens_, prompt)` 正是这个界限，越界者**永不可能**
+   再被用上（后续 prompt 必须匹配一个当前 prompt 已经分叉的 token）。剪枝后取最深的幸存者。
+2. **发布时生效**：prefill 成功走完后，把 `prefill_id == 本次 live id` 的槽标成 `valid`（id 精确圈定本次写的槽，
+   环形回绕也不会认错）。没走完就取消的 prefill 永远不会执行这一步 ⇒ 它写的槽保持不可用。
+
+这样一来，req#11（只走 156 token，不产生检查点）之后，req#12 仍然能用 req#10 留下的**尾部检查点 53,248**：
+`shared = 53,592` 覆盖它 ⇒ 只需重算 53,763 − 53,248 = **515 token ≈ 0.4 s**。
+
+**顺带修掉一个潜伏隐患**：prefill 中途被取消时原代码直接 `return`，`cached_state_valid_` 仍为 `true`，
+于是「上一次 prefill 的边界 + 快照」被当成有效——可取消的那次已经改写了 KV，也可能覆盖过 rewind 槽的快照 ⇒
+下一次请求可能拿到不一致的状态/KV。现在取消分支会 `cached_state_valid_ = false` 并清空整环，下一个 prefill 重新发布。
+
+**验证**：`cmake --build build-win -j 12` 全量通过（`ninfer-serve.exe` 03:15:15），`ninfer_engine_options_test` 通过，
+`git diff --check` 干净。trace 现在还会打印有效检查点数：`[tp2-reuse] … host=<valid>/<slots> stride=… -> reuse=… src=host`。
+### Round 16.3 — 检查点环拆成 grid + tail 双子环（含实测与验证）
+
+**动机来自实测**：用户会话的 trace 在 77k 上下文就到 `host=29/32`，req#18 直接 `host=32/32` 全满。原因是每个
+prefill 都会贡献最多 8 个尾部锚点，而环按位置顺序覆盖 ⇒ **位置网格（深分叉唯一的覆盖手段）被逐步挤掉**，
+200k 上下文下必然更糟。
+
+**改法**：
+
+- `kReuseTailCheckpointCount = 8`；环分两段：`[0, grid_slots)` 放位置网格（永不被尾部锚点覆盖），
+  `[grid_slots, size)` 放尾部锚点（每次 prefill 刷新）。Shard 新增 `host_checkpoint_grid_slots` /
+  `host_checkpoint_tail_next`，两个游标各自在自己的子环里循环。
+- stride 按 **grid 槽数** 算：`max(8192, ceil(max_context / (slots - tail_slots)))` ⇒ 32 槽 / 200k 时
+  `ceil(204800/24) = 8534 -> 8576 tok`（覆盖 24 x 8576 = 205,824 ≥ 204,800 ✓）。
+- 尾部窗口自适应：`tail_span = min(8192, prefill_chunk x tail_slots)`，窄 chunk 不会灌爆尾部子环。
+- 有效性规则不变（发布时按 prefill id 标 valid、选择前按 `shared_prefix` 剪枝、取消即失效）。
+
+**验证**（停服务 -> 构建 -> 起服务，全部由我执行）：
+
+- 停服务后 `cmake --build build-win -j 12` 全量成功，`BUILD_EXIT=0`，`ninfer-serve.exe` 03:37:40。
+- 新账本：`[mem] host-checkpoints shard 0 slots 32 (grid 24 + tail 8) x 73.4 MiB | stride 8576 tok | pinned 2349.0 MiB` ✓
+  （stride 8576 本身就是拆环生效的证据；旧版是 8192）。
+- probe：`openai-chat` 58 token -> 203 ms，`cache 44 (75.9%)`，decode 76 tok/s ✓。
+- `--preserve-thinking` 生效：`req#1 started | ... | preserve thinking` ✓（服务器默认写进有效语义）。
+
+**本会话（用户会话）实测收益**（对照理论最小值 = prompt - shared）：`src=host` 命中 req#5/#11/#12/#19；
+每条请求的实际重算量与理论最小值差额 <= 1,022 token（一个 chunk）；对照旧二进制：req#5 10.2 s -> 1.3 s、
+req#11 37.6 s -> 28.6 s。剩下的耗时都是「客户端重渲染/工具结果带入的真新 token」，按 1.0-1.5k tok/s 必算。
+
+**`--preserve-thinking` 的语义**（A/B 用）：`chat_template.cpp:611` 决定已结束轮次的思考是否保留；
+Responses 路由的取值规则见 `openai_responses_state.cpp:159-165`：请求显式给了就用请求的（并标记语义变化），
+没给且**有父记录**就继承父值，没给且**无父记录**就用服务器默认（`translate.cpp:118`）。用户客户端每轮发全量历史
+（无 `previous_response_id`），所以重启后即为服务器默认 true。观察点：`shared` 是否还会中途塌陷。
+
+**端口**：启动脚本里 `$Port` 曾被改成 3456，而客户端 `.dsh/settings.yaml:18` 指向 `8099`，已按 8099 恢复；
+以后改端口两边必须同步，否则客户端连不上。

@@ -141,9 +141,10 @@ retain their stated MTP configurations and revisions.
 - [NInfer](https://github.com/Neroued/ninfer) revision
   [`04350ba9`](https://github.com/Neroued/ninfer/commit/04350ba94c203833598ba1a41943031c468208f1)
   or later, built from source;
-- 64-bit Linux;
-- NVIDIA GeForce RTX 5090 (`sm_120a`);
-- CUDA Toolkit 13.1 or newer.
+- 64-bit Linux or native Windows;
+- an NVIDIA GeForce RTX 5090, or two identical RTX 5060 Ti cards (TP-2, server
+  route only);
+- CUDA Toolkit 13.1 or newer (Linux), or CUDA 13.3 with Visual Studio 2022 (Windows).
 
 Already have the official v2 file? [Upgrade it locally](https://github.com/Neroued/ninfer/blob/master/docs/weight-conversion.md#upgrade-an-existing-v2-artifact)
 without downloading the weights again.
@@ -197,6 +198,14 @@ See the [HTTP serving guide](https://github.com/Neroued/ninfer/blob/master/docs/
 API surface and the [resource scheduling reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/resource-scheduling-and-context-cache.md)
 for cache and admission semantics.
 
+### Tensor-parallel-2 (TP-2) on two RTX 5060 Ti
+
+This artifact (19.03 GiB) does not fit on one 16 GiB card. On two identical RTX 5060 Ti (16 GiB)
+cards, serve it with the TP-2 core (`--devices 0,1`). The [dual RTX 5060 Ti TP-2 note](https://github.com/Neroued/ninfer/blob/master/docs/tp2-dual-5060ti.md)
+records the verified configuration, memory budget, and measurements (measured on the NVFP4
+artifact), and the [Windows native build guide](https://github.com/Neroued/ninfer/blob/master/docs/windows.md)
+covers the native two-card setup.
+
 ## Supported use
 
 The artifact supports:
@@ -241,10 +250,11 @@ card reports no AIME results.
 
 ## Limits
 
-- NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–8 active
-  requests per Engine.
+- NInfer executes on one RTX 5090 (or one TP-2 pair of identical RTX 5060 Ti cards on the server
+  route) and one resident model, with a startup-fixed capacity of 1–8 active requests per Engine
+  (the TP-2 route runs one request at a time).
 - It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
-  multi-GPU execution, CPU/GPU offload, or distributed serving.
+  general multi-GPU execution, CPU/GPU offload, or distributed serving.
 - Context allocation is subject to GPU memory and the selected KV-cache type.
 - NInfer does not execute generated tool calls.
 

@@ -243,6 +243,13 @@ generated token IDs in diagnostics.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 
+## Device selection
+
+The CLI runs on a single GPU selected by `--device` (default `0`). Tensor-parallel-2 (two
+identical RTX 5060 Ti cards) is available on the server route only: start `ninfer-serve` with
+`--devices <a>,<b>`; see [HTTP serving](serving.md#tensor-parallel-2-tp-2) and the
+[dual RTX 5060 Ti TP-2 note](tp2-dual-5060ti.md).
+
 ## Context and memory
 
 The official artifacts have a native context limit of 262,144 tokens. The practical allocation

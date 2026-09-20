@@ -144,6 +144,13 @@ llama.cpp 的 Qwen3.5 MTP 结构相同，其文档也只要求「需要精确一
   shard A；B 在 text mixer lockstep 后空等）。方向：①两卡 lockstep 冗余跑同一份 MTP 层（墙钟不变）；
   ②按 vocab 切 MTP 提案的 lm_head + 窗口 argmax（真正缩短关键路径）；③重扫 K=1/2/3。
 - **KV dtype 扫描补全**：fp8/int8 已有质量与显存数据，nvfp4/k8v4 只验证了可启动与吞吐。
+- **工具调用约束解码**（诊断见 Round 15）：对齐 llama.cpp 的 lazy tool-call grammar，把 `<function=` 后的工具名
+  和参数掩码限制在本次请求声明的工具上（先做「工具名前缀树 + 参数名掩码」，完整 GBNF 太重）。
+  注意掩码要和 MTP 投机解码 / exact-batch CUDA Graph 对齐，否则 verify 会误判接受。
+- **TP-2 host 侧状态检查点 + 短 prompt 按 LCP 截断复用**（**已实现并完成端到端验证**，诊断见 Round 16，实测见 Round 16.3）：把 GDN 状态快照放进 pinned host
+  环形池（0 显存增量，`--host-state-slots` 语义），步长 8192，复用扫描取最深的 `<= shared_prefix` 检查点。
+  修掉「客户端在 turn 边界重渲染出更短 prompt ⇒ reuse=0 ⇒ 整条全量重算（实测 42.0 / 57.6 s）」。实测 `src=host` 命中：req#5 10.2 s → 1.3 s、
+  req#11 37.6 s → 28.6 s，重算量与理论最小值差额 ≤ 1 个 chunk。
 
 ---
 
@@ -1012,3 +1019,93 @@ head-split 分片上无任何语义作用）。这不是 ① 的回归。
 已删除该打印与仅供其使用的 `mtp_draft_checked_`/`mtp_draft_hit_` 两个计数器；
 接受率改由 `NINFER_TP2_TIMING=1` 的 `[tp2-time] decode rounds=R committed=C` 推导：
 接受 draft 数 = C−R，接受率 = (C−R)/(R·K)。`docs/tp2-dual-5060ti.md` 已同步。
+
+---
+
+### Round 14 — 前缀复用“续写边界”：实测证伪并撤回（已完成）
+
+实现了方案 2（续写边界：`cached_tokens_` 延伸到上一轮生成序列末尾 + 新状态槽），用真实 DSH 流量（36 请求）验证：
+`slot=0` 35 次、`slot=1`(rewind) 1 次、**续写槽 0 次**；33/36 条 `shared == prefill_end` 精确相等 —— 客户端下一条 prompt
+与上一条逐 token 相同到末尾，然后在第一个生成 token 处分叉（不回传生成流，而是重新渲染 assistant 回合）。
+结论：该方案对本客户端零收益，**已撤回**（引擎两个文件回到 `1cdfab97`，`state` 回到 293.6 MiB/卡）；
+保留 `NINFER_TP2_REUSE_TRACE=1`（每请求打印 `prompt/cached/shared/prefill_end/rewind -> reuse/slot`），
+它是判断“客户端是否原样回传历史”的唯一手段。
+
+**下一步候选（用户暂缓）**：① system+tools 前缀末尾加锚点，修新会话/压缩后第一轮的 46.9 s（可省约 11 s）；
+② prefill 吞吐（suffix 0.95–1.13k tok/s、冷启 1.35–1.38k）；③ 每请求 ~0.3 s 固定开销。
+
+---
+
+### Round 15 — 待做：工具调用的约束解码（对齐 llama.cpp 的 lazy grammar）
+
+**现象**：DSH 接 NInfer 时偶尔把工具调用当正文吐出（`<tool_call> <function=todo_write> …`），前端提示
+“工具调用方式不对”；同一套 DSH 接 llama.cpp 从未出现。
+
+**已定位（诊断已完成，细节见 `docs/tp2-dual-5060ti-worklog.md` Round 15）**：不是量化（诱导探针 A/B：官方
+`nvfp4` 与转换 `w4a4_w8a8` 各 75 条工具请求，标记类失败 27/75 vs 19/75，z≈1.4 不显著；失败形态相同——模型照抄
+提示里的 SDK 名字 `tools.read`/`todo_write`）、不是 chat_template（逐字复述探针两种写法都正确解析）、不是解析器 bug。
+客户端侧也一致（`~/.dsh/settings.yaml`：两个 provider 都是 `api: openai-responses`，`agent-presets.default: ptc`）。
+根因是**引擎策略差异**：
+
+- llama.cpp 做 **lazy GBNF 约束解码**：`common/chat.cpp:1286` 为每个声明工具生成 `<function=NAME>` + 该工具 JSON
+  schema 的规则，`:1316-1337` 在 `tool_choice=auto`（`common/chat.h:258` 默认值）下 `grammar_lazy=true`、触发词
+  `<tool_call>`；`tools/server/server-common.cpp:1332-1346` 把 grammar 注入生成参数 ⇒ 未声明的名字在采样层不可达，
+  模型“想直接调 read”会被逼回已声明工具（PTC 下就是 `run_code`），参数也必然合规。
+- NInfer 没有约束层：自由生成后解析（`src/models/qwen3_5/frontend/tool_call_parser.cpp`），用 `enforce_declared_names`
+  校验，未声明即按契约拒收、原样返回文本并打 WARN。
+
+**待做（用户暂缓，后续做）**：
+
+1. **工具调用约束解码（首选）**：在 `<tool_call>` 进入后、`<function=` 位置掩码 logits，只允许本次声明的工具名；
+   参数按声明 schema 约束。先做「工具名前缀树 + 参数名掩码」，完整 GBNF 作为后续。
+   **必须先想清楚**：掩码在 MTP draft/verify 两侧的落点（draft 提议的 token 也要过同一份掩码），以及它与
+   exact-batch CUDA Graph 的关系，否则 verify 会误判接受。
+2. **不做**「未声明也当 tool_call 返回」：等于放行模型绕过 `run_code` 直接触发 `pwsh`/`write`，破坏 PTC 契约。
+3. 轻量诊断（随时可做）：WARN 里打印模型实际写出的工具名，线上就能看出是 `tools.read` 还是 `todo_write`。
+4. 可选闭环实验：llama.cpp 起来时把同一份探针（`%TEMP%\ab_probe.ps1`）打过去，预期不出现未声明名字。
+
+---
+
+### Round 16 — TP-2 host 侧状态检查点 + 短 prompt 按 LCP 截断复用
+
+**状态**：已实现（`src/runtime/engine/tp2_generation_core.{h,cpp}`、`src/runtime/engine/model_instance.cpp`、
+`tests/test_engine_options.cpp`）；`ninfer_engine` 编译通过、新增的选项契约单测通过；**端到端验证待重新链接并重启服务**。
+
+**问题（Round 15 后续实测）**：客户端在 turn 边界重渲染历史，新 prompt 比上一条**短**（实测 −219 / −1,233 /
+−15,888 token），分叉点落在历史中段。TP-2 核心只保留 2 个**显存**边界（上一条 prompt 末尾 + 一个 rewind 点），
+判据要求 `boundary <= shared_prefix`，两个边界都落在分叉点之后 ⇒ `reuse=0` ⇒ **整条 prompt 全量重算**：
+req#43 57,378 token / TTFT 42.0 s，req#51 74,536 token / TTFT 57.6 s（NVML 采样证实这 59 s 两卡都是 98–100%，
+与 `done` 行的 `prefill 1.30k tok/s (74,536 tok)` 一致）。
+
+**根因不是 KV**：walk 从边界开始，边界之前的 KV 页本来就不重算（`tp2_generation_core.cpp:1042-1045` 注释）。
+缺的是 **GDN（线性注意力）状态**：它是循环累积量，既不能从 KV 反推、也不能平移；全注意力层的 K/V 可以随便
+截断复用，线性层不行。llama.cpp 正是因此才额外做 context checkpoints（PR #15293）：它的
+`n_past = slot.prompt.tokens.get_common_prefix(input_tokens)`（`tools/server/server-context.cpp:3103`）只解决
+注意力层，hybrid 模型靠检查点兜底 —— `n_ctx_checkpoints = 32`、`checkpoint_min_step = 8192`（`common/common.h:611-615`），
+创建在 `llama_decode()` 之前（`server-context.cpp:3508-3518`），恢复时从新到旧找 `<= LCP` 的检查点，找不到才
+`do_reset` 全量重算（`:3236-3249`）。
+
+**方案（显存 0 增量）**：检查点放 **pinned host 内存**，引擎已有这套语义：`--host-state-slots`（文档表里叫
+「完整 Host StateImages」，`src/serve/serve_options.cpp:220-223`）、`HostStatePool` +
+`StateImageStore(device_pool, host_pool, capacity)`（`program_impl.cpp:125-144`）、启动阶段 `HostStatePin`；
+TP-2 核心本来就在用 `PinnedHostBuffer`（`tp2_generation_core.cpp:279`）。
+
+1. 一份状态 = **73.4 MiB/卡**（`state_bytes`；台账 `state 293.6 = (2+2)×73.4`）。16 槽 = 2.3 GB host、
+   32 槽 = 4.7 GB host、**显存 +0**；恢复一次 = 每卡 73.4 MiB H2D（pinned，≈5–20 ms），相对几十秒可忽略。
+2. prefill 过程中按 `kReuseCheckpointStride = 8192`（对齐 llama.cpp 的 `checkpoint_min_step`）把 `state_backing`
+   异步拷进环形 host 池，并记下 frontier 位置。
+3. 复用扫描从「2 个显存边界」扩成「2 个显存边界 + host 检查点」，取最深的 `<= shared_prefix`
+   （`tp2_generation_core.cpp:891-897` 就是扩展点）；`begin_gdn_state`（`:976-987`）增加 host→device 分支，
+   KV 路径完全不动。
+4. **正确性规则（谱系有效性）**：检查点带 `valid`；每次选择前把 `position > shared_prefix` 的置为失效（越界者
+   永不可能再被用上），prefill 成功发布时用 prefill id 把本次写的槽标为有效。**不能**只认「上一次 prefill」——
+   上一次若只走了很短的后缀（完全复用），它自己不留检查点，那样最常见的小尾巴分叉会依旧 `reuse=0`（Round 16.2）。
+   另外 prefill 中途取消时清 `cached_state_valid_` 并清空整环（取消走的 KV 与 `cached_prompt_tokens_` 不再一致）。
+5. 一个 131k 上下文按 8k 步长最多 16 个检查点，所以 16 槽即可覆盖满上下文（超出部分环形淘汰）；
+   200k 建议 32 槽。
+6. **尾部窗口**：最后 8192 token 内每个 chunk 末尾额外存一份（对齐 llama.cpp 的 `near_prompt_end` 例外），
+   覆盖「只重渲染尾巴」这一最常见情形（实测 req#12：只差 171 token 却全量重算 39.0 s → 命中尾部检查点后 ~0.4 s）。
+
+**验收**：同一会话连续两轮，第二轮 prompt 比第一轮短且分叉在中段 ⇒ `[tp2-reuse]` 报 `reuse > 0` 且来自 host
+检查点，`cache` 命中从 0% 升到 `shared` 量级，TTFT 从 ~57 s 降到 `(prompt − checkpoint)/1.3k + 固定开销`；
+回归：现有 TP-2 用例 + 新增「短 prompt 命中 host 检查点」场景；`git diff --check` 干净。

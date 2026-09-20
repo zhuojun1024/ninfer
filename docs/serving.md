@@ -50,6 +50,30 @@ and prefill remain outside speculative acceleration. A later request cannot enab
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
 
+## Tensor-parallel-2 (TP-2)
+
+`--devices <a>,<b>` runs the dedicated TP-2 core across two CUDA devices instead of the single-GPU
+Engine. It is the way to serve an artifact that does not fit on one card: the 27B NVFP4 artifact
+needs about 20.2 GiB of resident weights, which is 10.1 GiB per TP-2 shard and fits two 16 GiB
+RTX 5060 Ti cards but not one.
+
+- `<a>` and `<b>` are CUDA runtime indices (not the `nvidia-smi` PCI-bus order); when a pair is
+  wrong, the startup error lists the CUDA-visible devices.
+- Both devices must be `sm_120a` (compute capability 12.0) and identical by name; the engine fails
+  fast at construction otherwise.
+- The TP-2 route runs one request at a time: `--max-concurrency` and `--max-pending-requests` are
+  normalized to `1`, and requests queue in arrival order.
+- `--spec mtp` is the only supported speculative backend on this route (DFlash/DFlash2 are
+  rejected); `--vision` is supported.
+- KV capacity is page-aligned to `--max-context` (the core builds its own paged cache), and the
+  context cache is disabled (the core owns its prefix-reuse snapshots).
+- The single-request CLI and the perplexity evaluator are single-GPU; only `ninfer-serve` accepts
+  `--devices`.
+
+The [dual RTX 5060 Ti TP-2 note](tp2-dual-5060ti.md) records the verified configuration, memory
+budget, and measurements on two RTX 5060 Ti (16 GiB) cards, and the [Windows native build
+guide](windows.md) covers the native two-card setup.
+
 ## Endpoints
 
 | Method and path | Behavior |
@@ -774,6 +798,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
+| `--devices A,B` | two CUDA device indices enabling the TP-2 core (server route only) | unset |
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
@@ -793,7 +818,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
-| `--host-state-slots N` | pinned Host StateImage capacity | `8` |
+| `--host-state-slots N` | pinned Host StateImage capacity; on the TP-2 route it sizes the generation core's prefix-reuse checkpoint ring instead of a context cache | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
