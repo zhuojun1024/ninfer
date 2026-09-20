@@ -1160,11 +1160,20 @@ NInfer 设计（轻量版，先做「工具名前缀树 + 参数名掩码」）�
   （`unknown: TP-2 tool-call constraint vocabulary does not match the logits domain`）。现改为掩码按 **logits 域**生成
   （`build_mask(domain, mask)` / `build_mask_after(prefix, domain, mask)`），tokenizer 未定义的行一律置 0（排除）；
   仅在「约束表 > logits 域」时报错，且错误信息带上两个数值。新增 packed-domain 单测覆盖该尾部。
-- **发现（未修，待决定）**：TP-2 核心有 4 处把**物理行数** `vocab` 当作有效域传入采样：`ops::sample`（prefill 首 token、
-  plain decode）、`ops::argmax`（MTP target）、`speculative_accept_greedy_drafts`（接受核）。而 `ops::sample` 的契约把
-  `physical_rows` 与 `token_domain` 分开校验、`argmax` 的参数名就是 `valid_rows`，单卡路径（`text.cpp:2279/2283`）与
-  `decode.cpp:258` 的有效域判断都用 `public_token_count`；1415 行那枚**计算了却从未使用**的 `public_tokens` 正是这个
-  意图的残留。故 TP-2 路径目前可以采到 `[public_token_count, vocab)` 的打包行（非法 id）。属既有缺陷、非本次改动引入。
+- **既有缺陷，已修（同日）**：TP-2 核心有 4 处把**物理行数** `vocab` 当作有效域传出：`ops::sample`（prefill 首 token、
+  plain decode）、`ops::argmax`（MTP target）、`speculative_accept_greedy_drafts`（接受核）。契约本来就把两者分开
+  （`sample` 校验 `token_domain ∈ [1, physical_rows]`，`argmax` 参数名即 `valid_rows`，accept 文档写 `token_domain`），
+  单卡路径（`text.cpp:2279/2283`、`decode.cpp:258`、`draft.cpp` 的 selector 域）都传 `public_token_count`；那枚**算了却
+  从未使用**的 `public_tokens` 正是这个意图的残留。现将声明上提到 `vocab` 旁，4 处全部改传 `public_tokens`；
+  `sampling_workspace_capacity_bytes(vocab, 1, 1)` 保留（容量上界）。
+  影响面：越界 id 不会越界访存（embedding/lm_head 都是 248320 行，仅读到填充行），但会进 `OutputSession` 的
+  `Tokenizer::decoded_token`（`output_session.cpp:458/563`，无守卫）抛 `out_of_range` ⇒ 单个请求 500。TP-2 路径缺的正是
+  单卡 `program/decode.cpp:256 validate_licensed_tokens` 那层守卫。触发条件是「打包行胜过所有真实候选」（贪心要求它
+  是全域最大；采样要求它进 top-20 且活过 top_p/min_p），正常分布下几乎不会发生。
+  风险：`token_domain` 在核里只作遍历上界（`sampling.cuh:33/41/127`），两域的 `cap` 都是 `min(20,domain)`，RNG 抽取
+  发生在截断后的候选集上 ⇒ 修复只在本该触发的那些步改变结果，正常步逐位不变。
+- 顺带观察（未改）：`make_sampling_config` 把 `token_counts` 置空（`tp2_generation_core.cpp:233`），故 TP-2 路径的
+  presence/frequency penalty 实际不生效（惩罚项 `c_v` 恒为 0）。
 - 环境注记：DSH 沙箱处于 `workspace-write` 时 ninja **无法执行任何子进程**（连平凡工程都挂，`ninja -t/-n` 正常），
   构建须在 `danger-full-access` 下进行；另外 `pwsh` 的后台作业若用 `Tee-Object` 把输出写进管道会因管道写满而在中途卡死。
 

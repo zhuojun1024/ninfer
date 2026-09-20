@@ -914,6 +914,12 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
         qwen::execution::dimension(shard_a_.model->config().text.vocab_size);
     const std::int32_t hidden =
         qwen::execution::dimension(shard_a_.model->config().text.hidden_size);
+    // The embedding and lm_head are packed to `vocab` rows, but only the first `public_tokens` of them
+    // name something the tokenizer can spell; the rows in between are padding. Every selection over
+    // these logits is therefore bounded by the public domain, so a padding row can never be sampled,
+    // corrected, or licensed.
+    const std::int32_t public_tokens =
+        static_cast<std::int32_t>(shard_a_.model->resources().public_token_count);
 
     // Constrained tool-call decoding. The declared-name grammar turns the tool-call region into a
     // logit mask, so a name the request did not declare is unreachable at the sampling layer instead
@@ -1121,6 +1127,8 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     auto sampling_scope = shard_a_.workspace->scope();
     auto& ws_a = *shard_a_.workspace;
     auto& ws_b = *shard_b_.workspace;
+    // Reserved on the packed row count, which is an upper bound over every token domain ops::sample
+    // is called with below.
     const std::size_t sampling_ws = ops::sampling_workspace_capacity_bytes(vocab, 1, 1);
     auto sampling_buf_a = ws_a.alloc_bytes(sizeof(ops::SamplingConfig) + sampling_ws, 256);
     auto sampling_buf_b = ws_b.alloc_bytes(sizeof(ops::SamplingConfig) + sampling_ws, 256);
@@ -1339,7 +1347,7 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             ops::set_i32_scalar(logical_pos_a, static_cast<std::int32_t>(prompt_tokens),
                                 shard_a_.device.stream);
             Tensor sampled_a = ws_a.alloc(DType::I32, {1});
-            ops::sample(logits_a, sampled_a, vocab, sampling_a, logical_pos_a,
+            ops::sample(logits_a, sampled_a, public_tokens, sampling_a, logical_pos_a,
                         ops::kSamplePurposePrefill, ws_a, shard_a_.device.stream);
             std::int32_t first = 0;
             shard_a_.device.bind_to_current_thread();
@@ -1417,8 +1425,6 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     shard_a_.round_base = ws_a.used();
     shard_b_.round_base = ws_b.used();
     bool finished = false;
-    const std::int32_t public_tokens =
-        static_cast<std::int32_t>(shard_a_.model->resources().public_token_count);
     while (!finished) {
         if (cancellation.requested()) {
             (void)request.output.preview_terminal(FinishReason::Cancelled);
@@ -1463,7 +1469,7 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                 }
             }
             Tensor sampled_a = ws_a.alloc(DType::I32, {1});
-            ops::sample(logits_a, sampled_a, vocab, sampling_a, logical_pos_a,
+            ops::sample(logits_a, sampled_a, public_tokens, sampling_a, logical_pos_a,
                         ops::kSamplePurposeDecode, ws_a, shard_a_.device.stream);
             timing.record(3, shard_a_.device.stream);
             std::int32_t next = 0;
@@ -1576,10 +1582,10 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                     ops::apply_token_mask(window_logits, tool_mask_dev, shard_a_.device.stream);
                 }
             }
-            ops::argmax(window_logits, target_tokens, vocab, shard_a_.device.stream);
+            ops::argmax(window_logits, target_tokens, public_tokens, shard_a_.device.stream);
             ops::speculative_accept_greedy_drafts(
                 target_tokens, window_logits, window_drafts, current_extents, round_lengths,
-                round_anchors, licensed, licensed_counts, accepted, vocab, sampling_a,
+                round_anchors, licensed, licensed_counts, accepted, public_tokens, sampling_a,
                 ws_a, shard_a_.device.stream);
             timing.record(3, shard_a_.device.stream);
             std::vector<TokenId> licensed_host(static_cast<std::size_t>(width), 0);
