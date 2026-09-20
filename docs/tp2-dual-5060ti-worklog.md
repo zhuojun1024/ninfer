@@ -1723,3 +1723,140 @@ Responses 路由的取值规则见 `openai_responses_state.cpp:159-165`：请求
 
 **端口**：启动脚本里 `$Port` 曾被改成 3456，而客户端 `.dsh/settings.yaml:18` 指向 `8099`，已按 8099 恢复；
 以后改端口两边必须同步，否则客户端连不上。
+
+## Round 15b — 工具调用约束解码（路线 A）：实现、验证与两处既有缺陷（已修）
+
+承接 Round 15 的诊断（不是量化、不是 chat_template、不是解析器、不是客户端配置；llama.cpp 做 lazy GBNF 约束解码，
+NInfer 没有约束层）。本轮把「路线 A：文本化轻量版」落地，并在真实流量里连带修掉两处**既有** TP-2 缺陷。
+
+### 1. 路线选择（A/B）
+
+「工具名跨多 token 时掩码算错」这类正确性风险在 llama.cpp 上同样存在，但被其实现方式压得很低：
+`llama_grammar_apply_impl`（`src/llama-grammar.cpp:1354`）把每个候选 token 用 `token_to_piece` 解码成文本、用
+`llama_partial_utf8` 处理跨 token 的半个 UTF-8，再拿「已累积文本 + 片段」去 GBNF parse 栈校验——**按文本约束、对分词
+不敏感**，且 parser 长期生产验证。若在 token 序列上建前缀树则分词敏感、易掩错。故分两条路线：
+
+- **路线 A（本轮落地）**：状态机累积「已生成文本」（同 llama.cpp 的 `trigger_buffer`），每步把候选 token 用 NInfer
+  tokenizer 解码成文本片段（处理跨 token 半个 UTF-8），校验「累积文本 + 片段」是否为已声明工具名/参数名的合法前缀
+  （用声明名的 trie 加速），否则置 `-INF`。对分词不敏感，正确性风险对齐 llama.cpp，代码量远小于完整 GBNF。
+  代价：约束激活的每步有 O(vocab) 的 CPU 掩码计算（~数 ms），但只作用于工具调用区（几个 token），摊销可忽略。
+- **路线 B（Phase 2 选项，未做）**：直接搬 `llama-grammar.cpp` 的栈式 parser（~1500 行）+ 为 Qwen 生成 grammar。
+  正确性风险最低（生产验证），天然支持完整 schema 校验。若 A 在真实流量仍偶发边界问题、或要做完整参数 schema
+  校验，升级到 B。
+
+不做「未声明也当 tool_call 返回」：等于放行模型绕过 `run_code` 直接触发 `pwsh`/`write`，破坏 PTC 契约。
+
+### 2. 实现
+
+- **新 op `apply_token_mask`**：`include/ninfer/ops/token_mask.h` + `src/ops/kernel/token_mask.cuh` +
+  `src/ops/launcher/token_mask.{h,cu}` + `src/ops/wrapper/token_mask.cpp`（注册进 `src/ops/basic_sources.cmake`）。
+  逻辑形状：BF16 `logits[rows, columns]`（dim0 连续）与同形状 U8 掩码，元素 `(v,c)` 在 `v + c*rows`；掩码为 0 处写成
+  `-inf`（`__float2bfloat16(-CUDART_INF_F)`）。契约：rank-2、dtype/形状匹配、`ne[2]/ne[3]==1`、连续、非空、掩码只读、
+  两侧不得别名。**在 CUDA Graph 之外调用**（graph 只捕获 verify forward，`window_logits` 从 graph 出来后再掩码）。
+- **新 frontend 模块 `tool_call_constraint.{h,cpp}`**：
+  - `ToolCallMaskTable`：每个 vocab id 一份解码字节 + 特殊 token 位；由 `Frontend` 用 `shared_ptr<const Tokenizer>`
+    持有并**只建一次**（`frontend.cpp` 构造时 `build_tool_call_mask_table(tokenizer)`）；表行数 = tokenizer 公开词表，
+    无效行给空片段 + special=1。
+  - `ToolCallNameTrie`（256 叉）、`ToolCallGrammar`、`ToolCallGrammarState`（字节级状态机，模式
+    `Free / FunctionLiteral / FunctionName / FunctionClose / ParameterName / ParameterValue / ToolClose`）、
+    `ToolCallConstraint`（共享表 + 不可变语法 + 每请求可变状态，故按请求构造的是**非 const** 对象）。
+  - 语法细节：触发词 `<tool_call>` 用**滚动匹配**（不是贪心整段匹配）；`FunctionClose` 用 `alive_` 位掩码同时跟踪
+    `</function>` 与 `<parameter=`；`</parameter>` 用 KMP；任何错配即 `dead_`（本位置不再约束、不再有合法前缀）；
+    空白只在 `FunctionLiteral / FunctionClose / ToolClose` 的 `progress_ == 0` 处跳过（`FunctionName` **不跳过**）。
+  - **安全阀**：某位置若除纯空白外没有任何候选能推进语法，则报「不受约束」而不是发全 0 掩码——空白被跳过、不推进
+    语法，掩到它会让模型一直吐空格直到 context 用尽；全 0 掩码则会卡死请求。`build_mask` 因此返回 `advances`
+    （只有存活片段含非空白字节时才为真）。
+  - **`dead_` 只在探测副本上读取**，历史不会污染候选判定。
+- **`OutputSession`**：保留 Content 通道的原始字节流（`raw_content_text()`）并暴露 `in_reasoning()`。掩码与工具调用
+  parser 吃**同一条**字节流 ⇒ 跨 token 的工具名、半个 UTF-8、跨越结构字面量的 token 都不会被误判。
+- **`tool_call_parser.h`**：把 Qwen framing 常量（`<tool_call>` / `</tool_call>` / `<function=` / `</function>` /
+  `<parameter=` / `</parameter>`）收敛为 `inline constexpr std::string_view`，删掉 `.cpp` 里的本地重复。
+- **`frontend`**：`make_tool_call_constraint` 返回非 const `shared_ptr<ToolCallConstraint>`；契约为空 / 未
+  `enforce_declared_names` / `tools` 为空时返回空。
+- **`tp2_generation_core`**：plain decode 在 `ops::sample` 之前、MTP 在每个 verify 列 `ops::argmax` 之前应用掩码；
+  每列掩码 = 「committed 文本 + 该列之前的 drafts」对应的语法位置（`build_mask_after`），draft 本身不掩码（非法
+  draft 与掩码后的 argmax 不一致，因而被 `speculative_accept_greedy_drafts` 拒收）；约束只在 `!in_reasoning()` 时激活。
+  掩码只在 `FunctionLiteral / FunctionName / FunctionClose / ParameterName / ToolClose` 生效，`ParameterValue` 与
+  自由文本不掩码。
+- **测试**：`tests/ops/test_token_mask.cpp`（GPU；逐位精确比对、掩码只读、全掩、形状/rank/dtype/别名校验；注册进
+  `tests/ops/tests.cmake`）与 `tests/test_tool_call_constraint.cpp`（纯 CPU；惰性触发、只许已声明名、多 token 名字、
+  完整名后必须 `>`、参数名、自由值、回到 Free、跨字面量 token、不可拼写名的回退、纯空白死路、二次调用、
+  packed-domain 尾部；注册进 `tests/models/qwen3_5/tests.cmake`）。
+
+### 3. 验证
+
+- `ninfer_token_mask_test` / `ninfer_tool_call_constraint_test` / `ninfer_tool_call_parser_test` 全部通过；同一批
+  `ninfer_sampling_test` / `ninfer_argmax_test` / `ninfer_engine_options_test` 也通过（6/6）。
+- `ninfer_qwen3_5_frontend_test` 仍是 PLAN.md 703–707 记录的**既有**失败（`unsupported frontend/chat_template.jinja`，
+  与本改动无关；曾用「临时关掉掩码表构建」bisect 证实 HEAD 同样失败）。
+- **真实服务端到端**：用户 11:46 重启后 req#51（`openai-responses` 流式、`tools 1`、prompt 111,124 / output 733、
+  `cache 110,158 (99.1%)`、TTFT 1.2 s）**正常结束、无任何报错** —— 域修复生效（修复前该请求必 500）。
+- **未做**：对照 Round 15 的 75 条探针复测（需按同一探针脚本重跑）。
+
+### 4. 既有缺陷 1：TP-2 的采样域是打包行数（已修）
+
+约束表覆盖不到 logits 域时暴露：TP-2 核心有 4 处把**物理行数** `vocab` 当作有效域传出——`ops::sample`（prefill 首
+token、plain decode）、`ops::argmax`（MTP target）、`speculative_accept_greedy_drafts`（接受核）。契约本来就把两者
+分开（`sample` 校验 `token_domain ∈ [1, physical_rows]`，`argmax` 参数名即 `valid_rows`，accept 文档写 `token_domain`），
+单卡路径（`text.cpp:2279/2283`、`decode.cpp:258`、`draft.cpp` 的 selector 域）都传 `public_token_count`；那枚**算了却
+从未使用**的 `public_tokens` 正是这个意图的残留。
+
+两个不同的词表概念：`resources.public_token_count` 是 tokenizer 公开词表（合法 id 域），`config.text.vocab_size`
+（本机 248320）是**打包后**的 embedding/logits 行数；`frontend/resources.cpp:12` 只要求 `count <= vocab_size`。
+修复：声明上提到 `vocab` 旁，4 处全部改传 `public_tokens`；`sampling_workspace_capacity_bytes(vocab, 1, 1)` 保留
+（容量上界）。约束掩码同样按 **logits 域**生成（`build_mask(domain, mask)` / `build_mask_after(prefix, domain, mask)`），
+tokenizer 未定义的行一律置 0（排除）。
+
+**影响面**：越界 id 不会越界访存（embedding/lm_head 都是 248320 行，仅读到填充行），但会进 `OutputSession` 的
+`Tokenizer::decoded_token`（`output_session.cpp:458/563`，无守卫）抛 `out_of_range` ⇒ 单个请求 500。TP-2 路径缺的
+正是单卡 `program/decode.cpp:256 validate_licensed_tokens` 那层守卫。触发条件是「打包行胜过所有真实候选」（贪心要求
+它是全域最大；采样要求它进 top-20 且活过 top_p/min_p），正常分布下几乎不会发生。
+
+**风险论证（为何近乎无操作）**：`token_domain` 在核里只作遍历上界（`sampling.cuh:33/41/127`），两域的 `cap` 都是
+`min(20, domain)`，RNG 抽取发生在截断后的候选集上 ⇒ 修复只在本该触发的那些步改变结果，正常步逐位不变。
+
+### 5. 既有缺陷 2：penalty 的计数数组恒为空（已修）
+
+`make_sampling_config` 把 `token_counts` 置空，而惩罚项只从该数组取 `c_v`（`sampling_device.cuh:252`：
+`cnt = c.token_counts ? c.token_counts[v] : 0`，再加轮内 overlay），故 TP-2 路径的 presence/frequency penalty 对
+**跨轮**重复完全无效——只剩 MTP verify 的轮内 overlay（同一窗口内的 draft）还起作用。
+
+修法按单卡 `install_sampling`（`decode.cpp:145-149`）：仅当 penalty 非零时在请求 workspace 建 `I32[public_tokens]`
+计数数组、`cudaMemsetAsync` 清零（arena 会交回上一请求的字节）后挂到 `sampling_config`；`ops::sample`（四个
+finalize kernel 都 `atomicAdd`）与 `speculative_accept_greedy_drafts` 自行累加产出的 token。未配 penalty 时不建
+数组、`c_v` 恒为 0，与单卡路径一致。该路由没有 forced-token 路径，故不需要 `increment_token_counts`。
+
+**A/B 实测**（同 seed 12345、同 prompt、同参数；临时 revert `64db25f1` 编出修复前二进制，两份二进制各独占起一次
+服务）：
+
+| 运行 | 修复前 | 修复后 |
+|---|---|---|
+| penalty = 0 | 532 chars, `apple x30`, 最长同词连续 15 | **与修复前逐字节相同** |
+| presence = 2.0 | **与 penalty=0 逐字节相同** | 不同（580 chars, `apple x15`, 去重词 69） |
+| frequency = 2.0 | **与 penalty=0 逐字节相同** | 不同（717 chars, `apple x9`, 最长连续 2, 去重词 99） |
+
+要点：修复前三种配置**逐字节相同**（penalty 完全无效）；修复后无 penalty 路径与修复前**逐字节相同**（无回归）；
+修复后 penalty 生效且 frequency=2.0 把重复彻底压掉。统计含模型在 reasoning 里复述 prompt 的那些 `apple`（约 16 个），
+所以 `apple x30` 不是纯生成量，但三次之间的相对变化不受影响。同 seed 重复两次逐字节相同 ⇒ 差异可归因于 penalty 而
+非随机性。
+
+### 6. 未做的观察（留档）
+
+- `tp2_generation_core.cpp` 的 `sampling_b` 是死代码（只有 `(void)sampling_b;`），`sampling_buf_b` 也只为它而建。
+- TP-2 路径建议补一个 `validate_licensed_tokens` 同款守卫（见 §4 影响面）。
+- 服务 `/v1/models` 发布的 id 取决于启动参数/工件（实测同一工件：默认启动发布 `qwen3.8-27b`，另一次发布
+  `qwen3.8-27b-w4a4-w8a8`，而 stderr 的 `engine ready` 行始终打印后者）。**请求里的 model 必须从 `/v1/models` 取**，
+  不要从日志或硬编码推。
+
+### 7. 运维注记（Windows 原生 / DSH 代理沙箱）
+
+- DSH 文件策略处于 `workspace-write` 时 **ninja 无法执行任何子进程**：`cmake --build` 静默挂住，连一个平凡单边工程
+  的 `build.ninja` 也一样（`ninja -t` / `ninja -n` 正常）。构建须在 `danger-full-access` 下进行。
+- `pwsh` 后台作业里用 `Tee-Object`（或任何写进该作业 stdout 的管道）会在管道写满后中途卡死；改
+  `cmd /c "... > log 2>&1"` 再轮询文件。
+- `ninfer-serve` 必须由用户在自己的终端启动：`Start-Process` 起的服务是「调用方 shell 的 job object 子进程」，
+  agent 工具调用结束即被回收（实测：单次工具调用内起的服务能顺利跑完并被我杀掉，跨调用即消失）。
+  停服务 + 重链 exe 由 agent 执行没有问题（停掉的旧进程不占 exe，重链后由用户重启）。
+- 编译前必须 `. ./tools/win_port/vcvars.ps1`；跑测试需要把 FFmpeg / curl 的 DLL 目录加进 `PATH`，否则加载器报
+  `0xC0000135`。
+- 端口：历史问题见 Round 16.3 末尾（脚本 `$Port` 与客户端 `.dsh/settings.yaml` 必须同步）；本轮实测服务端为 3456。

@@ -144,9 +144,9 @@ llama.cpp 的 Qwen3.5 MTP 结构相同，其文档也只要求「需要精确一
   shard A；B 在 text mixer lockstep 后空等）。方向：①两卡 lockstep 冗余跑同一份 MTP 层（墙钟不变）；
   ②按 vocab 切 MTP 提案的 lm_head + 窗口 argmax（真正缩短关键路径）；③重扫 K=1/2/3。
 - **KV dtype 扫描补全**：fp8/int8 已有质量与显存数据，nvfp4/k8v4 只验证了可启动与吞吐。
-- **工具调用约束解码**（诊断见 Round 15）：对齐 llama.cpp 的 lazy tool-call grammar，把 `<function=` 后的工具名
-  和参数掩码限制在本次请求声明的工具上（先做「工具名前缀树 + 参数名掩码」，完整 GBNF 太重）。
-  注意掩码要和 MTP 投机解码 / exact-batch CUDA Graph 对齐，否则 verify 会误判接受。
+- **工具调用约束解码**（**已完成**，路线 A；诊断见 Round 15，实现与验证见 worklog Round 15b）：对齐 llama.cpp 的 lazy
+  tool-call grammar，把 `<function=` 后的工具名与参数名掩码限制在本次请求声明的工具上（文本化轻量版；完整 GBNF 的
+  路线 B 见 Round 15）。掩码在 CUDA Graph 之外应用，MTP 按 verify 列取各自语法位置、draft 不掩码，思考阶段不约束。
 - **TP-2 host 侧状态检查点 + 短 prompt 按 LCP 截断复用**（**已实现并完成端到端验证**，诊断见 Round 16，实测见 Round 16.3）：把 GDN 状态快照放进 pinned host
   环形池（0 显存增量，`--host-state-slots` 语义），步长 8192，复用扫描取最深的 `<= shared_prefix` 检查点。
   修掉「客户端在 turn 边界重渲染出更短 prompt ⇒ reuse=0 ⇒ 整条全量重算（实测 42.0 / 57.6 s）」。实测 `src=host` 命中：req#5 10.2 s → 1.3 s、
@@ -1036,154 +1036,49 @@ head-split 分片上无任何语义作用）。这不是 ① 的回归。
 
 ---
 
-### Round 15 — 待做：工具调用的约束解码（对齐 llama.cpp 的 lazy grammar）
+### Round 15 — 工具调用的约束解码（路线 A 已落地）
 
 **现象**：DSH 接 NInfer 时偶尔把工具调用当正文吐出（`<tool_call> <function=todo_write> …`），前端提示
 “工具调用方式不对”；同一套 DSH 接 llama.cpp 从未出现。
 
-**已定位（诊断已完成，细节见 `docs/tp2-dual-5060ti-worklog.md` Round 15）**：不是量化（诱导探针 A/B：官方
-`nvfp4` 与转换 `w4a4_w8a8` 各 75 条工具请求，标记类失败 27/75 vs 19/75，z≈1.4 不显著；失败形态相同——模型照抄
-提示里的 SDK 名字 `tools.read`/`todo_write`）、不是 chat_template（逐字复述探针两种写法都正确解析）、不是解析器 bug。
-客户端侧也一致（`~/.dsh/settings.yaml`：两个 provider 都是 `api: openai-responses`，`agent-presets.default: ptc`）。
-根因是**引擎策略差异**：
+**已定位（诊断细节见 worklog Round 15）**：不是量化（官方 `nvfp4` 与转换 `w4a4_w8a8` 各 75 条工具请求，标记类失败
+27/75 vs 19/75，z≈1.4 不显著）、不是 chat_template、不是解析器、不是客户端配置。根因是**引擎策略差异**：llama.cpp 对
+声明工具做 lazy GBNF 约束解码（`common/chat.cpp:1286` 为每个工具生成 `<function=NAME>` 规则，`server-common.cpp:1332`
+注入生成参数），未声明的名字在采样层不可达；NInfer 只在解析层用 `enforce_declared_names` 拒收后原样返回文本。
 
-- llama.cpp 做 **lazy GBNF 约束解码**：`common/chat.cpp:1286` 为每个声明工具生成 `<function=NAME>` + 该工具 JSON
-  schema 的规则，`:1316-1337` 在 `tool_choice=auto`（`common/chat.h:258` 默认值）下 `grammar_lazy=true`、触发词
-  `<tool_call>`；`tools/server/server-common.cpp:1332-1346` 把 grammar 注入生成参数 ⇒ 未声明的名字在采样层不可达，
-  模型“想直接调 read”会被逼回已声明工具（PTC 下就是 `run_code`），参数也必然合规。
-- NInfer 没有约束层：自由生成后解析（`src/models/qwen3_5/frontend/tool_call_parser.cpp`），用 `enforce_declared_names`
-  校验，未声明即按契约拒收、原样返回文本并打 WARN。
+**决策（路线 A/B）**：llama.cpp 的 grammar 按**文本**校验（`token_to_piece` + `llama_partial_utf8` + GBNF 栈），对
+分词不敏感；在 token 序列上建前缀树则分词敏感、易掩错。故分两条路线：
 
-**待做（用户暂缓，后续做）**：
+- **路线 A（本轮落地）**：状态机累积已生成文本，每步用 tokenizer 把候选 token 解码成片段（处理跨 token 半个
+  UTF-8），校验「累积文本 + 片段」是否为已声明工具名/参数名的合法前缀，否则置 `-INF`。对分词不敏感，正确性风险
+  对齐 llama.cpp，代码量远小于完整 GBNF。
+- **路线 B（Phase 2 选项，未做）**：移植 `llama-grammar.cpp` 的栈式 parser + 为 Qwen 生成 grammar，天然支持完整参数
+  schema 校验。仅当 A 在真实流量仍偶发边界问题、或要做完整 schema 校验时升级。
 
-1. **工具调用约束解码（首选）**：在 `<tool_call>` 进入后、`<function=` 位置掩码 logits，只允许本次声明的工具名；
-   参数按声明 schema 约束。先做「工具名前缀树 + 参数名掩码」，完整 GBNF 作为后续。
-   **必须先想清楚**：掩码在 MTP draft/verify 两侧的落点（draft 提议的 token 也要过同一份掩码），以及它与
-   exact-batch CUDA Graph 的关系，否则 verify 会误判接受。
-2. **不做**「未声明也当 tool_call 返回」：等于放行模型绕过 `run_code` 直接触发 `pwsh`/`write`，破坏 PTC 契约。
-3. 轻量诊断（随时可做）：WARN 里打印模型实际写出的工具名，线上就能看出是 `tools.read` 还是 `todo_write`。
-4. 可选闭环实验：llama.cpp 起来时把同一份探针（`%TEMP%\ab_probe.ps1`）打过去，预期不出现未声明名字。
+**状态**：路线 A 已实现并通过单测。实现落在 `include/ninfer/ops/token_mask.h`（+ `src/ops/{kernel,launcher,wrapper}`）、
+`src/models/qwen3_5/frontend/tool_call_constraint.{h,cpp}`、`frontend.{h,cpp}`、`output_session.{h,cpp}`、
+`tool_call_parser.h`、`src/runtime/engine/tp2_generation_core.cpp`；`ninfer_token_mask_test` /
+`ninfer_tool_call_constraint_test` / `ninfer_tool_call_parser_test` 通过，真实服务 `tools 1` 请求端到端正常。
+要点：掩码只在工具调用结构区生效（`ParameterValue` 与自由文本不掩码）、只在非思考阶段激活、在 CUDA Graph **之外**
+应用；MTP 按 verify 列取各自语法位置，draft 不掩码（非法 draft 与掩码后的 argmax 不一致而被拒）。
+实现细节、边界处理与验证见 worklog Round 15b。
 
-**设计（调研完成，对照 `C:\llama.cpp` @ `ar3-opt` 源码）**：
+**不做**：「未声明也当 tool_call 返回」等于放行模型绕过 `run_code` 直接触发 `pwsh`/`write`，破坏 PTC 契约。
 
-llama.cpp 机制（已核实）：
-- grammar 是 GBNF 状态机（`src/llama-grammar.cpp` 的 `llama_grammar`，维护一组 parse 栈 `stacks`）。
-- `llama_grammar_apply_impl`（`llama-grammar.cpp:1354`）：`awaiting_trigger` 期间直接返回（不掩码）；否则对每个候选
-  token，用 `llama_grammar_reject_candidates(rules, stacks, candidates)` 算出当前状态下非法的候选，把它们的 `logit` 置
-  `-INFINITY`。EOG 仅在某个 parse 栈为空时允许。
-- `llama_grammar_accept_impl`（`:1397`）：接受 token 时推进状态；`awaiting_trigger` 期间累积 `trigger_buffer`，命中触发
-  token 或正则 `trigger_patterns` 后 `awaiting_trigger=false` 开始约束。
-- 采样器侧（`common/sampling.cpp:265`）：`grammar_lazy=true` 时用 `llama_sampler_init_grammar_lazy_patterns` 建 grammar；
-  `grammar_should_apply`（`:452`）在 reasoning budget 处于 IDLE/DONE 时才应用（思考阶段不约束）。触发词为 `<tool_call>`。
+**同轮修掉的两处既有缺陷**（细节见 worklog Round 15b）：
 
-NInfer 设计（轻量版，先做「工具名前缀树 + 参数名掩码」）：
+- TP-2 把**物理行数**当有效域传给 `ops::sample` / `ops::argmax` / `speculative_accept_greedy_drafts`，可以采到
+  tokenizer 未定义的打包行（248320 行 vs 公开词表）；现全部改传 `public_token_count`，正常步逐位不变。
+- `make_sampling_config` 的 `token_counts` 恒为 null ⇒ presence/frequency penalty 对跨轮重复完全无效；现按请求建
+  计数数组。A/B 实测（同 seed，修复前/后两份二进制各起一次服务）：修复前三种 penalty 配置输出**逐字节相同**，
+  修复后 `frequency=2.0` 把重复从「最长连续 15」压到「2」，且无 penalty 路径逐字节不变。
 
-1. **约束表示**：一个小状态机（非完整 GBNF parser），跟踪工具调用格式位置。Qwen 格式
-   （`tool_call_parser.cpp:20-25`）：`<tool_call> <function=NAME> <parameter=PARAM> VALUE </parameter> </function> </tool_call>`。
-   状态：AWAITING_TRIGGER →（命中 `<tool_call>`）→ FUNCTION_NAME → PARAM_NAME → PARAM_VALUE → … → DONE。每个状态算出允许
-   token 集合（掩码）：
-   - AWAITING_TRIGGER：不掩码（自由文本/思考）。
-   - FUNCTION_NAME：只允许能续接「已声明工具名」的 token（声明名的前缀树）。
-   - PARAM_NAME：只允许能续接「当前工具已声明参数名」的 token。
-   - PARAM_VALUE/其它：不掩码（完整 schema 校验留作 GBNF 后续）。
-   状态机累积已生成文本（同 llama.cpp 的 `trigger_buffer`），处理名字跨多 token 的情形。
-2. **掩码落点（核心）**：新增 op/内核 `apply_token_mask(logits, mask, ...)`，把不允许的 logits 写 `-INF`。
-   - plain decode（无 MTP）：在 `ops::sample`（`tp2_generation_core.cpp:1407`）前掩码 `[vocab,1]` logits。
-   - MTP verify：在 `ops::argmax`（`:1489`）+ `speculative_accept_greedy_drafts`（`:1490`）前掩码 `[vocab,width]` 的
-     `window_logits`；每列 grammar 状态不同，掩码按列。
-   - **关键**：只掩码 target 的 verify logits ⇒ target argmax 恒合法 ⇒ 被接受的 token 恒合法。draft 提案无需单独掩码
-     （非法 draft 与掩码后的 target argmax 不匹配，被 `speculative_accept_greedy_drafts` 拒收）。
-3. **CUDA Graph**：verify forward 被捕获进 graph，`window_logits` 从 graph 出来；掩码在 graph 之后、argmax 之前应用
-   （graph 外），host 算掩码、device 应用。**无需改 CUDA Graph**。
-4. **plumbing**：把 `ToolCallOutputContract`（或派生的掩码结构：工具名 + 参数名）从 `prepared_prompt`
-   （`prepared_prompt.h:152`）plumb 到解码循环。契约在 prompt 准备时由 `PromptOptions.tool_jsons`（`types.h:413`）构建
-   （`build_tool_call_output_contract`）。存进 TP-2 核心的 Request 或传给 decode 函数。
-5. **lazy 触发**：约束是 lazy 的——模型吐出 `<tool_call>` 后才激活。host 侧累积生成文本、检测触发；触发前不掩码。
-6. **思考门控**：思考（reasoning）阶段不约束（同 llama.cpp 的 `grammar_should_apply`）。NInfer 有 `ThinkingControlOptions`，
-   思考中禁用掩码。
+**剩余（可选）**：
 
-实施分阶段：
-- **Phase 1（轻量）**：工具名前缀树 + 参数名掩码。建状态机 + 掩码；加 `apply_token_mask` op；在 plain decode 与 MTP verify
-  应用；plumb 契约；lazy 触发 + 思考门控。
-- **Phase 2（完整 GBNF）**：完整 JSON schema 校验（参数类型、结构）。
-
-**路线选择（A/B，2026-07-11 修正）**：
-
-「正确性 bug」风险（工具名跨多 token 时掩码算错）在 llama.cpp 上同样存在，但被其实现方式压到很低：
-`llama_grammar_apply_impl` 把每个候选 token 用 `token_to_piece` 解码成文本、用 `llama_partial_utf8` 处理跨 token
-半个 UTF-8，再拿「已累积文本 + 片段」去 GBNF parse 栈校验——**按文本约束、对分词不敏感**，且 parser 长期生产验证。
-若轻量版在 token 序列上建前缀树则分词敏感、易掩错。故分两条路线：
-
-- **路线 A（文本化轻量版，Phase 1 先做）**：状态机累积「已生成文本」（同 llama.cpp 的 `trigger_buffer`），每步把候选
-  token 用 NInfer tokenizer 解码成文本片段（处理跨 token 半个 UTF-8），校验「累积文本 + 片段」是否为已声明工具名/参数名
-  的合法前缀（用声明名的 trie 加速），否则置 `-INF`。对分词不敏感，正确性风险对齐 llama.cpp，代码量远小于完整 GBNF。
-  代价：约束激活的每步有 O(vocab) 的 CPU 掩码计算（~数 ms），但仅作用于工具调用区（几个 token），摊销可忽略。
-- **路线 B（移植 llama.cpp 的 GBNF parser，Phase 2 选项）**：直接搬 `llama-grammar.cpp` 的栈式 parser（~1500 行）+ 为
-  Qwen 生成 grammar。正确性风险最低（生产验证），天然支持完整 schema 校验。若 A 在真实流量仍偶发边界问题、或要做完整
-  schema 校验，升级到 B。
-
-验证：
-- 单测：掩码正确把工具名限制在已声明集合。
-- 集成：模型不再吐未声明工具名（对照 Round 15 的 75 条探针）。
-- MTP：约束在 MTP 下生效（非法 draft 被拒）。
-- 回归：非工具调用生成不受影响。
-
-风险/未决：
-- 分词：工具名可能跨多 token，状态机须累积文本、按前缀匹配。
-- 性能：每步掩码计算应很便宜（小状态机）。
-- 一致性：掩码须在所有采样路径（plain decode、MTP verify、未来路径）一致应用。
-
-**实现与验证（2026-09-20，路线 A 已落地）**
-
-- 新增 op `include/ninfer/ops/token_mask.h` + `src/ops/{kernel/token_mask.cuh,launcher/token_mask.{h,cu},wrapper/token_mask.cpp}`：
-  按 `[rows, columns]`（dim0 连续）逐元素把 U8 掩码为 0 处的 logits 写成 `-inf`（BF16），在 CUDA Graph **之外**调用。
-- 新增 `src/models/qwen3_5/frontend/tool_call_constraint.{h,cpp}`：`ToolCallMaskTable`（每个 vocab id 一份解码字节 + 特殊位，
-  由 `Frontend` 用 `shared_ptr<const Tokenizer>` 持有并**只建一次**）、`ToolCallNameTrie`、`ToolCallGrammar`、
-  `ToolCallGrammarState`（字节级，`Free / FunctionLiteral / FunctionName / FunctionClose / ParameterName / ParameterValue /
-  ToolClose`）、`ToolCallConstraint`（共享表 + 不可变语法 + 每请求可变状态，故按请求构造的是非 const 对象）。
-- `OutputSession` 保留 Content 通道的原始字节流（`raw_content_text()`）并暴露 `in_reasoning()`：掩码与工具调用 parser 吃
-  **同一条**字节流，所以跨 token 的工具名、半个 UTF-8、跨越结构字面量的 token 都不会被误判。
-- `tp2_generation_core`：plain decode 在 `ops::sample` 之前、MTP 在每个 verify 列 `ops::argmax` 之前应用掩码；MTP 每列掩码 =
-  「committed 文本 + 该列之前的 drafts」对应的语法位置（`build_mask_after`），draft 本身不掩码（非法 draft 与掩码后的
-  argmax 不一致因而被拒）。约束只在 `!in_reasoning()` 时激活。
-- 掩码只在 `FunctionLiteral / FunctionName / FunctionClose / ParameterName / ToolClose` 生效；`ParameterValue` 与自由文本不掩码。
-- **安全阀**：某位置若除纯空白外没有任何候选能推进语法，则报「不受约束」而不是发全 0 掩码——空白被跳过、不推进语法，
-  掩到它会让模型一直吐空格直到 context 用尽；全 0 掩码则会卡死请求。
-- 验证：`ninfer_token_mask_test`（GPU；掩码逐位精确比对、掩码只读、全掩、形状/rank/dtype/别名校验）与
-  `ninfer_tool_call_constraint_test`（CPU；惰性触发、只许已声明名、多 token 名字、完整名后必须 `>`、参数名、自由值、
-  回到 Free、跨字面量 token、不可拼写名的回退、二次调用）**均通过**；`ninfer_tool_call_parser_test` 通过；
-  `ninfer_qwen3_5_frontend_test` 仍是上文 703–707 行记录的既有失败（与本改动无关）。
-- 未做：真实模型端到端（对照 Round 15 的 75 条探针）与 MTP 下的实测对照——需重启 `ninfer-serve` 后执行。
-- **修正（同日追加）**：约束表的行数是 tokenizer 的公开词表（`resources.public_token_count`），而 logits 域是**打包后**的
-  embedding 行数（本机 artifact `config.text.vocab_size` = 248320，公开域更小；`frontend/resources.cpp:12` 明确只要求
-  `count <= config.text.vocab_size`）。原先的一致性检查错误地要求两者**相等**，于是任何带 tools 的请求都 500
-  （`unknown: TP-2 tool-call constraint vocabulary does not match the logits domain`）。现改为掩码按 **logits 域**生成
-  （`build_mask(domain, mask)` / `build_mask_after(prefix, domain, mask)`），tokenizer 未定义的行一律置 0（排除）；
-  仅在「约束表 > logits 域」时报错，且错误信息带上两个数值。新增 packed-domain 单测覆盖该尾部。
-- **既有缺陷，已修（同日）**：TP-2 核心有 4 处把**物理行数** `vocab` 当作有效域传出：`ops::sample`（prefill 首 token、
-  plain decode）、`ops::argmax`（MTP target）、`speculative_accept_greedy_drafts`（接受核）。契约本来就把两者分开
-  （`sample` 校验 `token_domain ∈ [1, physical_rows]`，`argmax` 参数名即 `valid_rows`，accept 文档写 `token_domain`），
-  单卡路径（`text.cpp:2279/2283`、`decode.cpp:258`、`draft.cpp` 的 selector 域）都传 `public_token_count`；那枚**算了却
-  从未使用**的 `public_tokens` 正是这个意图的残留。现将声明上提到 `vocab` 旁，4 处全部改传 `public_tokens`；
-  `sampling_workspace_capacity_bytes(vocab, 1, 1)` 保留（容量上界）。
-  影响面：越界 id 不会越界访存（embedding/lm_head 都是 248320 行，仅读到填充行），但会进 `OutputSession` 的
-  `Tokenizer::decoded_token`（`output_session.cpp:458/563`，无守卫）抛 `out_of_range` ⇒ 单个请求 500。TP-2 路径缺的正是
-  单卡 `program/decode.cpp:256 validate_licensed_tokens` 那层守卫。触发条件是「打包行胜过所有真实候选」（贪心要求它
-  是全域最大；采样要求它进 top-20 且活过 top_p/min_p），正常分布下几乎不会发生。
-  风险：`token_domain` 在核里只作遍历上界（`sampling.cuh:33/41/127`），两域的 `cap` 都是 `min(20,domain)`，RNG 抽取
-  发生在截断后的候选集上 ⇒ 修复只在本该触发的那些步改变结果，正常步逐位不变。
-- **另一既有缺陷，已修（同日）**：`make_sampling_config` 把 `token_counts` 置空，而惩罚项只从该数组取 `c_v`
-  （`sampling_device.cuh:252`），故 TP-2 路径的 presence/frequency penalty 对**跨轮**重复完全无效——只剩 MTP verify
-  的轮内 overlay（同一窗口内的 draft）还起作用。现按单卡 `install_sampling`（`decode.cpp:145-149`）的做法：仅当
-  penalty 非零时在请求 workspace 建 `I32[public_tokens]` 计数数组、`cudaMemsetAsync` 清零后挂到 `sampling_config`；
-  `ops::sample` 与 `speculative_accept_greedy_drafts` 自行累加产出的 token。未配 penalty 时不建数组、`c_v` 恒为 0，
-  与单卡路径一致。
-  实测（同 seed 12345、同 prompt、同参数，两份二进制各起一次服务）：pre-fix 的 zero / presence=2.0 / frequency=2.0 三次输出
-  **逐字节相同**（penalty 完全无效）；post-fix 的无 penalty 输出与 pre-fix **逐字节相同**（修复不触碰无 penalty 路径），
-  而 presence / frequency 输出与它不同：frequency=2.0 时重复词从 `apple x30`、最长连续 15 降到 `apple x9`、最长连续 2，
-  去重词数 57→99。
-- 环境注记：DSH 沙箱处于 `workspace-write` 时 ninja **无法执行任何子进程**（连平凡工程都挂，`ninja -t/-n` 正常），
-  构建须在 `danger-full-access` 下进行；另外 `pwsh` 的后台作业若用 `Tee-Object` 把输出写进管道会因管道写满而在中途卡死。
+1. 真实模型端到端复测：对照 Round 15 的 75 条探针，确认未声明名字不再出现。
+2. 轻量诊断：WARN 里打印模型实际写出的工具名，线上即可看出是 `tools.read` 还是 `todo_write`。
+3. 路线 B（完整 GBNF / 参数 schema 校验）。
+4. 可选加固：TP-2 补一个 `validate_licensed_tokens` 同款守卫。
 
 ---
 

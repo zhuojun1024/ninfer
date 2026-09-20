@@ -379,6 +379,16 @@ comparison meaningful; the served configuration samples (`0.7 / 20 / 0.80`).
   ~1,000 launches per round kept the host behind the GPU) and only became deterministic once the
   verify turned into a graph replay. The added sync costs 0.01 ms because shard B trails by less than
   one kernel, and eager and graph now agree byte for byte on every prompt.
+- Every token selection on the TP-2 route (`ops::sample` for the prefill token and for plain decode, the
+  MTP target `ops::argmax`, and `speculative_accept_greedy_drafts`) is bounded by the public tokenizer
+  vocabulary instead of the packed embedding row count. A padding row could be selected, corrected or
+  licensed, and the resulting id then failed tokenizer decoding and killed the whole request; the
+  single-GPU route and the draft selector already passed `public_token_count`.
+- Presence and frequency penalties reach the sampler on the TP-2 route. `make_sampling_config` left
+  `token_counts` null and the penalty only reads that array, so across rounds both penalties were inert
+  and only the MTP verify window's round-local overlay still applied. The request now owns an
+  `I32[public_token_count]` count array, reset with the request, that `ops::sample` and the speculative
+  accept kernel increment as they produce tokens.
 
 ## Work log
 
