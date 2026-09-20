@@ -61,6 +61,10 @@ numbers above.
 
 ## Cross-engine comparison: llama.cpp `ar3-opt`
 
+Its own tensor-parallel implementation — graph-level sharding, the allreduce transports, and why
+neither `-sm row` nor NCCL applies on this host — is analysed source by source in
+[llama.cpp TP notes](tp2-dual-5060ti-llamacpp-notes.md).
+
 The reference engine on this machine is a tuned llama.cpp build (`C:\llama_ar3-opt`, source branch
 `ar3-opt` at `C:\llama.cpp`), so both engines were measured back to back on the same two cards with
 the same protocol and exactly one engine resident at a time: one non-streaming chat completion at a
