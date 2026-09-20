@@ -8,6 +8,7 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "models/qwen3_5/frontend/tool_call_constraint.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "text/unicode.h"
 
@@ -598,10 +599,15 @@ public:
             }
         }
         thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
+        mask_table = std::make_shared<const fi::ToolCallMaskTable>(
+            fi::build_tool_call_mask_table(tokenizer));
     }
 
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
+    // Decoded vocabulary for constrained tool-call decoding: one piece per vocabulary id, shared
+    // by every constrained request because every request constrains against the same vocabulary.
+    std::shared_ptr<const fi::ToolCallMaskTable> mask_table;
     fi::ProcessorOptions processor;
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
@@ -894,6 +900,15 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     return OutputSession(impl_->tokenizer, std::move(policy), output,
                          prompt.data_->starts_in_reasoning, thinking,
                          impl_->thinking_control_tokens, prompt.data_->tool_call_output);
+}
+
+std::shared_ptr<fi::ToolCallConstraint> Frontend::make_tool_call_constraint(
+    const std::shared_ptr<const fi::ToolCallOutputContract>& contract) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    if (contract == nullptr || !contract->enforce_declared_names || contract->tools.empty()) {
+        return {};
+    }
+    return std::make_shared<fi::ToolCallConstraint>(impl_->mask_table, *contract);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

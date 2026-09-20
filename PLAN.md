@@ -140,7 +140,7 @@ llama.cpp 的 Qwen3.5 MTP 结构相同，其文档也只要求「需要精确一
 
 ## 6. 可选后续（非阻塞）
 
-- **W2 负载均衡**：MTP 开启时 GPU0 100% / GPU1 ~72% 属结构性（MTP 层 + 全部 argmax/accept/fold/采样/策略只在
+- **W2 负载均衡**（**已完成**）：MTP 开启时 GPU0 100% / GPU1 ~72% 属结构性（MTP 层 + 全部 argmax/accept/fold/采样/策略只在
   shard A；B 在 text mixer lockstep 后空等）。方向：①两卡 lockstep 冗余跑同一份 MTP 层（墙钟不变）；
   ②按 vocab 切 MTP 提案的 lm_head + 窗口 argmax（真正缩短关键路径）；③重扫 K=1/2/3。
 - **KV dtype 扫描补全**：fp8/int8 已有质量与显存数据，nvfp4/k8v4 只验证了可启动与吞吐。
@@ -707,7 +707,7 @@ Ctrl+C 停止），只有 `-Background` 才用 `Start-Process`；自测服务时
   在本分支均未改动，故 HEAD 上同样失败。
 - 教训：Windows 上重新链接 exe 前必须先停服务（运行中的 exe 会锁住文件 → `LNK1104`）。
 
-**剩余缺口（需用户判断）**：目标里的「跑通单卡 ninfer CLI」在本机无法字面完成——CLI 仅支持单卡，而该
+**剩余缺口（用户决定不做）**：目标里的「跑通单卡 ninfer CLI」在本机无法字面完成——CLI 仅支持单卡，而该
 27B NVFP4 artifact 需要约 20.2 GiB 常驻权重（10.1 GiB/shard × 2），16 GiB 卡装不下（已写入
 `docs/windows.md` 限制节）。要真正跑到端到端，需要另造一个小的 `.ninfer` 测试 artifact（转换工具链 +
 合成小 checkpoint），属额外工作；当前 CLI 二进制本身已验证可运行（`--help`），且与 serve 共用同一套
@@ -1064,12 +1064,116 @@ head-split 分片上无任何语义作用）。这不是 ① 的回归。
 3. 轻量诊断（随时可做）：WARN 里打印模型实际写出的工具名，线上就能看出是 `tools.read` 还是 `todo_write`。
 4. 可选闭环实验：llama.cpp 起来时把同一份探针（`%TEMP%\ab_probe.ps1`）打过去，预期不出现未声明名字。
 
+**设计（调研完成，对照 `C:\llama.cpp` @ `ar3-opt` 源码）**：
+
+llama.cpp 机制（已核实）：
+- grammar 是 GBNF 状态机（`src/llama-grammar.cpp` 的 `llama_grammar`，维护一组 parse 栈 `stacks`）。
+- `llama_grammar_apply_impl`（`llama-grammar.cpp:1354`）：`awaiting_trigger` 期间直接返回（不掩码）；否则对每个候选
+  token，用 `llama_grammar_reject_candidates(rules, stacks, candidates)` 算出当前状态下非法的候选，把它们的 `logit` 置
+  `-INFINITY`。EOG 仅在某个 parse 栈为空时允许。
+- `llama_grammar_accept_impl`（`:1397`）：接受 token 时推进状态；`awaiting_trigger` 期间累积 `trigger_buffer`，命中触发
+  token 或正则 `trigger_patterns` 后 `awaiting_trigger=false` 开始约束。
+- 采样器侧（`common/sampling.cpp:265`）：`grammar_lazy=true` 时用 `llama_sampler_init_grammar_lazy_patterns` 建 grammar；
+  `grammar_should_apply`（`:452`）在 reasoning budget 处于 IDLE/DONE 时才应用（思考阶段不约束）。触发词为 `<tool_call>`。
+
+NInfer 设计（轻量版，先做「工具名前缀树 + 参数名掩码」）：
+
+1. **约束表示**：一个小状态机（非完整 GBNF parser），跟踪工具调用格式位置。Qwen 格式
+   （`tool_call_parser.cpp:20-25`）：`<tool_call> <function=NAME> <parameter=PARAM> VALUE </parameter> </function> </tool_call>`。
+   状态：AWAITING_TRIGGER →（命中 `<tool_call>`）→ FUNCTION_NAME → PARAM_NAME → PARAM_VALUE → … → DONE。每个状态算出允许
+   token 集合（掩码）：
+   - AWAITING_TRIGGER：不掩码（自由文本/思考）。
+   - FUNCTION_NAME：只允许能续接「已声明工具名」的 token（声明名的前缀树）。
+   - PARAM_NAME：只允许能续接「当前工具已声明参数名」的 token。
+   - PARAM_VALUE/其它：不掩码（完整 schema 校验留作 GBNF 后续）。
+   状态机累积已生成文本（同 llama.cpp 的 `trigger_buffer`），处理名字跨多 token 的情形。
+2. **掩码落点（核心）**：新增 op/内核 `apply_token_mask(logits, mask, ...)`，把不允许的 logits 写 `-INF`。
+   - plain decode（无 MTP）：在 `ops::sample`（`tp2_generation_core.cpp:1407`）前掩码 `[vocab,1]` logits。
+   - MTP verify：在 `ops::argmax`（`:1489`）+ `speculative_accept_greedy_drafts`（`:1490`）前掩码 `[vocab,width]` 的
+     `window_logits`；每列 grammar 状态不同，掩码按列。
+   - **关键**：只掩码 target 的 verify logits ⇒ target argmax 恒合法 ⇒ 被接受的 token 恒合法。draft 提案无需单独掩码
+     （非法 draft 与掩码后的 target argmax 不匹配，被 `speculative_accept_greedy_drafts` 拒收）。
+3. **CUDA Graph**：verify forward 被捕获进 graph，`window_logits` 从 graph 出来；掩码在 graph 之后、argmax 之前应用
+   （graph 外），host 算掩码、device 应用。**无需改 CUDA Graph**。
+4. **plumbing**：把 `ToolCallOutputContract`（或派生的掩码结构：工具名 + 参数名）从 `prepared_prompt`
+   （`prepared_prompt.h:152`）plumb 到解码循环。契约在 prompt 准备时由 `PromptOptions.tool_jsons`（`types.h:413`）构建
+   （`build_tool_call_output_contract`）。存进 TP-2 核心的 Request 或传给 decode 函数。
+5. **lazy 触发**：约束是 lazy 的——模型吐出 `<tool_call>` 后才激活。host 侧累积生成文本、检测触发；触发前不掩码。
+6. **思考门控**：思考（reasoning）阶段不约束（同 llama.cpp 的 `grammar_should_apply`）。NInfer 有 `ThinkingControlOptions`，
+   思考中禁用掩码。
+
+实施分阶段：
+- **Phase 1（轻量）**：工具名前缀树 + 参数名掩码。建状态机 + 掩码；加 `apply_token_mask` op；在 plain decode 与 MTP verify
+  应用；plumb 契约；lazy 触发 + 思考门控。
+- **Phase 2（完整 GBNF）**：完整 JSON schema 校验（参数类型、结构）。
+
+**路线选择（A/B，2026-07-11 修正）**：
+
+「正确性 bug」风险（工具名跨多 token 时掩码算错）在 llama.cpp 上同样存在，但被其实现方式压到很低：
+`llama_grammar_apply_impl` 把每个候选 token 用 `token_to_piece` 解码成文本、用 `llama_partial_utf8` 处理跨 token
+半个 UTF-8，再拿「已累积文本 + 片段」去 GBNF parse 栈校验——**按文本约束、对分词不敏感**，且 parser 长期生产验证。
+若轻量版在 token 序列上建前缀树则分词敏感、易掩错。故分两条路线：
+
+- **路线 A（文本化轻量版，Phase 1 先做）**：状态机累积「已生成文本」（同 llama.cpp 的 `trigger_buffer`），每步把候选
+  token 用 NInfer tokenizer 解码成文本片段（处理跨 token 半个 UTF-8），校验「累积文本 + 片段」是否为已声明工具名/参数名
+  的合法前缀（用声明名的 trie 加速），否则置 `-INF`。对分词不敏感，正确性风险对齐 llama.cpp，代码量远小于完整 GBNF。
+  代价：约束激活的每步有 O(vocab) 的 CPU 掩码计算（~数 ms），但仅作用于工具调用区（几个 token），摊销可忽略。
+- **路线 B（移植 llama.cpp 的 GBNF parser，Phase 2 选项）**：直接搬 `llama-grammar.cpp` 的栈式 parser（~1500 行）+ 为
+  Qwen 生成 grammar。正确性风险最低（生产验证），天然支持完整 schema 校验。若 A 在真实流量仍偶发边界问题、或要做完整
+  schema 校验，升级到 B。
+
+验证：
+- 单测：掩码正确把工具名限制在已声明集合。
+- 集成：模型不再吐未声明工具名（对照 Round 15 的 75 条探针）。
+- MTP：约束在 MTP 下生效（非法 draft 被拒）。
+- 回归：非工具调用生成不受影响。
+
+风险/未决：
+- 分词：工具名可能跨多 token，状态机须累积文本、按前缀匹配。
+- 性能：每步掩码计算应很便宜（小状态机）。
+- 一致性：掩码须在所有采样路径（plain decode、MTP verify、未来路径）一致应用。
+
+**实现与验证（2026-09-20，路线 A 已落地）**
+
+- 新增 op `include/ninfer/ops/token_mask.h` + `src/ops/{kernel/token_mask.cuh,launcher/token_mask.{h,cu},wrapper/token_mask.cpp}`：
+  按 `[rows, columns]`（dim0 连续）逐元素把 U8 掩码为 0 处的 logits 写成 `-inf`（BF16），在 CUDA Graph **之外**调用。
+- 新增 `src/models/qwen3_5/frontend/tool_call_constraint.{h,cpp}`：`ToolCallMaskTable`（每个 vocab id 一份解码字节 + 特殊位，
+  由 `Frontend` 用 `shared_ptr<const Tokenizer>` 持有并**只建一次**）、`ToolCallNameTrie`、`ToolCallGrammar`、
+  `ToolCallGrammarState`（字节级，`Free / FunctionLiteral / FunctionName / FunctionClose / ParameterName / ParameterValue /
+  ToolClose`）、`ToolCallConstraint`（共享表 + 不可变语法 + 每请求可变状态，故按请求构造的是非 const 对象）。
+- `OutputSession` 保留 Content 通道的原始字节流（`raw_content_text()`）并暴露 `in_reasoning()`：掩码与工具调用 parser 吃
+  **同一条**字节流，所以跨 token 的工具名、半个 UTF-8、跨越结构字面量的 token 都不会被误判。
+- `tp2_generation_core`：plain decode 在 `ops::sample` 之前、MTP 在每个 verify 列 `ops::argmax` 之前应用掩码；MTP 每列掩码 =
+  「committed 文本 + 该列之前的 drafts」对应的语法位置（`build_mask_after`），draft 本身不掩码（非法 draft 与掩码后的
+  argmax 不一致因而被拒）。约束只在 `!in_reasoning()` 时激活。
+- 掩码只在 `FunctionLiteral / FunctionName / FunctionClose / ParameterName / ToolClose` 生效；`ParameterValue` 与自由文本不掩码。
+- **安全阀**：某位置若除纯空白外没有任何候选能推进语法，则报「不受约束」而不是发全 0 掩码——空白被跳过、不推进语法，
+  掩到它会让模型一直吐空格直到 context 用尽；全 0 掩码则会卡死请求。
+- 验证：`ninfer_token_mask_test`（GPU；掩码逐位精确比对、掩码只读、全掩、形状/rank/dtype/别名校验）与
+  `ninfer_tool_call_constraint_test`（CPU；惰性触发、只许已声明名、多 token 名字、完整名后必须 `>`、参数名、自由值、
+  回到 Free、跨字面量 token、不可拼写名的回退、二次调用）**均通过**；`ninfer_tool_call_parser_test` 通过；
+  `ninfer_qwen3_5_frontend_test` 仍是上文 703–707 行记录的既有失败（与本改动无关）。
+- 未做：真实模型端到端（对照 Round 15 的 75 条探针）与 MTP 下的实测对照——需重启 `ninfer-serve` 后执行。
+- **修正（同日追加）**：约束表的行数是 tokenizer 的公开词表（`resources.public_token_count`），而 logits 域是**打包后**的
+  embedding 行数（本机 artifact `config.text.vocab_size` = 248320，公开域更小；`frontend/resources.cpp:12` 明确只要求
+  `count <= config.text.vocab_size`）。原先的一致性检查错误地要求两者**相等**，于是任何带 tools 的请求都 500
+  （`unknown: TP-2 tool-call constraint vocabulary does not match the logits domain`）。现改为掩码按 **logits 域**生成
+  （`build_mask(domain, mask)` / `build_mask_after(prefix, domain, mask)`），tokenizer 未定义的行一律置 0（排除）；
+  仅在「约束表 > logits 域」时报错，且错误信息带上两个数值。新增 packed-domain 单测覆盖该尾部。
+- **发现（未修，待决定）**：TP-2 核心有 4 处把**物理行数** `vocab` 当作有效域传入采样：`ops::sample`（prefill 首 token、
+  plain decode）、`ops::argmax`（MTP target）、`speculative_accept_greedy_drafts`（接受核）。而 `ops::sample` 的契约把
+  `physical_rows` 与 `token_domain` 分开校验、`argmax` 的参数名就是 `valid_rows`，单卡路径（`text.cpp:2279/2283`）与
+  `decode.cpp:258` 的有效域判断都用 `public_token_count`；1415 行那枚**计算了却从未使用**的 `public_tokens` 正是这个
+  意图的残留。故 TP-2 路径目前可以采到 `[public_token_count, vocab)` 的打包行（非法 id）。属既有缺陷、非本次改动引入。
+- 环境注记：DSH 沙箱处于 `workspace-write` 时 ninja **无法执行任何子进程**（连平凡工程都挂，`ninja -t/-n` 正常），
+  构建须在 `danger-full-access` 下进行；另外 `pwsh` 的后台作业若用 `Tee-Object` 把输出写进管道会因管道写满而在中途卡死。
+
 ---
 
 ### Round 16 — TP-2 host 侧状态检查点 + 短 prompt 按 LCP 截断复用
 
-**状态**：已实现（`src/runtime/engine/tp2_generation_core.{h,cpp}`、`src/runtime/engine/model_instance.cpp`、
-`tests/test_engine_options.cpp`）；`ninfer_engine` 编译通过、新增的选项契约单测通过；**端到端验证待重新链接并重启服务**。
+**状态**：已实现并完成端到端验证（`src/runtime/engine/tp2_generation_core.{h,cpp}`、`src/runtime/engine/model_instance.cpp`、
+`tests/test_engine_options.cpp`）；`ninfer_engine` 编译通过、新增的选项契约单测通过；实测 `src=host` 命中（req#5 10.2 s → 1.3 s、req#11 37.6 s → 28.6 s，详见 worklog Round 16.3）。
 
 **问题（Round 15 后续实测）**：客户端在 turn 边界重渲染历史，新 prompt 比上一条**短**（实测 −219 / −1,233 /
 −15,888 token），分叉点落在历史中段。TP-2 核心只保留 2 个**显存**边界（上一条 prompt 末尾 + 一个 rewind 点），

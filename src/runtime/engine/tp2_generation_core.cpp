@@ -5,6 +5,7 @@
 #include "core/layout.h"
 #include "models/registry.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/frontend/tool_call_constraint.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "ninfer/ops/argmax.h"
@@ -12,6 +13,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/token_mask.h"
 
 #include <algorithm>
 #include <chrono>
@@ -913,6 +915,25 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     const std::int32_t hidden =
         qwen::execution::dimension(shard_a_.model->config().text.hidden_size);
 
+    // Constrained tool-call decoding. The declared-name grammar turns the tool-call region into a
+    // logit mask, so a name the request did not declare is unreachable at the sampling layer instead
+    // of being rejected after the fact. The mask is applied outside the captured verify graph, to
+    // the logits the graph hands back, so the graph itself is unchanged.
+    std::shared_ptr<qwen::frontend::ToolCallConstraint> tool_constraint;
+    if (data.tool_call_output != nullptr) {
+        tool_constraint = frontend_->make_tool_call_constraint(data.tool_call_output);
+    }
+    const bool tool_constrained = tool_constraint != nullptr;
+    // The logits domain is the packed embedding row count, which the artifact contract allows to be
+    // wider than the tokenizer public domain the constraint table covers; build_mask() excludes the
+    // rows in between. A table wider than the logits domain means the artifact and tokenizer disagree.
+    const std::size_t logits_domain = static_cast<std::size_t>(vocab);
+    if (tool_constrained && tool_constraint->vocab_size() > logits_domain) {
+        throw std::logic_error("TP-2 tool-call constraint vocabulary " +
+                               std::to_string(tool_constraint->vocab_size()) +
+                               " exceeds the logits domain " + std::to_string(logits_domain));
+    }
+
     GenerationResult result;
     result.prompt = request.summary;
     result.timings.prepare_seconds = request.prepare_seconds;
@@ -1117,6 +1138,34 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     Tensor logical_pos_b = ws_b.alloc(DType::I32, {1});
     (void)sampling_b;
     (void)logical_pos_b;
+
+    // Constrained-decoding scratch. The mask is computed on the host (declared-name trie over the
+    // decoded vocabulary pieces) and uploaded once per constrained step. The device buffer is
+    // allocated in the request scope, below every round watermark, so it cannot disturb a captured
+    // verify graph.
+    const std::int32_t constraint_columns = mtp_enabled_ ? mtp_drafts_ + 1 : 1;
+    Tensor tool_mask_dev;
+    std::vector<std::uint8_t> tool_mask_one;
+    std::vector<std::uint8_t> tool_mask_columns;
+    std::size_t constraint_fed = 0;
+    if (tool_constrained) {
+        tool_mask_dev = ws_a.alloc(DType::U8, {vocab, constraint_columns});
+        tool_mask_columns.resize(static_cast<std::size_t>(vocab) *
+                                 static_cast<std::size_t>(constraint_columns));
+    }
+    auto constraint_advance = [&]() {
+        if (!tool_constrained) { return; }
+        const std::string_view raw = request.output.raw_content_text();
+        if (raw.size() > constraint_fed) {
+            tool_constraint->feed(raw.substr(constraint_fed));
+            constraint_fed = raw.size();
+        }
+    };
+    // The mask binds only while the committed output is content: the tool parser reads no
+    // reasoning channel, so the grammar must not constrain the thinking phase either.
+    auto constraint_live = [&]() {
+        return tool_constrained && !request.output.in_reasoning();
+    };
 
     auto& ctx_a = *shard_a_.context;
     auto& ctx_b = *shard_b_.context;
@@ -1403,6 +1452,16 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             timing.record(2, shard_a_.device.stream);
             ops::set_i32_scalar(logical_pos_a, static_cast<std::int32_t>(position + 1),
                                 shard_a_.device.stream);
+            if (constraint_live()) {
+                constraint_advance();
+                if (tool_constraint->build_mask(logits_domain, tool_mask_one)) {
+                    shard_a_.device.bind_to_current_thread();
+                    CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_one.data(),
+                                               tool_mask_one.size(), cudaMemcpyHostToDevice,
+                                               shard_a_.device.stream));
+                    ops::apply_token_mask(logits_a, tool_mask_dev, shard_a_.device.stream);
+                }
+            }
             Tensor sampled_a = ws_a.alloc(DType::I32, {1});
             ops::sample(logits_a, sampled_a, vocab, sampling_a, logical_pos_a,
                         ops::kSamplePurposeDecode, ws_a, shard_a_.device.stream);
@@ -1486,11 +1545,42 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             run_verify_window(window_ids, static_cast<std::int32_t>(mtp_position), window_logits,
                               round_hidden);
             timing.record(2, shard_a_.device.stream);
+            if (constraint_live()) {
+                constraint_advance();
+                // Column c is drawn after the draft columns before it, and those are exactly the
+                // columns a round commits before its first mismatch, so the position the mask is
+                // built from is the position that column is consumed at.
+                std::fill(tool_mask_columns.begin(), tool_mask_columns.end(), std::uint8_t{1});
+                bool masked = false;
+                std::string drafted_prefix;
+                for (std::int32_t column = 0; column < width; ++column) {
+                    if (tool_constraint->build_mask_after(drafted_prefix, logits_domain,
+                                                       tool_mask_one)) {
+                        const std::size_t base =
+                            static_cast<std::size_t>(column) * static_cast<std::size_t>(vocab);
+                        std::copy(tool_mask_one.begin(), tool_mask_one.end(),
+                                  tool_mask_columns.begin() +
+                                      static_cast<std::ptrdiff_t>(base));
+                        masked = true;
+                    }
+                    if (column + 1 < width) {
+                        drafted_prefix.append(tool_constraint->piece(
+                            static_cast<std::size_t>(window_ids[column + 1])));
+                    }
+                }
+                if (masked) {
+                    shard_a_.device.bind_to_current_thread();
+                    CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_columns.data(),
+                                               tool_mask_columns.size(), cudaMemcpyHostToDevice,
+                                               shard_a_.device.stream));
+                    ops::apply_token_mask(window_logits, tool_mask_dev, shard_a_.device.stream);
+                }
+            }
             ops::argmax(window_logits, target_tokens, vocab, shard_a_.device.stream);
             ops::speculative_accept_greedy_drafts(
                 target_tokens, window_logits, window_drafts, current_extents, round_lengths,
-                round_anchors, licensed, licensed_counts, accepted, vocab, sampling_a, ws_a,
-                shard_a_.device.stream);
+                round_anchors, licensed, licensed_counts, accepted, vocab, sampling_a,
+                ws_a, shard_a_.device.stream);
             timing.record(3, shard_a_.device.stream);
             std::vector<TokenId> licensed_host(static_cast<std::size_t>(width), 0);
             std::int32_t licensed_count = 0;

@@ -12,6 +12,15 @@
 
 namespace ninfer::models::qwen3_5::frontend {
 
+// Qwen tool-call framing. The post-hoc parser, the incremental output decoder, and the constrained
+// decoder all match these exact bytes.
+inline constexpr std::string_view kToolOpen      = "<tool_call>";
+inline constexpr std::string_view kToolClose     = "</tool_call>";
+inline constexpr std::string_view kFunctionOpen  = "<function=";
+inline constexpr std::string_view kFunctionClose = "</function>";
+inline constexpr std::string_view kParamOpen     = "<parameter=";
+inline constexpr std::string_view kParamClose    = "</parameter>";
+
 // Qwen's tool syntax carries each argument as untyped text. This terminal contract records only
 // the supported top-level JSON Schema types needed to normalize that text. A type mismatch remains
 // a structured call for consumer validation; recursive validation is outside this non-strict

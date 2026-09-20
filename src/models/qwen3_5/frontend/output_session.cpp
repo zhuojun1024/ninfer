@@ -366,6 +366,10 @@ public:
     fi::ToolCallOutputDecoder tool_call_output;
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
+    // Raw content-channel bytes committed so far, including the tool-call region the incremental
+    // tool decoder buffers away. The constrained decoder needs the same byte stream the parser
+    // matches, so it is accumulated before that decoder consumes each delta.
+    std::string raw_content;
     bool preview_ready = false;
 };
 
@@ -632,6 +636,7 @@ PublishedOutput OutputSession::commit_preview() {
 
     for (OutputDelta& delta : output) {
         if (delta.channel == OutputChannel::Content) {
+            impl_->raw_content.append(delta.text);
             delta.text = impl_->tool_call_output.feed(delta.text);
         }
     }
@@ -653,6 +658,14 @@ PublishedOutput OutputSession::commit_preview() {
         }
     }
     return output;
+}
+
+std::string_view OutputSession::raw_content_text() const noexcept {
+    return impl_ != nullptr ? std::string_view(impl_->raw_content) : std::string_view{};
+}
+
+bool OutputSession::in_reasoning() const noexcept {
+    return impl_ != nullptr && impl_->state.in_reasoning;
 }
 
 std::vector<GeneratedToolCall> OutputSession::take_tool_calls() noexcept {

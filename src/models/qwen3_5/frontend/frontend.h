@@ -26,6 +26,11 @@ struct FrontendOptions {
     std::uint32_t media_preprocess_threads = 0;
 };
 
+namespace frontend {
+struct ToolCallOutputContract;
+class ToolCallConstraint;
+} // namespace frontend
+
 struct FrontendResources;
 struct PreparedPromptData;
 class Frontend;
@@ -76,6 +81,11 @@ public:
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
                         const OutputOptions& output            = {},
                         const ThinkingControlOptions& thinking = {}) const;
+    // Builds the constrained-decoding state for a request whose prompt carries a terminal
+    // tool-call contract. Empty when the request declares no tools or does not enforce them.
+    [[nodiscard]] std::shared_ptr<frontend::ToolCallConstraint> make_tool_call_constraint(
+        const std::shared_ptr<const frontend::ToolCallOutputContract>& contract) const;
+
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
 

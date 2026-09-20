@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::models::qwen3_5 {
@@ -73,6 +74,14 @@ public:
     void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview();
+    // Raw content-channel bytes committed so far, in order, including the tool-call region that the
+    // incremental tool decoder buffers out of the published content. Constrained decoding consumes
+    // this exact stream so its position always matches the parser is.
+    [[nodiscard]] std::string_view raw_content_text() const noexcept;
+    // True while the committed output is still inside the reasoning channel. The constrained
+    // decoder stays inactive there, matching the parser, which only reads content.
+    [[nodiscard]] bool in_reasoning() const noexcept;
+
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;

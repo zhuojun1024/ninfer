@@ -17,13 +17,6 @@ using NormalizationPolicy = Contract::NormalizationPolicy;
 using SchemaType          = Contract::SchemaType;
 using TypeSet             = Contract::TypeSet;
 
-constexpr std::string_view kToolOpen      = "<tool_call>";
-constexpr std::string_view kToolClose     = "</tool_call>";
-constexpr std::string_view kFunctionOpen  = "<function=";
-constexpr std::string_view kFunctionClose = "</function>";
-constexpr std::string_view kParamOpen     = "<parameter=";
-constexpr std::string_view kParamClose    = "</parameter>";
-
 struct RawParameter {
     std::string_view name;
     std::string_view value;
