@@ -1860,3 +1860,74 @@ finalize kernel 都 `atomicAdd`）与 `speculative_accept_greedy_drafts` 自行�
 - 编译前必须 `. ./tools/win_port/vcvars.ps1`；跑测试需要把 FFmpeg / curl 的 DLL 目录加进 `PATH`，否则加载器报
   `0xC0000135`。
 - 端口：历史问题见 Round 16.3 末尾（脚本 `$Port` 与客户端 `.dsh/settings.yaml` 必须同步）；本轮实测服务端为 3456。
+
+## Round 16b — 新会话分叉锚点：把分叉位置存进 host ring（Round 14 ① 遗留项已修）
+
+Round 14 ① 记的那笔浪费在 Round 16 落地 host ring 之后**并没有消失**。Round 16 的 ring 是两个子环：位置网格
+（`grid_slots` 个槽，步长 `max(8192, ceil(max_context/grid_slots))`，保证覆盖整个上下文）和尾部锚点
+（`kReuseTailWindow` = 8192 内的 chunk 前沿）。而**实际启动没有传 `--host-state-slots`**（`tools/win_port/serve.ps1`
+不含该选项），故取默认 8 ⇒ `tail=4, grid=4` ⇒ `stride = max(8192, ceil(131072/4)) = 32768`。新会话只共享
+system+tools（~14.8k），**落在第一个网格点之前**；被继承 prompt 的尾部锚点全在它的末尾（~106k），按 pruning 规则
+（`position > shared_prefix` 即失效）全部作废 ⇒ `reuse=0`，全量重算。
+
+### 改动
+
+新增第三个子环 `divergence`（`kReuseDivergenceCheckpointCount = 1`），**加在 `--host-state-slots` 预算之外**
+（每 shard +73.4 MiB pinned host；若从 grid 里抠槽，小 ring 会把 stride 从 32768 推粗到 43776，反而伤到"深处分叉"
+那个场景）。prefill 走查时若 `shared_prefix` 严格落在本次走查区间内，就把 chunk 截断到该位置并 D2H 冻结一份状态；
+下次渲染同一稳定块的请求即从该处重启。命中判据复用现有扫描，未新增路径。
+
+同一次改动还修了 `snapshot_host_checkpoint` 的一个既有缺陷：原实现只覆写 `position`/`prefill_id` 就发起 memcpy，
+而末尾的 publish 扫描只在走查正常结束时才跑；若 prefill 中途抛异常，该槽会保留**上一次 prefill 的 `valid=true`**
+配上新 `position` 和可能撕裂的 buffer，后续请求会据此恢复一份错误状态。现在写入前先 `valid = false`。
+
+### 关键修正：锚点不能落在观测到的分叉点上
+
+第一版直接实测失败：
+
+```
+B: prompt=35361 cached=35463 shared=17457 host=1/9 -> reuse=47  slot=8 src=host
+C: prompt=17472 cached=35361 shared=17456 host=0/9 -> reuse=0   slot=0 src=device
+```
+
+B 把锚点写在 17457，而 C 与 B 的 shared prefix 是 17456 —— **差一个 token**。"首个不同 token 的下标"取决于稳定块
+末尾那个跨界 token 吸收了多少后续字符，而该 pair 的后续文本不同。锚点落在分叉点上时，下一次 pruning 会把它直接
+杀掉（`host=0/9`）。改为锚定在分叉点前 `kReuseDivergenceMargin = 8` 个 token：代价是 8 个 token 的重算（~5 ms），
+换来整段前缀不丢。
+
+### 实测（原生 Windows，`--max-context 131072`，默认 `--host-state-slots`）
+
+场景几何刻意贴近真实部署：A = nonce + HEAD(~17.5k) + tailA(~17.5k)，B = 同 nonce + HEAD + tailB，C = 同 nonce +
+HEAD + 短尾。HEAD 末尾距 B 的末尾 ~17.5k token，**远超尾部窗口（4096）**，所以尾部锚点够不着。
+
+| 请求 | prompt_n | cache_n | prompt_ms |
+|---|---|---|---|
+| A_long | 35421 | 44 | 23774 |
+| B_deep | 35363 | 0 | 23401 |
+| C_short | 23 | **17451** | **71.8** |
+
+服务端追踪（`NINFER_TP2_REUSE_TRACE=1`）：
+
+```
+B: prompt=35363 cached=35465 shared=17459 ... host=0/9 stride=32768 -> reuse=0     slot=0 src=device
+C: prompt=17474 cached=35363 shared=17458 ... host=1/9 stride=32768 -> reuse=17451 slot=8 src=host
+```
+
+C 命中的是 `slot=8`，即 **divergence 子环**（grid 0-3、tail 4-7、divergence 8），不是尾部分窗；且 C 的 shared
+(17458) 比 B 的 (17459) 少一个 token，那次漂移正被 8 token 余量吸收。B 付全量 35,363 token / 23.4 s（即改动前每个
+新会话的代价），C 只走 23 token / 71.8 ms。启动账本：
+
+```
+[mem] host-checkpoints shard 0 slots 9 (grid 4 + tail 4 + divergence 1) x 73.4 MiB | stride 32768 tok | pinned 660.7 MiB
+```
+
+**收益**：同一稳定块的第 2 个及以后的新会话各省 ~10.8 s。第一个分叉请求无法受益——它的分叉点在走查前不可知，
+锚点是它自己写下的。
+
+### 验证与遗留
+
+- 改动的 TU 单独编译通过（`ninja -C build-win src/runtime/CMakeFiles/ninfer_engine.dir/engine/tp2_generation_core.cpp.obj`），
+  全量 `ninja ninfer-serve` 链接通过。
+- 端到端如上表；服务端追踪 + 启动账本双重佐证，无需对比旧二进制。
+- TP-2 的 ring **仍无自动化测试覆盖**：`test_tp2_forward` 只测 `forward_tp2`，不构造 `TP2GenerationCore`。
+  要覆盖它需要真工件 + 双卡，故本轮仍以端到端实测为准。

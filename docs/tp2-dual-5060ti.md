@@ -53,7 +53,12 @@ use `temperature 0` per request and the response's `usage` token counts, one req
   split halves each shard's proposal-head read and lets both shards draft in parallel.
 - **Prefix reuse**: repeating an identical 16,057-token prompt returned in 0.30 s (0.33 s for the
   65k-token one) against 10.11 s / 48.1 s fresh, so one rewind snapshot behind the prefill end covers
-  the chat-turn pattern (see Resident memory).
+  the chat-turn pattern (see Resident memory). A prompt that shares only the client's stable system
+  prompt and tool definitions with the conversation before it -- a new session, or the first request
+  after a context compression -- is covered too: the core freezes that divergence in the host ring, so
+  the next such prompt reuses the whole stable block instead of restarting from zero. With a
+  20k-token stable block and a 35k-token predecessor, the first divergent prompt walked 35,363 tokens
+  in 23.4 s, and the one after it reused 17,451 and walked 23 tokens in 71.8 ms.
 - **Concurrency**: two simultaneous streaming requests both completed (24 and 27 chunks, 1.99 s).
 
 The startup after CUDA-graph capture is a one-off 14.4 s on this configuration; it is outside the

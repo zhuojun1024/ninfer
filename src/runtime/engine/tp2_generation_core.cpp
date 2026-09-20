@@ -173,6 +173,23 @@ constexpr std::uint32_t kReuseTailWindow = 8192;
 // ring with them (each prefill leaves up to one per chunk) and evicts the position grid, which is
 // exactly the coverage a divergence deep inside the history needs.
 constexpr std::uint32_t kReuseTailCheckpointCount = 8;
+// Host ring slots reserved for the divergence anchor: the position where the last prefill's prompt
+// stopped matching the lineage it inherited. A new session - and a context compression - shares only
+// the client's stable system prompt and tool definitions with the conversation before it, so its
+// divergence lands well inside the previous prompt. Neither other group reaches there: the position
+// grid's first checkpoint sits a whole stride in, and a small ring widens that stride to tens of
+// thousands of tokens; the tail anchors sit at the opposite end. One slot is enough because a client
+// renders its stable prefix once, and because the ring prunes on a single lineage: a checkpoint past
+// the newest shared prefix is dead for good, so a second slot could never hold a rival prefix.
+constexpr std::uint32_t kReuseDivergenceCheckpointCount = 1;
+// How far before the observed divergence the anchor is placed. A shared prefix is only reusable
+// while every later prompt agrees on every token before it, and the index where two prompts first
+// differ is where the tokenizer stopped emitting the same ids - the token that straddles the stable
+// block's end absorbs a different amount of what follows it in each pair. The next request that
+// renders the same block can therefore report a shared prefix one or two tokens shorter than the one
+// that froze the anchor, and the prune above would then discard it. The margin trades single-digit
+// tokens of recompute for keeping the whole prefix.
+constexpr std::uint32_t kReuseDivergenceMargin = 8;
 
 std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
     return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -288,6 +305,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         if (host_slots != 0) {
             host_checkpoint_tail_slots_ =
                 std::max(1U, std::min(kReuseTailCheckpointCount, host_slots / 2U));
+            host_checkpoint_divergence_slots_ = kReuseDivergenceCheckpointCount;
             const std::uint32_t grid_slots =
                 std::max(1U, host_slots - host_checkpoint_tail_slots_);
             const std::uint32_t per_slot = (options_.max_context + grid_slots - 1U) / grid_slots;
@@ -466,8 +484,11 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         // Portable pinned memory, like the MTP verify window: every checkpoint is read and written
         // through this shard's own device, but a portable allocation keeps that true if the
         // execution context ever binds the peer first.
-        const std::uint32_t slots         = options_.context_cache.host_state_slots;
-        shard.host_checkpoint_grid_slots  = slots - host_checkpoint_tail_slots_;
+        const std::uint32_t slots = options_.context_cache.host_state_slots +
+                                    host_checkpoint_divergence_slots_;
+
+        shard.host_checkpoint_grid_slots = options_.context_cache.host_state_slots -
+                                           host_checkpoint_tail_slots_;
         shard.host_checkpoints.reserve(slots);
         for (std::uint32_t index = 0; index < slots; ++index) {
             Shard::HostCheckpoint checkpoint;
@@ -591,10 +612,11 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                      static_cast<double>(total_bytes) / 1048576.0);
         if (!shard.host_checkpoints.empty()) {
             std::fprintf(stderr,
-                         "[mem] host-checkpoints shard %d slots %zu (grid %zu + tail %u) x %.1f "
-                         "MiB | stride %u tok | pinned %.1f MiB\n",
+                         "[mem] host-checkpoints shard %d slots %zu (grid %zu + tail %u + "
+                         "divergence %u) x %.1f MiB | stride %u tok | pinned %.1f MiB\n",
                          shard_index, shard.host_checkpoints.size(),
                          shard.host_checkpoint_grid_slots, host_checkpoint_tail_slots_,
+                         host_checkpoint_divergence_slots_,
                          static_cast<double>(shard.state_backing.bytes) / 1048576.0,
                          host_checkpoint_stride_,
                          static_cast<double>(shard.state_backing.bytes *
@@ -1333,20 +1355,45 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     // stream, so it sees exactly the tokens the enclosing loop has enqueued and none of the later
     // ones, and the ring slot it lands in is only revisited by a later prefill's checkpoint at the
     // same index.
-    auto snapshot_host_checkpoint = [&](Shard& shard, std::uint32_t frontier, bool tail) {
+    // Which reserved group of the ring a checkpoint lands in. The grid and the tail anchors rotate
+    // through their own slots; the divergence anchor owns a single slot and is rewritten in place,
+    // so it advances no cursor and neither rotation can evict it.
+    enum class HostRing { Grid, Tail, Divergence };
+    auto snapshot_host_checkpoint = [&](Shard& shard, std::uint32_t frontier, HostRing ring) {
         if (shard.host_checkpoints.empty()) { return; }
-        const std::size_t begin = tail ? shard.host_checkpoint_grid_slots : 0;
-        const std::size_t count = tail ? shard.host_checkpoints.size() - begin : begin;
-        if (count == 0) { return; }
+        const std::size_t grid = shard.host_checkpoint_grid_slots;
+        const std::size_t tail = host_checkpoint_tail_slots_;
+        std::size_t begin      = 0;
+        std::size_t count      = grid;
+        switch (ring) {
+            case HostRing::Grid: break;
+            case HostRing::Tail: begin = grid; count = tail; break;
+            case HostRing::Divergence:
+                begin = grid + tail;
+                count = host_checkpoint_divergence_slots_;
+                break;
+        }
+        if (count == 0 || begin + count > shard.host_checkpoints.size()) { return; }
+        const std::size_t index = ring == HostRing::Tail   ? shard.host_checkpoint_tail_next
+                                  : ring == HostRing::Grid ? shard.host_checkpoint_next
+                                                           : 0;
         shard.device.bind_to_current_thread();
-        std::size_t& cursor = tail ? shard.host_checkpoint_tail_next : shard.host_checkpoint_next;
-        Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[begin + cursor];
+        Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[begin + index];
+        // Overwriting the slot already destroys the checkpoint it held, so retire it before the copy
+        // is enqueued: a prefill that throws between here and the publish sweep must not leave a
+        // torn buffer behind a flag that still says the last completed prefill wrote it. Only the
+        // sweep below, which runs after the walk finished, makes a checkpoint usable again.
+        checkpoint.valid      = false;
         checkpoint.position   = frontier;
         checkpoint.prefill_id = host_checkpoint_live_id_;
         CUDA_CHECK(cudaMemcpyAsync(checkpoint.buffer->data(), shard.state_backing.data,
                                    shard.state_backing.bytes, cudaMemcpyDeviceToHost,
                                    shard.device.stream));
-        cursor = (cursor + 1) % count;
+        if (ring == HostRing::Tail) {
+            shard.host_checkpoint_tail_next = (index + 1) % count;
+        } else if (ring == HostRing::Grid) {
+            shard.host_checkpoint_next = (index + 1) % count;
+        }
     };
 
     // Prefill: batched forwards over chunk-sized slices of the prompt suffix, accumulating KV and
@@ -1383,6 +1430,29 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             snapshot_state(shard_b_, slot);
         }
     }
+    // Divergence anchor. shared_prefix is where this prompt stopped matching the lineage it
+    // inherited, and the next new session - or the next context compression - renders the same stable
+    // block and diverges in the same place, so it is the one position a later request is already
+    // known to want. Freezing the state there lets that request restart on the boundary instead of at
+    // the grid point behind it. The anchor sits kReuseDivergenceMargin tokens *before* the observed
+    // divergence rather than on it: the next pair can report a shared prefix a token or two shorter,
+    // and an anchor on the exact index would be pruned before it could ever be used. Only a frontier
+    // strictly inside this walk is worth freezing: at or below reuse the walk's own starting state is
+    // already checkpointed, and at the prompt end the device snapshot holds it. A checkpoint that
+    // already sits there stays untouched, which is what keeps a reused stable prefix free of work.
+    const auto has_valid_host_checkpoint_at = [](const Shard& shard, std::uint32_t position) {
+        for (const auto& checkpoint : shard.host_checkpoints) {
+            if (checkpoint.valid && checkpoint.position == position) { return true; }
+        }
+        return false;
+    };
+    const std::uint32_t anchor_position = shared_prefix > kReuseDivergenceMargin
+                                              ? shared_prefix - kReuseDivergenceMargin
+                                              : shared_prefix;
+    const bool anchor_divergence = host_checkpoint_stride_ != 0 && anchor_position > reuse &&
+                                   anchor_position < prompt_tokens &&
+                                   !has_valid_host_checkpoint_at(shard_a_, anchor_position) &&
+                                   !has_valid_host_checkpoint_at(shard_b_, anchor_position);
     for (std::uint32_t t0 = reuse; t0 < prompt_tokens;) {
         if (cancellation.requested()) {
             // The walk wrote KV of a prompt this request never finished, so the device cache no
@@ -1419,6 +1489,9 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
         for (std::size_t slot = 1; slot < kReuseSnapshotCount; ++slot) {
             const std::uint32_t target = snapshot_at[slot];
             if (target > t0 && target < t0 + length) { length = target - t0; }
+        }
+        if (anchor_divergence && anchor_position > t0 && anchor_position < t0 + length) {
+            length = anchor_position - t0;
         }
         qwen::execution::Tp2VisionChunk media_chunk;
         const qwen::execution::Tp2VisionChunk* media_ptr = nullptr;
@@ -1465,13 +1538,17 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             const bool in_tail           = frontier != prompt_tokens &&
                                  static_cast<std::uint64_t>(frontier) + tail_span > prompt_tokens;
             if (on_grid) {
-                snapshot_host_checkpoint(shard_a_, frontier, false);
-                snapshot_host_checkpoint(shard_b_, frontier, false);
+                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Grid);
+                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Grid);
                 next_host_checkpoint =
                     (frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
             } else if (in_tail) {
-                snapshot_host_checkpoint(shard_a_, frontier, true);
-                snapshot_host_checkpoint(shard_b_, frontier, true);
+                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Tail);
+                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Tail);
+            }
+            if (anchor_divergence && frontier == anchor_position) {
+                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Divergence);
+                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Divergence);
             }
         }
         if (t0 + length == prompt_tokens) {

@@ -291,6 +291,11 @@ private:
     std::uint32_t host_checkpoint_tail_slots_ = 0;
     std::uint64_t host_checkpoint_live_id_    = 0;
     std::uint64_t host_checkpoint_next_id_    = 1;
+    // Slots appended to the end of every shard's ring for the divergence anchor. They sit outside
+    // the configured --host-state-slots budget: the anchor answers a different question than the
+    // position grid, and carving them out of the grid would coarsen the stride that covers the
+    // whole context. They cost pinned host memory only.
+    std::uint32_t host_checkpoint_divergence_slots_ = 0;
     // Set by the reuse scan when the winning boundary is a host checkpoint rather than a device
     // snapshot, so the state restore knows which memory it copies from.
     bool reuse_from_host_ = false;
