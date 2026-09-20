@@ -1093,6 +1093,18 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     Tp2RoundTiming& timing = tp2_timing();
     timing.init();
     timing.reset();
+    // Prefill-stage split, reported under NINFER_TP2_TIMING. The stages are separated by device
+    // synchronizations so a host-side segment cannot hide device work, which perturbs the absolute
+    // numbers a little; this is a diagnostic mode, not a measurement of the production path.
+    const bool prefill_trace = [] {
+        const char* env = std::getenv("NINFER_TP2_TIMING");
+        return env != nullptr && env[0] == '1';
+    }();
+    std::uint32_t prefill_chunks      = 0;
+    std::uint64_t prefill_host_writes = 0;
+    Clock::time_point scan_done       = start;
+    Clock::time_point state_done      = start;
+    Clock::time_point walk_done       = start;
 
     // Prompt-prefix reuse. The KV pages hold the K/V of every position the last completed prefill
     // wrote, and the state snapshots hold the matching GDN states, so a prompt that extends the
@@ -1157,6 +1169,7 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
             rewind_near_ = std::clamp(gap + 2, kReuseRewindMinimum, kReuseRewindMaximum);
         }
     }
+    if (prefill_trace) { scan_done = Clock::now(); }
     if (reuse_trace) {
         std::size_t valid_checkpoints = 0;
         for (const auto& checkpoint : shard_a_.host_checkpoints) {
@@ -1260,6 +1273,11 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     };
     begin_gdn_state(shard_a_);
     begin_gdn_state(shard_b_);
+    if (prefill_trace) {
+        CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
+        state_done = Clock::now();
+    }
 
     if (streaming) {
         sink->start(GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
@@ -1361,6 +1379,7 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     enum class HostRing { Grid, Tail, Divergence };
     auto snapshot_host_checkpoint = [&](Shard& shard, std::uint32_t frontier, HostRing ring) {
         if (shard.host_checkpoints.empty()) { return; }
+        ++prefill_host_writes;
         const std::size_t grid = shard.host_checkpoint_grid_slots;
         const std::size_t tail = host_checkpoint_tail_slots_;
         std::size_t begin      = 0;
@@ -1572,7 +1591,13 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                                     &sampled_a, true);
             }
         }
+        ++prefill_chunks;
         t0 += length;
+    }
+    if (prefill_trace) {
+        CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
+        walk_done = Clock::now();
     }
     computed_prefill_tokens_ += prompt_tokens - reuse;
     if (vision_session) {
@@ -1602,6 +1627,20 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                 if (checkpoint.prefill_id == host_checkpoint_live_id_) { checkpoint.valid = true; }
             }
         }
+    }
+
+    if (prefill_trace) {
+        const auto millis = [](Clock::time_point from, Clock::time_point to) {
+            return std::chrono::duration<double, std::milli>(to - from).count();
+        };
+        const Clock::time_point report = Clock::now();
+        std::fprintf(stderr,
+                     "[tp2-prefill] reuse=%u suffix=%u chunks=%u host_writes=%llu | scan=%.2f "
+                     "state=%.2f walk=%.2f post=%.2f total=%.2f ms\n",
+                     reuse, prompt_tokens - reuse, prefill_chunks,
+                     static_cast<unsigned long long>(prefill_host_writes), millis(start, scan_done),
+                     millis(scan_done, state_done), millis(state_done, walk_done),
+                     millis(walk_done, report), millis(start, report));
     }
 
     // Prompt wall time spans prefill and the first-sample step: the first accepted token is
