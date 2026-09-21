@@ -194,8 +194,8 @@ system prompt 强制淘汰）：默认输出 `host KV arena shard 0/1: 2048.0 Mi
 
 **前置**
 
-- [ ] 处理工作树未提交改动（Round 18 会话恢复加固：`tp2_generation_core.{h,cpp}`、
-      `test_tp2_sessions.cpp`，已实测未提交）——提交或 stash
+- [x] 处理工作树未提交改动（Round 18 会话恢复加固：`tp2_generation_core.{h,cpp}`、
+      `test_tp2_sessions.cpp`，已实测未提交）——已由 `4890f554`（代码）与 `ad1336a1`（文档）提交
 - [ ] 记录基线：`tools/win_port/bench_serve.ps1` decode/prefill + op 级 NVFP4 bench
       （WSL，a4 graph 模式，T=1024/1536/2048）
 
