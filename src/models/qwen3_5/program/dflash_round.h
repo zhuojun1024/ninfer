@@ -104,6 +104,21 @@ public:
     [[nodiscard]] std::size_t context_bytes() const noexcept { return context_bytes_; }
     [[nodiscard]] std::size_t ring_payload_bytes() const noexcept { return ring_payload_bytes_; }
     [[nodiscard]] std::size_t frame_bytes() const noexcept { return frame_bytes_; }
+
+    // --- persistent context image (checkpoint / retention) ---
+    // The draft's context is the projected target residual, so it is not a function of the target KV
+    // or GDN state and nothing recomputes it without the target forward that produced it. A host
+    // checkpoint, a device snapshot and a session slab therefore carry these bytes beside the target
+    // state image they pair with, and restore them together. The payload is the one resident lane's
+    // local K/V ring, layer-major K then V exactly like the single-device host layout
+    // (state/state_image.cpp); the absolute token frontier it reaches is a scalar the caller keeps
+    // beside the image, because the ring's coverage is [frontier - window, frontier) and no byte of
+    // the payload encodes it.
+    [[nodiscard]] std::size_t context_image_bytes() const noexcept { return ring_payload_bytes_; }
+    void copy_context_to_host(std::byte* destination, cudaStream_t stream) const;
+    void copy_context_from_host(const std::byte* source, cudaStream_t stream);
+    void copy_context_to_device(DeviceSpan destination, cudaStream_t stream) const;
+    void copy_context_from_device(DeviceSpan source, cudaStream_t stream);
     [[nodiscard]] std::size_t proposal_workspace_capacity() const noexcept;
     [[nodiscard]] std::size_t proposal_workspace_peak() const noexcept;
     void reset_proposal_workspace_peak() noexcept;

@@ -102,9 +102,15 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         if (options.speculative.backend == SpeculativeBackend::DFlash) {
             throw std::invalid_argument("TP-2 generation supports --spec mtp or --spec dflash2 only");
         }
-        // The DFlash2 draft ring is not part of any session or checkpoint image yet (stage B6), so
-        // the core refuses prefix reuse and cross-session retention itself; a request that reached
-        // either would verify against a draft context describing the wrong positions.
+        // Stage B6 does carry the DFlash2 draft ring through the core's prefix-reuse checkpoints,
+        // device snapshots and cross-session slabs, but the cross-session retention property it was
+        // meant to re-enable does not hold for this route yet: a prompt-end recall (a boundary that
+        // is not a multiple of the prefill chunk) forwards a suffix of a different width than a
+        // from-scratch walk, and the masked-draft window's fp8 target logits then flip a near tie in
+        // the session test's prompts, so the recalled answer diverges from the from-scratch answer.
+        // The route therefore keeps the stage-B5 retention disablement below; the draft images it
+        // still carries make the device snapshot and host checkpoint paths correct for a route that
+        // does not reach the session slabs. See PLAN.md section 3.6, "B6 result".
         if (options.speculative.backend == SpeculativeBackend::DFlash2) {
             options.context_cache.enabled = false;
             options.context_cache.host_state_slots = 0;

@@ -142,6 +142,11 @@ private:
         // (--host-state-slots) and costs no device memory.
         struct HostCheckpoint {
             std::unique_ptr<PinnedHostBuffer> buffer;
+            // The masked draft's context at the same frontier, on the shard that owns the draft
+            // (shard 0). The draft cannot be recomputed from the target state, so a checkpoint that
+            // carries only the GDN image would leave the draft context describing the wrong tokens.
+            std::unique_ptr<PinnedHostBuffer> dflash_buffer;
+            std::uint32_t dflash_frontier = 0;
             std::uint32_t position   = 0;
             // The prefill that wrote this checkpoint. A prefill that never completed (cancelled)
             // leaves its slots invalid instead of usable state.
@@ -191,6 +196,12 @@ private:
         // proposal workspace of its own (program/dflash_round.h). Shard 1 holds no draft weights
         // and builds none of this.
         std::unique_ptr<models::qwen3_5::execution::DFlash2Round> dflash_round;
+        // The draft context at the reuse boundaries the GDN snapshots freeze: slot 0 is the prefill
+        // end and slot 1 the rewind behind it (the round-scratch slot 2 is not paired - the verify
+        // never advances the draft ring). The draft cannot be recomputed from the target state, so a
+        // boundary that cannot restore these bytes cannot be offered for reuse.
+        std::array<DeviceSpan, kReuseSnapshotCount> dflash_snapshots{};
+        std::unique_ptr<DeviceArena> dflash_snapshot_arena;
     };
 
     // Cross-session KV retention. Exactly one session's KV and GDN state live in the device pools,
@@ -219,6 +230,14 @@ private:
         // reachable. A slab is sized to the frontier that was evicted, never to max_context.
         std::array<std::unique_ptr<HostKVAllocation>, 2> host_kv;
         std::array<std::unique_ptr<PinnedHostBuffer>, 2> host_state;
+        // The masked draft's context image paired with each of the three target state images above,
+        // on the shard that owns the draft (shard 0; shard 1 stays empty). A recall restores the
+        // draft ring together with the target state it belongs to, because the skipped prefix
+        // produces no target residual and nothing else can rebuild it. The counterpart frontier is
+        // the boundary the recall restores to, so no separate field is needed.
+        std::array<std::unique_ptr<PinnedHostBuffer>, 2> host_dflash;
+        std::array<std::unique_ptr<PinnedHostBuffer>, 2> host_dflash_prompt;
+        std::array<std::unique_ptr<PinnedHostBuffer>, 2> host_dflash_shared;
         std::array<std::unique_ptr<PinnedHostBuffer>, 2> host_prompt_state;
         // The state at the deepest position another conversation was seen to diverge from this one.
         // A position's state is a function of the tokens before it and this entry's slab carries the
@@ -268,6 +287,14 @@ private:
     // before.
     [[nodiscard]] std::optional<models::qwen3_5::execution::DFlashFeatureSink>
     make_dflash_prefill_sink(Shard& shard);
+
+    // The masked draft's context image, on the shard that owns the draft; a no-op on shard 1 and on
+    // every backend other than DFlash2. The device slot pairs with state_snapshots[slot] and the
+    // host image with a checkpoint or session slab, so the two are always copied and restored
+    // together with the target state at the same absolute frontier.
+    void store_dflash_image(Shard& shard, PinnedHostBuffer& image);
+    void load_dflash_image(Shard& shard, const PinnedHostBuffer& image);
+    void snapshot_dflash_state(Shard& shard, std::size_t slot);
 
     // The Engine routes TP-2 submissions from the calling (HTTP) thread, so this core owns
     // serialization: the shard state, the startup-materialized KV pages and the DevicePair belong
@@ -361,8 +388,11 @@ private:
     // Freezes the state at 'position' into an evicted entry's shared-prefix image. 'from_device'
     // takes it from the device pools, which still hold the state the walk is about to advance;
     // otherwise the two pointers are pinned host images to copy from.
+    // 'dflash_frozen', when non-null, is the masked draft's context image at the same boundary, on
+    // the shard that owns the draft; 'from_device' takes the live ring instead.
     void session_capture_shared_state(std::size_t index, std::uint32_t position, bool from_device,
-                                      const PinnedHostBuffer* const* frozen);
+                                      const PinnedHostBuffer* const* frozen,
+                                      const PinnedHostBuffer* dflash_frozen);
     // Copies the resident session into its host slabs. Returns false when the host budget cannot
     // hold it, in which case the entry is dropped instead: the next prefill overwrites the device
     // pools, and an entry must never claim state that no longer exists.

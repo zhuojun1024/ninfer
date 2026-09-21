@@ -27,9 +27,13 @@
 // A conversation that shares no tokens with the resident one is a switch even when nothing else can
 // serve it, so these scenarios also pin down what a switch costs when the host slabs are unusable.
 //
-// The scenario runs twice: on the plain route and with MTP enabled, because the MTP layer keeps
-// its own KV slab on shard 0 and that slab travels through the same eviction transaction. The
-// oracle in each round uses the same speculative configuration with retention disabled.
+// The scenario runs on three routes: plain, MTP and DFlash2. MTP keeps its own KV slab on shard 0
+// and DFlash2 keeps its masked draft's local context ring there; both travel through the same
+// eviction transaction and the same prefix-reuse checkpoints. The default set is plain and MTP;
+// DFlash2 runs only when NINFER_TEST_ROUTE names it, because its masked-draft window's fp8 logits
+// diverge from a from-scratch walk at near ties even though the recalled state is carried exactly
+// (PLAN.md section 3.6, "B6 result"). The oracle in each round uses the same speculative
+// configuration with retention disabled.
 //
 // The artifact is selected with NINFER_TEST_ARTIFACT; two identical sm_120a devices are required.
 // Without either, the test skips with exit code 77.
@@ -82,8 +86,21 @@ std::pair<int, int> pick_devices() {
     return {-1, -1};
 }
 
+// The generation route one scenario runs on. The oracle of a route is the same route with
+// retention disabled, so a DFlash2 comparison is against a DFlash2 full prefill.
+enum class Route { Plain, Mtp, DFlash2 };
+
+const char* route_name(Route route) {
+    switch (route) {
+    case Route::Plain: return "plain";
+    case Route::Mtp: return "mtp";
+    case Route::DFlash2: return "dflash2";
+    }
+    return "unknown";
+}
+
 ninfer::EngineOptions engine_options(const char* artifact, int device_a, int device_b,
-                                     bool retention, bool mtp) {
+                                     bool retention, Route route) {
     ninfer::EngineOptions options;
     options.artifact_path                        = artifact;
     options.device                               = device_a;
@@ -96,13 +113,20 @@ ninfer::EngineOptions engine_options(const char* artifact, int device_a, int dev
     // reused and how far a recall has to re-prefill.
     options.max_concurrency                     = 1;
     options.max_pending_requests                = 1;
-    if (mtp) {
+    if (route == Route::Mtp) {
         options.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 2;
         // The server recipe runs MTP on fp8 KV, and this is the route the cross-session slabs
         // have to carry; bf16 KV with MTP never gets past its first prefill (see the note in
         // docs/tp2-dual-5060ti.md).
         options.kv_cache = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    }
+    if (route == Route::DFlash2) {
+        // The same fp8 KV recipe the server runs, and the full window the route is tuned with, so
+        // the draft's ring and pending staging take their real size through the slabs.
+        options.speculative.backend      = ninfer::SpeculativeBackend::DFlash2;
+        options.speculative.draft_tokens = 7;
+        options.kv_cache                 = ninfer::KvCacheStorage::Fp8E4M3Row256;
     }
     options.context_cache.host_kv_capacity_bytes = retention ? kHostKvBytes : 0;
     options.context_cache.max_private_continuations = retention ? kSessions : 1;
@@ -153,9 +177,20 @@ int fail(const std::string& label, const std::string& message) {
     return 1;
 }
 
+// Renders a token vector for a failure message, so a divergence reports where it starts instead of
+// only that it happened.
+std::string tokens_text(const std::vector<TokenId>& tokens) {
+    std::string text = "[";
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        if (index != 0) { text += " "; }
+        text += std::to_string(tokens[index]);
+    }
+    return text + "]";
+}
+
 // One full A/B/A/LRU scenario. Returns 0 on success, 1 on a failed assertion.
-int run_scenario(const char* artifact, int device_a, int device_b, bool mtp) {
-    const std::string label = mtp ? "mtp" : "plain";
+int run_scenario(const char* artifact, int device_a, int device_b, Route route) {
+    const std::string label = route_name(route);
 
     const std::vector<TokenId> opening    = make_prompt(1200, 64);
     const std::vector<TokenId> follow_up  = make_prompt(4000, 16);
@@ -204,7 +239,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, bool mtp) {
     std::vector<TokenId> shared_c_answer;
     std::vector<TokenId> interrupted_answer;
     {
-        ninfer::Engine oracle(engine_options(artifact, device_a, device_b, false, mtp));
+        ninfer::Engine oracle(engine_options(artifact, device_a, device_b, false, route));
         opening_answer = run(oracle, opening).generated_token_ids;
         std::vector<TokenId> continued = opening;
         append(continued, opening_answer);
@@ -233,7 +268,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, bool mtp) {
         return fail(label, "the oracle produced no tokens");
     }
 
-    ninfer::Engine engine(engine_options(artifact, device_a, device_b, true, mtp));
+    ninfer::Engine engine(engine_options(artifact, device_a, device_b, true, route));
 
     // Conversation A: the empty catalog makes this a full prefill that installs the entry.
     const ninfer::GenerationResult a_first = run(engine, opening);
@@ -241,7 +276,9 @@ int run_scenario(const char* artifact, int device_a, int device_b, bool mtp) {
         return fail(label, "the first conversation was not prefilled from zero");
     }
     if (a_first.generated_token_ids != opening_answer) {
-        return fail(label, "a fresh conversation diverged from the oracle");
+        return fail(label, "a fresh conversation diverged from the oracle: got " +
+                               tokens_text(a_first.generated_token_ids) + " expected " +
+                               tokens_text(opening_answer));
     }
 
     std::vector<TokenId> a_continued = opening;
@@ -267,7 +304,9 @@ int run_scenario(const char* artifact, int device_a, int device_b, bool mtp) {
                               " prompt tokens, expected " + std::to_string(recalled_frontier));
     }
     if (a_second.generated_token_ids != continued_answer) {
-        return fail(label, "a recalled conversation diverged from the oracle");
+        return fail(label, "a recalled conversation diverged from the oracle: got " +
+                               tokens_text(a_second.generated_token_ids) + " expected " +
+                               tokens_text(continued_answer));
     }
 
     // Fill the catalog past its capacity (three entries: one resident, two host). C and D each
@@ -281,7 +320,9 @@ int run_scenario(const char* artifact, int device_a, int device_b, bool mtp) {
                               std::to_string(a_evicted.reused_prompt_tokens) + " prompt tokens");
     }
     if (a_evicted.generated_token_ids != continued_answer) {
-        return fail(label, "a re-prefilled conversation diverged from the oracle");
+        return fail(label, "a re-prefilled conversation diverged from the oracle: got " +
+                               tokens_text(a_evicted.generated_token_ids) + " expected " +
+                               tokens_text(continued_answer));
     }
 
     // Two conversations that share the system prompt. Switching to the second one has to move the
@@ -294,7 +335,10 @@ int run_scenario(const char* artifact, int device_a, int device_b, bool mtp) {
                                " prompt tokens on its first turn");
     }
     if (shared_a_first.generated_token_ids != shared_answer) {
-        return fail(label, "a conversation behind a shared system prompt diverged from the oracle");
+        return fail(label,
+                    "a conversation behind a shared system prompt diverged from the oracle: got " +
+                        tokens_text(shared_a_first.generated_token_ids) + " expected " +
+                        tokens_text(shared_answer));
     }
 
     const ninfer::GenerationResult shared_b_first = run(engine, shared_b);
@@ -306,7 +350,10 @@ int run_scenario(const char* artifact, int device_a, int device_b, bool mtp) {
                                " prompt tokens, expected " + std::to_string(system_prompt.size()));
     }
     if (shared_b_first.generated_token_ids != shared_b_answer) {
-        return fail(label, "a switch behind a shared system prompt diverged from the oracle");
+        return fail(label,
+                    "a switch behind a shared system prompt diverged from the oracle: got " +
+                        tokens_text(shared_b_first.generated_token_ids) + " expected " +
+                        tokens_text(shared_b_answer));
     }
 
     std::vector<TokenId> shared_a_continued = shared_a;
@@ -323,7 +370,10 @@ int run_scenario(const char* artifact, int device_a, int device_b, bool mtp) {
     }
     if (shared_a_second.generated_token_ids != shared_continued_answer) {
         return fail(label,
-                    "a conversation behind a shared system prompt diverged from the oracle on return");
+                    "a conversation behind a shared system prompt diverged from the oracle on "
+                    "return: got " +
+                        tokens_text(shared_a_second.generated_token_ids) + " expected " +
+                        tokens_text(shared_continued_answer));
     }
 
     // A title or summary call in between takes over the device pools without sharing anything with
@@ -374,7 +424,10 @@ int run_scenario(const char* artifact, int device_a, int device_b, bool mtp) {
                                std::to_string(rerender_prompt_end));
     }
     if (rerendered_first.generated_token_ids != rerendered_answer) {
-        return fail(label, "a conversation behind a re-rendered answer diverged from the oracle");
+        return fail(label,
+                    "a conversation behind a re-rendered answer diverged from the oracle: got " +
+                        tokens_text(rerendered_first.generated_token_ids) + " expected " +
+                        tokens_text(rerendered_answer));
     }
 
     // A client that gives up mid-prefill and sends the same prompt again. The cancelled walk wrote
@@ -438,22 +491,29 @@ int main() {
         return 77;
     }
 
-    // NINFER_TEST_ROUTE=plain|mtp narrows the run to one route, which is what a failing route
-    // needs when the other one costs a full model load.
-    const char* route    = std::getenv("NINFER_TEST_ROUTE");
-    const std::string selected = route == nullptr ? "" : route;
-    const bool only_mtp   = selected == "mtp";
-    const bool only_plain = selected == "plain";
+    // NINFER_TEST_ROUTE=plain|mtp|dflash2 narrows the run to one route, which is what a failing
+    // route needs when each of the others costs a full model load. The default set is the two
+    // routes the retention property holds for; DFlash2 is opt-in because its masked-draft window
+    // diverges from a from-scratch walk at near ties (PLAN.md section 3.6, "B6 result").
+    const char* selected_env   = std::getenv("NINFER_TEST_ROUTE");
+    const std::string selected = selected_env == nullptr ? "" : selected_env;
+    std::vector<Route> routes;
+    if (selected.empty()) {
+        routes = {Route::Plain, Route::Mtp};
+    } else if (selected == "plain") {
+        routes = {Route::Plain};
+    } else if (selected == "mtp") {
+        routes = {Route::Mtp};
+    } else if (selected == "dflash2") {
+        routes = {Route::DFlash2};
+    } else {
+        std::cerr << "FAIL: NINFER_TEST_ROUTE must be plain, mtp or dflash2\n";
+        return 1;
+    }
 
     try {
-        if (!only_mtp) {
-            if (const int status = run_scenario(artifact, devices.first, devices.second, false);
-                status != 0) {
-                return status;
-            }
-        }
-        if (!only_plain) {
-            if (const int status = run_scenario(artifact, devices.first, devices.second, true);
+        for (const Route route : routes) {
+            if (const int status = run_scenario(artifact, devices.first, devices.second, route);
                 status != 0) {
                 return status;
             }

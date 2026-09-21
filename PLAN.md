@@ -369,8 +369,37 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
     108 tok/s roofline 估算 —— DFlash2 的 verify 目前是 **eager**（feature sink 无法进 graph），同宽 verify 比 MTP
     多约 4 ms/轮，且提议约 6.4–6.8 ms/轮。内存：shard 0 `weights+ctx 13878.6 MiB`、free 1764 MiB（draft 3655.4 MiB）；
     两种 proposal head（默认 Full 与 `--lm-head-draft`）输出与速率一致；
-- **B6 状态与保留**：draft ring/pending features 随会话召回保存恢复（复用 MTP 的 host slab 先例，
-  `tp2_generation_core.cpp:1261-1266`）+ 接 `dflash_graph_profiles` ⇒ 验收：会话切换后召回仍逐位一致；
+- **B6 结果（已完成，工作树未提交；保留禁用保留）**：DFlash2 的 masked draft context（局部 cyclic K/V ring +
+  其绝对 frontier）现在与目标 GDN/KV 一起走 TP-2 的全部状态通道，但**不重新打开**会话保留：保留验收要求的
+  「召回逐 token 一致」对该路线在合成 prompt 上不成立（见下）。改动：
+  - `program/dflash_round.{h,cpp}`：新增 `context_image_bytes()` 与
+    `copy_context_to_host/from_host/to_device/from_device`——把 ring 按 layer-major（先 K 后 V、按 layer extent
+    紧排、跳过 alignment pitch）打包成宿主镜像与设备快照通用的扁平镜像；
+  - `runtime/engine/tp2_generation_core.{h,cpp}`：`HostCheckpoint` 增加 `dflash_buffer`+`dflash_frontier`，
+    `Shard` 增加 `dflash_snapshots[0..1]`+arena，`SessionEntry` 增加 `host_dflash`/`host_dflash_prompt`/
+    `host_dflash_shared`；`build_shard` 按实际分配计账；`session_ensure_host_slabs` 为拥有 draft 的 shard
+    强制分配 `host_dflash`（失败即拒绝该会话）；`session_store_active`/`session_restore`/
+    `session_capture_shared_state` 按 `RecallState`（Frontier/PromptEnd/Shared）成对搬运目标 GDN 与 draft ring；
+    `snapshot_host_checkpoint` 记录 `dflash_frontier`；`execute_walk` 新增 `begin_dflash_state`（None→zero、
+    LiveState→no-op、DeviceSnapshot/HostCheckpoint→按镜像恢复，HostCheckpoint 校验 `dflash_frontier == position`）；
+    发布/取消/publish 前用 `flush_dflash_context` 提交 pending staging；`extent==0` 不再回退 plain step 而是走真实
+    轮次（否则最后一列的 draft 残差缺失，frontier 处留洞）；复用扫描对 DFlash2 打开（移除 `!dflash2_enabled_` 残留守卫）；
+  - `tests/models/qwen3_5/test_tp2_sessions.cpp`：路由参数化 `plain|mtp|dflash2`（默认只跑前两条），DFlash2 用
+    `draft_tokens=7` + fp8 KV。
+  - 验收：`ninfer_qwen3_5_tp2_dflash_append_test` K=7 `0xbad27a494a9bc853`、K=5 `0xbee487264ca8ffb8` 不变；
+    `ninfer_qwen3_5_tp2_load_test` 三例通过；`ninfer_qwen3_5_tp2_sessions_test` plain/mtp 全绿。
+  - **未通过项（决定不重新打开保留）**：`NINFER_TEST_ROUTE=dflash2` 的 sessions 仍失败。实测召回的状态本身能逐位
+    恢复：shared_b 的 DeviceSnapshot@512 路径与 from-scratch oracle 的 verify 轮次（base 640/641/642/644/646、每轮
+    接受数、提交 token）逐项一致；失败在 prompt-end 召回（`RecallState::PromptEnd`，边界 64 不是 prefill chunk 256 的
+    整数倍）：此时后缀前向的列宽与 from-scratch walk 不同（24 vs 88 列），fp8 目标 logits 在合成 prompt 的近似并列处
+    翻转（同一对 token 220/198），贪心答案分叉（rerendered 得到 `[2752 11 220 …]`，期望 `[2752 11 198 …]`）。同一列宽
+    差异对 plain/MTP 不翻转，所以它们通过。按 §3.6 的决策规则，DFlash2 未达到保留属性 ⇒ `model_instance.cpp` 的
+    DFlash2 保留禁用保留，且不在该路线声称「召回逐位一致」。最终状态下重跑 `NINFER_TEST_ROUTE=dflash2` 得到
+    `[mem] host sessions capacity 0 | retention disabled` 与 `FAIL (dflash2): a recalled conversation reused 0
+    prompt tokens, expected 71`（保留关闭后跨会话召回按设计不发生；device 快照的会话内前缀复用仍开启，draft 镜像
+    照常搬运）。
+- **B6 状态与保留（见上方 B6 结果）**：draft ring/pending features 已随会话召回保存恢复（复用 MTP 的 host slab
+  先例），`dflash_graph_profiles` 已接；「会话切换后召回逐位一致」对本路线不成立，保留保持禁用；
 - **B7 性能验收**：双卡吞吐对 90–180 tok/s 目标 + 与 MTP 的对比 + plain/mtp 无回归。
 
 **理论性能差距（单卡 5090 vs 双卡 TP-2，DFlash2 K=7；roofline 合成，非实测）**：

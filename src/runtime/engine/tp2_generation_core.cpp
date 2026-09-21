@@ -322,12 +322,9 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
             const std::uint32_t rounded  = (per_slot + 127U) / 128U * 128U;
             host_checkpoint_stride_      = std::max(kReuseCheckpointStride, rounded);
         }
-        // The masked-draft route cannot reuse a prefix yet: the draft's local context ring is not
-        // part of the device snapshot, the host checkpoint ring or the session catalog (PLAN.md
-        // section 3.6, stage B6). Until it is, a reused prefix would leave the ring describing the
-        // wrong positions, so the route forfeits reuse rather than publish a draft context it cannot
-        // vouch for. The ring is disabled too, since nothing can consume it.
-        if (dflash2_enabled_) { host_checkpoint_stride_ = 0; }
+        // The masked-draft route carries its draft context through this same ring (stage B6): each
+        // checkpoint holds the target state image and the draft ring at the same frontier, so a
+        // reused prefix restores the context the skipped tokens produced.
     }
 
     // Cross-session retention budget. --host-kv-mib is the whole host KV budget, split evenly
@@ -340,9 +337,9 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         const std::uint32_t sessions =
             options_.context_cache.max_private_continuations.value_or(kTp2DefaultSessions);
         // One entry is the resident conversation; retention needs room for at least one more.
-        // DFlash2 disables cross-session retention for the same reason it disables reuse: a
-        // recalled session would restore the target KV and GDN state but not the draft ring.
-        if (host_kv_bytes / 2 != 0 && sessions > 1 && !dflash2_enabled_) {
+        // DFlash2 takes part: a session slab holds the draft ring beside the target KV and GDN
+        // state, so a recall restores the whole conversation rather than only its target half.
+        if (host_kv_bytes / 2 != 0 && sessions > 1) {
             host_kv_shard_bytes_ = host_kv_bytes / 2;
             session_capacity_    = sessions;
         }
@@ -556,8 +553,9 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         }
     }
 
-    std::size_t record_bytes = 0;
-    std::size_t round_bytes  = 0;
+    std::size_t record_bytes        = 0;
+    std::size_t round_bytes         = 0;
+    std::size_t dflash_image_bytes  = 0;
     if (mtp_enabled_ || dflash2_enabled_) {
         // ReplaySSM records for one verify window wide, one physical row, per-shard GDN geometry.
         // Both shards verify the window, so both need their own records and fold plan.
@@ -688,6 +686,25 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                      static_cast<double>(shard.dflash_round->context_bytes()) / 1048576.0,
                      static_cast<double>(shard.dflash_round->frame_bytes()) / 1048576.0,
                      static_cast<double>(proposal_bytes) / 1048576.0);
+        // The draft context at the two reuse boundaries the GDN snapshots freeze. It is one ring per
+        // boundary, allocated here because only the round knows the ring's image size; the state
+        // arena itself holds no draft slot (see Shard::dflash_snapshots).
+        const std::size_t dflash_image = shard.dflash_round->context_image_bytes();
+        dflash_image_bytes              = dflash_image;
+        shard.device.bind_to_current_thread();
+        shard.dflash_snapshot_arena =
+            std::make_unique<DeviceArena>(kReuseSnapshotCount * dflash_image);
+        for (auto& snapshot : shard.dflash_snapshots) {
+            snapshot = shard.dflash_snapshot_arena->alloc_bytes(dflash_image, 256);
+        }
+        CUDA_CHECK(cudaMemset(shard.dflash_snapshot_arena->base(), 0,
+                              shard.dflash_snapshot_arena->capacity()));
+        // The checkpoint ring pairs each target state image with the draft ring at the same
+        // frontier. The ring is only allocated once the round exists, which is why it is a second
+        // pass over a ring sized above.
+        for (auto& checkpoint : shard.host_checkpoints) {
+            checkpoint.dflash_buffer = std::make_unique<PinnedHostBuffer>(dflash_image, true);
+        }
     }
     // One startup ledger line per shard: every resident block is allocated before the first
     // request, so this is the whole device budget at the requested context ceiling.
@@ -696,18 +713,21 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         cudaMemGetInfo(&free_bytes, &total_bytes);
         std::fprintf(stderr,
                      "[mem] shard %d capacity %u | weights+ctx %.1f | kv %.1f | state %.1f | "
-                     "record %.1f | round %.1f | workspace %u.0 | vision %.1f | free %.1f of %.1f "
-                     "MiB\n",
+                     "record %.1f | draft-snap %.1f | round %.1f | workspace %u.0 | vision %.1f | "
+                     "free %.1f of %.1f MiB\n",
                      shard_index, capacity, resident_bytes,
                      static_cast<double>(kv_bytes) / 1048576.0,
                      static_cast<double>((2 + kReuseSnapshotCount) * state_bytes) / 1048576.0,
                      static_cast<double>(record_bytes) / 1048576.0,
+                     static_cast<double>(kReuseSnapshotCount * dflash_image_bytes) / 1048576.0,
                      static_cast<double>(round_bytes) / 1048576.0,
                      static_cast<unsigned>(kWorkspaceBytes >> 20),
                      static_cast<double>(vision_bytes) / 1048576.0,
                      static_cast<double>(free_bytes) / 1048576.0,
                      static_cast<double>(total_bytes) / 1048576.0);
         if (!shard.host_checkpoints.empty()) {
+            // The per-slot size is the target state image; the masked draft adds one ring image to
+            // each slot on the shard that owns it, which is the second pinned figure.
             std::fprintf(stderr,
                          "[mem] host-checkpoints shard %d slots %zu (grid %zu + tail %u + "
                          "divergence %u) x %.1f MiB | stride %u tok | pinned %.1f MiB\n",
@@ -716,7 +736,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                          host_checkpoint_divergence_slots_,
                          static_cast<double>(shard.state_backing.bytes) / 1048576.0,
                          host_checkpoint_stride_,
-                         static_cast<double>(shard.state_backing.bytes *
+                         static_cast<double>((shard.state_backing.bytes + dflash_image_bytes) *
                                              shard.host_checkpoints.size()) / 1048576.0);
         }
     }
@@ -1136,6 +1156,36 @@ TP2GenerationCore::make_dflash_prefill_sink(Shard& shard) {
     });
 }
 
+void TP2GenerationCore::store_dflash_image(Shard& shard, PinnedHostBuffer& image) {
+    if (shard.dflash_round == nullptr) { return; }
+    if (image.size() < shard.dflash_round->context_image_bytes()) {
+        throw std::logic_error("draft context host image is smaller than the draft ring");
+    }
+    shard.device.bind_to_current_thread();
+    shard.dflash_round->copy_context_to_host(static_cast<std::byte*>(image.data()),
+                                             shard.device.stream);
+}
+
+void TP2GenerationCore::load_dflash_image(Shard& shard, const PinnedHostBuffer& image) {
+    if (shard.dflash_round == nullptr) { return; }
+    if (image.size() < shard.dflash_round->context_image_bytes()) {
+        throw std::logic_error("draft context host image is smaller than the draft ring");
+    }
+    shard.device.bind_to_current_thread();
+    shard.dflash_round->copy_context_from_host(static_cast<const std::byte*>(image.data()),
+                                               shard.device.stream);
+}
+
+void TP2GenerationCore::snapshot_dflash_state(Shard& shard, std::size_t slot) {
+    if (shard.dflash_round == nullptr) { return; }
+    if (slot >= shard.dflash_snapshots.size() ||
+        shard.dflash_snapshots[slot].data == nullptr) {
+        throw std::logic_error("draft context snapshot slot is unavailable");
+    }
+    shard.device.bind_to_current_thread();
+    shard.dflash_round->copy_context_to_device(shard.dflash_snapshots[slot], shard.device.stream);
+}
+
 TP2GenerationCore::Submission TP2GenerationCore::submit(
     qwen::PreparedPrompt prompt, PromptSummary summary, double prepare_seconds,
     ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
@@ -1307,6 +1357,58 @@ bool TP2GenerationCore::session_ensure_host_slabs(SessionEntry& entry, std::uint
                 return false;
             }
         }
+        // The masked draft's context image travels with the target state image at every boundary the
+        // entry can be recalled on. The frontier one is mandatory: a recall that restored the target
+        // state without the draft ring would leave the draft describing tokens before the boundary,
+        // and the skipped prefix produces no target residual to rebuild it, so the entry would not be
+        // safe to recall at all. A shard that owns no draft (shard 1, and every other backend) skips
+        // all three.
+        if (shard.dflash_round != nullptr) {
+            const std::size_t dflash_bytes = shard.dflash_round->context_image_bytes();
+            shard.device.bind_to_current_thread();
+            if (entry.host_dflash[index] == nullptr) {
+                try {
+                    entry.host_dflash[index] =
+                        std::make_unique<PinnedHostBuffer>(dflash_bytes, true);
+                } catch (const std::exception& error) {
+                    const cudaError_t latched = cudaGetLastError();
+                    std::fprintf(stderr,
+                                 "[tp2-session] host draft context image shard %zu refused: %.1f MiB "
+                                 "pinned (%s): %s\n",
+                                 index, static_cast<double>(dflash_bytes) / 1048576.0,
+                                 cudaGetErrorString(latched), error.what());
+                    return false;
+                }
+            }
+            if (entry.host_dflash_prompt[index] == nullptr) {
+                try {
+                    entry.host_dflash_prompt[index] =
+                        std::make_unique<PinnedHostBuffer>(dflash_bytes, true);
+                } catch (const std::exception& error) {
+                    const cudaError_t latched = cudaGetLastError();
+                    std::fprintf(stderr,
+                                 "[tp2-session] warning: host prompt-end draft image shard %zu "
+                                 "refused: %.1f MiB pinned (%s): %s; this session needs the generated "
+                                 "tail reproduced to be recalled\n",
+                                 index, static_cast<double>(dflash_bytes) / 1048576.0,
+                                 cudaGetErrorString(latched), error.what());
+                }
+            }
+            if (entry.host_dflash_shared[index] == nullptr) {
+                try {
+                    entry.host_dflash_shared[index] =
+                        std::make_unique<PinnedHostBuffer>(dflash_bytes, true);
+                } catch (const std::exception& error) {
+                    const cudaError_t latched = cudaGetLastError();
+                    std::fprintf(stderr,
+                                 "[tp2-session] warning: host shared-prefix draft image shard %zu "
+                                 "refused: %.1f MiB pinned (%s): %s; this session will not carry a "
+                                 "stable prefix for the next conversation\n",
+                                 index, static_cast<double>(dflash_bytes) / 1048576.0,
+                                 cudaGetErrorString(latched), error.what());
+                }
+            }
+        }
         // The two extra images are best effort: they make a returning conversation cheaper, but the
         // frontier image above is what makes it recallable at all. A shortage of pinned memory
         // therefore degrades the recall instead of dropping the conversation.
@@ -1401,6 +1503,20 @@ bool TP2GenerationCore::session_store_active() {
                                        shard.state_snapshots[0].data, shard.state_backing.bytes,
                                        cudaMemcpyDeviceToHost, shard.device.stream));
         }
+        // The masked draft's context rides every target image without an extent of its own: the
+        // evicted frontier is the live ring, and the prompt-end image is the device snapshot slot 0
+        // the GDN copy above just read. Both are the flat ring image, so the device snapshot is a
+        // plain D2H.
+        if (shard.dflash_round != nullptr) {
+            store_dflash_image(shard, *entry.host_dflash[index]);
+            if (entry.host_dflash_prompt[index] != nullptr &&
+                shard.dflash_snapshots[0].data != nullptr) {
+                CUDA_CHECK(cudaMemcpyAsync(entry.host_dflash_prompt[index]->data(),
+                                           shard.dflash_snapshots[0].data,
+                                           shard.dflash_round->context_image_bytes(),
+                                           cudaMemcpyDeviceToHost, shard.device.stream));
+            }
+        }
     }
     if (mtp_enabled_) {
         shard_a_.device.bind_to_current_thread();
@@ -1419,10 +1535,12 @@ bool TP2GenerationCore::session_store_active() {
 
     shard_a_.device.bind_to_current_thread();
     entry.device_resident = false;
-    entry.host_prompt_end = (entry.host_prompt_state[0] != nullptr &&
-                             entry.host_prompt_state[1] != nullptr)
-                                ? entry.prompt_end
-                                : 0;
+    // The prompt-end boundary is only offered when its target image *and* its draft image exist; a
+    // recall that restored one without the other would run the draft against the wrong tokens.
+    const bool prompt_end_images =
+        entry.host_prompt_state[0] != nullptr && entry.host_prompt_state[1] != nullptr &&
+        (shard_a_.dflash_round == nullptr || entry.host_dflash_prompt[0] != nullptr);
+    entry.host_prompt_end = prompt_end_images ? entry.prompt_end : 0;
     entry.lru_clock       = ++session_lru_clock_;
     ++session_stores_;
     return true;
@@ -1454,6 +1572,19 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
         CUDA_CHECK(cudaMemcpyAsync(shard.state_backing.data, frozen.data(),
                                    shard.state_backing.bytes, cudaMemcpyHostToDevice,
                                    shard.device.stream));
+        // The draft context comes back with the target state it belongs to: the skipped prefix
+        // produces no target residual, so nothing else rebuilds the ring, and a recall that restored
+        // only the target half would verify against a draft describing the wrong tokens. The state
+        // images above are only published (host_prompt_end / host_shared_end) when their draft pair
+        // exists, so a null here means the boundary was never offered.
+        if (shard.dflash_round != nullptr) {
+            const PinnedHostBuffer& frozen_dflash = state == RecallState::Frontier
+                                                        ? *entry.host_dflash[index]
+                                                    : state == RecallState::PromptEnd
+                                                        ? *entry.host_dflash_prompt[index]
+                                                        : *entry.host_dflash_shared[index];
+            load_dflash_image(shard, frozen_dflash);
+        }
     }
     if (mtp_enabled_) {
         shard_a_.device.bind_to_current_thread();
@@ -1480,7 +1611,8 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
 
 void TP2GenerationCore::session_capture_shared_state(std::size_t index, std::uint32_t position,
                                                      bool from_device,
-                                                     const PinnedHostBuffer* const* frozen) {
+                                                     const PinnedHostBuffer* const* frozen,
+                                                     const PinnedHostBuffer* dflash_frozen) {
     if (index >= sessions_.size() || position == 0) { return; }
     SessionEntry& entry = sessions_[index];
     // Only a host-resident entry has a slab to pair the state with, and only a position its slab
@@ -1492,6 +1624,14 @@ void TP2GenerationCore::session_capture_shared_state(std::size_t index, std::uin
     for (std::size_t shard_index = 0; shard_index < 2; ++shard_index) {
         if (entry.host_shared_state[shard_index] == nullptr) { return; }
     }
+    // The draft half of the anchor has no use without its own image, and a partial write would tear
+    // an image a previous capture published under the same host_shared_end, so the requirement is
+    // checked before the first copy, not during.
+    const bool owns_draft = shard_a_.dflash_round != nullptr;
+    if (owns_draft &&
+        (entry.host_dflash_shared[0] == nullptr || (!from_device && dflash_frozen == nullptr))) {
+        return;
+    }
     for (std::size_t shard_index = 0; shard_index < 2; ++shard_index) {
         Shard& shard = *shards[shard_index];
         if (from_device) {
@@ -1499,11 +1639,22 @@ void TP2GenerationCore::session_capture_shared_state(std::size_t index, std::uin
             CUDA_CHECK(cudaMemcpyAsync(entry.host_shared_state[shard_index]->data(),
                                        shard.state_backing.data, shard.state_backing.bytes,
                                        cudaMemcpyDeviceToHost, shard.device.stream));
+            // The device draft ring sits at this boundary by construction: the walk restores it
+            // there before the first chunk, which is when the from-device capture runs.
+            if (shard.dflash_round != nullptr) {
+                store_dflash_image(shard, *entry.host_dflash_shared[shard_index]);
+            }
             continue;
         }
         if (frozen[shard_index] == nullptr) { return; }
         std::memcpy(entry.host_shared_state[shard_index]->data(), frozen[shard_index]->data(),
                     shard.state_backing.bytes);
+        if (shard.dflash_round != nullptr) {
+            // Both sides are flat ring images: the checkpoint's draft buffer is one, and so is the
+            // session slab.
+            std::memcpy(entry.host_dflash_shared[shard_index]->data(), dflash_frozen->data(),
+                        shard.dflash_round->context_image_bytes());
+        }
     }
     entry.host_shared_end = position;
 }
@@ -1814,7 +1965,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     const std::uint32_t reuse_grid =
         std::min<std::uint32_t>(std::max<std::uint32_t>(options_.prefill_chunk, 64),
                                 kPrefillChunkMaximum);
-    if (!dflash2_enabled_ && cached_state_valid_ && !cached_prompt_tokens_.empty()) {
+    if (cached_state_valid_ && !cached_prompt_tokens_.empty()) {
         const std::size_t common = std::min(cached_prompt_tokens_.size(), token_ids.size());
         while (shared_prefix < common &&
                cached_prompt_tokens_[shared_prefix] == token_ids[shared_prefix]) {
@@ -2010,6 +2161,43 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     };
     begin_gdn_state(shard_a_);
     begin_gdn_state(shard_b_);
+    // The masked draft's context is restored to that same boundary through the same sources. It
+    // cannot be left for the walk to rebuild: the walk starts at `reuse`, and the skipped prefix
+    // produces no target residual, so a boundary that does not restore these bytes is a hole. A
+    // captured conversation is only offered a boundary whose draft image exists (see the session
+    // slab allocation), so every source here has one.
+    auto begin_dflash_state = [&](Shard& shard) {
+        if (shard.dflash_round == nullptr) { return; }
+        shard.device.bind_to_current_thread();
+        switch (reuse_source_) {
+        case ReuseSource::None:
+            shard.dflash_round->zero_context();
+            return;
+        case ReuseSource::LiveState:
+            // The live ring already reaches this boundary: a recall restored it, or the conversation
+            // that just decoded left it flushed to its frontier at publish.
+            return;
+        case ReuseSource::DeviceSnapshot:
+            shard.dflash_round->copy_context_from_device(shard.dflash_snapshots[reuse_slot],
+                                                         shard.device.stream);
+            return;
+        case ReuseSource::HostCheckpoint: {
+            const Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[reuse_slot];
+            if (checkpoint.dflash_buffer == nullptr ||
+                checkpoint.dflash_frontier != checkpoint.position) {
+                throw std::logic_error(
+                    "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
+            }
+            shard.dflash_round->copy_context_from_host(
+                static_cast<const std::byte*>(checkpoint.dflash_buffer->data()),
+                shard.device.stream);
+            return;
+        }
+        }
+    };
+    begin_dflash_state(shard_a_);
+    begin_dflash_state(shard_b_);
+    dflash_context_frontier_ = reuse;
     if (prefill_trace) {
         CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
         CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
@@ -2109,6 +2297,29 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                                    shard.state_backing.bytes, cudaMemcpyDeviceToDevice,
                                    shard.device.stream));
     };
+    // The draft's still-uncommitted verify window, committed before the target state it belongs to
+    // is published. A round leaves the pending staging for the *next* round to commit (its first
+    // append_pending), and a finish commits it itself; the paths that end a walk in between are a
+    // cancellation and a decode round that the output policy truncated. The pending staging is
+    // deliberately not part of any checkpoint or session image, so this is the only way it reaches
+    // one, and it is the TP-2 form of the single-device commit's leading
+    // enqueue_dflash_context_append (transactions/commit.cpp:305-319).
+    auto flush_dflash_context = [&](std::uint32_t frontier) {
+        if (shard_a_.dflash_round == nullptr || dflash_context_frontier_ >= frontier) { return; }
+        const qwen::execution::ExecutionCore dflash_execution{
+            .device           = shard_a_.device,
+            .parameters       = *shard_a_.parameters,
+            .work             = *shard_a_.workspace,
+            .linear_attention = *shard_a_.state,
+            .replay_records   = nullptr,
+            .io               = shard_a_.io,
+            .prefill_hidden   = shard_a_.prefill_hidden,
+            .prefill_chunk    = options_.prefill_chunk,
+            .proposal_head    = options_.speculative.proposal_head,
+        };
+        shard_a_.dflash_round->append_pending(dflash_execution, dflash_context_frontier_, frontier);
+        dflash_context_frontier_ = frontier;
+    };
     // The same copy into the host ring, tagged with the frontier it captures. It rides the shard
     // stream, so it sees exactly the tokens the enclosing loop has enqueued and none of the later
     // ones, and the ring slot it lands in is only revisited by a later prefill's checkpoint at the
@@ -2148,6 +2359,15 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         CUDA_CHECK(cudaMemcpyAsync(checkpoint.buffer->data(), shard.state_backing.data,
                                    shard.state_backing.bytes, cudaMemcpyDeviceToHost,
                                    shard.device.stream));
+        // The masked draft's context at the same frontier rides the same slot. A chunk boundary is
+        // exactly where the prefill sink has finished committing that chunk, so the ring reaches
+        // this frontier; the frontier is recorded so a restore can refuse a checkpoint whose draft
+        // half does not describe the position it names.
+        if (shard.dflash_round != nullptr && checkpoint.dflash_buffer != nullptr) {
+            checkpoint.dflash_frontier = dflash_context_frontier_;
+            shard.dflash_round->copy_context_to_host(
+                static_cast<std::byte*>(checkpoint.dflash_buffer->data()), shard.device.stream);
+        }
         if (ring == HostRing::Tail) {
             shard.host_checkpoint_tail_next = (index + 1) % count;
         } else if (ring == HostRing::Grid) {
@@ -2190,9 +2410,12 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         snapshot_at[slot] = (span > last) ? prompt_tokens - last : 0;
         if (snapshot_at[slot] != 0 && snapshot_at[slot] == reuse) {
             // The restored state already sits exactly on this boundary, and the walk never revisits
-            // its own starting point, so freeze it before the first chunk.
+            // its own starting point, so freeze it before the first chunk. The draft ring was
+            // restored to the same boundary by begin_dflash_state.
             snapshot_state(shard_a_, slot);
             snapshot_state(shard_b_, slot);
+            snapshot_dflash_state(shard_a_, slot);
+            snapshot_dflash_state(shard_b_, slot);
         }
     }
     // Divergence anchor. shared_prefix is where this prompt stopped matching the lineage it
@@ -2225,18 +2448,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // block again. The device pools still hold it because the recall restored it and nothing has run
     // since.
     if (host_stored_session_ != kNoSession && reuse != 0 && reuse == shared_prefix) {
-        session_capture_shared_state(host_stored_session_, reuse, true, nullptr);
-    }
-    // The masked-draft route restarts the draft context with the request. Its ring is not part of
-    // any session or checkpoint image yet (PLAN.md section 3.6, stage B6) and the route forfeited
-    // reuse above, so the walk is about to capture the whole prompt again; zeroing first makes the
-    // untouched tail explicitly empty rather than a previous request's features.
-    dflash_context_frontier_ = 0;
-    if (dflash2_enabled_) {
-        if (shard_a_.dflash_round == nullptr) {
-            throw std::logic_error("TP-2 DFlash2 route has no masked-draft round");
-        }
-        shard_a_.dflash_round->zero_context();
+        // The device draft ring was restored to `reuse` by begin_dflash_state above, which is the
+        // boundary the target state is at too, so this captures the two halves together.
+        session_capture_shared_state(host_stored_session_, reuse, true, nullptr, nullptr);
     }
     for (std::uint32_t t0 = reuse; t0 < prompt_tokens;) {
         if (cancellation.requested()) {
@@ -2249,9 +2463,15 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             if (t0 > 0) {
                 snapshot_state(shard_a_, 0);
                 snapshot_state(shard_b_, 0);
+                snapshot_dflash_state(shard_a_, 0);
+                snapshot_dflash_state(shard_b_, 0);
                 cached_boundaries_[0] = t0;
                 cached_boundaries_[1] = 0;
                 cached_state_valid_   = true;
+                // A prefill chunk commits its own draft window inside the forward, so this is a
+                // no-op; it is here so the invariant is stated once: nothing is published with an
+                // uncommitted draft window.
+                flush_dflash_context(t0);
                 session_publish(
                     std::vector<TokenId>(token_ids.begin(),
                                          token_ids.begin() + static_cast<std::ptrdiff_t>(t0)),
@@ -2334,6 +2554,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             if (snapshot_at[slot] == t0 + length) {
                 snapshot_state(shard_a_, slot);
                 snapshot_state(shard_b_, slot);
+                snapshot_dflash_state(shard_a_, slot);
+                snapshot_dflash_state(shard_b_, slot);
             }
         }
         if (host_checkpoint_stride_ != 0) {
@@ -2390,18 +2612,25 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // the KV its slab already holds, and unlike the ring slot it survives the next evictions. It
     // lands before session_publish, which may erase the entry and shift every later index.
     if (host_stored_session_ != kNoSession && anchor_divergence) {
-        const PinnedHostBuffer* frozen[2] = {nullptr, nullptr};
-        bool complete                    = true;
+        const PinnedHostBuffer* frozen[2]    = {nullptr, nullptr};
+        const PinnedHostBuffer* frozen_draft = nullptr;
+        bool complete                        = true;
         for (std::size_t shard_index = 0; shard_index < 2 && complete; ++shard_index) {
             Shard& shard = shard_index == 0 ? shard_a_ : shard_b_;
             for (const auto& checkpoint : shard.host_checkpoints) {
                 if (checkpoint.prefill_id == host_checkpoint_live_id_ &&
                     checkpoint.position == anchor_position) {
                     frozen[shard_index] = checkpoint.buffer.get();
+                    // The draft half of the anchor lives in the same checkpoint slot, so a checkpoint
+                    // without it cannot carry the boundary.
+                    if (shard.dflash_round != nullptr) {
+                        frozen_draft = checkpoint.dflash_buffer.get();
+                    }
                     break;
                 }
             }
-            complete = frozen[shard_index] != nullptr;
+            complete = frozen[shard_index] != nullptr &&
+                       (shard.dflash_round == nullptr || frozen_draft != nullptr);
         }
         if (complete) {
             Shard* const anchor_shards[2] = {&shard_a_, &shard_b_};
@@ -2409,7 +2638,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 shard->device.bind_to_current_thread();
                 CUDA_CHECK(cudaStreamSynchronize(shard->device.stream));
             }
-            session_capture_shared_state(host_stored_session_, anchor_position, false, frozen);
+            session_capture_shared_state(host_stored_session_, anchor_position, false, frozen,
+                                         frozen_draft);
         }
     }
     if (prefill_trace) {
@@ -2431,6 +2661,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // fails mid-prefill leaves the previous request's boundaries and snapshots intact.
     snapshot_state(shard_a_, 0);
     snapshot_state(shard_b_, 0);
+    snapshot_dflash_state(shard_a_, 0);
+    snapshot_dflash_state(shard_b_, 0);
     cached_prompt_tokens_.assign(token_ids.begin(), token_ids.end());
     for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
         cached_boundaries_[slot] = snapshot_at[slot];
@@ -2517,9 +2749,6 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         auto scope_b = ws_b.scope();
         std::vector<TokenId> step;
         Tensor round_hidden;
-        // True when the DFlash2 round found no room for a window and fell back to a plain step,
-        // which already advanced current/position and updated the target state in place.
-        bool dflash_plain_step = false;
         // Phase marks: 0 round start, 1 after the MTP proposal chain, 2 after the verify forward,
         // 3 after the licensing kernels, 4 after the licenced-token readback, 5/6 around the state
         // fold. The plain loop has no proposal chain and no fold, so it collapses 1 onto 0.
@@ -2542,43 +2771,13 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             const std::uint32_t extent =
                 std::min({dflash_drafts_, max_by_budget, capacity_left});
             const std::int32_t width = static_cast<std::int32_t>(dflash_drafts_) + 1;
-            if (extent == 0) {
-                // The window has no room for a draft (the output budget or the context ends after
-                // this token). Forward the anchor as a plain step; the target state advances in
-                // place and the request terminates, so the draft context has no next round to feed.
-                Tensor logits_a = run_plain_decode_step(current, position);
-                timing.record(2, shard_a_.device.stream);
-                ops::set_i32_scalar(logical_pos_a, static_cast<std::int32_t>(position + 1),
-                                    shard_a_.device.stream);
-                if (constraint_live()) {
-                    constraint_advance();
-                    if (tool_constraint->build_mask(logits_domain, tool_mask_one)) {
-                        shard_a_.device.bind_to_current_thread();
-                        CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_one.data(),
-                                                   tool_mask_one.size(),
-                                                   cudaMemcpyHostToDevice,
-                                                   shard_a_.device.stream));
-                        ops::apply_token_mask(logits_a, tool_mask_dev, shard_a_.device.stream);
-                    }
-                }
-                Tensor sampled_a = ws_a.alloc(DType::I32, {1});
-                ops::sample(logits_a, sampled_a, public_tokens, sampling_a, logical_pos_a,
-                            ops::kSamplePurposeDecode, ws_a, shard_a_.device.stream);
-                timing.record(3, shard_a_.device.stream);
-                std::int32_t next = 0;
-                shard_a_.device.bind_to_current_thread();
-                CUDA_CHECK(cudaMemcpyAsync(&next, sampled_a.data, sizeof(std::int32_t),
-                                           cudaMemcpyDeviceToHost, shard_a_.device.stream));
-                timing.record(4, shard_a_.device.stream);
-                const Clock::time_point sync_start = Clock::now();
-                CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
-                timing.close_round(
-                    std::chrono::duration<double, std::milli>(Clock::now() - sync_start).count());
-                current = next;
-                ++position;
-                dflash_plain_step = true;
-                step.assign(1, static_cast<TokenId>(next));
-            } else {
+            // extent == 0 is a real round here, exactly as it is on the single-device route
+            // (decode.cpp:732 counts it as a fallback step but still runs the round): the window
+            // forwards the anchor column, the verify taps its residual into the pending staging, and
+            // the next append - or the finish append below - commits it. A plain decode step would
+            // leave the draft context one column short of the target frontier, and that frontier is
+            // what a checkpoint or a session recall has to reproduce exactly.
+            {
                 const qwen::execution::ExecutionCore dflash_execution{
                     .device           = shard.device,
                     .parameters       = *shard.parameters,
@@ -2904,54 +3103,52 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // preview_model already established the (possibly terminal) preview; commit it as-is.
         publish_preview(false);
         if (dflash2_enabled_) {
-            if (!dflash_plain_step) {
-                // The output policy licenses a prefix of the round's tokens. The verify recorded
-                // the window's GDN transitions and advanced the live state; undo that and replay
-                // exactly the committed columns, as the single-device resolve does.
-                const std::uint32_t committed = decision.accepted_tokens;
-                timing.record(5, shard_a_.device.stream);
-                for (Shard* fold_shard : {&shard_a_, &shard_b_}) {
-                    fold_shard->device.bind_to_current_thread();
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        fold_shard->state_backing.data,
-                        fold_shard->state_snapshots[kRoundScratchSlot].data,
-                        fold_shard->state_backing.bytes, cudaMemcpyDeviceToDevice,
-                        fold_shard->device.stream));
-                }
-                const ops::GdnReplayFoldRow fold_row{
-                    .source_state_slot      = 0,
-                    .destination_state_slot = 0,
-                    .commit_columns         = static_cast<std::int32_t>(committed)};
-                const std::span<const ops::GdnReplayFoldRow> fold_rows(&fold_row, 1);
-                shard_a_.device.bind_to_current_thread();
-                shard_a_.replay_fold->execute(fold_rows, shard_a_.device.stream);
-                shard_b_.device.bind_to_current_thread();
-                shard_b_.replay_fold->execute(fold_rows, shard_b_.device.stream);
-                // The target frontier advances by exactly the committed columns. The draft ring
-                // stays one verify window behind, except when this round ends the request: then it
-                // is caught up to the final frontier, which is the single-device rule.
-                const std::uint32_t base         = position;
-                position                         = base + committed;
-                const bool dflash_finished       = decision.finished();
-                dflash_context_frontier_         = dflash_finished ? position : base;
-                if (dflash_finished && position > base) {
-                    const qwen::execution::ExecutionCore dflash_execution{
-                        .device           = shard_a_.device,
-                        .parameters       = *shard_a_.parameters,
-                        .work             = *shard_a_.workspace,
-                        .linear_attention = *shard_a_.state,
-                        .replay_records   = nullptr,
-                        .io               = shard_a_.io,
-                        .prefill_hidden   = shard_a_.prefill_hidden,
-                        .prefill_chunk    = options_.prefill_chunk,
-                        .proposal_head    = options_.speculative.proposal_head,
-                    };
-                    shard_a_.dflash_round->append_pending(dflash_execution, base, position);
-                }
-                current = static_cast<std::int32_t>(step[committed - 1]);
-                timing.record(6, shard_a_.device.stream);
-                timing.fold_ms += timing.elapsed(5, 6);
+            // The output policy licenses a prefix of the round's tokens. The verify recorded
+            // the window's GDN transitions and advanced the live state; undo that and replay
+            // exactly the committed columns, as the single-device resolve does.
+            const std::uint32_t committed = decision.accepted_tokens;
+            timing.record(5, shard_a_.device.stream);
+            for (Shard* fold_shard : {&shard_a_, &shard_b_}) {
+                fold_shard->device.bind_to_current_thread();
+                CUDA_CHECK(cudaMemcpyAsync(
+                    fold_shard->state_backing.data,
+                    fold_shard->state_snapshots[kRoundScratchSlot].data,
+                    fold_shard->state_backing.bytes, cudaMemcpyDeviceToDevice,
+                    fold_shard->device.stream));
             }
+            const ops::GdnReplayFoldRow fold_row{
+                .source_state_slot      = 0,
+                .destination_state_slot = 0,
+                .commit_columns         = static_cast<std::int32_t>(committed)};
+            const std::span<const ops::GdnReplayFoldRow> fold_rows(&fold_row, 1);
+            shard_a_.device.bind_to_current_thread();
+            shard_a_.replay_fold->execute(fold_rows, shard_a_.device.stream);
+            shard_b_.device.bind_to_current_thread();
+            shard_b_.replay_fold->execute(fold_rows, shard_b_.device.stream);
+            // The target frontier advances by exactly the committed columns. The draft ring
+            // stays one verify window behind, except when this round ends the request: then it
+            // is caught up to the final frontier, which is the single-device rule.
+            const std::uint32_t base         = position;
+            position                         = base + committed;
+            const bool dflash_finished       = decision.finished();
+            dflash_context_frontier_         = dflash_finished ? position : base;
+            if (dflash_finished && position > base) {
+                const qwen::execution::ExecutionCore dflash_execution{
+                    .device           = shard_a_.device,
+                    .parameters       = *shard_a_.parameters,
+                    .work             = *shard_a_.workspace,
+                    .linear_attention = *shard_a_.state,
+                    .replay_records   = nullptr,
+                    .io               = shard_a_.io,
+                    .prefill_hidden   = shard_a_.prefill_hidden,
+                    .prefill_chunk    = options_.prefill_chunk,
+                    .proposal_head    = options_.speculative.proposal_head,
+                };
+                shard_a_.dflash_round->append_pending(dflash_execution, base, position);
+            }
+            current = static_cast<std::int32_t>(step[committed - 1]);
+            timing.record(6, shard_a_.device.stream);
+            timing.fold_ms += timing.elapsed(5, 6);
         } else if (!mtp_enabled_) {
             current = step.back();
             ++position;
@@ -3012,6 +3209,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         const std::uint32_t sampled = static_cast<std::uint32_t>(request.generated.size());
         const std::uint32_t frontier =
             sampled == 0 ? prompt_tokens : prompt_tokens + sampled - 1U;
+        // A decode round the walk did not survive to the next round - a cancellation, or a round the
+        // output policy truncated - left its committed columns in the pending staging. The published
+        // entry names exactly the target frontier, and its draft image has to reach it, so commit the
+        // remainder first. A finished round already did this itself.
+        flush_dflash_context(frontier);
         session_publish(history, frontier);
     }
     result.generated_token_ids = std::move(request.generated);

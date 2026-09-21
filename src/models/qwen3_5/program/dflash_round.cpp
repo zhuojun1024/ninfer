@@ -235,6 +235,64 @@ void DFlash2Round::zero_context() {
     CUDA_CHECK(cudaMemsetAsync(context_arena_->base(), 0, context_bytes_, device_->stream));
 }
 
+namespace {
+
+// One draft context image: every layer's K rows followed by every layer's V rows, packed at the
+// layer extent. The ring's layers are separated by an alignment pitch that is not part of the image,
+// which is why this walks the layers instead of copying the arena. The same packing is used for a
+// host image and for a device snapshot, so a checkpoint, a device snapshot and a session slab can be
+// swapped for one another.
+void transfer_ring_image(const CyclicKVCacheSlotView& view, std::byte* image, bool to_image,
+                         cudaMemcpyKind kind, cudaStream_t stream) {
+    const std::size_t k_total = static_cast<std::size_t>(view.layers) * view.k_layer_bytes;
+    for (std::uint32_t layer = 0; layer < view.layers; ++layer) {
+        void* k = static_cast<std::byte*>(view.k_layer0.data) +
+                  static_cast<std::ptrdiff_t>(layer) * view.k_layer_pitch_bytes;
+        void* v = static_cast<std::byte*>(view.v_layer0.data) +
+                  static_cast<std::ptrdiff_t>(layer) * view.v_layer_pitch_bytes;
+        std::byte* image_k = image + static_cast<std::size_t>(layer) * view.k_layer_bytes;
+        std::byte* image_v =
+            image + k_total + static_cast<std::size_t>(layer) * view.v_layer_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(to_image ? static_cast<void*>(image_k) : k,
+                                   to_image ? k : static_cast<const void*>(image_k),
+                                   view.k_layer_bytes, kind, stream));
+        CUDA_CHECK(cudaMemcpyAsync(to_image ? static_cast<void*>(image_v) : v,
+                                   to_image ? v : static_cast<const void*>(image_v),
+                                   view.v_layer_bytes, kind, stream));
+    }
+}
+
+} // namespace
+
+void DFlash2Round::copy_context_to_host(std::byte* destination, cudaStream_t stream) const {
+    device_->bind_to_current_thread();
+    transfer_ring_image(ring_->slot_view(0), destination, true, cudaMemcpyDeviceToHost, stream);
+}
+
+void DFlash2Round::copy_context_from_host(const std::byte* source, cudaStream_t stream) {
+    device_->bind_to_current_thread();
+    transfer_ring_image(ring_->slot_view(0), const_cast<std::byte*>(source), false,
+                        cudaMemcpyHostToDevice, stream);
+}
+
+void DFlash2Round::copy_context_to_device(DeviceSpan destination, cudaStream_t stream) const {
+    if (destination.bytes < ring_payload_bytes_) {
+        throw std::invalid_argument("DFlash2 context image is smaller than the draft ring");
+    }
+    device_->bind_to_current_thread();
+    transfer_ring_image(ring_->slot_view(0), static_cast<std::byte*>(destination.data), true,
+                        cudaMemcpyDeviceToDevice, stream);
+}
+
+void DFlash2Round::copy_context_from_device(DeviceSpan source, cudaStream_t stream) {
+    if (source.bytes < ring_payload_bytes_) {
+        throw std::invalid_argument("DFlash2 context image is smaller than the draft ring");
+    }
+    device_->bind_to_current_thread();
+    transfer_ring_image(ring_->slot_view(0), static_cast<std::byte*>(source.data), false,
+                        cudaMemcpyDeviceToDevice, stream);
+}
+
 ExecutionCore DFlash2Round::round_execution(const ExecutionCore& source, DeviceArena& work) const {
     return ExecutionCore{
         .device           = source.device,
