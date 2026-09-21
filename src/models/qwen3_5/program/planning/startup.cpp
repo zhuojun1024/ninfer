@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
+#include "models/qwen3_5/program/dflash_round.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
@@ -577,71 +578,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 return finish(layout);
             };
             const auto dflash_proposal_capacity = [&](std::int32_t width, std::int32_t batch) {
+                if (draft->dflash2.has_value()) {
+                    // One planner for both routes: the TP-2 masked-draft round sizes its own
+                    // proposal arena with the same capacity functions this single-device sizing
+                    // has always used.
+                    return execution::dflash2_proposal_workspace_bytes(
+                        parameters, config, plan.capacity, plan.proposal_head, width, batch);
+                }
                 WorkspaceLayoutBuilder layout;
                 const std::int32_t tokens = width * batch;
                 matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
-                if (draft->dflash2.has_value()) {
-                    const auto prepare = [&] {
-                        (void)workspace::dflash2_branch(layout, config, *draft, width, batch);
-                        scratch(layout,
-                                ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-                                    width, width, batch, batch));
-                    };
-                    {
-                        auto attention = layout.scope();
-                        prepare();
-                        matrix(layout, DType::BF16, dimension(draft->attention.query_width()),
-                               tokens);
-                        matrix(layout, DType::BF16, dimension(draft->attention.key_width()),
-                               tokens);
-                        matrix(layout, DType::BF16, dimension(draft->attention.key_width()),
-                               tokens);
-                        matrix(layout, DType::BF16, dimension(draft->attention.query_width()),
-                               tokens);
-                        scratch(layout, ops::sliding_window_attention_workspace_capacity_bytes(
-                                            {dimension(draft->attention.head_dim),
-                                             dimension(draft->attention.num_attention_heads),
-                                             dimension(draft->attention.num_key_value_heads)},
-                                            dimension(draft->sliding_window.value_or(0)),
-                                            {0, plan.capacity}, width, width, batch));
-                        scratch(layout,
-                                ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                                    dimension(draft->attention.query_width()), width, width, batch,
-                                    batch));
-                    }
-                    {
-                        auto mlp = layout.scope();
-                        prepare();
-                        matrix(layout, DType::BF16, dimension(draft->intermediate_size), tokens);
-                        for (const auto& block : parameters.draft->layers) {
-                            const auto& p = block.mlp.gate_up;
-                            scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
-                                                p.weight.qtype, p.weight.n, p.weight.k, p.policy,
-                                                tokens, tokens));
-                        }
-                        scratch(
-                            layout,
-                            ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                                dimension(draft->intermediate_size), width, width, batch, batch));
-                    }
-                    const auto mask_columns = drafts * batch;
-                    matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);
-                    matrix(layout, DType::FP32, dimension(draft->dflash2->selector_top_k),
-                           mask_columns);
-                    const auto& head = plan.proposal_head == ProposalHead::Optimized
-                                           ? parameters.proposal->head
-                                           : parameters.draft->output_head;
-                    scratch(layout, ops::linear_topk_workspace_capacity_bytes(
-                                        head.weight.qtype, head.weight.n, head.weight.k,
-                                        mask_columns, mask_columns));
-                    matrix(layout, DType::BF16, dimension(draft->dflash2->selector_rank),
-                           mask_columns);
-                    linear_scratch(layout, parameters.draft->selector->hidden_projection,
-                                   mask_columns, mask_columns);
-                    scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(
-                                        drafts, drafts, batch, batch));
-                    return finish(layout);
-                }
                 {
                     auto attention = layout.scope();
                     (void)workspace::dflash_attention(layout, config, *draft, tokens);

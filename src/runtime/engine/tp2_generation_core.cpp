@@ -9,6 +9,7 @@
 #include "models/qwen3_5/frontend/tool_call_constraint.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/dflash_round.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/position.h"
@@ -146,9 +147,6 @@ Tp2RoundTiming& tp2_timing() {
 // exactly: at 262,144 tokens the 128 MiB a 384 MiB arena would hold is the difference between
 // fitting the card and not, and the oversized arena overflow is a reported error, not corruption.
 constexpr std::size_t kWorkspaceBytes = 192ULL << 20;
-// Alignment of the DFlash2 context backing (features, positions and the draft's local K/V ring);
-// the single-device persistent layout uses the same 256-byte arena alignment.
-constexpr std::size_t kDflashContextAlignment = 256;
 // Smallest Vision item ceiling the route will fall back to when the full envelope does not fit
 // beside the KV pool: below this an ordinary photo would no longer fit in one item, so the route
 // reports the failure instead of silently admitting only thumbnails.
@@ -638,12 +636,13 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                      static_cast<double>(vision_workspace_->handoff_capacity_bytes) / 1048576.0,
                      static_cast<double>(vision_bytes) / 1048576.0);
     }
-    // DFlash2 masked-draft context: the draft component is materialized whole on shard 0 (the
-    // split spec keeps dflash2/* shard-local), so only that shard pays for the target-feature
-    // staging and the draft's own local K/V. The shapes follow the single-device persistent layout
-    // (planning/startup.cpp): one prefill chunk of features is enough because TP-2 clamps its chunk
-    // to kPrefillChunkMaximum (1024) while the draft's local window is 2048, so no prefill ever has
-    // to stage more than one window's worth of target residual.
+    // DFlash2 masked-draft round: the draft component is materialized whole on shard 0 (the split
+    // spec keeps dflash2/* shard-local), so only that shard pays for the target-feature staging, the
+    // draft's own local K/V and the round's proposal workspace. The round owns all of it
+    // (program/dflash_round.h) so the production assembly is exactly the one the loader-only test
+    // drives. One prefill chunk of features is enough because TP-2 clamps its chunk to
+    // kPrefillChunkMaximum (1024) while the draft's local window is 2048, so no prefill ever stages
+    // more than one window's worth of target residual.
     if (shard.parameters->draft.has_value()) {
         const auto& draft = *shard.model->config().draft;
         if (!draft.dflash2.has_value()) {
@@ -651,47 +650,28 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
             // but through the per-layer path (and a full KV layer) that this core does not own.
             throw std::logic_error("TP-2 masked draft requires the DFlash2 context layout");
         }
-        const std::int32_t target_features = qwen::execution::dimension(
-            config.hidden_size * std::uint64_t(draft.target_layer_ids.size()));
-        const std::int32_t feature_columns = static_cast<std::int32_t>(
-            std::min<std::uint32_t>(std::max<std::uint32_t>(options_.prefill_chunk, 64U),
-                                    kPrefillChunkMaximum));
-        const std::int32_t feature_lanes = static_cast<std::int32_t>(
-            std::max<std::uint32_t>(options_.speculative.draft_tokens + 1U, 1U));
-        LayoutBuilder dflash_builder;
-        qwen::detail::DFlashPersistentLayout dflash_layout;
-        dflash_layout.prefill_features = dflash_builder.add_tensor(
-            DType::BF16, {target_features, feature_columns}, kDflashContextAlignment,
-            "DFlash prefill target features");
-        dflash_layout.prefill_positions =
-            dflash_builder.add_tensor(DType::I32, {feature_columns}, kDflashContextAlignment,
-                                      "DFlash prefill target positions");
-        dflash_layout.pending_features = dflash_builder.add_tensor(
-            DType::BF16, {target_features, feature_lanes, 1}, kDflashContextAlignment,
-            "DFlash pending target features");
-        const CyclicKVCacheLayout dflash_ring_layout = plan_cyclic_kv_cache(
-            dflash_builder, draft.local_layer_count(), draft.sliding_window.value_or(0),
-            qwen::execution::dimension(draft.attention.num_key_value_heads),
-            qwen::execution::dimension(draft.attention.head_dim), 1);
-        const std::size_t dflash_bytes =
-            dflash_builder.finish(kDflashContextAlignment, "TP-2 DFlash context");
+        const std::uint32_t feature_columns = std::min<std::uint32_t>(
+            std::max<std::uint32_t>(options_.prefill_chunk, 64U), kPrefillChunkMaximum);
+        const std::uint32_t draft_window = options_.speculative.draft_tokens;
+        // The proposal gets an arena of its own, sized by the planner the single-device route uses.
+        // It is deliberately not carved out of the shard workspace: propose_dflash2_batch resets the
+        // arena it is handed, and that workspace holds the resident prefill hidden state.
+        const std::size_t proposal_bytes = qwen::execution::dflash2_proposal_workspace_bytes(
+            *shard.parameters, config, capacity, ProposalHead::Full,
+            static_cast<std::int32_t>(draft_window) + 1, 1);
+        const qwen::execution::DFlash2RoundSpec dflash_spec = qwen::execution::plan_dflash2_round(
+            draft, config, feature_columns, draft_window, proposal_bytes);
         shard.device.bind_to_current_thread();
-        shard.dflash_arena = std::make_unique<DeviceArena>(dflash_bytes);
-        const DeviceSpan dflash_backing =
-            shard.dflash_arena->alloc_bytes(dflash_bytes, kDflashContextAlignment);
-        CUDA_CHECK(cudaMemset(dflash_backing.data, 0, dflash_bytes));
-        shard.dflash_ring = std::make_unique<CyclicKVCache>(dflash_backing, dflash_ring_layout);
-        shard.dflash = std::make_unique<qwen::detail::DFlashPersistentState>(
-            dflash_backing, dflash_layout, *shard.dflash_ring);
-        shard.prefill_features  = shard.dflash->prefill_features;
-        shard.prefill_positions = shard.dflash->prefill_positions;
-        shard.pending_features  = shard.dflash->pending_features;
+        shard.dflash_round =
+            std::make_unique<qwen::execution::DFlash2Round>(shard.device, dflash_spec);
         std::fprintf(stderr,
-                     "[mem] shard %d DFlash2 context | targets %d x %d | ring %.1f | total %.1f "
-                     "MiB\n",
-                     shard_index, target_features, feature_columns,
-                     static_cast<double>(dflash_ring_layout.payload_bytes()) / 1048576.0,
-                     static_cast<double>(dflash_bytes) / 1048576.0);
+                     "[mem] shard %d DFlash2 round | targets %d x %d | ring %.1f | context %.1f | "
+                     "frame %.1f | proposal %.1f MiB\n",
+                     shard_index, dflash_spec.target_features, dflash_spec.feature_columns,
+                     static_cast<double>(shard.dflash_round->ring_payload_bytes()) / 1048576.0,
+                     static_cast<double>(shard.dflash_round->context_bytes()) / 1048576.0,
+                     static_cast<double>(shard.dflash_round->frame_bytes()) / 1048576.0,
+                     static_cast<double>(proposal_bytes) / 1048576.0);
     }
     // One startup ledger line per shard: every resident block is allocated before the first
     // request, so this is the whole device budget at the requested context ceiling.
@@ -1103,51 +1083,25 @@ std::vector<TokenId> TP2GenerationCore::mtp_propose_window(Shard& shard, Tensor&
 
 std::optional<qwen::execution::DFlashFeatureSink>
 TP2GenerationCore::make_dflash_prefill_sink(Shard& shard) {
-    if (shard.dflash == nullptr) { return std::nullopt; }
-    const auto& draft = *shard.model->config().draft;
-    // The chunk width the prefill forward will actually run with. The sink's buffer is sized for
-    // the maximum and each chunk slices its own prefix out of it (capture_positions copies the
-    // matching positions prefix, consume_prefill_chunk slices the feature prefix). Only the
-    // prefill fields are set: the batch (verify-window) fields stay null until the masked draft's
-    // proposal/verify wiring exists, and `pending_features` is reserved for it.
+    if (shard.dflash_round == nullptr) { return std::nullopt; }
+    // The chunk width the prefill forward will actually run with. The sink's buffer is sized for the
+    // maximum and each chunk slices its own prefix out of it (capture_positions copies the matching
+    // positions prefix, consume_prefill_chunk slices the feature prefix). Only the prefill fields are
+    // set: the batch (verify-window) fields stay null until the masked draft has its verify wiring.
+    // One resident session, so the draft ring's lane is 0 and the whole captured chunk is committed.
     const std::uint32_t chunk = std::min<std::uint32_t>(
         std::max<std::uint32_t>(options_.prefill_chunk, 64U), kPrefillChunkMaximum);
-    return qwen::execution::DFlashFeatureSink{
-        .features  = &shard.prefill_features,
-        .positions = &shard.prefill_positions,
-        .layers    = std::span<const std::uint32_t>(draft.target_layer_ids),
-        .consume_prefill =
-            [&shard, chunk](const Tensor& features, const Tensor& positions, bool /*rewrite*/) {
-                // One resident session, so the draft context's ring lane is lane 0 and the whole
-                // captured chunk is committed. Prefix reuse and session recall still have to carry
-                // this ring with the rest of the state; until then the sink is only fed by a
-                // from-scratch prefill.
-                auto& work = *shard.workspace;
-                // The materialization scratch is dead when this returns; holding it would only
-                // raise the forward's peak against the fixed 192 MiB arena.
-                auto scratch  = work.scope();
-                Tensor counts = work.alloc(DType::I32, {1});
-                Tensor lanes  = work.alloc(DType::I32, {1});
-                ops::set_i32_scalar(counts, features.ne[1], shard.device.stream);
-                ops::set_i32_scalar(lanes, 0, shard.device.stream);
-                const auto exact = static_cast<std::uint32_t>(features.ne[1]);
-                qwen::execution::DFlashAppendContext append{
-                    .execution =
-                        qwen::execution::ExecutionCore{
-                            .device           = shard.device,
-                            .parameters       = *shard.parameters,
-                            .work             = work,
-                            .linear_attention = *shard.state,
-                            .replay_records   = nullptr,
-                            .io               = shard.io,
-                            .prefill_hidden   = shard.prefill_hidden,
-                            .prefill_chunk    = chunk,
-                            .proposal_head    = ProposalHead::Full,
-                        },
-                    .dflash = *shard.dflash};
-                qwen::execution::dflash_append_context(append, features, positions, counts, lanes,
-                                                       counts, {exact, exact});
-            }};
+    return shard.dflash_round->make_prefill_sink(qwen::execution::ExecutionCore{
+        .device           = shard.device,
+        .parameters       = *shard.parameters,
+        .work             = *shard.workspace,
+        .linear_attention = *shard.state,
+        .replay_records   = nullptr,
+        .io               = shard.io,
+        .prefill_hidden   = shard.prefill_hidden,
+        .prefill_chunk    = chunk,
+        .proposal_head    = ProposalHead::Full,
+    });
 }
 
 TP2GenerationCore::Submission TP2GenerationCore::submit(

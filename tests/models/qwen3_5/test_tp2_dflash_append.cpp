@@ -1,11 +1,14 @@
-// TP-2 DFlash2 masked-draft context append (PLAN.md section 3.6, stage B3).
+// TP-2 DFlash2 masked-draft round (PLAN.md section 3.6, stage B4).
 //
-// The engine gate keeps --spec dflash2 off the TP-2 route until the masked draft has its own
-// proposal/verify wiring (src/runtime/engine/model_instance.cpp:101-104, deliberately kept), so this
-// test drives the exact seam the B2b commit added instead of opening that gate: the target prefill
-// forward with a DFlashFeatureSink whose consumer runs dflash_append_context on shard 0, assembled
-// from the same ExecutionCore/DFlashAppendContext fields the runtime core uses in
-// TP2GenerationCore::make_dflash_prefill_sink (src/runtime/engine/tp2_generation_core.cpp:1104-1151).
+// The engine gate keeps --spec dflash2 off the TP-2 route until the masked draft has its own verify
+// wiring (src/runtime/engine/model_instance.cpp:101-104, deliberately kept), so this test drives the
+// production round component the runtime core itself builds
+// (src/models/qwen3_5/program/dflash_round.h) instead of opening that gate. The component owns the
+// draft's persistent context (prefill target features, positions, pending staging and the local K/V
+// ring), its exact-B decode frame and a proposal workspace of its own, and it sequences the three
+// steps a request makes against them: the target prefill's feature sink, the append of each captured
+// chunk, and the production masked-block proposal. The loader-only path (plan_load(DFlash2) +
+// materialize_model_tp2) is unchanged; no Engine option normalization is involved.
 //
 // The single-card draft-only oracle is not constructible: the loader binds the whole text component
 // unconditionally (src/models/qwen3_5/load.cpp:56) and Parameters::Parameters prepares the full text
@@ -15,39 +18,33 @@
 //
 //   1. the sink does not perturb the target: the last-column logits of an identical prefill are
 //      bit-identical with and without the sink installed (both shards);
-//   2. the append chain completes: the consumer runs exactly once and the sink captured every
-//      configured feature layer and its positions;
+//   2. the append chain completes: the round's consumer runs exactly once and the sink captured
+//      every configured feature layer and its positions;
 //   3. the draft ring is finite, non-zero and structurally sane: K BF16 / V FP16 with the configured
 //      geometry, the addressed prefix [0, chunk) written for all five layers, the untouched capacity
 //      remainder exactly zero, and the ring bit-identical to the same features appended directly;
 //   4. the append is chunk-width independent: one width=chunk append and two width=chunk/2 appends
 //      over the same captured features produce a bit-identical ring;
-//   5. the same input, prefilled twice from a zeroed state, reproduces the ring bit for bit;
+//   5. the same input, prefilled twice from a zeroed round, reproduces the ring bit for bit;
 //   6. the chunk=1024 append fits the shipped 192 MiB workspace (tp2_generation_core.cpp:148), with
-//      the peak reported against that budget (the PLAN's unmeasured item).
-//
-// It then runs stage B3 on the appended ring: a real DFlash2 decode frame is planned exactly as a
-// masked-draft round would be (round_buffers.cpp:184-221) and shard 0 executes the production
-// masked-block proposal (execution/draft.cpp propose_dflash2_batch) through the dflash_propose_batch
-// seam. That forward cannot run unchanged on TP-2: text/token_embedding is RowParallel
-// (load/tp_split_spec.cpp:117-122) while the draft consumes the full hidden state, so the proposal
-// gathers the peer half through TextContext::embedding_full_width (the same embedding_tp2 path the
-// MTP stem uses) and rebinds its own device afterwards. The test establishes:
-//
-//   7. the proposal produces the documented B3 outputs: K drafts, [16,K,B] candidate ids and
-//      proposal q, and the [K+1,B] masked query positions; every candidate row is distinct and in the
-//      public token domain, every draft is one of its position's candidates, and the greedy
-//      selector's q is the exact one-hot distribution that names the draft;
+//      the peak reported against that budget;
+//   7. the assembled round's proposal produces the documented stage-B3 outputs: K drafts, [16,K,B]
+//      candidate ids and proposal q, and the [K+1,B] masked query positions; every candidate row is
+//      distinct and in the public token domain, every draft is one of its position's candidates,
+//      and the greedy selector's q is the exact one-hot distribution that names the draft;
 //   8. the same ring proposed twice, and the whole prefill -> append -> proposal chain re-run from a
-//      zeroed state, agree bit for bit (hash reported, cross-process compared);
-//   9. its cost: the decode frame, the resident context, and the transient proposal workspace peak
-//      against the shipped 192 MiB arena, plus CUDA-event wall time per proposal.
+//      zeroed round, agree bit for bit (hash reported, cross-process compared);
+//   9. the round leaves the shard workspace untouched: propose_dflash2_batch resets the arena it is
+//      handed (execution/draft.cpp:284), so the component must pass its own; a poisoned resident
+//      prefill_hidden survives a proposal bit for bit and the resident arena watermark does not move;
+//  10. its cost: the context, the frame, the round's own proposal arena and the transient peak, plus
+//      CUDA-event wall time per proposal, against the shipped 192 MiB arena.
 //
 // What it does not establish: the ring values are not checked against an independent host oracle
 // that decodes the stored q8_g32_fp16 feature/context weights with their scales, so a wrong-but-
 // deterministic fused result would pass; and there is no acceptance oracle for the drafts
-// themselves (that needs the target verify/accept stage, B5). The selector, the verify/accept/fold
-// loop and the session/checkpoint state are deliberately not part of this stage.
+// themselves (that needs the target verify/accept stage, B5). The selector's Engine publication, the
+// verify/accept/fold loop and the session/checkpoint state are deliberately not part of this stage.
 //
 // The artifact is selected with NINFER_TEST_ARTIFACT; two identical sm_120a devices are required.
 // Without either the test skips with exit code 77.
@@ -56,19 +53,16 @@
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/device.h"
-#include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/tp/device_pair.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/context.h"
-#include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/dflash_round.h"
 #include "models/qwen3_5/program/round_buffers.h"
-#include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "ninfer/ops/position.h"
-#include "ninfer/ops/scalar.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -99,8 +93,6 @@ namespace qwen = ninfer::models::qwen3_5;
 // the chunk=1024 sink prefill inside exactly the arena the product route gives it, not a test-sized
 // one.
 constexpr std::size_t kWorkspaceBytes = 192ULL << 20;
-// Mirrors the DFlash context alignment (tp2_generation_core.cpp:151).
-constexpr std::size_t kDflashContextAlignment = 256;
 constexpr std::uint32_t kTestCacheTokens      = 2048;
 constexpr std::uint32_t kTestCachePages       = kTestCacheTokens / 64;
 
@@ -198,95 +190,9 @@ ShardState build_shard_state(DeviceContext& device, const qwen::TextConfig& conf
     return shard;
 }
 
-// The DFlash draft's persistent context on shard 0, allocated exactly as build_shard does
-// (tp2_generation_core.cpp:647-695): one prefill chunk of target features, the positions, the
-// pending staging buffer, and the zeroed local cyclic K/V ring for the five sliding layers.
-struct DFlashContext {
-    DeviceSpan backing;
-    std::size_t bytes = 0;
-    std::unique_ptr<DeviceArena> arena;
-    std::unique_ptr<CyclicKVCache> ring;
-    std::unique_ptr<qwen::detail::DFlashPersistentState> state;
-    Tensor features;
-    Tensor positions;
-    Tensor pending;
-};
-
-DFlashContext build_dflash_context(DeviceContext& device, const qwen::DraftConfig& draft,
-                                   const qwen::TextConfig& target, std::int32_t columns,
-                                   std::int32_t lanes) {
-    const std::int32_t target_features =
-        qwen::execution::dimension(target.hidden_size * draft.target_layer_ids.size());
-    LayoutBuilder builder;
-    qwen::detail::DFlashPersistentLayout layout;
-    layout.prefill_features = builder.add_tensor(DType::BF16, {target_features, columns},
-                                                 kDflashContextAlignment,
-                                                 "test DFlash prefill target features");
-    layout.prefill_positions = builder.add_tensor(DType::I32, {columns}, kDflashContextAlignment,
-                                                  "test DFlash prefill target positions");
-    layout.pending_features = builder.add_tensor(DType::BF16, {target_features, lanes, 1},
-                                                 kDflashContextAlignment,
-                                                 "test DFlash pending target features");
-    const CyclicKVCacheLayout ring_layout = plan_cyclic_kv_cache(
-        builder, draft.local_layer_count(), draft.sliding_window.value_or(0),
-        qwen::execution::dimension(draft.attention.num_key_value_heads),
-        qwen::execution::dimension(draft.attention.head_dim), 1);
-    DFlashContext context;
-    context.bytes = builder.finish(kDflashContextAlignment, "test DFlash context");
-    device.bind_to_current_thread();
-    context.arena   = std::make_unique<DeviceArena>(context.bytes);
-    context.backing = context.arena->alloc_bytes(context.bytes, kDflashContextAlignment);
-    CUDA_CHECK(cudaMemset(context.backing.data, 0, context.bytes));
-    context.ring  = std::make_unique<CyclicKVCache>(context.backing, ring_layout);
-    context.state = std::make_unique<qwen::detail::DFlashPersistentState>(context.backing, layout,
-                                                                          *context.ring);
-    context.features  = context.state->prefill_features;
-    context.positions = context.state->prefill_positions;
-    context.pending   = context.state->pending_features;
-    return context;
-}
-
-void zero_dflash(DeviceContext& device, DFlashContext& context) {
-    device.bind_to_current_thread();
-    CUDA_CHECK(cudaMemsetAsync(context.backing.data, 0, context.bytes, device.stream));
-}
-
-// The DFlash2 decode frame the runtime lays out for one exact-B round
-// (round_buffers.cpp:184-221, plan at tp2_generation_core.cpp:785-800 for MTP). Stage B3 needs only
-// the proposal fields, so the frame is planned through the production helper with the same spec a
-// masked-draft round would use and bound to a test-owned backing.
-struct DFlashRound {
-    std::unique_ptr<DeviceArena> arena;
-    DeviceSpan backing;
-    std::size_t bytes      = 0;
-    std::unique_ptr<qwen::RoundState> io;
-    qwen::DFlashDecodeState* frame = nullptr;
-};
-
-DFlashRound build_dflash_round(DeviceContext& device, const qwen::TextConfig& target,
-                               std::uint32_t drafts) {
-    LayoutBuilder builder;
-    qwen::RoundStateLayout layout = qwen::begin_round_state_layout(
-        builder,
-        qwen::RoundStateSpec{
-            .hidden         = qwen::execution::dimension(target.hidden_size),
-            .output_rows    = qwen::execution::dimension(target.vocab_size),
-            .batch_capacity = 1,
-            .draft_window   = drafts,
-            .backend        = SpeculativeBackend::DFlash2,
-        });
-    qwen::complete_round_state_layout(builder, layout);
-    DFlashRound round;
-    round.bytes = builder.finish(256);
-    device.bind_to_current_thread();
-    round.arena   = std::make_unique<DeviceArena>(round.bytes);
-    round.backing = round.arena->alloc_bytes(round.bytes, 256);
-    CUDA_CHECK(cudaMemset(round.backing.data, 0, round.bytes));
-    round.io    = std::make_unique<qwen::RoundState>(round.backing, layout);
-    round.frame = &*round.io->dflash_decode;
-    return round;
-}
-
+// The draft context, the decode frame and the proposal workspace are owned by the production round
+// component (models/qwen3_5/program/dflash_round.h); the test constructs it rather than laying
+// those buffers out itself, so what it exercises is the assembly the runtime core also uses.
 std::vector<std::int32_t> read_i32(DeviceContext& device, const Tensor& tensor) {
     device.bind_to_current_thread();
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
@@ -623,13 +529,41 @@ int main(int argc, char** argv) {
         publish_kv_rows(device0.get(), &shard0);
         publish_kv_rows(device1.get(), &shard1);
 
-        DFlashContext dflash =
-            build_dflash_context(*device0, draft, target, chunk, /*lanes=*/1);
+        // The production round component owns the draft context, the exact-B decode frame and the
+        // proposal workspace. The proposal arena is sized to the shipped per-shard workspace budget
+        // (192 MiB), which is what the runtime core would give it, so the peak below is comparable
+        // across stages.
+        const qwen::execution::DFlash2RoundSpec round_spec = qwen::execution::plan_dflash2_round(
+            draft, target, static_cast<std::uint32_t>(chunk),
+            static_cast<std::uint32_t>(proposal_drafts), kWorkspaceBytes);
+        device0->bind_to_current_thread();
+        qwen::execution::DFlash2Round round(*device0, round_spec);
         const double ring_bytes = static_cast<double>(layers) * head_dim *
-                                  static_cast<double>(dflash.ring->padded_capacity()) * kv_heads *
+                                  static_cast<double>(round.ring().padded_capacity()) * kv_heads *
                                   (2.0 + 2.0);
-        std::printf("[mem] shard 0 DFlash2 context arena %.1f MiB (ring %.1f MiB)\n",
-                    static_cast<double>(dflash.bytes) / 1048576.0, ring_bytes / 1048576.0);
+        std::printf("[mem] shard 0 DFlash2 round: context %.1f MiB (ring %.1f MiB) | frame %.1f MiB "
+                    "| proposal arena %.1f MiB\n",
+                    static_cast<double>(round.context_bytes()) / 1048576.0,
+                    ring_bytes / 1048576.0,
+                    static_cast<double>(round.frame_bytes()) / 1048576.0,
+                    static_cast<double>(round.proposal_workspace_capacity()) / 1048576.0);
+
+        // One execution core describes the shard's resident state; each round step hands the
+        // component that state and the component substitutes its own frame and arena where the round
+        // must own them.
+        auto execution_core = [&]() {
+            return qwen::execution::ExecutionCore{
+                .device           = *device0,
+                .parameters       = parameters0,
+                .work             = *shard0.workspace,
+                .linear_attention = *shard0.state,
+                .replay_records   = nullptr,
+                .io               = shard0.io,
+                .prefill_hidden   = shard0.prefill_hidden,
+                .prefill_chunk    = static_cast<std::uint32_t>(chunk),
+                .proposal_head    = ProposalHead::Full,
+            };
+        };
 
         std::vector<int> ids(static_cast<std::size_t>(chunk));
         for (std::int32_t i = 0; i < chunk; ++i) { ids[static_cast<std::size_t>(i)] = 1000 + i % 997; }
@@ -641,7 +575,7 @@ int main(int argc, char** argv) {
             device1->bind_to_current_thread();
             CUDA_CHECK(cudaMemsetAsync(shard1.state_backing.data, 0, shard1.state_backing.bytes,
                                        device1->stream));
-            zero_dflash(*device0, dflash);
+            round.zero_context();
         };
 
         struct RunResult {
@@ -670,52 +604,22 @@ int main(int argc, char** argv) {
             return result;
         };
 
-        // Direct (sink-free) append driver: the same call the runtime consumer makes, on an explicit
-        // feature window, so the append itself can be exercised independently of the capture path.
-        std::uint32_t consumed = 0;
-        auto append_into = [&](qwen::detail::DFlashPersistentState& state, const Tensor& features,
-                               const Tensor& positions, std::uint32_t exact) {
-            auto scratch = shard0.workspace->scope();
-            device0->bind_to_current_thread();
-            Tensor counts = shard0.workspace->alloc(DType::I32, {1});
-            Tensor lanes  = shard0.workspace->alloc(DType::I32, {1});
-            ops::set_i32_scalar(counts, static_cast<std::int32_t>(exact), device0->stream);
-            ops::set_i32_scalar(lanes, 0, device0->stream);
-            qwen::execution::DFlashAppendContext append{
-                .execution =
-                    qwen::execution::ExecutionCore{
-                        .device           = *device0,
-                        .parameters       = parameters0,
-                        .work             = *shard0.workspace,
-                        .linear_attention = *shard0.state,
-                        .replay_records   = nullptr,
-                        .io               = shard0.io,
-                        .prefill_hidden   = shard0.prefill_hidden,
-                        .prefill_chunk    = static_cast<std::uint32_t>(chunk),
-                        .proposal_head    = ProposalHead::Full,
-                    },
-                .dflash = state,
-            };
-            qwen::execution::dflash_append_context(
-                append, features, positions, counts, lanes, counts, {exact, exact});
-        };
-
         // 1. Target prefill without the sink.
         const RunResult baseline = run_prefill(nullptr);
         std::cout << "  no-sink prefill: workspace peak A=" << (baseline.peak0 >> 20)
                   << " MiB B=" << (baseline.peak1 >> 20) << " MiB" << std::endl;
 
-        // 2. Target prefill with the sink; the consumer runs the B2b append.
-        qwen::execution::DFlashFeatureSink sink{
-            .features  = &dflash.features,
-            .positions = &dflash.positions,
-            .layers    = std::span<const std::uint32_t>(draft.target_layer_ids),
-            .consume_prefill =
-                [&](const Tensor& features, const Tensor& positions, bool /*rewrite*/) {
-                    ++consumed;
-                    append_into(*dflash.state, features, positions,
-                                static_cast<std::uint32_t>(features.ne[1]));
-                }};
+        // 2. Target prefill with the round's own sink; its consumer appends each captured chunk
+        // into the round's draft ring. The wrapper only counts the consumer's calls.
+        std::uint32_t consumed = 0;
+        qwen::execution::DFlashFeatureSink sink = round.make_prefill_sink(execution_core());
+        const qwen::execution::DFlashFeatureSink::PrefillConsumer round_consumer =
+            sink.consume_prefill;
+        sink.consume_prefill = [&consumed, round_consumer](const Tensor& features,
+                                                           const Tensor& positions, bool rewrite) {
+            ++consumed;
+            round_consumer(features, positions, rewrite);
+        };
         const RunResult with_sink = run_prefill(&sink);
         std::cout << "  sink prefill: workspace peak A=" << (with_sink.peak0 >> 20)
                   << " MiB B=" << (with_sink.peak1 >> 20) << " MiB | consumer calls=" << consumed
@@ -742,7 +646,7 @@ int main(int argc, char** argv) {
         // The sink captures the chunk's absolute cache positions; those drive the ring slots.
         std::vector<std::int32_t> captured(static_cast<std::size_t>(chunk), -1);
         device0->bind_to_current_thread();
-        CUDA_CHECK(cudaMemcpy(captured.data(), dflash.positions.data,
+        CUDA_CHECK(cudaMemcpy(captured.data(), round.state().prefill_positions.data,
                               sizeof(std::int32_t) * static_cast<std::size_t>(chunk),
                               cudaMemcpyDeviceToHost));
         for (std::int32_t i = 0; i < chunk; ++i) {
@@ -752,23 +656,23 @@ int main(int argc, char** argv) {
         std::cout << "  sink captured positions [0," << chunk << ")" << std::endl;
 
         // 3. Ring structure.
-        const RingSnapshot ring1 = read_ring(*device0, *dflash.ring);
-        require(dflash.ring->layer_count() == static_cast<std::uint32_t>(layers),
+        const RingSnapshot ring1 = read_ring(*device0, round.ring());
+        require(round.ring().layer_count() == static_cast<std::uint32_t>(layers),
                 "ring layer count is wrong");
-        require(dflash.ring->capacity() == draft.sliding_window.value_or(0),
+        require(round.ring().capacity() == draft.sliding_window.value_or(0),
                 "ring capacity is not the draft window");
-        require(dflash.ring->num_kv_heads() == kv_heads && dflash.ring->head_dim() == head_dim,
+        require(round.ring().num_kv_heads() == kv_heads && round.ring().head_dim() == head_dim,
                 "ring head geometry is wrong");
-        require(dflash.ring->lane_capacity() == 1, "ring lane capacity is not one");
+        require(round.ring().lane_capacity() == 1, "ring lane capacity is not one");
         bool dead_ok = true;
         for (std::int32_t layer = 0; layer < layers; ++layer) {
             const RingLayerStats k = ring_layer_stats(
                 ring1.k[static_cast<std::size_t>(layer)], false, head_dim,
-                static_cast<std::int32_t>(dflash.ring->padded_capacity()), kv_heads, 1, chunk,
+                static_cast<std::int32_t>(round.ring().padded_capacity()), kv_heads, 1, chunk,
                 &dead_ok);
             const RingLayerStats v = ring_layer_stats(
                 ring1.v[static_cast<std::size_t>(layer)], true, head_dim,
-                static_cast<std::int32_t>(dflash.ring->padded_capacity()), kv_heads, 1, chunk,
+                static_cast<std::int32_t>(round.ring().padded_capacity()), kv_heads, 1, chunk,
                 &dead_ok);
             std::printf("  ring layer %d: K live_nonzero=%zu/%zu nonfinite=%zu max_abs=%.4g "
                         "mean_abs=%.4g | V live_nonzero=%zu/%zu nonfinite=%zu max_abs=%.4g\n",
@@ -782,8 +686,10 @@ int main(int argc, char** argv) {
         require(dead_ok, "the ring wrote past the addressed prefix");
         std::cout << "  ring: geometry and coverage sane, capacity remainder zero" << std::endl;
 
-        // 4. The sink path equals the same features appended directly (one width=chunk call).
-        DFlashContext direct = build_dflash_context(*device0, draft, target, chunk, 1);
+        // 4. The sink path equals the same features appended directly (one width=chunk call). The
+        // direct driver is a second round component, so this compares the captured path against an
+        // explicit call into the same production append.
+        qwen::execution::DFlash2Round direct(*device0, round_spec);
         std::unique_ptr<DeviceArena> direct_arena(
             new DeviceArena(static_cast<std::size_t>(target.hidden_size) *
                                 draft.target_layer_ids.size() * chunk * 2 +
@@ -793,11 +699,12 @@ int main(int argc, char** argv) {
             DType::BF16,
             {qwen::execution::dimension(target.hidden_size * draft.target_layer_ids.size()), chunk});
         Tensor direct_positions = direct_arena->alloc(DType::I32, {chunk});
-        CUDA_CHECK(cudaMemcpyAsync(features_copy.data, dflash.features.data, features_copy.bytes(),
-                                   cudaMemcpyDeviceToDevice, device0->stream));
+        CUDA_CHECK(cudaMemcpyAsync(features_copy.data, round.state().prefill_features.data,
+                                   features_copy.bytes(), cudaMemcpyDeviceToDevice, device0->stream));
         ops::fill_i32_positions(direct_positions, 0, device0->stream);
-        append_into(*direct.state, features_copy, direct_positions, static_cast<std::uint32_t>(chunk));
-        const RingSnapshot direct1 = read_ring(*device0, *direct.ring);
+        direct.append(execution_core(), features_copy, direct_positions,
+                      static_cast<std::uint32_t>(chunk));
+        const RingSnapshot direct1 = read_ring(*device0, direct.ring());
         require(direct1 == ring1, "the direct append differs from the sink-driven append");
         std::cout << "  direct append over the captured features reproduces the sink ring "
                      "bit-for-bit"
@@ -805,14 +712,16 @@ int main(int argc, char** argv) {
 
         // 5. Chunk-width independence: two width=chunk/2 appends at absolute positions.
         const std::int32_t half = chunk / 2;
-        zero_dflash(*device0, direct);
+        direct.zero_context();
         Tensor half_features = features_copy.slice(1, 0, half);
         Tensor half_positions = direct_positions.slice(0, 0, half);
-        append_into(*direct.state, half_features, half_positions, static_cast<std::uint32_t>(half));
+        direct.append(execution_core(), half_features, half_positions,
+                      static_cast<std::uint32_t>(half));
         Tensor tail_features = features_copy.slice(1, half, half);
         Tensor tail_positions = direct_positions.slice(0, half, half);
-        append_into(*direct.state, tail_features, tail_positions, static_cast<std::uint32_t>(half));
-        const RingSnapshot direct2 = read_ring(*device0, *direct.ring);
+        direct.append(execution_core(), tail_features, tail_positions,
+                      static_cast<std::uint32_t>(half));
+        const RingSnapshot direct2 = read_ring(*device0, direct.ring());
         require(direct2 == direct1,
                 "two half-width appends differ from one full-width append");
         std::cout << "  " << chunk << " vs 2x" << half
@@ -820,34 +729,28 @@ int main(int argc, char** argv) {
 
         // 6. Reproducibility across runs from a zeroed state.
         const RunResult repeat = run_prefill(&sink);
-        const RingSnapshot ring2 = read_ring(*device0, *dflash.ring);
+        const RingSnapshot ring2 = read_ring(*device0, round.ring());
         require(repeat.logits0 == with_sink.logits0, "the repeat run changed shard 0 logits");
         require(ring2 == ring1, "the repeat run changed the ring");
         std::printf("  repeat run: ring bit-identical (fnv1a=0x%016llx)\n",
                     static_cast<unsigned long long>(ring1.hash));
 
-        // 7. Stage B3: the masked-block proposal forward on shard 0, after a prefill chunk has been
-        // consumed into the draft ring. The frame is a real DFlash2 round state built by the same
-        // planner the runtime uses, and the proposal runs the production propose path
-        // (execution/draft.cpp propose_dflash2_batch) through the B3 seam dflash_propose_batch. The
-        // selector inside that function is production code; no selector/verify/session stage is
-        // added here.
-        const std::int32_t k         = proposal_drafts;
-        const std::int32_t width     = k + 1;
-        const std::int32_t frontier  = chunk - 1;
+        // 7. The assembled round's proposal on shard 0, after a prefill chunk has been consumed into
+        // the draft ring. The round owns the frame, the draft state and its own workspace, and runs
+        // the production propose path (execution/draft.cpp propose_dflash2_batch) through the B3 seam
+        // dflash_propose_batch. The selector inside that function is production code; no
+        // selector/verify/session stage is added here.
+        const std::int32_t k          = proposal_drafts;
+        const std::int32_t width      = k + 1;
+        const std::int32_t frontier   = chunk - 1;
         const std::int32_t selector_k = static_cast<std::int32_t>(draft.dflash2->selector_top_k);
         const std::int32_t public_tokens =
             static_cast<std::int32_t>(parameters0.model.resources().public_token_count);
-        DFlashRound round = build_dflash_round(*device0, target, static_cast<std::uint32_t>(k));
-        std::unique_ptr<DeviceArena> proposal_arena(new DeviceArena(kWorkspaceBytes));
-        std::unique_ptr<DeviceArena> scratch_arena(new DeviceArena(1U << 20));
-        device0->bind_to_current_thread();
-        Tensor continuation = scratch_arena->alloc(DType::BF16, {hidden, 1});
 
         // One greedy decode round's ingress for the single resident row: the anchor is the last
         // prompt token, the frontier is its cache position, and the draft's own attention uses its
         // logical positions [frontier, frontier + width) (decode.cpp:662-674).
-        qwen::DFlashDecodeIngress host_ingress{};
+        qwen::DFlashDecodeIngress& host_ingress = round.ingress();
         host_ingress.anchors[0]                 = ids[static_cast<std::size_t>(frontier)];
         host_ingress.execution_frontiers[0]     = frontier;
         host_ingress.context_frontiers[0]       = chunk;
@@ -858,40 +761,14 @@ int main(int argc, char** argv) {
         host_ingress.state_source_slots[0]      = 0;
         host_ingress.state_destination_slots[0] = 0;
         host_ingress.sampling[0].temperature    = 0.0F;
-        qwen::DFlashDecodeEgress host_egress{};
         const qwen::execution::DFlashEnvelopes envelopes{
             .local  = {0, static_cast<std::uint32_t>(frontier)},
             .full   = {0, static_cast<std::uint32_t>(frontier)},
             .append = {0, static_cast<std::uint32_t>(width)}};
 
         auto enqueue_proposal = [&]() {
-            device0->bind_to_current_thread();
-            CUDA_CHECK(cudaMemcpyAsync(round.frame->ingress.data, &host_ingress,
-                                       sizeof(host_ingress), cudaMemcpyHostToDevice,
-                                       device0->stream));
-            qwen::execution::DFlashBatchContext context{
-                .execution =
-                    qwen::execution::ExecutionCore{
-                        .device           = *device0,
-                        .parameters       = parameters0,
-                        .work             = *proposal_arena,
-                        .linear_attention = *shard0.state,
-                        .replay_records   = nullptr,
-                        .io               = shard0.io,
-                        .prefill_hidden   = shard0.prefill_hidden,
-                        .prefill_chunk    = static_cast<std::uint32_t>(chunk),
-                        .proposal_head    = ProposalHead::Full,
-                    },
-                .text_cache                = shard0.decoder->text_kv,
-                .dflash                    = *dflash.state,
-                .frame                     = *round.frame,
-                .host_ingress              = host_ingress,
-                .host_egress               = host_egress,
-                .continuation_hidden_store = continuation,
-                .tp_card                   = &card0,
-            };
-            qwen::execution::dflash_propose_batch(context, 1, static_cast<std::uint32_t>(k),
-                                                  envelopes);
+            round.propose(execution_core(), shard0.decoder->text_kv, &card0,
+                          static_cast<std::uint32_t>(k), envelopes);
         };
 
         struct ProposalResult {
@@ -902,14 +779,15 @@ int main(int argc, char** argv) {
             std::uint64_t hash = 0;
         };
         auto run_proposal = [&]() {
-            proposal_arena->reset_peak();
+            round.reset_proposal_workspace_peak();
             enqueue_proposal();
             CUDA_CHECK(cudaStreamSynchronize(device0->stream));
+            const qwen::execution::DFlash2Proposal& published = round.proposal();
             ProposalResult result;
-            result.drafts     = read_i32(*device0, round.frame->draft_tokens);
-            result.candidates = read_i32(*device0, round.frame->candidate_ids);
-            result.proposal_q = read_fp32(*device0, round.frame->proposal_q);
-            result.peak       = proposal_arena->peak_used();
+            result.drafts     = read_i32(*device0, published.drafts);
+            result.candidates = read_i32(*device0, published.candidate_ids);
+            result.proposal_q = read_fp32(*device0, published.scores);
+            result.peak       = round.proposal_workspace_peak();
             std::uint64_t hash = 1469598103934665603ULL;
             const auto feed    = [&hash](const void* data, std::size_t bytes) {
                 hash ^= fnv1a(std::span<const std::byte>(
@@ -924,20 +802,20 @@ int main(int argc, char** argv) {
         };
 
         const ProposalResult proposal1 = run_proposal();
-        require(round.frame->draft_tokens.ne[0] == k && round.frame->draft_tokens.ne[1] == 1,
+        require(round.frame().draft_tokens.ne[0] == k && round.frame().draft_tokens.ne[1] == 1,
                 "the draft token buffer has an unexpected shape");
-        require(round.frame->draft_tokens.dtype == DType::I32 &&
-                    round.frame->candidate_ids.dtype == DType::I32 &&
-                    round.frame->proposal_q.dtype == DType::FP32,
+        require(round.frame().draft_tokens.dtype == DType::I32 &&
+                    round.frame().candidate_ids.dtype == DType::I32 &&
+                    round.frame().proposal_q.dtype == DType::FP32,
                 "the proposal output buffers have unexpected dtypes");
-        require(round.frame->candidate_ids.ne[0] == selector_k &&
-                    round.frame->candidate_ids.ne[1] == k && round.frame->candidate_ids.ne[2] == 1,
+        require(round.frame().candidate_ids.ne[0] == selector_k &&
+                    round.frame().candidate_ids.ne[1] == k && round.frame().candidate_ids.ne[2] == 1,
                 "the candidate buffer has an unexpected shape");
-        require(round.frame->proposal_q.ne[0] == selector_k &&
-                    round.frame->proposal_q.ne[1] == k && round.frame->proposal_q.ne[2] == 1,
+        require(round.frame().proposal_q.ne[0] == selector_k &&
+                    round.frame().proposal_q.ne[1] == k && round.frame().proposal_q.ne[2] == 1,
                 "the proposal-q buffer has an unexpected shape");
-        require(round.frame->proposal_ids.ne[0] == width &&
-                    round.frame->proposal_positions.ne[0] == width,
+        require(round.frame().proposal_ids.ne[0] == width &&
+                    round.frame().proposal_positions.ne[0] == width,
                 "the proposal query block has an unexpected width");
         require(proposal1.drafts.size() == static_cast<std::size_t>(k) &&
                     proposal1.candidates.size() == static_cast<std::size_t>(selector_k) * k &&
@@ -947,7 +825,7 @@ int main(int argc, char** argv) {
         // The masked block's query positions must be the anchor's own position first, then one
         // position per draft step, forwarded unchanged to the target verify in a later stage.
         std::vector<std::int32_t> proposal_positions =
-            read_i32(*device0, round.frame->proposal_positions);
+            read_i32(*device0, round.frame().proposal_positions);
         for (std::int32_t i = 0; i < width; ++i) {
             require(proposal_positions[static_cast<std::size_t>(i)] == frontier + i,
                     "the masked proposal block has an unexpected query position");
@@ -998,6 +876,41 @@ int main(int argc, char** argv) {
                     k, width, frontier, frontier + width, selector_k, one_hot_rows, distinct_ok,
                     one_hot_rows);
 
+        // 9. Arena ownership: propose_dflash2_batch resets the arena it is handed, so the round must
+        // pass its own and leave shard 0's resident workspace alone. Poison the resident
+        // prefill_hidden, propose again, and require the pattern and the workspace watermark to
+        // survive while the round's own arena reports the transient peak.
+        {
+            device0->bind_to_current_thread();
+            std::vector<std::uint16_t> poison(
+                static_cast<std::size_t>(shard0.prefill_hidden.bytes() / sizeof(std::uint16_t)));
+            for (std::size_t index = 0; index < poison.size(); ++index) {
+                poison[index] = (index % 2U == 0U) ? 0x3F80U : 0xC000U;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(shard0.prefill_hidden.data, poison.data(),
+                                       shard0.prefill_hidden.bytes(), cudaMemcpyHostToDevice,
+                                       device0->stream));
+            CUDA_CHECK(cudaStreamSynchronize(device0->stream));
+            const std::size_t resident_used = shard0.workspace->used();
+            const std::size_t resident_peak = shard0.workspace->peak_used();
+            round.reset_proposal_workspace_peak();
+            enqueue_proposal();
+            CUDA_CHECK(cudaStreamSynchronize(device0->stream));
+            require(read_bf16(*device0, shard0.prefill_hidden) == poison,
+                    "the proposal overwrote the shard's resident prefill_hidden");
+            require(shard0.workspace->used() == resident_used,
+                    "the proposal moved the shard workspace watermark");
+            require(shard0.workspace->peak_used() == resident_peak,
+                    "the proposal raised the shard workspace peak");
+            const std::size_t round_peak = round.proposal_workspace_peak();
+            require(round_peak > 0 && round_peak <= round.proposal_workspace_capacity(),
+                    "the proposal did not run on the round's own arena");
+            std::printf("  arena ownership: resident prefill_hidden and shard workspace watermark "
+                        "unchanged; round arena peak %.1f MiB of %.1f MiB\n",
+                        static_cast<double>(round_peak) / 1048576.0,
+                        static_cast<double>(round.proposal_workspace_capacity()) / 1048576.0);
+        }
+
         // Determinism: a second proposal on the same ring, then the whole prefill -> append ->
         // proposal chain from a zeroed state, must agree bit for bit.
         const ProposalResult proposal_same_state = run_proposal();
@@ -1013,7 +926,8 @@ int main(int argc, char** argv) {
                     "(fnv1a=0x%016llx)\n",
                     static_cast<unsigned long long>(proposal1.hash));
 
-        // Cost: an empty 192 MiB arena exactly like a shard's, timed with CUDA events.
+        // Cost: the round's own proposal arena, sized to the shipped per-shard 192 MiB budget, timed
+        // with CUDA events.
         for (int warm = 0; warm < 3; ++warm) { enqueue_proposal(); }
         CUDA_CHECK(cudaStreamSynchronize(device0->stream));
         constexpr int kTimedProposals = 20;
@@ -1038,15 +952,22 @@ int main(int argc, char** argv) {
                 ? draft_weights.selector->predecessor_codebook.bytes() +
                       draft_weights.selector->successor_codebook.bytes()
                 : 0;
-        std::printf("[mem] shard 0 DFlash2 draft weights %.1f MiB | proposal frame %.1f MiB | "
-                    "context arena %.1f MiB | proposal workspace peak %.1f MiB (%.0f%% of %zu MiB)\n",
+        // The arena the runtime core's own planner asks for at this geometry, for comparison with the
+        // shipped-budget arena the test sizes the round with.
+        const std::size_t planned_proposal_bytes = qwen::execution::dflash2_proposal_workspace_bytes(
+            parameters0, target, kTestCacheTokens, ProposalHead::Full, width, 1);
+        std::printf("[mem] shard 0 DFlash2 draft weights %.1f MiB | round frame %.1f MiB | "
+                    "context arena %.1f MiB | round proposal arena %.1f MiB | proposal workspace peak "
+                    "%.1f MiB (%.0f%% of %zu MiB) | planner %.1f MiB\n",
                     static_cast<double>(draft_bytes) / 1048576.0,
-                    static_cast<double>(round.bytes) / 1048576.0,
-                    static_cast<double>(dflash.bytes) / 1048576.0,
+                    static_cast<double>(round.frame_bytes()) / 1048576.0,
+                    static_cast<double>(round.context_bytes()) / 1048576.0,
+                    static_cast<double>(round.proposal_workspace_capacity()) / 1048576.0,
                     static_cast<double>(proposal1.peak) / 1048576.0,
                     100.0 * static_cast<double>(proposal1.peak) /
                         static_cast<double>(kWorkspaceBytes),
-                    kWorkspaceBytes >> 20);
+                    kWorkspaceBytes >> 20,
+                    static_cast<double>(planned_proposal_bytes) / 1048576.0);
         std::printf(
             "[mem]   draft block: feature_projection %.1f MiB | layers %.1f MiB | selector "
             "codebooks %.1f MiB | selector hidden_projection %.1f MiB | tied output head %.1f MiB "
@@ -1077,10 +998,10 @@ int main(int argc, char** argv) {
                     per_proposal_ms, kTimedProposals);
 
         std::printf(
-            "TP-2 DFlash2 append+proposal passed: chunk=%d sink logits bit-identical, "
+            "TP-2 DFlash2 round passed: chunk=%d sink logits bit-identical, "
             "consumer=%u/sink prefill, ring sane+reproducible, direct/split append bit-identical, "
-            "K=%d proposal deterministic (fnv1a=0x%016llx), workspace peak A=%.1f MiB (%.0f%% of "
-            "%zu MiB) B=%.1f MiB\n",
+            "shard workspace untouched by the proposal, K=%d proposal deterministic "
+            "(fnv1a=0x%016llx), workspace peak A=%.1f MiB (%.0f%% of %zu MiB) B=%.1f MiB\n",
             chunk, first_consumed, k, static_cast<unsigned long long>(proposal1.hash),
             static_cast<double>(with_sink.peak0) / 1048576.0,
             100.0 * static_cast<double>(with_sink.peak0) / static_cast<double>(kWorkspaceBytes),

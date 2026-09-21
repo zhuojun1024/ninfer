@@ -29,10 +29,8 @@
 #include <vector>
 
 namespace ninfer {
-class CyclicKVCache;
-
-namespace models::qwen3_5::detail {
-struct DFlashPersistentState;
+namespace models::qwen3_5::execution {
+class DFlash2Round;
 }
 } // namespace ninfer
 
@@ -186,20 +184,13 @@ private:
         std::unique_ptr<ops::GdnReplayFoldPlan> replay_fold;
         // Final-norm hidden at the last prompt position: the first round's MTP bridge input.
         Tensor mtp_anchor_hidden;
-        // DFlash2 masked-draft context, owned by the shard that materialized the draft component
-        // (shard 0 alone; tp_split_spec places dflash2/* whole there). The prefill forward taps
-        // the target residual at the draft's configured block ids into `prefill_features`, the
-        // sink's consumer turns each captured chunk into the draft's own sliding-window K/V in
-        // `dflash_ring`. `pending_features` is the masked draft's verify-window staging buffer;
-        // it is allocated here so the buffer set is complete, but nothing fills it yet because the
-        // TP-2 core has no DFlash verify wiring (that is part of the later proposal/selector
-        // stages). Shard 1 holds no draft weights and allocates none of this.
-        std::unique_ptr<DeviceArena> dflash_arena;
-        std::unique_ptr<CyclicKVCache> dflash_ring;
-        std::unique_ptr<models::qwen3_5::detail::DFlashPersistentState> dflash;
-        Tensor prefill_features;
-        Tensor prefill_positions;
-        Tensor pending_features;
+        // DFlash2 masked-draft round, owned by the shard that materialized the draft component
+        // (shard 0 alone; tp_split_spec places dflash2/* whole there). The round owns the draft's
+        // persistent context - the prefill target-feature staging, the pending verify-window
+        // staging and the draft's own sliding-window K/V ring - its exact-B decode frame and a
+        // proposal workspace of its own (program/dflash_round.h). Shard 1 holds no draft weights
+        // and builds none of this.
+        std::unique_ptr<models::qwen3_5::execution::DFlash2Round> dflash_round;
     };
 
     // Cross-session KV retention. Exactly one session's KV and GDN state live in the device pools,
