@@ -257,6 +257,46 @@ loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:7
   中，而 prefix reuse 会跳过共享前缀（被跳过段拿不到目标残差）⇒ 不搬状态，召回/reuse 后 draft context
   必然缺失；checkpoint 前还须 flush pending features。
 
+**可行性结论与潜在问题（调研汇总）**：功能可行（加载已实测），但有三处必须先解决或确认：
+
+1. **reduced proposal head 的 vocab 切分与 DFlash2 单卡 top-k 冲突（最先、最确定）**：`proposal_head` 默认
+   Optimized，`tp_split_spec.cpp:123-129` 会把它 ColumnParallel ⇒ shard 0 只有 131072/2 = 65536 行；而
+   `propose_dflash2_batch`（`draft.cpp:356-370`）在 shard 0 上对整个 reduced 词表做 `linear_topk`，该算子按
+   精确行数匹配 profile（248320 / 131072）⇒ 65536 直接抛 `unsupported head profile`，且 DFlash2 路径**没有**
+   任何跨卡合并（MTP 是在 `text.cpp:782-825` 用 `merge_local_row_blocks` + allreduce 合并的）。**已修**：
+   `load.cpp:137-145` 让 DFlash2 保留整份提议头（`split_proposal_head` 加 `!dflash2()`）；工作区容量按 shard
+   本地参数计算（`planning/startup.cpp:631-636`），头变整份后会自动跟着变大；
+2. **宽窗口 verify 掉出 tiny-T**：目标注意力的 tiny-T 内核只实现 T=1..6（全几何）/ T=7..8（仅 24 头），而 TP-2
+   单卡是 12/2 几何、MTP 的 `draft_tokens` 本来就被 clamp 到 1..5 ⇒ W≤6 正落在快路径。DFlash2 允许 K=1..15
+   ⇒ **W≥7 会走 ChunkedSmallT/Prompt（可跑，但是另一条内核/慢路径）** ⇒ 本机收益应先按 K≤5 估算
+   （tokens/round 由 3.59 降到约 3.0 ⇒ 性能预期由 ~108 降到约 ~90 tok/s），W≥7 的实际代价必须实测；
+3. **草案侧不缺宽窗口**：`sliding_window_attention` 覆盖 T=1..16、window 2048/4096，DFlash2 专用融合算子到
+   T≤48 ⇒ 瓶颈只在目标 verify 那一侧；
+4. **更正：`dflash_graph_profiles` 在 TP-2 上无意义** —— TP-2 强制 `use_cuda_graph=false`，`prepare_graphs`
+   首行就 return，这些桶从不 capture；TP-2 用自己那套 `WindowGraph` + `select_window_graph`
+   （`tp2_generation_core.cpp:868-914`，按 `visible_end` 分桶，eager 与 capture 共用同一 `forward_tp2_window`）
+   ⇒ 阶段分解里「接 dflash_graph_profiles」这条删除。
+
+**状态面与时序（调研汇总；最高风险区）**：
+
+- **运行期状态面为零**：TP-2 core 没有 `StateImageDevicePool`、没有 draft local ring、没有 pending/prefill feature
+  缓冲（设备侧只有 GDN 池 `tp2_generation_core.cpp:500-523`）；单卡侧有现成布局可移植（`state/state_image.h:26-30`、
+  `state_image.cpp:117-131,159-164`、`startup.cpp:139-165`）。
+- **要动的位置**：`build_shard` 建 ring 并计入 state arena slot；`snapshot_host_checkpoint`（`:2022-2057`，现只
+  D2H `state_backing`）加 ring 与 frontier；会话 slab 注册（`session_ensure_host_slabs` `:1153-1273`，仿
+  `host_mtp_kv`）；`SessionEntry`（`h:190-225`）加 draft 镜像与 frontier；四处拷贝点（store `:1296-1317`、
+  restore `:1352-1369`、device snapshot `:2008-2013`、round scratch `:2496-2497`）；以及
+  `forward_tp2_prefill/window` 新增 `DFlashFeatureSink*` 入口（`text.h:196-213` 目前没有）。
+- **两个硬时序**：① checkpoint/发布前必须 flush pending features（单卡靠 `commit.cpp:305-319`），而 TP-2 的
+  `session_store_active` 在请求边界只拷 text KV + GDN + MTP KV，既不 flush 也不搬 draft 面；② **prefix reuse
+  与 draft context 天然冲突**：跳过共享前缀就不产生 `[0,reuse)` 的 target residual（`execute_walk` 从 reuse 起，
+  `:2132`），draft 上下文出现空洞，现有镜像补不回来 ⇒ 要么把 draft context 纳入 reuse 边界状态，要么该路线
+  放弃 reuse。
+- **验收口径**：TP-2 没有 Verify 相位（MTP 当年退回 Prefill 并记为「非逐位一致」），所以 DFlash2 在 TP-2 上
+  只能按「无退化 + 质量同档 + 有加速」验收，**不能**按逐位 parity 验收。
+- **历史陷阱复现风险**：per-device smem opt-in 仍有四处进程级 static（`q8_dynamic_grouped_conv_add_materialized.cu:46`
+  等），恰好覆盖 draft 的 finish 路径；Round 49 的「前几个 token 正常、随后 0 复读」就是同类状态错位的静默表征。
+
 **阶段分解（每阶段独立验收）**：
 - **B1 加载与放置**：放开拒绝 + `tp_split_spec` 增加 `dflash2/*` 规则（feature_projection/codebook 复制，context
   K/V 按 head 切）+ 每卡 draft 配置/state/plan（`tp2_generation_core.cpp:436-523`）⇒ 验收：两卡都物化成功、
