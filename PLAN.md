@@ -473,6 +473,20 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
     相同（SHA256 `324835E9…`），失败run 互为相同（`8CF800…`）。
     性能：**未重测 decode tok/s**——本轮改动只落在选项归一化与复用扫描，未触及任何 decode/attention/head/kernel 文件，复用只
     影响 prefill，故 B5 记录的 TP-2 DFlash2 K=7 63.6 tok/s vs plain 35.1 tok/s（=1.81×；4096 context、单请求、greedy）不受影响。
+    **单实例确定性地基实验（下一轮第 1 条，已做）**：新增探针 `tests/models/qwen3_5/test_tp2_dflash_solo.cpp`
+    （目标 `ninfer_qwen3_5_tp2_dflash_solo_test`）——**单进程只构造一个 Engine**，用该引擎自己的答案续写并重放会话场景的请求序列
+    （opening → other_a → a_continued → other_b/c/d → a_continued(evicted) → shared_a → shared_b），打印每次走法的 tokens 与 fnv1a 摘要。
+    临时打开路线后**独立进程连跑 10 次**（`build-win/b6f-solo-1..10.log`），`shared_b`（reused=512）依次是：
+    7 次 `[1703 220 248046 198 248045 198 248045 198]`（digest `0x4bcc3994a5efba7d`）、
+    1 次 `… 248045 220]`（`0x4bcc3f94a5efc4af`）、1 次 `… 248045 248046]`（`0x49045194a1360b45`）。
+    ⇒ **单实例、单进程的产品形态本身就不确定**，且错值不止一个 ⇒ 不是「两个 Engine 同进程并存」的 harness 假象，**确属产品缺陷**，
+    也说明该 token 的 top-2/3 logits 只差 1 个 bf16 ulp 量级。门禁因此保持关闭；探针在路线被拒时按 SKIP(77) 处理，保留在树内，
+    作为重新放行时的验收工具。
+    **下一步（第 2–4 条）**：(2) 交换两个实例的构造顺序（oracle 后建）看差异是否跟随「后构造的实例」，并在失败run 里做
+    engine/oracle 逐轮对齐（`tp2_generation_core.cpp:2813-2941` 的 proposal/verify/argmax 段）；(3) 投毒法逐个排查候选缓冲
+    （draft ring / pending_features / round arena / GDN records / 快照槽 / paged KV），找出未被完全覆写的那一处；(4) 把 oracle 换成
+    同进程的 plain engine 作控制组，判定是「两个 DFlash2 实例互相干扰」还是「任意第二个实例都受影响」。
+    临时打开路线的改动已还原：`model_instance.cpp` 恢复构造期拒绝并重建验证（`dflash2 exit 0`、solo probe `exit 77`）。
 - **B6 状态与保留（见上方 B6 结果）**：draft ring/pending features 已随会话召回保存恢复（复用 MTP 的 host slab
   先例），`dflash_graph_profiles` 已接；「会话切换后召回逐位一致」对本路线不成立，保留保持禁用；
 - **B7 性能验收**：双卡吞吐对 90–180 tok/s 目标 + 与 MTP 的对比 + plain/mtp 无回归。
