@@ -26,9 +26,28 @@
 //   6. the chunk=1024 append fits the shipped 192 MiB workspace (tp2_generation_core.cpp:148), with
 //      the peak reported against that budget (the PLAN's unmeasured item).
 //
+// It then runs stage B3 on the appended ring: a real DFlash2 decode frame is planned exactly as a
+// masked-draft round would be (round_buffers.cpp:184-221) and shard 0 executes the production
+// masked-block proposal (execution/draft.cpp propose_dflash2_batch) through the dflash_propose_batch
+// seam. That forward cannot run unchanged on TP-2: text/token_embedding is RowParallel
+// (load/tp_split_spec.cpp:117-122) while the draft consumes the full hidden state, so the proposal
+// gathers the peer half through TextContext::embedding_full_width (the same embedding_tp2 path the
+// MTP stem uses) and rebinds its own device afterwards. The test establishes:
+//
+//   7. the proposal produces the documented B3 outputs: K drafts, [16,K,B] candidate ids and
+//      proposal q, and the [K+1,B] masked query positions; every candidate row is distinct and in the
+//      public token domain, every draft is one of its position's candidates, and the greedy
+//      selector's q is the exact one-hot distribution that names the draft;
+//   8. the same ring proposed twice, and the whole prefill -> append -> proposal chain re-run from a
+//      zeroed state, agree bit for bit (hash reported, cross-process compared);
+//   9. its cost: the decode frame, the resident context, and the transient proposal workspace peak
+//      against the shipped 192 MiB arena, plus CUDA-event wall time per proposal.
+//
 // What it does not establish: the ring values are not checked against an independent host oracle
 // that decodes the stored q8_g32_fp16 feature/context weights with their scales, so a wrong-but-
-// deterministic fused result would pass. See the report for the exact gap.
+// deterministic fused result would pass; and there is no acceptance oracle for the drafts
+// themselves (that needs the target verify/accept stage, B5). The selector, the verify/accept/fold
+// loop and the session/checkpoint state are deliberately not part of this stage.
 //
 // The artifact is selected with NINFER_TEST_ARTIFACT; two identical sm_120a devices are required.
 // Without either the test skips with exit code 77.
@@ -45,6 +64,7 @@
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "ninfer/ops/position.h"
@@ -55,6 +75,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -230,6 +251,125 @@ void zero_dflash(DeviceContext& device, DFlashContext& context) {
     CUDA_CHECK(cudaMemsetAsync(context.backing.data, 0, context.bytes, device.stream));
 }
 
+// The DFlash2 decode frame the runtime lays out for one exact-B round
+// (round_buffers.cpp:184-221, plan at tp2_generation_core.cpp:785-800 for MTP). Stage B3 needs only
+// the proposal fields, so the frame is planned through the production helper with the same spec a
+// masked-draft round would use and bound to a test-owned backing.
+struct DFlashRound {
+    std::unique_ptr<DeviceArena> arena;
+    DeviceSpan backing;
+    std::size_t bytes      = 0;
+    std::unique_ptr<qwen::RoundState> io;
+    qwen::DFlashDecodeState* frame = nullptr;
+};
+
+DFlashRound build_dflash_round(DeviceContext& device, const qwen::TextConfig& target,
+                               std::uint32_t drafts) {
+    LayoutBuilder builder;
+    qwen::RoundStateLayout layout = qwen::begin_round_state_layout(
+        builder,
+        qwen::RoundStateSpec{
+            .hidden         = qwen::execution::dimension(target.hidden_size),
+            .output_rows    = qwen::execution::dimension(target.vocab_size),
+            .batch_capacity = 1,
+            .draft_window   = drafts,
+            .backend        = SpeculativeBackend::DFlash2,
+        });
+    qwen::complete_round_state_layout(builder, layout);
+    DFlashRound round;
+    round.bytes = builder.finish(256);
+    device.bind_to_current_thread();
+    round.arena   = std::make_unique<DeviceArena>(round.bytes);
+    round.backing = round.arena->alloc_bytes(round.bytes, 256);
+    CUDA_CHECK(cudaMemset(round.backing.data, 0, round.bytes));
+    round.io    = std::make_unique<qwen::RoundState>(round.backing, layout);
+    round.frame = &*round.io->dflash_decode;
+    return round;
+}
+
+std::vector<std::int32_t> read_i32(DeviceContext& device, const Tensor& tensor) {
+    device.bind_to_current_thread();
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    std::vector<std::int32_t> out(static_cast<std::size_t>(tensor.bytes() / sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMemcpy(out.data(), tensor.data, tensor.bytes(), cudaMemcpyDeviceToHost));
+    return out;
+}
+
+std::vector<float> read_fp32(DeviceContext& device, const Tensor& tensor) {
+    device.bind_to_current_thread();
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    std::vector<float> out(static_cast<std::size_t>(tensor.bytes() / sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(out.data(), tensor.data, tensor.bytes(), cudaMemcpyDeviceToHost));
+    return out;
+}
+
+std::size_t weight_bytes(const ninfer::Weight& weight) {
+    return static_cast<std::size_t>(weight.payload_bytes + weight.high_plane_bytes);
+}
+
+std::size_t linear_bytes(const qwen::execution::LinearParameters& parameter) {
+    return weight_bytes(parameter.weight);
+}
+
+// Resident bytes of the whole shard-0 draft block that the proposal reads: the executable draft
+// weights plus the reduced proposal head it resolves its top-k against (load.cpp:142-144 keeps that
+// head whole for a masked draft).
+std::size_t draft_weight_bytes(const qwen::execution::DraftParameters& draft) {
+    std::size_t total =
+        linear_bytes(draft.feature_projection) + draft.context_norm.bytes() + draft.final_norm.bytes();
+    for (const auto& layer : draft.layers) {
+        total += layer.input_norm.bytes() + layer.post_attention_norm.bytes() +
+                 layer.query_norm.bytes() + layer.key_norm.bytes();
+        total += linear_bytes(layer.query_key_value) + linear_bytes(layer.context_key) +
+                 linear_bytes(layer.context_value) + linear_bytes(layer.output);
+        total += linear_bytes(layer.mlp.gate_up) + linear_bytes(layer.mlp.down);
+        if (layer.attention_conv) {
+            total += layer.attention_conv->base_kernel.bytes() +
+                     linear_bytes(layer.attention_conv->kernel_projection);
+        }
+        if (layer.mlp_conv) {
+            total += layer.mlp_conv->base_kernel.bytes() +
+                     linear_bytes(layer.mlp_conv->kernel_projection);
+        }
+    }
+    if (draft.selector) {
+        total += linear_bytes(draft.selector->hidden_projection) +
+                 draft.selector->predecessor_codebook.bytes() +
+                 draft.selector->successor_codebook.bytes();
+    }
+    total += linear_bytes(draft.output_head);
+    return total;
+}
+
+const char* qtype_name(QType type) {
+    switch (type) {
+    case QType::Q4_G64_FP16: return "q4_g64_fp16";
+    case QType::Q5_G64_FP16: return "q5_g64_fp16";
+    case QType::Q6_G64_FP16: return "q6_g64_fp16";
+    case QType::Q8_G32_FP16: return "q8_g32_fp16";
+    case QType::BF16: return "bf16";
+    case QType::FP32: return "fp32";
+    case QType::INT32: return "int32";
+    case QType::NVFP4: return "nvfp4";
+    case QType::FP8_E4M3FN_ROW_BF16: return "fp8_e4m3fn_row_bf16";
+    }
+    return "unknown";
+}
+
+const char* dtype_name(DType type) {
+    switch (type) {
+    case DType::BF16: return "bf16";
+    case DType::FP32: return "fp32";
+    case DType::I32: return "i32";
+    case DType::U8: return "u8";
+    case DType::I64: return "i64";
+    case DType::I8: return "i8";
+    case DType::FP16: return "fp16";
+    case DType::FP8_E4M3FN: return "fp8_e4m3fn";
+    }
+    return "unknown";
+}
+
 std::vector<std::uint16_t> read_bf16(DeviceContext& device, const Tensor& tensor) {
     device.bind_to_current_thread();
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
@@ -352,6 +492,7 @@ int main(int argc, char** argv) {
     try {
         std::filesystem::path path;
         std::int32_t chunk = 1024;
+        std::int32_t proposal_drafts = 7;
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]);
             const auto value = [&]() -> std::string {
@@ -362,8 +503,10 @@ int main(int argc, char** argv) {
                 path = value();
             } else if (arg == "--chunk") {
                 chunk = std::stoi(value());
+            } else if (arg == "--k") {
+                proposal_drafts = std::stoi(value());
             } else if (arg == "--help") {
-                std::cout << "--artifact PATH [--chunk N]\n";
+                std::cout << "--artifact PATH [--chunk N] [--k N]\n";
                 return 0;
             } else {
                 throw std::invalid_argument("unknown argument " + arg);
@@ -378,6 +521,9 @@ int main(int argc, char** argv) {
         }
         if (chunk < 64 || chunk > 1024 || chunk % 64 != 0) {
             throw std::invalid_argument("--chunk must be a multiple of 64 in [64,1024]");
+        }
+        if (proposal_drafts < 1 || proposal_drafts > 15) {
+            throw std::invalid_argument("--k must be in [1,15]");
         }
         const auto [dev0, dev1] = pick_devices();
         if (dev0 < 0) {
@@ -452,6 +598,10 @@ int main(int argc, char** argv) {
                                            &shard1.decoder->text_kv);
         card0.set_shard_config(&cfg0, 0);
         card1.set_shard_config(&cfg1, 1);
+        // The masked draft proposes on shard 0 alone, but the text token embedding it shares is
+        // column-split. Registering the pair is what lets embedding_full_width gather the peer half.
+        card0.set_tp_peer(&card1, &pair);
+        card1.set_tp_peer(&card0, &pair);
 
         // Publish one fixed physical KV row per shard, as the runtime core does once at startup.
         auto publish_kv_rows = [](DeviceContext* device, ShardState* shard) {
@@ -676,11 +826,263 @@ int main(int argc, char** argv) {
         std::printf("  repeat run: ring bit-identical (fnv1a=0x%016llx)\n",
                     static_cast<unsigned long long>(ring1.hash));
 
+        // 7. Stage B3: the masked-block proposal forward on shard 0, after a prefill chunk has been
+        // consumed into the draft ring. The frame is a real DFlash2 round state built by the same
+        // planner the runtime uses, and the proposal runs the production propose path
+        // (execution/draft.cpp propose_dflash2_batch) through the B3 seam dflash_propose_batch. The
+        // selector inside that function is production code; no selector/verify/session stage is
+        // added here.
+        const std::int32_t k         = proposal_drafts;
+        const std::int32_t width     = k + 1;
+        const std::int32_t frontier  = chunk - 1;
+        const std::int32_t selector_k = static_cast<std::int32_t>(draft.dflash2->selector_top_k);
+        const std::int32_t public_tokens =
+            static_cast<std::int32_t>(parameters0.model.resources().public_token_count);
+        DFlashRound round = build_dflash_round(*device0, target, static_cast<std::uint32_t>(k));
+        std::unique_ptr<DeviceArena> proposal_arena(new DeviceArena(kWorkspaceBytes));
+        std::unique_ptr<DeviceArena> scratch_arena(new DeviceArena(1U << 20));
+        device0->bind_to_current_thread();
+        Tensor continuation = scratch_arena->alloc(DType::BF16, {hidden, 1});
+
+        // One greedy decode round's ingress for the single resident row: the anchor is the last
+        // prompt token, the frontier is its cache position, and the draft's own attention uses its
+        // logical positions [frontier, frontier + width) (decode.cpp:662-674).
+        qwen::DFlashDecodeIngress host_ingress{};
+        host_ingress.anchors[0]                 = ids[static_cast<std::size_t>(frontier)];
+        host_ingress.execution_frontiers[0]     = frontier;
+        host_ingress.context_frontiers[0]       = chunk;
+        host_ingress.proposal_extents[0]        = k;
+        host_ingress.proposal_valid_columns[0]  = width;
+        host_ingress.target_valid_columns[0]    = width;
+        host_ingress.active_lanes[0]            = 0;
+        host_ingress.state_source_slots[0]      = 0;
+        host_ingress.state_destination_slots[0] = 0;
+        host_ingress.sampling[0].temperature    = 0.0F;
+        qwen::DFlashDecodeEgress host_egress{};
+        const qwen::execution::DFlashEnvelopes envelopes{
+            .local  = {0, static_cast<std::uint32_t>(frontier)},
+            .full   = {0, static_cast<std::uint32_t>(frontier)},
+            .append = {0, static_cast<std::uint32_t>(width)}};
+
+        auto enqueue_proposal = [&]() {
+            device0->bind_to_current_thread();
+            CUDA_CHECK(cudaMemcpyAsync(round.frame->ingress.data, &host_ingress,
+                                       sizeof(host_ingress), cudaMemcpyHostToDevice,
+                                       device0->stream));
+            qwen::execution::DFlashBatchContext context{
+                .execution =
+                    qwen::execution::ExecutionCore{
+                        .device           = *device0,
+                        .parameters       = parameters0,
+                        .work             = *proposal_arena,
+                        .linear_attention = *shard0.state,
+                        .replay_records   = nullptr,
+                        .io               = shard0.io,
+                        .prefill_hidden   = shard0.prefill_hidden,
+                        .prefill_chunk    = static_cast<std::uint32_t>(chunk),
+                        .proposal_head    = ProposalHead::Full,
+                    },
+                .text_cache                = shard0.decoder->text_kv,
+                .dflash                    = *dflash.state,
+                .frame                     = *round.frame,
+                .host_ingress              = host_ingress,
+                .host_egress               = host_egress,
+                .continuation_hidden_store = continuation,
+                .tp_card                   = &card0,
+            };
+            qwen::execution::dflash_propose_batch(context, 1, static_cast<std::uint32_t>(k),
+                                                  envelopes);
+        };
+
+        struct ProposalResult {
+            std::vector<std::int32_t> drafts;
+            std::vector<std::int32_t> candidates;
+            std::vector<float> proposal_q;
+            std::size_t peak = 0;
+            std::uint64_t hash = 0;
+        };
+        auto run_proposal = [&]() {
+            proposal_arena->reset_peak();
+            enqueue_proposal();
+            CUDA_CHECK(cudaStreamSynchronize(device0->stream));
+            ProposalResult result;
+            result.drafts     = read_i32(*device0, round.frame->draft_tokens);
+            result.candidates = read_i32(*device0, round.frame->candidate_ids);
+            result.proposal_q = read_fp32(*device0, round.frame->proposal_q);
+            result.peak       = proposal_arena->peak_used();
+            std::uint64_t hash = 1469598103934665603ULL;
+            const auto feed    = [&hash](const void* data, std::size_t bytes) {
+                hash ^= fnv1a(std::span<const std::byte>(
+                    static_cast<const std::byte*>(data), bytes));
+                hash *= 1099511628211ULL;
+            };
+            feed(result.drafts.data(), result.drafts.size() * sizeof(std::int32_t));
+            feed(result.candidates.data(), result.candidates.size() * sizeof(std::int32_t));
+            feed(result.proposal_q.data(), result.proposal_q.size() * sizeof(float));
+            result.hash = hash;
+            return result;
+        };
+
+        const ProposalResult proposal1 = run_proposal();
+        require(round.frame->draft_tokens.ne[0] == k && round.frame->draft_tokens.ne[1] == 1,
+                "the draft token buffer has an unexpected shape");
+        require(round.frame->draft_tokens.dtype == DType::I32 &&
+                    round.frame->candidate_ids.dtype == DType::I32 &&
+                    round.frame->proposal_q.dtype == DType::FP32,
+                "the proposal output buffers have unexpected dtypes");
+        require(round.frame->candidate_ids.ne[0] == selector_k &&
+                    round.frame->candidate_ids.ne[1] == k && round.frame->candidate_ids.ne[2] == 1,
+                "the candidate buffer has an unexpected shape");
+        require(round.frame->proposal_q.ne[0] == selector_k &&
+                    round.frame->proposal_q.ne[1] == k && round.frame->proposal_q.ne[2] == 1,
+                "the proposal-q buffer has an unexpected shape");
+        require(round.frame->proposal_ids.ne[0] == width &&
+                    round.frame->proposal_positions.ne[0] == width,
+                "the proposal query block has an unexpected width");
+        require(proposal1.drafts.size() == static_cast<std::size_t>(k) &&
+                    proposal1.candidates.size() == static_cast<std::size_t>(selector_k) * k &&
+                    proposal1.proposal_q.size() == static_cast<std::size_t>(selector_k) * k,
+                "the proposal produced the wrong number of elements");
+
+        // The masked block's query positions must be the anchor's own position first, then one
+        // position per draft step, forwarded unchanged to the target verify in a later stage.
+        std::vector<std::int32_t> proposal_positions =
+            read_i32(*device0, round.frame->proposal_positions);
+        for (std::int32_t i = 0; i < width; ++i) {
+            require(proposal_positions[static_cast<std::size_t>(i)] == frontier + i,
+                    "the masked proposal block has an unexpected query position");
+        }
+
+        std::size_t one_hot_rows = 0;
+        std::size_t distinct_ok  = 0;
+        for (std::int32_t position = 0; position < k; ++position) {
+            std::vector<std::int32_t> row(static_cast<std::size_t>(selector_k));
+            for (std::int32_t rank = 0; rank < selector_k; ++rank) {
+                const std::size_t index =
+                    static_cast<std::size_t>(position) * selector_k + rank;
+                row[static_cast<std::size_t>(rank)] = proposal1.candidates[index];
+                require(proposal1.candidates[index] >= 0 &&
+                            proposal1.candidates[index] < public_tokens,
+                        "a candidate id left the public token domain");
+            }
+            std::vector<std::int32_t> sorted = row;
+            std::sort(sorted.begin(), sorted.end());
+            require(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end(),
+                    "a candidate row repeats a token id");
+            ++distinct_ok;
+            require(std::find(row.begin(), row.end(),
+                              proposal1.drafts[static_cast<std::size_t>(position)]) != row.end(),
+                    "a draft token is not one of its position's candidates");
+
+            // Greedy selection writes the exact one-hot distribution over the candidate ranks.
+            const float* distribution =
+                proposal1.proposal_q.data() + static_cast<std::size_t>(position) * selector_k;
+            float total = 0.0F;
+            std::int32_t selected_rank = -1;
+            for (std::int32_t rank = 0; rank < selector_k; ++rank) {
+                total += distribution[rank];
+                if (distribution[rank] > 0.0F) {
+                    require(selected_rank < 0, "the greedy proposal q is not one-hot");
+                    selected_rank = rank;
+                }
+            }
+            require(selected_rank >= 0 && std::fabs(total - 1.0F) <= 1.0e-6F,
+                    "the proposal q does not sum to one");
+            require(row[static_cast<std::size_t>(selected_rank)] ==
+                        proposal1.drafts[static_cast<std::size_t>(position)],
+                    "the proposal q and the draft token disagree");
+            ++one_hot_rows;
+        }
+        std::printf("  proposal: K=%d width=%d positions=[%d,%d) candidates/row=%d "
+                    "rows=%zu distinct=%zu one_hot=%zu\n",
+                    k, width, frontier, frontier + width, selector_k, one_hot_rows, distinct_ok,
+                    one_hot_rows);
+
+        // Determinism: a second proposal on the same ring, then the whole prefill -> append ->
+        // proposal chain from a zeroed state, must agree bit for bit.
+        const ProposalResult proposal_same_state = run_proposal();
+        require(proposal_same_state.hash == proposal1.hash,
+                "two proposals on the same ring differ");
+        const RunResult chain_prefill = run_prefill(&sink);
+        require(chain_prefill.logits0 == with_sink.logits0,
+                "the proposal chain's prefill changed shard 0 logits");
+        const ProposalResult proposal_chain = run_proposal();
+        require(proposal_chain.hash == proposal1.hash,
+                "the proposal differs after a fresh prefill and append");
+        std::printf("  proposal determinism: same-state + fresh-chain bit-identical "
+                    "(fnv1a=0x%016llx)\n",
+                    static_cast<unsigned long long>(proposal1.hash));
+
+        // Cost: an empty 192 MiB arena exactly like a shard's, timed with CUDA events.
+        for (int warm = 0; warm < 3; ++warm) { enqueue_proposal(); }
+        CUDA_CHECK(cudaStreamSynchronize(device0->stream));
+        constexpr int kTimedProposals = 20;
+        cudaEvent_t start_event = nullptr, stop_event = nullptr;
+        CUDA_CHECK(cudaEventCreate(&start_event));
+        CUDA_CHECK(cudaEventCreate(&stop_event));
+        CUDA_CHECK(cudaEventRecord(start_event, device0->stream));
+        for (int iteration = 0; iteration < kTimedProposals; ++iteration) { enqueue_proposal(); }
+        CUDA_CHECK(cudaEventRecord(stop_event, device0->stream));
+        CUDA_CHECK(cudaEventSynchronize(stop_event));
+        float elapsed_ms = 0.0F;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start_event, stop_event));
+        CUDA_CHECK(cudaEventDestroy(start_event));
+        CUDA_CHECK(cudaEventDestroy(stop_event));
+        const double per_proposal_ms = static_cast<double>(elapsed_ms) / kTimedProposals;
+
+        const auto& draft_weights = *parameters0.draft;
+        const std::size_t draft_bytes = draft_weight_bytes(draft_weights);
+        const std::size_t head_bytes  = linear_bytes(draft_weights.output_head);
+        const std::size_t codebook_bytes =
+            draft_weights.selector
+                ? draft_weights.selector->predecessor_codebook.bytes() +
+                      draft_weights.selector->successor_codebook.bytes()
+                : 0;
+        std::printf("[mem] shard 0 DFlash2 draft weights %.1f MiB | proposal frame %.1f MiB | "
+                    "context arena %.1f MiB | proposal workspace peak %.1f MiB (%.0f%% of %zu MiB)\n",
+                    static_cast<double>(draft_bytes) / 1048576.0,
+                    static_cast<double>(round.bytes) / 1048576.0,
+                    static_cast<double>(dflash.bytes) / 1048576.0,
+                    static_cast<double>(proposal1.peak) / 1048576.0,
+                    100.0 * static_cast<double>(proposal1.peak) /
+                        static_cast<double>(kWorkspaceBytes),
+                    kWorkspaceBytes >> 20);
         std::printf(
-            "TP-2 DFlash2 append passed: chunk=%d sink logits bit-identical, consumer=%u/sink "
-            "prefill, ring sane+reproducible, direct/split append bit-identical, workspace peak "
-            "A=%.1f MiB (%.0f%% of %zu MiB) B=%.1f MiB\n",
-            chunk, first_consumed, static_cast<double>(with_sink.peak0) / 1048576.0,
+            "[mem]   draft block: feature_projection %.1f MiB | layers %.1f MiB | selector "
+            "codebooks %.1f MiB | selector hidden_projection %.1f MiB | tied output head %.1f MiB "
+            "(shared with the target)\n",
+            static_cast<double>(linear_bytes(draft_weights.feature_projection)) / 1048576.0,
+            static_cast<double>(draft_bytes - linear_bytes(draft_weights.feature_projection) -
+                                codebook_bytes - head_bytes -
+                                (draft_weights.selector
+                                     ? linear_bytes(draft_weights.selector->hidden_projection)
+                                     : 0)) /
+                1048576.0,
+            static_cast<double>(codebook_bytes) / 1048576.0,
+            static_cast<double>(draft_weights.selector
+                                    ? linear_bytes(draft_weights.selector->hidden_projection)
+                                    : 0) /
+                1048576.0,
+            static_cast<double>(head_bytes) / 1048576.0);
+        std::printf("[mem]   qtypes: feature_projection=%s output_head=%s layer0.qkv=%s "
+                    "layer0.down=%s codebook=%s\n",
+                    qtype_name(draft_weights.feature_projection.weight.qtype),
+                    qtype_name(draft_weights.output_head.weight.qtype),
+                    qtype_name(draft_weights.layers.front().query_key_value.weight.qtype),
+                    qtype_name(draft_weights.layers.front().mlp.down.weight.qtype),
+                    draft_weights.selector
+                        ? dtype_name(draft_weights.selector->predecessor_codebook.dtype)
+                        : "none");
+        std::printf("  proposal cost: %.3f ms/proposal (events, %d iterations)\n",
+                    per_proposal_ms, kTimedProposals);
+
+        std::printf(
+            "TP-2 DFlash2 append+proposal passed: chunk=%d sink logits bit-identical, "
+            "consumer=%u/sink prefill, ring sane+reproducible, direct/split append bit-identical, "
+            "K=%d proposal deterministic (fnv1a=0x%016llx), workspace peak A=%.1f MiB (%.0f%% of "
+            "%zu MiB) B=%.1f MiB\n",
+            chunk, first_consumed, k, static_cast<unsigned long long>(proposal1.hash),
+            static_cast<double>(with_sink.peak0) / 1048576.0,
             100.0 * static_cast<double>(with_sink.peak0) / static_cast<double>(kWorkspaceBytes),
             kWorkspaceBytes >> 20, static_cast<double>(with_sink.peak1) / 1048576.0);
         return 0;

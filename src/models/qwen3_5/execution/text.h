@@ -218,6 +218,13 @@ public:
     // the peer's half of a column-split weight.
     void set_tp_peer(TextContext* peer, tp::DevicePair* pair);
 
+    // Full-width token embedding for a component that runs on this shard alone but consumes the
+    // complete hidden state. The masked draft's proposal block is that case on TP-2: its weights
+    // are replicated whole on shard 0 while the shared text token embedding is column-split, so
+    // the peer half must be gathered through the registered pair. A replicated table is the plain
+    // local gather.
+    void embedding_full_width(const Tensor& ids, Tensor& out);
+
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 

@@ -286,8 +286,21 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                                   dimension(config.mask_token_id), ids, positions, stream);
         Tensor residual = work.alloc(DType::BF16, {dimension(target.hidden_size), width, batch});
         Tensor flat_residual = residual.view({dimension(target.hidden_size), columns});
-        ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding,
-                       flat_residual, stream);
+        // The masked draft's weights are replicated whole on the shard that proposes, but the text
+        // token embedding they are tied to is RowParallel on TP-2 (each shard owns half the hidden
+        // columns). The draft consumes the complete hidden state, so it gathers the peer half
+        // through the card's registered pair; the one-device route keeps the plain local gather.
+        if (state.tp_card != nullptr) {
+            state.tp_card->embedding_full_width(ids.view({columns}), flat_residual);
+            // embedding_tp2 drives the peer's stream and DevicePair::allreduce leaves the peer
+            // device current. The rest of the masked block runs on this shard, and a kernel that
+            // needs an opt-in dynamic-shared-memory attribute (the selector's [256,5120] BF16
+            // projection) must see this shard's function instance, so rebind it here.
+            state.execution.device.bind_to_current_thread();
+        } else {
+            ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding,
+                           flat_residual, stream);
+        }
         for (std::size_t layer_index = 0; layer_index < weights.layers.size(); ++layer_index) {
             const auto& layer = weights.layers[layer_index];
             nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
@@ -680,6 +693,20 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
                            const Tensor& table_rows,
                            ops::KVCacheAppendPrefixExecutionEnvelope envelope) {
     append_context_impl(state, features, positions, commit_counts, lanes, table_rows, envelope);
+}
+
+void dflash_propose_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                          DFlashEnvelopes envelopes) {
+    // Stage B3: the masked-block proposal on its own. This is the production propose_batch_impl
+    // (which for a masked draft is propose_dflash2_batch) without the leading context append and
+    // the trailing target verify/accept that dflash_decode_batch runs around it, so a TP-2 shard
+    // that already appended its context can publish a proposal with nothing else wired. The same
+    // argument checks as dflash_decode_batch's body apply.
+    if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) || k == 0 ||
+        k > kDFlashDecodeMaximumDrafts) {
+        throw std::logic_error("DFlash decode batch state is incomplete");
+    }
+    propose_batch_impl(state, state.frame, batch_size, k, envelopes);
 }
 
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,

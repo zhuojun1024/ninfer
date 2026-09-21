@@ -357,6 +357,20 @@ bool TextContext::embedding_is_split() const noexcept {
     return dimension(embed_->k) != dimension(config_.hidden_size);
 }
 
+void TextContext::embedding_full_width(const Tensor& ids, Tensor& out) {
+    if (!embedding_is_split()) {
+        ops::embedding(ids, *embed_, out, ctx_.stream);
+        return;
+    }
+    if (peer_tp_ == nullptr || pair_tp_ == nullptr) {
+        throw std::logic_error(
+            "embedding_full_width: a column-split token embedding needs set_tp_peer");
+    }
+    // The peer ids are broadcast inside embedding_tp2 and a peer scratch destination is allocated
+    // there, so only this shard's full-width [hidden, T] result is requested.
+    embedding_tp2(*peer_tp_, *pair_tp_, ids, nullptr, out, nullptr);
+}
+
 void TextContext::merge_local_row_blocks(TextContext& peer, tp::DevicePair& pair,
                                          const Tensor& local, const Tensor& local_peer,
                                          Tensor& destination, Tensor& destination_peer,

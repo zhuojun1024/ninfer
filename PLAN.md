@@ -320,6 +320,21 @@ loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:7
   （loader 无条件绑 text、`Parameters` 无条件准备整条 text 栈、整模型单卡放不下）；
 - **B3 提议前向**：masked 块 5 层滑动 + 动态卷积按 D1 执行 ⇒ 验收：提议对同一 features 确定可复现，且**贪心解码下
   DFlash2 与 plain 的输出 token 序列完全一致**（投机只改速度、不改贪心结果，这条同时覆盖接受与折叠的正确性）；
+  **B3 结果（本轮，TP-2-only；未提交）**：新增出口 `dflash_propose_batch`（`execution/draft.cpp`、`program/context.h`）
+  复用生产 `propose_dflash2_batch`（不重写数学；masked 块 + `linear_topk` + `candidate_selector_path` 一起跑属复用生产代码，
+  非新写 selector）。打通路上发现两个 TP-2 缺口：① `text/token_embedding` 是 RowParallel
+  （`load/tp_split_spec.cpp:117-122`），而 masked draft 要整宽 embedding ⇒ 新增 `TextContext::embedding_full_width`
+  （复用 `embedding_tp2`，与 MTP stem 同路径，`execution/text.cpp`），`propose_dflash2_batch` 在 `DFlashBatchContext.tp_card`
+  非空时走它；② 跨卡 allreduce 结束后 `DevicePair::allreduce` 把 peer 设备留为 current（`core/tp/device_pair.cu:440,459`），
+  使 selector 的 [256,5120] BF16 投影（需 opt-in 动态 smem）在错误设备实例上设置属性 ⇒ 提案在嵌入后须重绑本卡。测试
+  `test_tp2_dflash_append` 扩为 prefill→append→proposal：K=7 产出 draft[7]、candidate[16,7]、proposal_q[16,7]、query
+  positions `[1023,1031)`，每行 16 个候选互异且落在公共 token 域、draft ∈ 该行候选、贪心 proposal_q 为精确 one-hot；同
+  ring 两次提议与全新 prefill→append→proposal 链逐位一致（fnv1a=0xbad27a494a9bc853，两个独立进程一致；K=5 为
+  0xbee487264ca8ffb8）。每卡草稿权重实测为量化档（layers/feature_projection=q8_g32_fp16、codebook=bf16、tied output
+  head=fp8_e4m3fn），shard 0 的 draft 块（含被共享的 tied head 1213 MiB）3655.4 MiB；proposal frame 4.4 MiB、瞬时
+  workspace 峰值 4.4 MiB（192 MiB 的 2%）、事件计时 **7.95 ms/次（K=7）、7.93 ms/次（K=5）**。**本轮未做**：selector 的
+  Engine 发布、verify/接受/折叠、会话/checkpoint 状态（B4–B6）；因此 plan 的「贪心 DFlash2 == plain」端到端验收无法在本轮
+  建立，B5 前不得声称。
 - **B4 selector 发布**：`linear_topk` + `hidden_projection` + `candidate_selector_path` ⇒ 验收：同 B3 的端到端一致性
   + 接受率统计（不再沿用「与单卡一致」的口径）；
 - **B5 验证/接受/折叠**：复用 `forward_tp2_window` + Verify + 稀疏拒绝采样（注意改用 DFlash2 的接受语义，MTP 是

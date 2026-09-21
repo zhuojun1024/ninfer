@@ -83,6 +83,9 @@ struct DFlashBatchContext {
     const qwen3_5::DFlashDecodeIngress& host_ingress;
     qwen3_5::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // TP-2 only: the local text card whose registered pair gathers the peer half of a
+    // column-split token embedding for the masked draft's proposal block. Null on one device.
+    TextContext* tp_card = nullptr;
 };
 
 struct DFlashAppendContext {
@@ -189,6 +192,12 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
                            const Tensor& commit_counts, const Tensor& lanes,
                            const Tensor& table_rows,
                            ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+// The masked draft's proposal forward alone (PLAN.md section 3.6, stage B3): the five sliding
+// draft layers, the dynamic grouped convolutions and the reduced-head selector, without the
+// append/verify chain that dflash_decode_batch bundles around them. The caller owns the frame,
+// the draft state and a transient workspace the proposal may reset.
+void dflash_propose_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                          DFlashEnvelopes envelopes);
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, DFlashEnvelopes envelopes,
                                  ops::CausalAttentionExecutionEnvelope target_envelope,
