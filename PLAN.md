@@ -498,11 +498,31 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
     `verify_window_host_`、或那张全同窗口下被钳位的行）。下一步（本轮未做）：投毒法（B，候选缓冲写图案看谁没被覆写）、构造顺序交换与
     plain-oracle 控制组（C）、限时 `compute-sanitizer --tool initcheck`（D）；A 已经把范围压到「最后一轮第 0 列的 logits」，
     最快的下一步是在该轮 dump 该列 top-k logits 与全部中间量（`window_hidden` 哈希、KV 行哈希）逐 run 比对。
+    **实验 1b（末轮 logits/hidden dump，两次尝试都未成立）**：加临时钩子 `NINFER_TP2_DIAG_LOGITS`（打印该轮第 0 列 top-5 与
+    `target_hidden` 的哈希），6 次运行每次都在**第一轮**失败：`tp2_generation_core.cpp:2924: CUDA_CHECK(cudaMemcpyAsync(host_logits.data(),
+    frame.target_logits.data, logit_count * sizeof(float), D2H, ...)) failed: cudaErrorInvalidValue`；先用视图指针（`window_logits.data`）、
+    后用基张量指针（`frame.target_logits.data`）都一样 ⇒ `vocab * width * sizeof(float)` 与该张量的实际分配不符（很可能它不是
+    `[vocab, width]` 的 fp32，而是本地半区 / bf16 / 只含末 token 的 merge 结果）。**要做「输入缓冲 vs 计算内部」的切分，先得拿到该张量自己的
+    字节数或元素类型**（Tensor 的 size/bytes 字段，或逐步缩小拷贝长度试探）。日志：`build-win/b6j-logits-1..6.log`（视图指针版）、
+    `b6k-logits-1..6.log`（基张量版）。
+    **本轮按有界收口停止深挖，门禁保持关闭。**剩余可能（均未验证）：(i) 该轮 target 窗口里一处**未初始化、或被上一轮残留污染的 workspace 读**
+    （尤其全同窗口、`licensed=1` 时与其它列不同的分支/钳位路径）；(ii) 两卡窗口前向里一处**跨 stream 的写读序缺口**（时序相关 ⇒ 低频、每轮都存在、
+    只有末轮因 logits 恰好并列才显形）；(iii) 该轮 head/merge 归约的非确定顺序。区分它们需要的新手段：拿到 `frame.target_logits` /
+    `frame.target_hidden` 的真实字节数后做跨 run 哈希；限时 `compute-sanitizer --tool initcheck` 跑 solo 探针；或对窗口前向做逐 kernel 的
+    race 检查（nsys/sanitizer）。
+    临时钩子已用 `git checkout -- src/runtime/engine/tp2_generation_core.cpp src/runtime/engine/model_instance.cpp` 干净回退（工作树对这些文件
+    回到 HEAD）；重建后 `NINFER_TEST_ROUTE=dflash2` refusal exit 0、solo 探针 exit 77。
     同进程的 plain engine 作控制组，判定是「两个 DFlash2 实例互相干扰」还是「任意第二个实例都受影响」。
     临时打开路线的改动已还原：`model_instance.cpp` 恢复构造期拒绝并重建验证（`dflash2 exit 0`、solo probe `exit 77`）。
 - **B6 状态与保留（见上方 B6 结果）**：draft ring/pending features 已随会话召回保存恢复（复用 MTP 的 host slab
   先例），`dflash_graph_profiles` 已接；「会话切换后召回逐位一致」对本路线不成立，保留保持禁用；
 - **B7 性能验收**：双卡吞吐对 90–180 tok/s 目标 + 与 MTP 的对比 + plain/mtp 无回归。
+- **B7 前置侦察（已完成，未实施；路线放行后才可交付）**：DFlash2 verify 目前 eager 的原因**不是** capture-illegal（单卡路线已把同一个 `DFlashFeatureSink` 捕进 CUDA Graph，`draft.cpp:712-718` + `program/graphs.cpp:373-421`），而是 4 处未接线：
+  ① 总开关只对 MTP 生效（`tp2_generation_core.cpp:374`）；② verify 桶只在 MTP 分支建（`:387-400`）；
+  ③ `capture_verify_graph` 不收 sink（`:910-912`，**必须补**，否则图里没有 scatter 节点、`pending_features` 会静默缺列、只掉接受率）；
+  ④ `:979-984` 有一条以「未固化 host capture 调用」为由的 `throw`，其前提已被单卡路线证伪。
+  最大风险：建桶会让 **eager 分支也改用 bucket envelope**（`:960-971`），而 DFlash2 的输出对 verify 窗口布局敏感 ⇒ 必须先做「只切 envelope」的贪心逐字节 A/B，再做 graph on/off，否则同时改了两个变量。
+  判据：graph arm 的 verify ≈ 30.6 ms（MTP 同宽实测）、比 eager 低 4~4.5 ms/轮、等输出吞吐约 +15%；硬前提 `pair_.in_kernel_allreduce()`；若否决 envelope 变化则捕获走不通且无等价替代（可动的只有 <0.1 ms 的 D2H+sync）。
 
 **理论性能差距（单卡 5090 vs 双卡 TP-2，DFlash2 K=7；roofline 合成，非实测）**：
 
