@@ -192,17 +192,36 @@ private:
         // holds exactly this prefix, which is what lets a returning prompt prefill only its suffix.
         std::vector<TokenId> tokens;
         std::uint32_t frontier = 0;
+        // Token count of the prompt the last completed prefill for this conversation walked. A later
+        // prompt that still shares this many tokens contains that whole prompt, which is what makes
+        // it a later turn of the same conversation instead of a client switching away from it. It
+        // stays put while decode extends `tokens`, and survives an eviction and a recall unchanged.
+        std::uint32_t prompt_end = 0;
         // True while this entry's KV and GDN state are the ones in the device pools.
         bool device_resident = false;
-        // Host copies, one KV slab per shard (shard B carries no MTP slab) and one GDN state image
-        // per shard. A slab is sized to the frontier that was evicted, never to max_context.
+        // Host copies, one KV slab per shard (shard B carries no MTP slab) and two GDN state images
+        // per shard: the state the evicted frontier sat on, and the state the last completed prefill
+        // froze at this conversation's own prompt end. A client that re-renders the answer it was
+        // handed stops matching at the first generated token, so for it only the second image is
+        // reachable. A slab is sized to the frontier that was evicted, never to max_context.
         std::array<std::unique_ptr<HostKVAllocation>, 2> host_kv;
         std::array<std::unique_ptr<PinnedHostBuffer>, 2> host_state;
+        std::array<std::unique_ptr<PinnedHostBuffer>, 2> host_prompt_state;
+        // The state at the deepest position another conversation was seen to diverge from this one.
+        // A position's state is a function of the tokens before it and this entry's slab carries the
+        // KV before that position, so a later conversation sharing this much history can be recalled
+        // onto it. That is what keeps a stable block - a system prompt every conversation opens with
+        // - reusable after a small unrelated request has taken over the device pools.
+        std::array<std::unique_ptr<PinnedHostBuffer>, 2> host_shared_state;
         std::unique_ptr<HostKVAllocation> host_mtp_kv;
-        std::uint32_t host_pages     = 0;
         std::uint32_t host_mtp_pages = 0;
-        bool host_valid              = false;
-        std::uint64_t lru_clock      = 0;
+        // Token count the prompt-end state image corresponds to. Zero means the entry was evicted
+        // before its first prompt completed, and only the frontier image can be recalled.
+        std::uint32_t host_prompt_end = 0;
+        // Token count the shared-prefix image corresponds to, never deeper than the frontier it was
+        // evicted at. Zero means no other conversation has diverged from this one yet.
+        std::uint32_t host_shared_end = 0;
+        std::uint64_t lru_clock       = 0;
     };
     static constexpr std::size_t kNoSession = static_cast<std::size_t>(-1);
 
@@ -310,13 +329,22 @@ private:
     // decides how deep this prompt can start: it displaces the resident session when the incoming
     // prompt belongs to another conversation, so the device pools hold the recalled session by the
     // time the scan reads them.
+    // Which frozen state a recall restores: the frontier the entry was evicted at, the end of the
+    // prompt its last prefill walked, or the boundary another conversation diverged at.
+    enum class RecallState : std::uint8_t { Frontier, PromptEnd, Shared };
     void session_recall(std::span<const TokenId> prompt_tokens);
+    // Freezes the state at 'position' into an evicted entry's shared-prefix image. 'from_device'
+    // takes it from the device pools, which still hold the state the walk is about to advance;
+    // otherwise the two pointers are pinned host images to copy from.
+    void session_capture_shared_state(std::size_t index, std::uint32_t position, bool from_device,
+                                      const PinnedHostBuffer* const* frozen);
     // Copies the resident session into its host slabs. Returns false when the host budget cannot
     // hold it, in which case the entry is dropped instead: the next prefill overwrites the device
     // pools, and an entry must never claim state that no longer exists.
     bool session_store_active();
-    // Copies an entry's host slabs back into the device pools and makes it the resident session.
-    void session_restore(SessionEntry& entry);
+    // Copies an entry's host slabs back into the device pools and makes it the resident session:
+    // the KV before 'boundary' plus the frozen GDN state 'state' names.
+    void session_restore(SessionEntry& entry, std::uint32_t boundary, RecallState state);
     // Frees an entry's host slabs, drops it from the catalog, and keeps the active index valid.
     void session_drop(std::size_t index);
     // Gives entry host KV slabs of at least 'pages' pages per shard, reusing larger existing ones.
@@ -351,6 +379,10 @@ private:
     std::vector<SessionEntry> sessions_;
     std::size_t active_session_      = kNoSession;
     std::uint64_t session_lru_clock_ = 0;
+    // The entry the last recall moved into its host slabs, while the running prefill is the only
+    // thing that can still name the boundary the two conversations diverged at. kNoSession when the
+    // recall found nothing to store. Every prefill reads it once, before the walk advances the state.
+    std::size_t host_stored_session_ = kNoSession;
     // Entries the catalog accepts, resident one included. Zero disables session retention, which
     // is what a zero host KV budget selects.
     std::size_t session_capacity_    = 0;
