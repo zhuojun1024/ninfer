@@ -192,8 +192,24 @@ worklog §36.1 记录过同一函数的同类事故（当年 `--spec` 也被丢�
 `--spec dflash2`（`model_instance.cpp:97-104` 抛 `TP-2 generation supports --spec mtp only`，理由是 dual-shard
 loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:713`、`:2438`）。
 
-**收益目标与前置否决**：归档对双卡的预期是 **DFlash2 90–180 tok/s**（worklog `:60`）。若单卡 5090 上 DFlash2
-相对 MTP 的收益不足以覆盖双卡的内存与复杂度，本项直接关闭 —— **先有单卡收益证据，再动双卡**。
+**单卡收益证据（已备，成本＝读文档）**：仓库已发布单张 5090、C=1 的 DFlash2 K=7 对 MTP3 对比
+（`docs/performance/qwen3.8-27b.md:275-307`）：
+
+- 每请求 phase 速率：`nvfp4` 档 +64.5% / +21.1% / +19.2%（三个 AIME 长解码 fixture）、Code +36.6%、
+  Translation +33.1%、Structured +62.3%、Story −3.8%；`groupwise-int` 档多数为负（Story −35.6%、
+  AIME15 −11.1%）⇒ 收益**依赖权重格式**；
+- 整语料（C=1）：`nvfp4` decode 速率 **+19.5%**、makespan **−22.7%**；`groupwise-int` −9.1% / +12.1%；
+- 机制：DFlash2 每轮提议更多（tokens/round 3.5–6.5 vs MTP3 2.7–3.7），但接受率更低（35–78% vs 37–91%）；
+- 文档自身的保留：两次 campaign 的 revision 与工件不同、输出长度随机不同，**不是隔离的 backend 对比**，
+  且**未跑新的 MTP3 基线**、不代表答案正确性；groupwise-int 另有 AIME30 重复循环离群样本；DFlash2 K=15
+  与并发 DFlash2 **未发布**；
+- 本机做不了单卡对照：最小 27B 工件也有 17.4 GB（> 16 GiB），`qwen3_8_27b_w4a4_w8a8_dflash2.ninfer` 为
+  24.8 GB ⇒ **只能以已发布 campaign 作为收益证据**。
+
+**推论**：本机路线是 w4a4/w8a8（接近 `nvfp4` 档）⇒ 收益为正、方向支持适配。但 DFlash2 的收益来自「每轮
+更多提议」，而双卡上 draft 每轮成本（5 层 × 两卡 + 特征汇聚）与 verify 成本都会上升 ⇒ 能否保住这 +19.5%
+取决于 B1–B4 的实现效率，**这才是本项的真实风险**。归档对双卡的预期是 **DFlash2 90–180 tok/s**
+（worklog `:60`），作为 B7 的验收目标。
 
 **可直接复用的既有面（MTP 已铺好）**：分片放置机制（`tp_split_spec.cpp:87-94` + `tp_shard_views.cpp:42-61`
 的「一卡持有、另一卡留空 view」，加上 `has_weight` 容忍缺失）；加载 seam（`load.cpp:63-85,125-155`）；**整条
