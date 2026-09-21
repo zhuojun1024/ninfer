@@ -118,6 +118,15 @@ void check_shard_shapes(const qwen::execution::Parameters& parameters, const qwe
             if (!draft.selector.has_value()) {
                 throw std::runtime_error("shard 0 DFlash2 draft has no selector weights");
             }
+            // The masked draft resolves its top-k on shard 0 alone against the whole reduced
+            // vocabulary, so the proposal head must stay whole here (MTP splits it and merges
+            // the pair's row blocks in proposal_argmax).
+            if (weights.proposal.has_value()) {
+                const auto& head = model.weight(weights.proposal->head).view;
+                if (head.shape[0] != 131072 || head.shape[1] != 5120) {
+                    throw std::runtime_error("shard 0 DFlash2 proposal head is not replicated");
+                }
+            }
             const auto& codebook = model.weight(draft.selector->predecessor_codebook).view;
             if (codebook.shape[0] != 248320 || codebook.shape[1] != 256) {
                 throw std::runtime_error("shard 0 DFlash2 predecessor codebook is not [248320,256]");
@@ -247,7 +256,7 @@ int main(int argc, char** argv) {
         const bool expect_mtp     = options.speculative == SpeculativeBackend::Mtp;
         const bool expect_dflash2 = options.speculative == SpeculativeBackend::DFlash2;
         const bool expect_split   = !options.speculative_enabled() || options.proposal_enabled();
-        const bool expect_proposal_split = options.proposal_enabled();
+        const bool expect_proposal_split = options.proposal_enabled() && !expect_dflash2;
         check_shard_shapes(parameters0, *model0, 0, expect_mtp, expect_split, expect_proposal_split,
                            expect_dflash2, options.vision);
         check_shard_shapes(parameters1, *model1, 1, expect_mtp, expect_split, expect_proposal_split,
