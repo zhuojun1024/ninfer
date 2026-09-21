@@ -369,9 +369,6 @@ private:
     // positions its state snapshots correspond to, and whether those snapshots are usable.
     std::vector<TokenId> cached_prompt_tokens_;
     std::array<std::uint32_t, kReuseSnapshotCount> cached_boundaries_{};
-    // Rewind depth used for the snapshots of the next prefill, predicted from the previous pair of
-    // prompts' shared-prefix gap.
-    std::uint32_t rewind_near_ = 9;
     bool cached_state_valid_ = false;
     // Session catalog. sessions_ holds the resident entry plus the host-resident ones; the
     // resident entry is the device lineage, so cached_prompt_tokens_ mirrors its history while

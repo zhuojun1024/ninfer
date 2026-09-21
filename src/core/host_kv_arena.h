@@ -194,7 +194,11 @@ private:
 
 class HostKVArena {
 public:
-    HostKVArena(std::size_t capacity_bytes, std::span<const HostKVPageLayout> supported_layouts);
+    // The backing store is pageable unless the caller asks for pinned memory; a refused pin falls
+    // back to pageable inside the backing store, so construction only fails when pageable memory
+    // itself cannot be obtained.
+    HostKVArena(std::size_t capacity_bytes, std::span<const HostKVPageLayout> supported_layouts,
+                HostPinning pinning = HostPinning::Pageable);
 
     HostKVArena(const HostKVArena&)            = delete;
     HostKVArena& operator=(const HostKVArena&) = delete;
@@ -263,9 +267,14 @@ private:
     bool release_descriptor(std::uint32_t descriptor, std::uint32_t generation) noexcept;
     void insert_free_extent(FreeExtent extent) noexcept;
     [[nodiscard]] std::byte* allocation_data(const Descriptor& descriptor) const noexcept;
+
+public:
+    // True when the backing store is pinned rather than pageable; callers report which tier a shard
+    // actually landed in, because the two behave differently under memory pressure.
+    [[nodiscard]] bool backing_pinned() const noexcept;
     void bump_revision() noexcept;
 
-    std::optional<PinnedHostBuffer> backing_;
+    std::optional<HostBuffer> backing_;
     std::size_t capacity_bytes_ = 0;
     std::size_t occupied_bytes_ = 0;
     std::vector<HostKVPageLayout> layouts_;

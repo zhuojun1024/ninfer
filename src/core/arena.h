@@ -117,6 +117,35 @@ private:
     std::size_t size_ = 0;
 };
 
+// Which memory the OS may evict under commit pressure decides whether a large host-side KV arena
+// can exist at all: a pinned mapping is resident for the process lifetime and cudaMallocHost fails
+// when the commit limit is tight, so host KV backing stays pageable by default and pins only on an
+// explicit request.
+enum class HostPinning { Pageable, PreferPinned };
+
+// Contiguous host storage for state copied to and from the device. The pageable path is ordinary
+// committed memory (evictable, no lock budget); the pinned path trades that for faster transfers
+// and falls back to pageable when the allocation is refused.
+class HostBuffer {
+public:
+    explicit HostBuffer(std::size_t size_bytes, HostPinning pinning = HostPinning::Pageable);
+    ~HostBuffer();
+
+    HostBuffer(const HostBuffer&)            = delete;
+    HostBuffer& operator=(const HostBuffer&) = delete;
+    HostBuffer(HostBuffer&& other) noexcept;
+    HostBuffer& operator=(HostBuffer&& other) noexcept;
+
+    void* data() const noexcept;
+    std::size_t size() const noexcept;
+    bool pinned() const noexcept;
+
+private:
+    void* data_       = nullptr;
+    std::size_t size_ = 0;
+    bool pinned_      = false;
+};
+
 using WorkspaceArena = DeviceArena;
 
 } // namespace ninfer

@@ -209,7 +209,7 @@ void HostKVAllocation::disarm() noexcept {
 }
 
 HostKVArena::HostKVArena(std::size_t capacity_bytes,
-                         std::span<const HostKVPageLayout> supported_layouts)
+                         std::span<const HostKVPageLayout> supported_layouts, HostPinning pinning)
     : capacity_bytes_(capacity_bytes),
       layouts_(supported_layouts.begin(), supported_layouts.end()) {
     for (std::size_t index = 0; index < layouts_.size(); ++index) {
@@ -228,7 +228,7 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
         throw std::invalid_argument("Non-empty Host KV arena requires supported page layouts");
     }
 
-    backing_.emplace(capacity_bytes_);
+    backing_.emplace(capacity_bytes_, pinning);
     const auto smallest = std::min_element(
         layouts_.begin(), layouts_.end(), [](const HostKVPageLayout& a, const HostKVPageLayout& b) {
             return a.page_stride < b.page_stride;
@@ -652,6 +652,8 @@ std::byte* HostKVArena::allocation_data(const Descriptor& descriptor) const noex
     if (!backing_) { return nullptr; }
     return static_cast<std::byte*>(backing_->data()) + descriptor.offset;
 }
+
+bool HostKVArena::backing_pinned() const noexcept { return backing_ && backing_->pinned(); }
 
 void HostKVArena::bump_revision() noexcept {
     ++revision_;

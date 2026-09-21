@@ -135,6 +135,10 @@ struct ContextCacheOptions {
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
+    // Host KV backing is pageable by default so the OS can evict it under commit pressure. Pin it
+    // only when the faster transfers are worth a permanent lock: a refused pin still falls back to
+    // the pageable path instead of failing the arena.
+    bool host_kv_pinned                = false;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;

@@ -91,6 +91,9 @@ ninfer::EngineOptions engine_options(const char* artifact, int device_a, int dev
     options.max_context                          = kMaxContext;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(kMaxContext);
     options.prefill_chunk                       = 256;
+    // The chunk plan and the recall alignment share this width: the host checkpoint boundaries a
+    // recall may reuse are multiples of it, so changing it also moves which conversations can be
+    // reused and how far a recall has to re-prefill.
     options.max_concurrency                     = 1;
     options.max_pending_requests                = 1;
     if (mtp) {
@@ -347,15 +350,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, bool mtp) {
     // comparison passes when the KV is still the one the device already held. That difference is
     // tracked separately; see PLAN.md's TP-2 session note. The prefix/state themselves are pinned
     // down by the frontier, prompt-end and switch scenarios above.
-    if (std::getenv("NINFER_TP2_DEBUG_KV") != nullptr) {
-        std::cerr << "  recalled:";
-        for (const TokenId token : shared_c_first.generated_token_ids) {
-            std::cerr << ' ' << token;
-        }
-        std::cerr << "\n  oracle  :";
-        for (const TokenId token : shared_c_answer) { std::cerr << ' ' << token; }
-        std::cerr << '\n';
-    }
+
     if (!shared_c_first.generated_token_ids.empty() && !shared_c_answer.empty() &&
         shared_c_first.generated_token_ids.front() != shared_c_answer.front()) {
         return fail(label, "a conversation behind a stored system prompt diverged from the oracle on "

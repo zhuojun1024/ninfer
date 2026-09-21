@@ -287,4 +287,66 @@ void* PinnedHostBuffer::data() const noexcept { return data_; }
 
 std::size_t PinnedHostBuffer::size() const noexcept { return size_; }
 
+HostBuffer::HostBuffer(std::size_t size_bytes, HostPinning pinning) {
+    if (size_bytes == 0) { throw std::invalid_argument("HostBuffer size must be nonzero"); }
+
+    if (pinning == HostPinning::PreferPinned) {
+        void* ptr = nullptr;
+        if (cudaMallocHost(&ptr, size_bytes) == cudaSuccess) {
+            data_   = ptr;
+            size_   = size_bytes;
+            pinned_ = true;
+            return;
+        }
+        // Pinning is an optimization here: a refused request leaves the buffer pageable instead of
+        // failing the arena, because commit charge rather than transfer rate is what decides whether
+        // a large host KV pool can exist.
+        (void)cudaGetLastError();
+    }
+
+    void* ptr = std::malloc(size_bytes);
+    if (ptr == nullptr) { throw std::runtime_error("pageable host allocation failed"); }
+    data_ = ptr;
+    size_ = size_bytes;
+}
+
+HostBuffer::~HostBuffer() {
+    if (pinned_) {
+        free_pinned(data_);
+    } else {
+        std::free(data_);
+    }
+}
+
+HostBuffer::HostBuffer(HostBuffer&& other) noexcept
+    : data_(other.data_), size_(other.size_), pinned_(other.pinned_) {
+    other.data_   = nullptr;
+    other.size_   = 0;
+    other.pinned_ = false;
+}
+
+HostBuffer& HostBuffer::operator=(HostBuffer&& other) noexcept {
+    if (this == &other) { return *this; }
+
+    if (pinned_) {
+        free_pinned(data_);
+    } else {
+        std::free(data_);
+    }
+    data_   = other.data_;
+    size_   = other.size_;
+    pinned_ = other.pinned_;
+
+    other.data_   = nullptr;
+    other.size_   = 0;
+    other.pinned_ = false;
+    return *this;
+}
+
+void* HostBuffer::data() const noexcept { return data_; }
+
+std::size_t HostBuffer::size() const noexcept { return size_; }
+
+bool HostBuffer::pinned() const noexcept { return pinned_; }
+
 } // namespace ninfer

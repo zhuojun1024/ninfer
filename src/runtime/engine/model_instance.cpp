@@ -112,11 +112,13 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // they survive too: a zero host KV budget disables that retention.
         const std::uint32_t host_state_slots = options.context_cache.host_state_slots;
         const std::size_t host_kv_capacity   = options.context_cache.host_kv_capacity_bytes;
+        const bool host_kv_pinned            = options.context_cache.host_kv_pinned;
         const std::uint32_t session_capacity =
             options.context_cache.max_private_continuations.value_or(kTp2DefaultSessions);
         options.context_cache = ContextCacheOptions{.enabled        = false,
                                                     .host_state_slots = host_state_slots,
                                                     .host_kv_capacity_bytes = host_kv_capacity,
+                                                    .host_kv_pinned = host_kv_pinned,
                                                     .max_private_continuations = session_capacity};
     }
     switch (options.purpose) {
