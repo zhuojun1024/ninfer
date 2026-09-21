@@ -63,8 +63,10 @@ RTX 5060 Ti cards but not one.
   fast at construction otherwise.
 - The TP-2 route runs one request at a time: `--max-concurrency` and `--max-pending-requests` are
   normalized to `1`, and requests queue in arrival order.
-- `--spec mtp` is the only supported speculative backend on this route (DFlash/DFlash2 are
-  rejected); `--vision` is supported.
+- `--spec mtp` and `--spec dflash2` are the supported speculative backends on this route
+  (`--spec dflash`, the DFlash v1 masked draft, is rejected); `--vision` is supported. A DFlash2
+  route runs with the context cache, host checkpoints and cross-session retention switched off,
+  because its masked draft's local ring is not part of the session or checkpoint image yet.
 - KV capacity is page-aligned to `--max-context` (the core builds its own paged cache), and the
   context cache is disabled (the core owns its prefix-reuse snapshots).
 - The single-request CLI and the perplexity evaluator are single-GPU; only `ninfer-serve` accepts
