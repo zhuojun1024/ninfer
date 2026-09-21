@@ -185,30 +185,65 @@ worklog §36.1 记录过同一函数的同类事故（当年 `--spec` 也被丢�
 
 ---
 
-### 3.6 DFlash2 上 TP-2 的适配（未排期；证据与约束）
+### 3.6 DFlash2 上 TP-2 的适配计划（未排期；结论来自 §7 调研）
 
-**现状**：DFlash2 已完整实现、并在**单卡 5090** 路线合格（数学与状态见 `docs/maintainer/dflash.md`，性能与
-corpus 见 `docs/performance/*` 与 bench）；TP-2 路线**有意拒绝** `--spec dflash2`（`src/runtime/engine/
-model_instance.cpp` 的 TP-2 归一化直接抛 `TP-2 generation supports --spec mtp only`），且该限制被明确
-保留（worklog §36.1 `:713`「dflash/dflash2 明确报错」、`:2438`「DFlash 限制保留」）。
+**现状**：DFlash2 已完整实现、并在**单卡 5090** 路线合格（数学与状态见 `docs/maintainer/dflash.md`，实现见
+`execution/draft.cpp`、`load/dflash{,2}.cpp`，性能与 corpus 见 `docs/performance/*`）；TP-2 路线**有意拒绝**
+`--spec dflash2`（`model_instance.cpp:97-104` 抛 `TP-2 generation supports --spec mtp only`，理由是 dual-shard
+loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:713`、`:2438`）。
 
-**为什么不是开关**：把 MTP 接进 TP-2（worklog §36.1/36.2）实际动过：选项归一化、ctor 把 backend 与
-proposal_head 传给 `plan_load`、`tp_split_spec` 强制 `mtp/*` 复制、shard 0 打开 `enable_mtp` 并规划+物化
-MTP KV、alignment window 与 priming 顺序。而那只是 **1 层、约 0.2 GiB** 的 MTP；DFlash2 是 5 层 draft +
-selector rank/top-k + 卷积 tap/group（`docs/maintainer/dflash.md`），分片与复制决策重得多。
+**收益目标与前置否决**：归档对双卡的预期是 **DFlash2 90–180 tok/s**（worklog `:60`）。若单卡 5090 上 DFlash2
+相对 MTP 的收益不足以覆盖双卡的内存与复杂度，本项直接关闭 —— **先有单卡收益证据，再动双卡**。
 
-**本机约束**：工件 23.7 GB **单卡装不下**（worklog `:57`）⇒ 本机没有单卡对照基线，双卡又尚未适配。归档对
-双卡的预期收益是 **DFlash2 90–180 tok/s**（worklog `:60`）—— 这是收益目标，也是做与不做的判据。
+**可直接复用的既有面（MTP 已铺好）**：分片放置机制（`tp_split_spec.cpp:87-94` + `tp_shard_views.cpp:42-61`
+的「一卡持有、另一卡留空 view」，加上 `has_weight` 容忍缺失）；加载 seam（`load.cpp:63-85,125-155`）；**整条
+验证回路**（`forward_tp2_window`、Verify 绑定、每列 logits/hidden、`run_verify_window`、RecordForReplay+fold、
+`speculative_accept_sparse_drafts`）；独立 draft KV 几何先例（`state/decoder_state.h:20-29`）；以及 graph 分桶
+`dflash_graph_profiles`（`graph_profiles.h:9`、`graph_profiles.cpp:91`，已用于 `graphs.cpp:375,399`）。
 
-**适配工作分解（初稿，待补细节）**：
-1. 判定归属：整份复制到两卡，还是与某 shard 共置、另一卡只做验证（对标 MTP 的「复制 + shard A 单卡提议」）；
-2. `tp_split_spec` 的复制/切分规则扩展（现只覆盖 `mtp/*`）；
-3. 每卡 DFlash2 权重 + KV + workspace 的规划与物化（16 GiB 预算里再挤，需实测台账）；
-4. 提议与验证回路：proposed token 的跨卡可见性、对齐与 priming 顺序（复用 MTP 经验）；
-5. 加载与校验：`DFlash2DraftModel` 配置、proposal head、`candidate_selector`、draft 计数 1..15；
-6. 验收：双卡数值正确性（对照单卡基线或 oracle）+ 吞吐目标 90–180 tok/s + 与 MTP 的对比。
+**必须新设计的地方（单卡假设的破除）**：
+1. **条件特征跨卡**：提议条件是目标 5 个 block 的 residual 拼接投影（`draft.cpp:59-89` 的 `DFlashFeatureSink`），
+   而 TP-2 把 64 层切在两卡 ⇒ 每步都要跨卡 handoff，代码里**尚无设计**；
+2. **selector 与词表**：`candidate_selector_path` 直读**全词表** codebook（pred/succ 各 248320×256 BF16，合计约
+   254 MiB），且 proposal head 与目标 lm_head 共用权重（`load.cpp:83`）⇒ TP-2 已按 vocab 切 text head 的做法
+   会破坏 selector 的全词表 top-k ⇒ codebook 必须**整份复制**；
+3. **提议回路**：MTP 的「右移一位 embedding + 末列设备覆盖 + host 串行 AR」是 MTP 特有（`tp2_generation_core.cpp
+   :760-802,1004-1042`），DFlash2 是一次非因果 masked 块 + 稀疏拒绝采样，需重做（验证面不用）；
+4. **每卡预算**：草稿按现成工件的实际编码**实测 2.07 GiB**（`qwen3_8_27b_w4a4_w8a8_dflash2.ninfer` 与同源无
+   dflash2 工件的 payload 差 = 2,226,792,960 B；纯 BF16 则 3.59 GiB），另有 5 层 local ring K(BF16)+V(FP16)
+   固定 40 MiB，无 per-token 增长（`dflash.md:274-289`）。
 
-**前置否决条件**：若单卡 5090 上 DFlash2 相对 MTP 的收益不足以覆盖双卡的内存与复杂度，则本项直接关闭。
+**决策点（先定再写码）**：
+- **D1 归属**：整份复制还是按 head/FFN 切分？**实测结论：复制不可行** —— 满上下文配置（262144 tok / fp8 /
+  MTP K=2）下 free 仅 697 / 1217 MiB（`docs/tp2-dual-5060ti.md:329-337`），而复制需 2.07 GiB/卡；DFlash2 与
+  MTP 又是**互斥 backend**，选 DFlash2 释放 shard 0 的 MTP 权重 430 MiB + KV 516 MiB 后 free 也只到约
+  1.6 GiB。切分后每卡约 1.04 GiB 可行，但 shard 1 仅余约 0.2 GiB。**评估阶段先用小上下文**：本机
+  `--max-context 4096` 实测 free 4344 MiB（§3.1 验收记录），可先绕开这个瓶颈；
+- **D2 量化**：草稿权重用何种格式（bf16 复制无余量 ⇒ 需量化或切分），需先看工件里 companion 权重的实际精度；
+- **D3 特征 handoff**：目标侧按 block 捕获后 all-gather（每步 5×5120 BF16）还是让提议卡各持一半？
+- **D4 提议位置**：沿用 MTP 的「只在 shard 0 提议」（则特征与 codebook 都要在 shard 0 齐备），还是两卡各提议一半。
+
+**阶段分解（每阶段独立验收）**：
+- **B1 加载与放置**：放开拒绝 + `tp_split_spec` 增加 `dflash2/*` 规则（feature_projection/codebook 复制，context
+  K/V 按 head 切）+ 每卡 draft 配置/state/plan（`tp2_generation_core.cpp:436-523`）⇒ 验收：两卡都物化成功、
+  `ninfer_qwen3_5_tp2_load_test` 通过；
+- **B2 上下文物化**：5 个 block 的 residual 捕获 + 跨卡 handoff + `feature_projection`/`context_norm` +
+  `context_kv_materialize` 写本地 ring ⇒ 验收：与单卡 oracle 的 context K/V 数值一致；
+- **B3 提议前向**：masked 块 5 层滑动 + 动态卷积按 D1 执行 ⇒ 验收：`drafts/proposal_q` 与单卡 oracle 一致；
+- **B4 selector 发布**：`linear_topk` + `hidden_projection` + `candidate_selector_path` ⇒ 验收：提议 token 与单卡一致；
+- **B5 验证/接受/折叠**：复用 `forward_tp2_window` + Verify + 稀疏拒绝采样（注意改用 DFlash2 的接受语义，MTP 是
+  greedy 接受）⇒ 验收：端到端 token 与单卡基线一致；
+- **B6 状态与保留**：draft ring/pending features 随会话召回保存恢复（复用 MTP 的 host slab 先例，
+  `tp2_generation_core.cpp:1261-1266`）+ 接 `dflash_graph_profiles` ⇒ 验收：会话切换后召回仍逐位一致；
+- **B7 性能验收**：双卡吞吐对 90–180 tok/s 目标 + 与 MTP 的对比 + plain/mtp 无回归。
+
+**工件现状（已查）**：本机 `D:/LLM/qwen3_8_27b_w4a4_w8a8.ninfer` **不含** DFlash2（组件仅 text/vision/mtp，
+parameters=1422），但同目录已有 `qwen3_8_27b_w4a4_w8a8_dflash2.ninfer`（parameters=1513、objects=1218）⇒
+评估**不需要重新转换**，直接换工件即可。
+
+**待实测的未知量**：Windows 原生构建的真实 free（台账 `free` 取自 `cudaMemGetInfo`，WSL2 少报约 1 GiB）；
+草稿按 head/row 切分是否数值等价（目前无对应 split 测试）；K=15 时 workspace 峰值；目标 5 层残差跨 shard 汇聚
+的每步开销；草稿每层 allreduce 的延迟；稀疏拒绝采样在 TP-2 分片 logits 下的等价性。
 
 ## 4. 上游 cherry-pick 计划（第一梯队 + 第二梯队）
 
