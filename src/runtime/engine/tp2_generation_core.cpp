@@ -1088,7 +1088,7 @@ GenerationResult TP2GenerationCore::Submission::wait(OutputSink* sink,
 //
 // The device KV page pool is materialized once at startup and reused in place, so it holds exactly
 // one session at a time. Turning a client to another conversation therefore copies the resident
-// session's KV and GDN state into pinned host slabs and copies the returning session back, which
+// session's KV and GDN state into host KV slabs and copies the returning session back, which
 // costs one PCIe round trip instead of a full prefill. The catalog below owns both the token
 // history that describes what the device pools must reproduce and the host slabs that hold it while
 // another conversation is resident.
