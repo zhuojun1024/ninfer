@@ -301,8 +301,14 @@ loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:7
 - **B1 加载与放置**：放开拒绝 + `tp_split_spec` 增加 `dflash2/*` 规则（feature_projection/codebook 复制，context
   K/V 按 head 切）+ 每卡 draft 配置/state/plan（`tp2_generation_core.cpp:436-523`）⇒ 验收：两卡都物化成功、
   `ninfer_qwen3_5_tp2_load_test` 通过；
-- **B2 上下文物化**：5 个 block 的 residual 捕获 + 跨卡 handoff + `feature_projection`/`context_norm` +
-  `context_kv_materialize` 写本地 ring ⇒ 验收：与单卡 oracle 的 context K/V 数值一致；
+- **B2 上下文物化**：分两步。**B2a（已完成）**：两个 `forward_tp2_*` 入口接受可选
+  `DFlashFeatureSink*`，prefill 里 `begin` → 层循环 → `capture_positions` → `consume_prefill_chunk`，
+  window 里 `begin` → 层循环（batch 模式），`NullTap` 仍是默认；**B2b（待做）**：在
+  `TP2GenerationCore::Shard` 为 shard 0 建 `prefill_features`/`prefill_positions`/`pending_features`
+  缓冲（形状取 `startup.cpp:220-232`）并在 prefill 循环里装配 sink。注意：**B2 无法单独验证** ——
+  sink 的 consumer 是 B3 的 `append_context_impl`，没有它 `consume_prefill_chunk` 会抛「consumer 不可用」；
+  而单卡 oracle 只能做 **draft-only**（草案 2.07 GiB 单卡放得下、文本权重放不下），
+  所以验收判据是「draft ring 的 K/V 与单卡 draft-only oracle 一致」；
 - **B3 提议前向**：masked 块 5 层滑动 + 动态卷积按 D1 执行 ⇒ 验收：`drafts/proposal_q` 与单卡 oracle 一致；
 - **B4 selector 发布**：`linear_topk` + `hidden_projection` + `candidate_selector_path` ⇒ 验收：提议 token 与单卡一致；
 - **B5 验证/接受/折叠**：复用 `forward_tp2_window` + Verify + 稀疏拒绝采样（注意改用 DFlash2 的接受语义，MTP 是

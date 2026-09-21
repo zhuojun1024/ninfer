@@ -1856,7 +1856,7 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
                                       Tensor* logits, Tensor* logits_peer,
                                       Tensor* mtp_input_hidden, Tensor* logits_columns,
                                       Tensor* hidden_columns, Phase phase,
-                                      const Tp2VisionChunk* vision) {
+                                      const Tp2VisionChunk* vision, DFlashFeatureSink* sink) {
     const std::int32_t hidden = dimension(config_.hidden_size);
     const std::int32_t vocab  = dimension(config_.vocab_size);
     const std::int32_t tokens = static_cast<std::int32_t>(ids.size());
@@ -2016,6 +2016,14 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
         }
     }
     NullTap tap;
+    auto run_layers = [&] {
+        if (sink != nullptr) {
+            run_layers_tp2(peer, pair, x, x_peer, phase, *sink);
+        } else {
+            run_layers_tp2(peer, pair, x, x_peer, phase, tap);
+        }
+    };
+    if (sink != nullptr) { sink->begin(x); }
     if (phase == Phase::Verify) {
         // The verify window runs the phase the single-token decode path runs, so its per-column
         // logits agree with decode on near-ties. That phase needs the explicit sequence bindings the
@@ -2051,9 +2059,14 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
                                                        &verify_backend_rows);
         ScopedPositions verify_peer_cache(peer.active_cache_positions_, verify_positions);
         ScopedPositions verify_peer_rope(peer.active_rope_positions_, verify_positions);
-        run_layers_tp2(peer, pair, x, x_peer, phase, tap);
+        run_layers();
     } else {
-        run_layers_tp2(peer, pair, x, x_peer, phase, tap);
+        run_layers();
+    }
+    if (sink != nullptr && phase != Phase::Verify) {
+        // Positions are captured after the layers so the sink can check every feature layer published.
+        sink->capture_positions(*active_cache_positions_, ctx_.stream);
+        sink->consume_prefill_chunk(tokens, false);
     }
 
     ctx_.bind_to_current_thread();
@@ -2111,7 +2124,8 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
 void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
                                      const std::int32_t* ids, const std::int32_t* positions,
                                      ops::CausalAttentionExecutionEnvelope envelope,
-                                     Tensor& logits_columns, Tensor* hidden_columns) {
+                                     Tensor& logits_columns, Tensor* hidden_columns,
+                                     DFlashFeatureSink* sink) {
     const std::int32_t hidden = dimension(config_.hidden_size);
     const std::int32_t vocab  = dimension(config_.vocab_size);
     if (ids == nullptr || positions == nullptr) {
@@ -2186,7 +2200,12 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
     embedding_tp2(peer, pair, bind0.ids, &bind1.ids, x, &x_peer);
 
     NullTap tap;
-    run_layers_tp2(peer, pair, x, x_peer, Phase::Prefill, tap);
+    if (sink != nullptr) {
+        sink->begin(x);
+        run_layers_tp2(peer, pair, x, x_peer, Phase::Prefill, *sink);
+    } else {
+        run_layers_tp2(peer, pair, x, x_peer, Phase::Prefill, tap);
+    }
 
     ctx_.bind_to_current_thread();
     Tensor xf      = work_.alloc(DType::BF16, {hidden, tokens});

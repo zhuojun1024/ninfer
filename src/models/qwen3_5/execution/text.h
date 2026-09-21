@@ -197,7 +197,8 @@ public:
                              std::int32_t first_position, Tensor* logits, Tensor* logits_peer,
                              Tensor* mtp_input_hidden = nullptr, Tensor* logits_columns = nullptr,
                              Tensor* hidden_columns = nullptr, Phase phase = Phase::Prefill,
-                             const Tp2VisionChunk* vision = nullptr);
+                             const Tp2VisionChunk* vision = nullptr,
+                             DFlashFeatureSink* sink = nullptr);
 
     // Tensor-parallel verify window with capture-safe inputs. It runs exactly forward_tp2_prefill's
     // prefill phase over a small speculative window, but every per-round input is supplied as pinned
@@ -210,7 +211,7 @@ public:
     void forward_tp2_window(TextContext& peer, tp::DevicePair& pair, const std::int32_t* ids,
                             const std::int32_t* positions,
                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits_columns,
-                            Tensor* hidden_columns = nullptr);
+                            Tensor* hidden_columns = nullptr, DFlashFeatureSink* sink = nullptr);
 
     // Registers the peer shard's context and the device pair. The tensor-parallel driver sets this
     // on both shards once, so operations that only run on one shard (the MTP stem) can still drive
