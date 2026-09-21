@@ -303,12 +303,16 @@ loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:7
   `ninfer_qwen3_5_tp2_load_test` 通过；
 - **B2 上下文物化**：分两步。**B2a（已完成）**：两个 `forward_tp2_*` 入口接受可选
   `DFlashFeatureSink*`，prefill 里 `begin` → 层循环 → `capture_positions` → `consume_prefill_chunk`，
-  window 里 `begin` → 层循环（batch 模式），`NullTap` 仍是默认；**B2b（待做）**：在
-  `TP2GenerationCore::Shard` 为 shard 0 建 `prefill_features`/`prefill_positions`/`pending_features`
-  缓冲（形状取 `startup.cpp:220-232`）并在 prefill 循环里装配 sink。注意：**B2 无法单独验证** ——
-  sink 的 consumer 是 B3 的 `append_context_impl`，没有它 `consume_prefill_chunk` 会抛「consumer 不可用」；
-  而单卡 oracle 只能做 **draft-only**（草案 2.07 GiB 单卡放得下、文本权重放不下），
-  所以验收判据是「draft ring 的 K/V 与单卡 draft-only oracle 一致」；
+  window 里 `begin` → 层循环（batch 模式），`NullTap` 仍是默认。**B2b（已完成，`ae83d4a6`）**：shard 0
+  按单卡持久布局分配 `prefill_features[hidden*L, chunk]` / `prefill_positions[chunk]` /
+  `pending_features[hidden*L, K+1, 1]` 与零初始化的 draft local ring（`plan_cyclic_kv_cache`，lane=1），
+  prefill 循环装配 sink：`layers` 取 `draft.target_layer_ids`，consumer 按 lane 0、整 chunk 走
+  `dflash_append_context`（scratch 已 scope）。门禁未动 ⇒ 运行期仍恒走 `NullTap`，sessions 的 plain 与
+  mtp 都通过。**四个未决项**：① ring 未纳入 `session_store_active`/host slab/checkpoint（B6），lane 固定 0，
+  且 prefix reuse 会让 draft context 空洞；② workspace 峰值未实测（chunk=1024 时 consumer 约 60 MB）；
+  ③ verify 的 batch 字段未接（B3/B4），`pending_features` 仅分配未使用；④ **B2 无法单独验证** ——
+  consumer 是 B3 的 `dflash_append_context`，而单卡 oracle 只能做 **draft-only**（草案 2.07 GiB 单卡放得下、
+  文本权重放不下），所以验收判据是「draft ring 的 K/V 与单卡 draft-only oracle 一致」；
 - **B3 提议前向**：masked 块 5 层滑动 + 动态卷积按 D1 执行 ⇒ 验收：`drafts/proposal_q` 与单卡 oracle 一致；
 - **B4 selector 发布**：`linear_topk` + `hidden_projection` + `candidate_selector_path` ⇒ 验收：提议 token 与单卡一致；
 - **B5 验证/接受/折叠**：复用 `forward_tp2_window` + Verify + 稀疏拒绝采样（注意改用 DFlash2 的接受语义，MTP 是
