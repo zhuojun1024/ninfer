@@ -190,9 +190,11 @@ TP-2 路径未跑 perplexity 评测（质量证据用同提示词多采样 A/B�
 - [x] 第二梯队-1 `1d8587bc` → `1ed82861`（干净，22 文件；Windows staging 保留）
 - [x] 第二梯队-2 `05507ab0` → `2a7ec6c5`（干净，2 文件）
 - [x] 第二梯队-3 `5f5fccab` → `4b1e8507`（2 冲突已解，19 文件）
-- [ ] WSL 构建 + op 测试 + 字节一致 + 前端夹具测试（后台 job pwsh-5 构建中）
-- [ ] Windows 构建（build-win2 全量，避开运行中 exe 的 LNK1104）
-- [ ] 端到端验证脚本 + 用户重启 + e2e
+- [x] WSL 构建（BUILD_EXIT=0，212 目标全过；merge artifact 修复已提交 `75831a03`）
+- [ ] WSL op 测试 + 字节一致 + 前端夹具测试（**WSL2 CUDA 驱动崩溃**：`cudaGetDeviceCount()` 内 PTX JIT segfault，GPU 被 Windows 服务占用；jinja 测试通过证明二进制无误，op 测试改在 Windows 侧跑）
+- [x] Windows 构建（build-win2 全量 + BUILD_TESTING=ON，BUILD_EXIT=0，697 目标；`localtime_r`→`localtime_s` 修复 `474daf92`）
+- [x] Windows op 测试（NVFP4 A4/A16、frontend、jinja 全过；`NINFER_OP_REPORT_STATS=1` 错误指标在容差内，268 条记录）
+- [ ] 端到端验证（`tools/win_port/verify_cherry_pick.ps1` 已写）+ 用户重启 3456 服务 + e2e
 
 ### 5.1 `98dada0e` 冲突解决要点（本地 `--reasoning-effort` 特性接回上游 jinja 设计）
 
