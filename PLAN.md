@@ -194,7 +194,21 @@ TP-2 路径未跑 perplexity 评测（质量证据用同提示词多采样 A/B�
 - [ ] WSL op 测试 + 字节一致 + 前端夹具测试（**WSL2 CUDA 驱动崩溃**：`cudaGetDeviceCount()` 内 PTX JIT segfault，GPU 被 Windows 服务占用；jinja 测试通过证明二进制无误，op 测试改在 Windows 侧跑）
 - [x] Windows 构建（build-win2 全量 + BUILD_TESTING=ON，BUILD_EXIT=0，697 目标；`localtime_r`→`localtime_s` 修复 `474daf92`）
 - [x] Windows op 测试（NVFP4 A4/A16、frontend、jinja 全过；`NINFER_OP_REPORT_STATS=1` 错误指标在容差内，268 条记录）
-- [ ] 端到端验证（`tools/win_port/verify_cherry_pick.ps1` 已写）+ 用户重启 3456 服务 + e2e
+- [x] 端到端 A/B 验证（`tools/win_port/verify_cherry_pick.ps1`；旧 vs 新二进制同配置同脚本）
+
+### 5.4 e2e A/B 验证结果（2026-09-21，双 5060 Ti，3456 服务）
+
+同配置（启动脚本 MaxContext 204800、draft-tokens 3、KV fp8）同方法（bench_serve.ps1）：
+
+| 项 | 旧二进制 | 新二进制 | Δ |
+|---|---|---|---|
+| prefill_2048 | 574.3 tok/s | 587.9 tok/s | +2.4% |
+| prefill_8192 | 1,568.9 tok/s | 1,555.4 tok/s | −0.9% |
+| prefill_32768 | 1,498.3 tok/s | 1,488.2 tok/s | −0.7% |
+| decode_short | 71.6 tok/s | 72.5 tok/s | +1.3% |
+| decode_at_8192 | 70.9 tok/s | 75.0 tok/s | +5.8% |
+
+**结论**：cherry-pick 无退化。prefill 持平（噪声范围内），decode 略升（+1.3%~+5.8%）。decode token 数不同（旧 118/128 vs 新 84/83）因 jinja 模板渲染/采样随机性，吞吐非严格可比但方向持平或略升。正确性正常（两边都生成带 reasoning 的回复）。结果：`profiles/bench/upstream_cherry_pick/bench-{old,new}.json`。
 
 ### 5.1 `98dada0e` 冲突解决要点（本地 `--reasoning-effort` 特性接回上游 jinja 设计）
 
