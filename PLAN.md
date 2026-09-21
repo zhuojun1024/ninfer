@@ -188,9 +188,10 @@ worklog §36.1 记录过同一函数的同类事故（当年 `--spec` 也被丢�
 ### 3.6 DFlash2 上 TP-2 的适配计划（未排期；结论来自 §7 调研）
 
 **现状**：DFlash2 已完整实现、并在**单卡 5090** 路线合格（数学与状态见 `docs/maintainer/dflash.md`，实现见
-`execution/draft.cpp`、`load/dflash{,2}.cpp`，性能与 corpus 见 `docs/performance/*`）；TP-2 路线**有意拒绝**
-`--spec dflash2`（`model_instance.cpp:97-104` 抛 `TP-2 generation supports --spec mtp only`，理由是 dual-shard
-loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:713`、`:2438`）。
+`execution/draft.cpp`、`load/dflash{,2}.cpp`，性能与 corpus 见 `docs/performance/*`）；TP-2 路线原**有意拒绝**
+`--spec dflash2`（`model_instance.cpp` 抛 `TP-2 generation supports --spec mtp only`，理由是 dual-shard
+loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`、`:2438`）。**B5 已把该拒绝打开**（见下文 B5 结果），
+`--spec dflash`（v1）仍拒绝。
 
 **单卡收益证据（已备，成本＝读文档）**：仓库已发布单张 5090、C=1 的 DFlash2 K=7 对 MTP3 对比
 （`docs/performance/qwen3.8-27b.md:275-307`）：
@@ -342,8 +343,32 @@ loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:7
   再次 propose ⇒ 图案逐位存活、shard workspace 计数不变、组件 arena 峰值 4.4 MiB（K=7）/3.3 MiB（K=5），与 planner 预算
   完全相同。验收：组装轮次逐位复现 B3 哈希（K=7 `0xbad27a494a9bc853`、K=5 `0xbee487264ca8ffb8`，跨二进制/跨进程），
   单次提议 7.95 ms；context 90.4 MiB（较 B3 多 0.34 MiB，因组件按生产 `lanes=K+1=8` 分配 `pending_features`，暂无人读）；
-- **B5 验证/接受/折叠**：复用 `forward_tp2_window` + Verify + 稀疏拒绝采样（注意改用 DFlash2 的接受语义，MTP 是
-  greedy 接受）⇒ 验收：端到端 token 与单卡基线一致；
+- **B5 结果（已完成，工作树未提交）**：DFlash2 的 masked draft 已在 TP-2 跑通「prefill sink → append_pending →
+  masked 提议 → 目标 verify（带 feature sink）→ 稀疏拒绝采样 → GDN fold → terminal append」整轮，gate 在
+  `model_instance.cpp` 打开（`--spec dflash2` 放行，`--spec dflash` 仍拒绝）。
+  - 改动：`program/dflash_round.{h,cpp}` 新增 `make_verify_sink()`/`append_pending()`/`draft_window()`/
+    `feature_lanes()`；`runtime/engine/tp2_generation_core.{h,cpp}` 的 `run_verify_window` 增加 sink 形参，构造期建立
+    DFlash2 标志/草稿数/context frontier，`build_shard` 为 DFlash2 建 GDN records + `replay_fold`（width=drafts+1），
+    decode 分支按单卡 `execution/draft.cpp:dflash_decode_batch_body` 的顺序实现，extent==0 回退 plain step；
+    `src/runtime/engine/model_instance.cpp:97-112` 打开 gate 并为本路线关闭 context cache/host checkpoint/会话保留
+    （draft ring 尚未进入 B6 的状态镜像）。
+  - 关键缺陷（本轮修复）：verify window 的 ids/positions 是设备端产物，D2H 到 pinned buffer 后**未同步**就被
+    `forward_tp2_window` 读到另一张卡的 stream 上（MTP 的窗口是 host 直接写的，所以既有路径不暴露此问题）⇒ 修复前
+    输出退化成重复片段，加一次 `cudaStreamSynchronize` 后连贯。
+  - 验收：K=7/K=5 `ninfer_qwen3_5_tp2_dflash_append_test` 哈希不变；`load_test` 三例、`sessions_test` 全绿；
+    `ninfer-serve --devices 0,1 --max-context 4096 --kv-dtype fp8 --greedy --no-prefix-reuse` 上 5 个 prompt 全部连贯
+    （最长同词重复=1），同一 prompt 重复请求逐字节一致（确定性）。
+  - **「DFlash2 == plain 逐 token」不成立，且本引擎不可能成立**：窗口前向与单 token decode 是不同执行形状，逐列
+    logits 有差（`docs/tp2-dual-5060ti.md:172-176` 已对 MTP 声明）。本轮对照实测（同工件、同 prompt、greedy 128
+    token）：MTP K=2 与 plain 公共前缀 320 字符即分叉；DFlash2 **K=2 为 390 字符（优于 MTP K=2）**、K=7 为 207
+    字符（随窗口变宽而变短）。因此 B5 的验收改为「不劣于 MTP 且不退化」，已满足；严格的 token 逐位一致作为
+    **无法建立**项记录。
+  - 实测（4096 context、fp8 KV、greedy、65 prompt token→128 输出 token）：plain 35.1 tok/s；MTP K=2 62.8 tok/s
+    （56 轮/127 提交=2.27 token/轮、接受率 63.4%）；DFlash2 K=2 51.0 tok/s（58 轮、接受率 59.5%）；**DFlash2 K=7
+    63.6 tok/s（41 轮/127 提交=3.10 token/轮、接受率 30.0%）**，为 plain 的 1.81×、与 MTP K=2 持平。未达 §3.6 的
+    108 tok/s roofline 估算 —— DFlash2 的 verify 目前是 **eager**（feature sink 无法进 graph），同宽 verify 比 MTP
+    多约 4 ms/轮，且提议约 6.4–6.8 ms/轮。内存：shard 0 `weights+ctx 13878.6 MiB`、free 1764 MiB（draft 3655.4 MiB）；
+    两种 proposal head（默认 Full 与 `--lm-head-draft`）输出与速率一致；
 - **B6 状态与保留**：draft ring/pending features 随会话召回保存恢复（复用 MTP 的 host slab 先例，
   `tp2_generation_core.cpp:1261-1266`）+ 接 `dflash_graph_profiles` ⇒ 验收：会话切换后召回仍逐位一致；
 - **B7 性能验收**：双卡吞吐对 90–180 tok/s 目标 + 与 MTP 的对比 + plain/mtp 无回归。

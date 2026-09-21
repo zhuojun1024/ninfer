@@ -94,13 +94,21 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             options.prefill_chunk = chunk - chunk % 128U;
         }
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
-        // The TP-2 core drives its own single-request round loop, so only the MTP backend (which
-        // proposes from the artifact's own nextn head and needs no companion component) is
-        // available here. DFlash/DFlash2 need a separate draft component the dual-shard loader does
-        // not bring up.
-        if (options.speculative.backend == SpeculativeBackend::DFlash ||
-            options.speculative.backend == SpeculativeBackend::DFlash2) {
-            throw std::invalid_argument("TP-2 generation supports --spec mtp only");
+        // The TP-2 core drives its own single-request round loop. MTP proposes from the artifact's
+        // own nextn head; DFlash2 owns a draft component the shard split materializes whole on
+        // shard 0, and the core runs its masked proposal, target verify, sparse acceptance and GDN
+        // fold itself (PLAN.md section 3.6, stage B5). DFlash v1 still has no TP-2 context layout,
+        // and its draft state would go through the per-layer path this core does not own.
+        if (options.speculative.backend == SpeculativeBackend::DFlash) {
+            throw std::invalid_argument("TP-2 generation supports --spec mtp or --spec dflash2 only");
+        }
+        // The DFlash2 draft ring is not part of any session or checkpoint image yet (stage B6), so
+        // the core refuses prefix reuse and cross-session retention itself; a request that reached
+        // either would verify against a draft context describing the wrong positions.
+        if (options.speculative.backend == SpeculativeBackend::DFlash2) {
+            options.context_cache.enabled = false;
+            options.context_cache.host_state_slots = 0;
+            options.context_cache.host_kv_capacity_bytes = 0;
         }
         // Vision is available on the TP-2 route: the artifact's static shard split places the
         // Vision tower on the shard that holds the vision component (shard 1) and the MTP layer on

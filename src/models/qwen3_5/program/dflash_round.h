@@ -121,6 +121,21 @@ public:
     void append(ExecutionCore execution, const Tensor& features, const Tensor& positions,
                 std::uint32_t exact, std::int32_t lane = 0);
 
+    // --- verify capture (target verify window -> draft context) ---
+    // The sink one target verify window taps its residual blocks into. Unlike the prefill sink it
+    // owns no consumer: the captured columns land in the draft's pending staging buffer and are
+    // committed one round later by append_pending, exactly as the single-device route's
+    // prepare_ragged_prefix hand-off does. width is the verify window (K+1) and batch the resident
+    // rows; the destination lane is frame active_lanes.
+    [[nodiscard]] DFlashFeatureSink make_verify_sink();
+    // Commits the pending verify-window features [start, end) - the columns of the window that the
+    // next round has committed - into the draft's local ring at those absolute positions. start is
+    // the draft's context frontier, end the target's execution frontier; end - start must fit the
+    // round's feature_lanes, which is the pending staging width. A zero-width call is a no-op.
+    void append_pending(ExecutionCore execution, std::uint32_t start, std::uint32_t end);
+    [[nodiscard]] std::uint32_t draft_window() const noexcept { return spec_.draft_window; }
+    [[nodiscard]] std::int32_t feature_lanes() const noexcept { return spec_.feature_lanes; }
+
     // --- proposal ---
     [[nodiscard]] qwen3_5::DFlashDecodeIngress& ingress() noexcept { return ingress_; }
     [[nodiscard]] const qwen3_5::DFlashDecodeIngress& ingress() const noexcept { return ingress_; }

@@ -7,6 +7,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/linear_topk.h"
+#include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sliding_window_attention.h"
 
@@ -275,6 +276,54 @@ void DFlash2Round::append(ExecutionCore execution, const Tensor& features, const
         .dflash    = *state_,
     };
     dflash_append_context(append_state, features, positions, counts, lanes, counts, {exact, exact});
+}
+
+DFlashFeatureSink DFlash2Round::make_verify_sink() {
+    // The window's residuals land in the pending staging buffer one column per absolute position;
+    // the destination lane is the row's frame lane, and valid_columns limits the write to the
+    // columns the target actually forwarded (the physical tail holds the last valid column).
+    return DFlashFeatureSink{
+        .batch_features      = &state_->pending_features,
+        .batch_lanes         = &frame_->active_lanes,
+        .batch_valid_columns = &frame_->target_valid_columns,
+        .batch_width         = spec_.feature_lanes,
+        .batch_size          = static_cast<std::int32_t>(spec_.batch_capacity),
+        .layers              = std::span<const std::uint32_t>(spec_.target_layer_ids),
+    };
+}
+
+void DFlash2Round::append_pending(ExecutionCore execution, std::uint32_t start, std::uint32_t end) {
+    if (end < start) {
+        throw std::invalid_argument("DFlash2 pending append has an inverted frontier");
+    }
+    const std::uint32_t count = end - start;
+    if (count == 0) { return; }
+    if (count > static_cast<std::uint32_t>(spec_.feature_lanes)) {
+        throw std::invalid_argument("DFlash2 pending append exceeds the staging window");
+    }
+    device_->bind_to_current_thread();
+    auto scratch = execution.work.scope();
+    // Compact the committed prefix of the pending window into the physical width the context
+    // materialization consumes. prepare_ragged_prefix is the same op the single-device route uses
+    // for this hand-off: it copies columns [start, end) and publishes the absolute positions and the
+    // per-lane count that drive both the context projection and the ring write.
+    Tensor compact = execution.work.alloc(
+        DType::BF16, {spec_.target_features, spec_.feature_lanes, 1});
+    Tensor positions = execution.work.alloc(DType::I32, {spec_.feature_lanes, 1});
+    Tensor counts    = execution.work.alloc(DType::I32, {1});
+    Tensor lanes     = execution.work.alloc(DType::I32, {1});
+    Tensor starts    = execution.work.alloc(DType::I32, {1});
+    Tensor ends      = execution.work.alloc(DType::I32, {1});
+    ops::set_i32_scalar(lanes, 0, device_->stream);
+    ops::set_i32_scalar(starts, static_cast<std::int32_t>(start), device_->stream);
+    ops::set_i32_scalar(ends, static_cast<std::int32_t>(end), device_->stream);
+    ops::prepare_ragged_prefix(state_->pending_features, lanes, starts, ends, compact, positions,
+                               counts, device_->stream);
+    DFlashAppendContext append_state{
+        .execution = round_execution(execution, execution.work),
+        .dflash    = *state_,
+    };
+    dflash_append_context(append_state, compact, positions, counts, lanes, counts, {count, count});
 }
 
 void DFlash2Round::propose(ExecutionCore execution, const qwen3_5::PagedKVCache& text_cache,

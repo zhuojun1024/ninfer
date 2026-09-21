@@ -321,8 +321,12 @@ private:
     void capture_verify_graph(WindowGraph& graph, const std::int32_t* ids,
                               const std::int32_t* positions, Tensor& logits_columns,
                               Tensor& hidden_columns);
+    // The speculative verify window. sink, when non-null, is the masked-draft feature sink the
+    // target residual blocks are tapped into; it is only supported on the eager route, which is the
+    // one the DFlash2 backend selects (verify_graph_enabled_ stays false there).
     void run_verify_window(const std::int32_t* ids, std::int32_t first_position,
-                           Tensor& logits_columns, Tensor& hidden_columns);
+                           Tensor& logits_columns, Tensor& hidden_columns,
+                           models::qwen3_5::execution::DFlashFeatureSink* sink = nullptr);
 
     // One plain (non-speculative) decode step at the given position. The launch mechanism is the
     // decode step mode: a captured graph by default, the eager forward for either A/B partner.
@@ -449,6 +453,16 @@ private:
 
     bool mtp_enabled_         = false;
     std::uint32_t mtp_drafts_ = 0;
+    // DFlash2 masked-draft route (--spec dflash2): the draft is materialized whole on shard 0 and
+    // this core drives its proposal/verify/accept/fold round itself. The two backends are mutually
+    // exclusive (the option normalizer admits one), and DFlash2 keeps its own proposal width.
+    bool dflash2_enabled_         = false;
+    std::uint32_t dflash_drafts_  = 0;
+    // How far the draft's local ring has been materialized, in absolute target tokens. The prefill
+    // sink advances it by each chunk; every decode round advances it by the committed prefix of the
+    // previous round's verify window (append_pending). It never exceeds the target execution
+    // frontier and lags it by at most one verify window.
+    std::uint32_t dflash_context_frontier_ = 0;
     // The first draft of the previous decode step, and whether there is one to compare. A draft
     // proposed at position p predicts the token at p+2, so the target's argmax at the next step is
     // exactly the acceptance oracle for it.

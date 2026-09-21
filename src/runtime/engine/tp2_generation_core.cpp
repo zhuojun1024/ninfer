@@ -289,6 +289,11 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     if (mtp_enabled_) {
         mtp_drafts_ = std::clamp<std::uint32_t>(options.speculative.draft_tokens, 1U, 5U);
     }
+    dflash2_enabled_ = options.speculative.backend == SpeculativeBackend::DFlash2;
+    if (dflash2_enabled_) {
+        dflash_drafts_ = std::clamp<std::uint32_t>(options.speculative.draft_tokens, 1U,
+                                                   qwen::kDFlashDecodeMaximumDrafts);
+    }
 
     artifact::Reader reader(options.artifact_path);
     auto plan = qwen::plan_load(reader, load);
@@ -317,6 +322,12 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
             const std::uint32_t rounded  = (per_slot + 127U) / 128U * 128U;
             host_checkpoint_stride_      = std::max(kReuseCheckpointStride, rounded);
         }
+        // The masked-draft route cannot reuse a prefix yet: the draft's local context ring is not
+        // part of the device snapshot, the host checkpoint ring or the session catalog (PLAN.md
+        // section 3.6, stage B6). Until it is, a reused prefix would leave the ring describing the
+        // wrong positions, so the route forfeits reuse rather than publish a draft context it cannot
+        // vouch for. The ring is disabled too, since nothing can consume it.
+        if (dflash2_enabled_) { host_checkpoint_stride_ = 0; }
     }
 
     // Cross-session retention budget. --host-kv-mib is the whole host KV budget, split evenly
@@ -329,7 +340,9 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         const std::uint32_t sessions =
             options_.context_cache.max_private_continuations.value_or(kTp2DefaultSessions);
         // One entry is the resident conversation; retention needs room for at least one more.
-        if (host_kv_bytes / 2 != 0 && sessions > 1) {
+        // DFlash2 disables cross-session retention for the same reason it disables reuse: a
+        // recalled session would restore the target KV and GDN state but not the draft ring.
+        if (host_kv_bytes / 2 != 0 && sessions > 1 && !dflash2_enabled_) {
             host_kv_shard_bytes_ = host_kv_bytes / 2;
             session_capacity_    = sessions;
         }
@@ -365,10 +378,12 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         const char* env        = std::getenv("NINFER_TP2_VERIFY_GRAPH");
         verify_graph_enabled_  = env == nullptr || env[0] != '0';
     }
-    if (mtp_enabled_) {
+    if (mtp_enabled_ || dflash2_enabled_) {
         // The verify window is assembled in this portable pinned buffer every round: the capture
-        // path reads it through a memcpy node, and the eager path reads it directly.
-        const std::uint32_t width = mtp_drafts_ + 1U;
+        // path reads it through a memcpy node, and the eager path reads it directly. MTP assembles
+        // it from the host proposal chain; DFlash2 reads the verify ids/positions the proposal
+        // published back from the frame. Both use the same [ids(W), positions(W)] layout.
+        const std::uint32_t width = (mtp_enabled_ ? mtp_drafts_ : dflash_drafts_) + 1U;
         verify_window_host_ = std::make_unique<PinnedHostBuffer>(
             static_cast<std::size_t>(2) * width * sizeof(std::int32_t), true);
     }
@@ -543,19 +558,20 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
 
     std::size_t record_bytes = 0;
     std::size_t round_bytes  = 0;
-    if (mtp_enabled_) {
+    if (mtp_enabled_ || dflash2_enabled_) {
         // ReplaySSM records for one verify window wide, one physical row, per-shard GDN geometry.
         // Both shards verify the window, so both need their own records and fold plan.
         // The verify forward records here instead of advancing the live state, and the fold replays
         // the accepted prefix back into it (in place: with a single row the Op allows it, so the
-        // state pool still needs one slot).
+        // state pool still needs one slot). MTP and DFlash2 use the same mechanism; only the window
+        // width differs.
         LayoutBuilder record_builder;
         const GdnReplayRecordLayout record_layout = plan_gdn_replay_records(
             record_builder,
             GdnReplayRecordSpec{
                 .layers          = qwen::execution::dimension(scfg.linear_attention_layers),
                 .record_capacity = 1,
-                .width           = static_cast<std::int32_t>(mtp_drafts_) + 1,
+                .width           = static_cast<std::int32_t>(mtp_enabled_ ? mtp_drafts_ : dflash_drafts_) + 1,
                 .conv_channels =
                     (scfg.gdn ? qwen::execution::dimension(scfg.gdn->conv_channels()) : 0),
                 .qk_heads =
@@ -906,7 +922,8 @@ void TP2GenerationCore::capture_verify_graph(WindowGraph& graph, const std::int3
 }
 
 void TP2GenerationCore::run_verify_window(const std::int32_t* ids, std::int32_t first_position,
-                                          Tensor& logits_columns, Tensor& hidden_columns) {
+                                          Tensor& logits_columns, Tensor& hidden_columns,
+                                          qwen::execution::DFlashFeatureSink* sink) {
     Shard& shard_a = shard_a_;
     Shard& shard_b = shard_b_;
     const auto width    = static_cast<std::size_t>(logits_columns.ne[1]);
@@ -917,19 +934,34 @@ void TP2GenerationCore::run_verify_window(const std::int32_t* ids, std::int32_t 
         // The eager route runs the same window and the same envelope; only the launch differs. That
         // keeps NINFER_TP2_VERIFY_GRAPH=0 a true A/B of the captured sequence rather than a
         // comparison of two different attention routes.
-        const WindowGraph* bucket = select_window_graph(verify_graphs_, visible_end);
-        if (bucket == nullptr) {
-            throw std::logic_error("TP-2 verify window coverage is incomplete");
-        }
-        const ops::CausalAttentionExecutionEnvelope envelope{bucket->visible_begin,
-                                                             bucket->visible_end};
+        // The masked-draft route builds no verify-graph buckets (it has no capture path), so its
+        // window runs under the exact envelope the bucket would have covered. MTP keeps the bucket
+        // the eager arm is compared against.
+        const ops::CausalAttentionExecutionEnvelope envelope =
+            verify_graphs_.empty()
+                ? ops::CausalAttentionExecutionEnvelope{
+                      static_cast<std::uint32_t>(first_position) + 1U, visible_end}
+                : [&] {
+                      const WindowGraph* bucket = select_window_graph(verify_graphs_, visible_end);
+                      if (bucket == nullptr) {
+                          throw std::logic_error("TP-2 verify window coverage is incomplete");
+                      }
+                      return ops::CausalAttentionExecutionEnvelope{bucket->visible_begin,
+                                                                   bucket->visible_end};
+                  }();
         shard_a.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
                                               &shard_a.records);
         shard_b.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
                                               &shard_b.records);
         shard_a.context->forward_tp2_window(*shard_b.context, pair_, ids, positions, envelope,
-                                            logits_columns, &hidden_columns);
+                                            logits_columns, &hidden_columns, sink);
     } else {
+        if (sink != nullptr) {
+            // A captured window bakes the feature sink's scatter addresses but not the host-side
+            // capture calls, so the masked-draft verify always runs the eager route
+            // (verify_graph_enabled_ is only set for MTP).
+            throw std::logic_error("TP-2 masked-draft verify cannot use a captured window");
+        }
         WindowGraph* graph = select_window_graph(verify_graphs_, visible_end);
         if (graph == nullptr) {
             throw std::logic_error("TP-2 verify CUDA Graph coverage is incomplete");
@@ -1100,7 +1132,7 @@ TP2GenerationCore::make_dflash_prefill_sink(Shard& shard) {
         .io               = shard.io,
         .prefill_hidden   = shard.prefill_hidden,
         .prefill_chunk    = chunk,
-        .proposal_head    = ProposalHead::Full,
+        .proposal_head    = options_.speculative.proposal_head,
     });
 }
 
@@ -1782,7 +1814,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     const std::uint32_t reuse_grid =
         std::min<std::uint32_t>(std::max<std::uint32_t>(options_.prefill_chunk, 64),
                                 kPrefillChunkMaximum);
-    if (cached_state_valid_ && !cached_prompt_tokens_.empty()) {
+    if (!dflash2_enabled_ && cached_state_valid_ && !cached_prompt_tokens_.empty()) {
         const std::size_t common = std::min(cached_prompt_tokens_.size(), token_ids.size());
         while (shared_prefix < common &&
                cached_prompt_tokens_[shared_prefix] == token_ids[shared_prefix]) {
@@ -2028,7 +2060,10 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // decoded vocabulary pieces) and uploaded once per constrained step. The device buffer is
     // allocated in the request scope, below every round watermark, so it cannot disturb a captured
     // verify graph.
-    const std::int32_t constraint_columns = mtp_enabled_ ? mtp_drafts_ + 1 : 1;
+    const std::int32_t constraint_columns =
+        dflash2_enabled_ ? static_cast<std::int32_t>(dflash_drafts_) + 1
+        : mtp_enabled_  ? static_cast<std::int32_t>(mtp_drafts_) + 1
+                        : 1;
     Tensor tool_mask_dev;
     std::vector<std::uint8_t> tool_mask_one;
     std::vector<std::uint8_t> tool_mask_columns;
@@ -2192,6 +2227,17 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     if (host_stored_session_ != kNoSession && reuse != 0 && reuse == shared_prefix) {
         session_capture_shared_state(host_stored_session_, reuse, true, nullptr);
     }
+    // The masked-draft route restarts the draft context with the request. Its ring is not part of
+    // any session or checkpoint image yet (PLAN.md section 3.6, stage B6) and the route forfeited
+    // reuse above, so the walk is about to capture the whole prompt again; zeroing first makes the
+    // untouched tail explicitly empty rather than a previous request's features.
+    dflash_context_frontier_ = 0;
+    if (dflash2_enabled_) {
+        if (shard_a_.dflash_round == nullptr) {
+            throw std::logic_error("TP-2 DFlash2 route has no masked-draft round");
+        }
+        shard_a_.dflash_round->zero_context();
+    }
     for (std::uint32_t t0 = reuse; t0 < prompt_tokens;) {
         if (cancellation.requested()) {
             // Chunks that finished wrote KV for tokens the prompt really has and left the GDN state
@@ -2275,6 +2321,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                                   mtp_enabled_ ? &mtp_input_a : nullptr, nullptr, nullptr,
                                   qwen::TextPhase::Prefill, media_ptr,
                                   dflash_sink ? &*dflash_sink : nullptr);
+        if (dflash_sink) {
+            // The sink's consumer ran synchronously inside the forward and appended this chunk's
+            // absolute positions to the draft ring, so the context frontier tracks the prefill.
+            dflash_context_frontier_ = t0 + length;
+        }
         if (mtp_enabled_ && t0 + length != prompt_tokens) {
             mtp_prefill_priming(shard_a_, token_ids.data() + t0, length, t0, mtp_input_a, nullptr,
                                 false);
@@ -2466,13 +2517,216 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         auto scope_b = ws_b.scope();
         std::vector<TokenId> step;
         Tensor round_hidden;
+        // True when the DFlash2 round found no room for a window and fell back to a plain step,
+        // which already advanced current/position and updated the target state in place.
+        bool dflash_plain_step = false;
         // Phase marks: 0 round start, 1 after the MTP proposal chain, 2 after the verify forward,
         // 3 after the licensing kernels, 4 after the licenced-token readback, 5/6 around the state
         // fold. The plain loop has no proposal chain and no fold, so it collapses 1 onto 0.
         const Clock::time_point round_start = Clock::now();
         timing.record(0, shard_a_.device.stream);
         if (!mtp_enabled_) { timing.record(1, shard_a_.device.stream); }
-        if (!mtp_enabled_) {
+        if (dflash2_enabled_) {
+            // One masked-draft round, mirroring the single-device sequence
+            // (execution/draft.cpp dflash_decode_batch_body): commit the pending verify window of
+            // the previous round into the draft ring, propose the masked block, verify the window
+            // through the target with the feature sink installed, then accept with DFlash2's sparse
+            // semantics and fold only the committed columns.
+            Shard& shard = shard_a_;
+            auto& round  = *shard.dflash_round;
+            const std::uint32_t budget_remaining = request.budget.remaining();
+            const std::uint32_t max_by_budget =
+                budget_remaining > 1 ? budget_remaining - 1U : 0U;
+            const std::uint32_t capacity_left =
+                position + 1U < options_.max_context ? options_.max_context - position - 1U : 0U;
+            const std::uint32_t extent =
+                std::min({dflash_drafts_, max_by_budget, capacity_left});
+            const std::int32_t width = static_cast<std::int32_t>(dflash_drafts_) + 1;
+            if (extent == 0) {
+                // The window has no room for a draft (the output budget or the context ends after
+                // this token). Forward the anchor as a plain step; the target state advances in
+                // place and the request terminates, so the draft context has no next round to feed.
+                Tensor logits_a = run_plain_decode_step(current, position);
+                timing.record(2, shard_a_.device.stream);
+                ops::set_i32_scalar(logical_pos_a, static_cast<std::int32_t>(position + 1),
+                                    shard_a_.device.stream);
+                if (constraint_live()) {
+                    constraint_advance();
+                    if (tool_constraint->build_mask(logits_domain, tool_mask_one)) {
+                        shard_a_.device.bind_to_current_thread();
+                        CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_one.data(),
+                                                   tool_mask_one.size(),
+                                                   cudaMemcpyHostToDevice,
+                                                   shard_a_.device.stream));
+                        ops::apply_token_mask(logits_a, tool_mask_dev, shard_a_.device.stream);
+                    }
+                }
+                Tensor sampled_a = ws_a.alloc(DType::I32, {1});
+                ops::sample(logits_a, sampled_a, public_tokens, sampling_a, logical_pos_a,
+                            ops::kSamplePurposeDecode, ws_a, shard_a_.device.stream);
+                timing.record(3, shard_a_.device.stream);
+                std::int32_t next = 0;
+                shard_a_.device.bind_to_current_thread();
+                CUDA_CHECK(cudaMemcpyAsync(&next, sampled_a.data, sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToHost, shard_a_.device.stream));
+                timing.record(4, shard_a_.device.stream);
+                const Clock::time_point sync_start = Clock::now();
+                CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+                timing.close_round(
+                    std::chrono::duration<double, std::milli>(Clock::now() - sync_start).count());
+                current = next;
+                ++position;
+                dflash_plain_step = true;
+                step.assign(1, static_cast<TokenId>(next));
+            } else {
+                const qwen::execution::ExecutionCore dflash_execution{
+                    .device           = shard.device,
+                    .parameters       = *shard.parameters,
+                    .work             = *shard.workspace,
+                    .linear_attention = *shard.state,
+                    .replay_records   = nullptr,
+                    .io               = shard.io,
+                    .prefill_hidden   = shard.prefill_hidden,
+                    .prefill_chunk    = options_.prefill_chunk,
+                    .proposal_head    = options_.speculative.proposal_head,
+                };
+                // Hand off the previous verify window: its columns [C, E) are the target residual
+                // the draft context is missing, exactly the prepare_ragged_prefix append the
+                // single-device route makes at the head of its round.
+                round.append_pending(dflash_execution, dflash_context_frontier_, position);
+                dflash_context_frontier_ = position;
+                qwen::DFlashDecodeIngress& ingress = round.ingress();
+                ingress                            = {};
+                ingress.anchors[0]                 = current;
+                ingress.execution_frontiers[0]     = static_cast<std::int32_t>(position);
+                ingress.context_frontiers[0]       = static_cast<std::int32_t>(position);
+                ingress.proposal_extents[0]        = static_cast<std::int32_t>(extent);
+                ingress.proposal_valid_columns[0]  = width;
+                ingress.target_valid_columns[0]    = static_cast<std::int32_t>(extent) + 1;
+                for (std::int32_t column = 0; column < width; ++column) {
+                    const std::int32_t offset =
+                        std::min(column, static_cast<std::int32_t>(extent));
+                    ingress.target_rope_positions[column] =
+                        static_cast<std::int32_t>(position) + offset;
+                }
+                ingress.text_kv_table_rows[0]      = 0;
+                ingress.dflash_kv_table_rows[0]    = 0;
+                ingress.active_lanes[0]            = 0;
+                ingress.state_source_slots[0]      = 0;
+                ingress.state_destination_slots[0] = 0;
+                ingress.sampling[0]                = sampling_config;
+                const qwen::execution::DFlashEnvelopes envelopes{
+                    .local  = {0, position},
+                    .full   = {0, position},
+                    .append = {0, static_cast<std::uint32_t>(width)},
+                };
+                shard.device.bind_to_current_thread();
+                round.propose(dflash_execution, shard.decoder->text_kv, shard.context.get(),
+                              dflash_drafts_, envelopes);
+                timing.record(1, shard_a_.device.stream);
+
+                qwen::DFlashDecodeState& frame = round.frame();
+                Tensor window_logits = frame.target_logits.view({vocab, width});
+                Tensor window_hidden = frame.target_hidden.view({hidden, width});
+                ops::speculative_prepare_verify_inputs(
+                    frame.anchors, frame.draft_tokens, frame.execution_frontiers,
+                    frame.proposal_extents, frame.verify_ids, frame.verify_positions,
+                    shard_a_.device.stream);
+                // The window is assembled in the same pinned buffer the MTP verify uses, so the
+                // eager forward reads the verified ids/positions directly.
+                auto* window_ids       = static_cast<std::int32_t*>(verify_window_host_->data());
+                auto* window_positions = window_ids + width;
+                shard_a_.device.bind_to_current_thread();
+                CUDA_CHECK(cudaMemcpyAsync(window_ids, frame.verify_ids.data,
+                                           sizeof(std::int32_t) * static_cast<std::size_t>(width),
+                                           cudaMemcpyDeviceToHost, shard_a_.device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(window_positions, frame.verify_positions.data,
+                                           sizeof(std::int32_t) * static_cast<std::size_t>(width),
+                                           cudaMemcpyDeviceToHost, shard_a_.device.stream));
+                // The window is produced on the device, so unlike the MTP path (whose host builds
+                // the buffer directly) both copies above are asynchronous into pinned memory.
+                // forward_tp2_window then reads that host buffer to build *each* shard's own copy,
+                // and shard B's copy runs on a different stream with no ordering against shard A's
+                // D2H. Synchronize before the host buffer becomes the forward's input.
+                CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+                if (constraint_live()) {
+                    // The mask is built on the host, so the window has to be visible first.
+                    CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+                    constraint_advance();
+                    std::fill(tool_mask_columns.begin(), tool_mask_columns.end(), std::uint8_t{1});
+                    bool masked = false;
+                    std::string drafted_prefix;
+                    for (std::int32_t column = 0; column < width; ++column) {
+                        if (tool_constraint->build_mask_after(drafted_prefix, logits_domain,
+                                                              tool_mask_one)) {
+                            const std::size_t base =
+                                static_cast<std::size_t>(column) *
+                                static_cast<std::size_t>(vocab);
+                            std::copy(tool_mask_one.begin(), tool_mask_one.end(),
+                                      tool_mask_columns.begin() +
+                                          static_cast<std::ptrdiff_t>(base));
+                            masked = true;
+                        }
+                        if (column + 1 < width) {
+                            drafted_prefix.append(tool_constraint->piece(
+                                static_cast<std::size_t>(window_ids[column + 1])));
+                        }
+                    }
+                    if (masked) {
+                        shard_a_.device.bind_to_current_thread();
+                        CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_columns.data(),
+                                                   tool_mask_columns.size(),
+                                                   cudaMemcpyHostToDevice,
+                                                   shard_a_.device.stream));
+                        ops::apply_token_mask(window_logits, tool_mask_dev,
+                                              shard_a_.device.stream);
+                    }
+                }
+                // The target verify: RecordForReplay leaves the live GDN state untouched, so the
+                // fold below can replay exactly the committed columns from the pre-round snapshot.
+                // The feature sink captures the window's residuals for the next round's append.
+                snapshot_state(shard_a_, kRoundScratchSlot);
+                snapshot_state(shard_b_, kRoundScratchSlot);
+                qwen::execution::DFlashFeatureSink verify_sink = round.make_verify_sink();
+                const ops::CausalAttentionExecutionEnvelope target_envelope{
+                    position + 1U, position + static_cast<std::uint32_t>(width)};
+                run_verify_window(window_ids, static_cast<std::int32_t>(position), window_logits,
+                                  window_hidden, &verify_sink);
+                timing.record(2, shard_a_.device.stream);
+                ops::argmax(window_logits, frame.target_argmax, public_tokens,
+                            shard_a_.device.stream);
+                // DFlash2 acceptance is the sparse 16-candidate rejection sampler, not MTP's greedy
+                // matcher: the draft distribution is the selector's proposal q.
+                ops::speculative_accept_sparse_drafts(
+                    frame.target_argmax, window_logits, frame.draft_tokens, frame.candidate_ids,
+                    frame.proposal_q, frame.proposal_extents, frame.execution_frontiers,
+                    frame.anchors, frame.licensed_tokens, frame.licensed_counts,
+                    frame.accepted_drafts, public_tokens, sampling_a,
+                    ops::SpeculativeAcceptExecutionEnvelope{false}, ws_a, shard_a_.device.stream);
+                timing.record(3, shard_a_.device.stream);
+                std::vector<TokenId> licensed_host(static_cast<std::size_t>(width), 0);
+                std::int32_t licensed_count = 0;
+                CUDA_CHECK(cudaMemcpyAsync(licensed_host.data(), frame.licensed_tokens.data,
+                                           sizeof(TokenId) * static_cast<std::size_t>(width),
+                                           cudaMemcpyDeviceToHost, shard_a_.device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(&licensed_count, frame.licensed_counts.data,
+                                           sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                           shard_a_.device.stream));
+                timing.record(4, shard_a_.device.stream);
+                const Clock::time_point sync_start = Clock::now();
+                CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+                shard_b_.device.bind_to_current_thread();
+                CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
+                shard_a_.device.bind_to_current_thread();
+                timing.close_round(
+                    std::chrono::duration<double, std::milli>(Clock::now() - sync_start).count());
+                if (licensed_count < 1 || licensed_count > width) {
+                    throw std::logic_error("TP-2 DFlash2 round produced an invalid licensed prefix");
+                }
+                step.assign(licensed_host.begin(),
+                            licensed_host.begin() + static_cast<std::ptrdiff_t>(licensed_count));
+            }
+        } else if (!mtp_enabled_) {
             Tensor logits_a = run_plain_decode_step(current, position);
             timing.record(2, shard_a_.device.stream);
             ops::set_i32_scalar(logical_pos_a, static_cast<std::int32_t>(position + 1),
@@ -2649,7 +2903,56 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         ++decode_rounds_;
         // preview_model already established the (possibly terminal) preview; commit it as-is.
         publish_preview(false);
-        if (!mtp_enabled_) {
+        if (dflash2_enabled_) {
+            if (!dflash_plain_step) {
+                // The output policy licenses a prefix of the round's tokens. The verify recorded
+                // the window's GDN transitions and advanced the live state; undo that and replay
+                // exactly the committed columns, as the single-device resolve does.
+                const std::uint32_t committed = decision.accepted_tokens;
+                timing.record(5, shard_a_.device.stream);
+                for (Shard* fold_shard : {&shard_a_, &shard_b_}) {
+                    fold_shard->device.bind_to_current_thread();
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        fold_shard->state_backing.data,
+                        fold_shard->state_snapshots[kRoundScratchSlot].data,
+                        fold_shard->state_backing.bytes, cudaMemcpyDeviceToDevice,
+                        fold_shard->device.stream));
+                }
+                const ops::GdnReplayFoldRow fold_row{
+                    .source_state_slot      = 0,
+                    .destination_state_slot = 0,
+                    .commit_columns         = static_cast<std::int32_t>(committed)};
+                const std::span<const ops::GdnReplayFoldRow> fold_rows(&fold_row, 1);
+                shard_a_.device.bind_to_current_thread();
+                shard_a_.replay_fold->execute(fold_rows, shard_a_.device.stream);
+                shard_b_.device.bind_to_current_thread();
+                shard_b_.replay_fold->execute(fold_rows, shard_b_.device.stream);
+                // The target frontier advances by exactly the committed columns. The draft ring
+                // stays one verify window behind, except when this round ends the request: then it
+                // is caught up to the final frontier, which is the single-device rule.
+                const std::uint32_t base         = position;
+                position                         = base + committed;
+                const bool dflash_finished       = decision.finished();
+                dflash_context_frontier_         = dflash_finished ? position : base;
+                if (dflash_finished && position > base) {
+                    const qwen::execution::ExecutionCore dflash_execution{
+                        .device           = shard_a_.device,
+                        .parameters       = *shard_a_.parameters,
+                        .work             = *shard_a_.workspace,
+                        .linear_attention = *shard_a_.state,
+                        .replay_records   = nullptr,
+                        .io               = shard_a_.io,
+                        .prefill_hidden   = shard_a_.prefill_hidden,
+                        .prefill_chunk    = options_.prefill_chunk,
+                        .proposal_head    = options_.speculative.proposal_head,
+                    };
+                    shard_a_.dflash_round->append_pending(dflash_execution, base, position);
+                }
+                current = static_cast<std::int32_t>(step[committed - 1]);
+                timing.record(6, shard_a_.device.stream);
+                timing.fold_ms += timing.elapsed(5, 6);
+            }
+        } else if (!mtp_enabled_) {
             current = step.back();
             ++position;
         } else {
