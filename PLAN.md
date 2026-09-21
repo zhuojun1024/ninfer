@@ -239,6 +239,24 @@ loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:7
 - **D3 特征 handoff**：目标侧按 block 捕获后 all-gather（每步 5×5120 BF16）还是让提议卡各持一半？
 - **D4 提议位置**：沿用 MTP 的「只在 shard 0 提议」（则特征与 codebook 都要在 shard 0 齐备），还是两卡各提议一半。
 
+**B1 结果（已完成）**：`dflash2/*` 在 split spec 中归入 shard-local（`shards=0x1`，与 `mtp/*` 同规则），
+`tp_split_spec.h` 契约注释同步；顺带修掉一个真实缺陷：`parameters.cpp` 的 draft 分支缺 shard 存在性判断
+（MTP/Vision 都有），在 shard 1 上用不存在的权重构造参数块 ⇒ 报 `projection weight must be a matrix`。
+修复后 `ninfer_qwen3_5_tp2_load_test` 三例全绿（`--spec dflash2` 头复制、`--spec dflash2 --lm-head-draft`
+头按 vocab 切、`--spec mtp --lm-head-draft` 无回归），用例另断言 shard 0 持有整份 draft（feature_projection
+[5120,25600]、draft query [4096,5120]、predecessor codebook [248320,256]），shard 1 不付这份字节。加载
+用例直接走 loader、不经过 Engine 选项归一化 ⇒ 生成路径的 `--spec mtp only` 门禁可保留到 B5 打通。
+
+**B2/B6 设计要点（调研结论）**：
+
+- 捕获 plumbing 很小：`run_layers_tp2` 每层在两次 all-reduce 之后已调用 `tap.capture_layer`，两个
+  `forward_tp2_*` 入口只是硬编码 `NullTap` ⇒ 加可选 `DFlashFeatureSink*` 分支即可，层循环不用改；
+- 两卡 residual **逐位相同**（三条 allreduce 都在本端做 BF16 local+peer 加法）⇒ 只捕 shard 0 就够；
+- TP-2 chunk ≤ 1024 < S=2048 ⇒「只存最后活动窗口」不会触发，features 缓冲只需一个 chunk 大小；
+- **必须新增的状态搬运**：draft 的 local context ring 目前不在 `state_backing`/host checkpoint/host KV slab
+  中，而 prefix reuse 会跳过共享前缀（被跳过段拿不到目标残差）⇒ 不搬状态，召回/reuse 后 draft context
+  必然缺失；checkpoint 前还须 flush pending features。
+
 **阶段分解（每阶段独立验收）**：
 - **B1 加载与放置**：放开拒绝 + `tp_split_spec` 增加 `dflash2/*` 规则（feature_projection/codebook 复制，context
   K/V 按 head 切）+ 每卡 draft 配置/state/plan（`tp2_generation_core.cpp:436-523`）⇒ 验收：两卡都物化成功、
