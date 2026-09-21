@@ -58,9 +58,10 @@
 | Windows 移植（Round 54） | VS2022 + CUDA 13.3 原生构建；CLI/serve/TP-2 全部跑通，TP-2 性能与 Linux 持平（decode 32.9/56.9 tok/s）；TMA 描述符 mapped-pinned 修复（C2719 + CUDA Graph 捕获两连）（归档 §12） |
 | ①③④ 优化（Round 11–12） | ① exact-batch graph 落地（verify −4.4 ms/轮、decode +16.6%）；③ AR∥MMA 子块流水实现后实测慢 5%，**否决并回退**；④ 复核后原前提不成立，判定完成（归档 Round 11/12） |
 | Round 13–16 | [mtp] 刷屏打印清理；前缀续写边界方案实测证伪并撤回；工具调用约束解码路线 A 落地（token 掩码、图外应用）；host 侧状态检查点（步长 8192，显存 0 增量）落地 |
-| 多会话 KV 池（Round 55/18） | host KV 换入换出 + 5 会话 LRU + 共享前缀镜像；召回与 from-scratch oracle 逐 token 一致（归档 §13/13.1） |
+| 多会话 KV 池（Round 55/18） | host KV 换入换出 + 5 会话 LRU + 共享前缀镜像；召回恢复的 KV 与 device 逐字节一致，结果与 from-scratch 在分块边界舍入范围内一致（精确并列仍可能翻转首个采样，见 §3.1）（归档 §13/13.1） |
 | Round 17 | plain decode exact-batch graph（+12.6%）+ AR 按 payload 大小切传输策略（+0.63%）落地 |
-| Round 19 | shared_c 召回分歧根因定论（chunk 宽度经 `rewind_near_` 依赖引擎历史）；**修复未实施，见 §3.1** |
+| Round 19 | shared_c 召回分歧根因定论（chunk 宽度经 `rewind_near_` 依赖引擎历史）；修复已落地并验证（§3.1） |
+| Round 20 | chunk 计划与 ring rewind 解耦（1a/1b/1c）：同一 prompt 不再依赖引擎历史，plain/mtp 逐位通过；边界敏感性定量（末块宽度不是变量、边界位置是、120 步 decode 零翻转）；host KV arena 改可分页 backing（`--host-kv-pinned` 才锁页，锁页被拒自动回退） |
 
 **未达成的原有门槛（诚实记录）**：MTP3 ≥ 70 tok/s 未达到（纯 decode 上限 K=2 50.5–54.0）；
 TP-2 路径未跑 perplexity 评测（质量证据用同提示词多采样 A/B）；per-shard arena 的
@@ -70,7 +71,7 @@ TP-2 路径未跑 perplexity 评测（质量证据用同提示词多采样 A/B�
 
 ## 3. 未完成事项
 
-### 3.1 Round 19：chunk 计划与 ring rewind 目标解耦（最高优先）
+### 3.1 Round 19/20：chunk 计划与 ring rewind 目标解耦（已完成）
 
 根因（已定论）：prefill 最后一块 chunk 的宽度由 `rewind_near_`（按上一请求的分歧位置推出）决定
 ⇒ 同一 prompt 每次 walk 的 chunk 边界都不同 ⇒ prefill 末列 logits 漂移 0.3–0.56（对 logit≈5 是
@@ -80,8 +81,74 @@ TP-2 路径未跑 perplexity 评测（质量证据用同提示词多采样 A/B�
 `min(prefill_chunk, remaining)`）；ring 检查点只落在这些固定边界上；放弃「把快照放在贴近 frontier
 的位置」的小优化（`kReuseTailCheckpointCount` 的密集尾部窗口已把 rewind 成本限制在几十 token 内）。
 
-验收：`shared_c` 场景召回 walk 与 from-scratch oracle 逐 token 一致；现有 TP-2 用例全过；
-删除 `NINFER_TP2_DEBUG_LOGITS`/`NINFER_TP2_DEBUG_KV` 诊断代码。
+**进展（Round 20，第一半已落地）**：`snapshot_at[1]` 改成「最后一块 chunk 的起点」
+（`span = prompt_tokens - reuse`，`last = span % prefill_chunk`），chunk 计划不再读 `rewind_near_`。
+连续两次运行实测：
+
+- 所有 walk 的 prefill logits 逐位一致（`#3` 与 `#19` 同为 `chunk=512+128 top1=197 4.937500`，
+  `#9` 为 `chunk=512+128 top1=54 4.406250`）⇒ **同一 prompt 的结果不再依赖引擎历史**；
+- 修复前 oracle 的 `shared_c` 是 4.750000、召回是 4.406250，现在二者是同一个 `4.406250/4.406250`
+  ⇒ 原来的召回分歧消失；
+- `rewind_near_` 现在只剩写入，属待删死代码（连同 `kReuseRewindMinimum` / `kReuseRewindMaximum`）。
+
+**剩余（第二半）**：用例改在下一层失败 —— `shared_a_second` 复用 647（decode 逐 token 检查点，
+落在 chunk 网格之外），后缀首块是 `647+17`，而 from-scratch 是 `640+24`，仍会翻 token。修法：
+**召回边界只允许落在 `prefill_chunk` 网格上**（647 → 640、71 → 0），用例断言随之改成 640/0。
+特性价值不受损：跨会话共享的 system prompt 边界 512 本来就在网格上，舍掉的只是网格内 ≤1 块的
+细粒度复用（代价是重算 ≤255 token）。
+
+**实测结果（对齐已实现）**：召回边界加 `position % prefill_chunk == 0` 过滤后单跑一次：
+`shared_c`（512，网格上）oracle 与召回都是 `chunk=512+128 top1=54 4.406250` ⇒ 精确一致；
+`shared_a_second` 的 647 被降级到 512（oracle 的 640 device snapshot 同样被过滤，双方都落到 512）
+⇒ 两侧 chunk 计划一致。代价与副作用：
+
+- 复用量的损失**有界**（≤1 个 chunk = ≤255 token），因为对齐回退取的是「不晚于 frontier 的某个
+  chunk 边界」检查点；
+- 但当**连一个对齐检查点都不存在**时（例如 71 token 的小会话，`opening` 的 64 也非 256 倍数），
+  复用会掉到 0 = 全量重算，仓库存档的「host slab 召回」用例因此不再覆盖该特性。
+  用例当前失败点即此：`a recalled conversation reused 0 prompt tokens, expected 71`。
+
+⇒ 更精确的规则（下一步实现）：**优先取「网格对齐且存在」的最深检查点；一个都没有时，回退到最深
+的任意检查点**。这样 647→512（两侧对齐、精确），而 71 仍保留 71（小会话的 host slab 召回不被牺牲）。
+
+**1c 已实现（两通道选择）**：先只在对齐候选里选最深的一个；若该通道一个都没选中（整条 lineage
+都落在第一个 chunk 内），再退回「任意候选里最深的一个」。实测 plain 路线全绿：
+`recall reused 71 prompt tokens bit-identically`，同时 512 的 cascade 场景保持精确一致。
+
+**验收（已达成）**：plain 与 mtp 两条路线各自输出
+`TP-2 session retention (plain|mtp) passed: recall reused 71 prompt tokens bit-identically; LRU eviction
+forced a full prefill`；`NINFER_TP2_DEBUG_LOGITS`（含临时 `pc=` 字段）与 `NINFER_TP2_DEBUG_KV`
+诊断代码、以及 `rewind_near_` / `kReuseRewindMinimum/Maximum` 死代码已全部删除（`tp2_generation_core.cpp`
+残留引用为 0，用例仍全绿）。
+
+**Round 20 补充结论（边界敏感性的定量）**：同一批 640-token prompt 跑 `prefill_chunk ∈
+{128,256,384,512,640}`（该值按 `% 128` 量化），得到：
+
+- **末块宽度本身不是变量**：末块 128（pc=128/256/512）、256（pc=384）、640（pc=640 的其中一个
+  prompt）三种情况下 logits 逐位相同（`197@4.937500`、`54@4.406250`）；
+- **真正的变量是「最后一块从哪里开始」**：唯一一次差异出现在 pc=640 的另一个 prompt —— 末块被截成
+  `504+136` 而非 `512+128`，logit 由 6.218750 跳到 7.687500（Δ=1.47，远大于 bf16 步长 0.0625），
+  但 argmax 不变、token 序列一字未变；
+- **token 层面零翻转**：5 种分块 × 3 个 prompt × 8 轮 decode = 120 步，argmax 全部一致；同一 prompt
+  在一次运行内的重复副本也逐位相同（跨进程可复现）；
+- ⇒ 0.3~0.56 不是量化噪声，而是分块边界导致的末列归约顺序差异（量级可达 ~1.5），对 greedy 结果几乎
+  无影响，但**精确并列**（`shared_c` 为 54 与 220 都 4.406250、gap=0）可能翻转 —— 这同时解释了非生产
+  `prefill_chunk` 下 cascade 场景的 FAIL（网格变化改了重算跨度，不是缺陷）。用例的 256 已固定下来，
+  并在注释里写明它与召回对齐网格绑定。
+
+**host KV arena 可分页化（本轮附带完成）**：`HostBuffer`（`src/core/arena.{h,cu}`）默认分页
+（`std::malloc`，可被 OS 换出），`HostPinning::PreferPinned` 才走 `cudaMallocHost`，且**锁页被拒
+自动回退分页**；`HostKVArena` 日志打印真实层级（`host KV arena shard 0: 64.0 MiB pageable`）；CLI
+新增 `--host-kv-pinned`；文档同步更新（`docs/serving.md`、`docs/tp2-dual-5060ti.md`，并更正原文
+「逐 token 一致」的过强表述）。端到端验证（`ninfer-serve --devices 0,1 --host-kv-mib 4096`，7 个不同
+system prompt 强制淘汰）：默认输出 `host KV arena shard 0/1: 2048.0 MiB pageable`，加
+`--host-kv-pinned` 输出 `2048.0 MiB pinned`，两次均无 `refused`，停服后显存干净释放 ⇒ 4 GiB 池可建、
+开关真实生效。⇒ `--host-kv-mib` 不再要求锁页常驻，也不会因锁页被拒而整体失败；提交量不变
+（分页 ≠ 少占提交）。
+
+**踩到并修掉的隐含陷阱**：`src/runtime/engine/model_instance.cpp` 的 TP-2 归一化用指定初始化器重建
+`ContextCacheOptions`，只搬运它显式列出的字段 ⇒ 新字段会被静默丢弃（本次 `host_kv_pinned` 就这样失效
+过一次，表现为 `--host-kv-pinned` 无效果、日志仍报 `pageable`）。给该结构加字段时必须同步这里。
 
 ### 3.2 交付前收尾（归档 §7）
 

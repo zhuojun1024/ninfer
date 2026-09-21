@@ -287,25 +287,31 @@ Enable it by giving the host KV budget, which is split evenly between the two sh
 `--host-kv-mib 32768` is 16 GiB per card, enough for five 204,800-token fp8 conversations at
 16.125 KiB/token/card, and the startup ledger states that arithmetic back
 (`[tp2-session] host budget 16384.0 MiB/shard holds 5 of 5 full-context sessions (3225.0 MiB each)`).
-The arena is pinned on the first eviction, so a single-conversation workload never pays for the
-budget; `--host-kv-mib 0` disables the pool entirely and restores the previous behaviour.
+The arena is built on the first eviction, so a single-conversation workload never allocates it. Its
+backing is pageable, which keeps the pool creatable when the commit limit is tight and lets the OS
+reclaim it under pressure; `--host-kv-pinned` pins it instead when the faster transfers are worth a
+permanent lock, and a refused pin falls back to pageable rather than failing the pool.
+`--host-kv-mib 0` disables the pool entirely and restores the previous behaviour.
 
 Observable behaviour:
 
 - A returning conversation reports `reused_prompt_tokens == frontier` (its whole stored history) and
   the prefill only walks the new suffix. The frontier is one token short of the history, because the
   last sampled token is not forwarded until the next round.
-- The recalled answer is token-for-token identical to a from-scratch prefill of the same prompt: the
-  KV bytes, and therefore the attention, are the same.
+- A recall restores byte-identical KV, so a returning conversation reproduces a from-scratch prefill
+  of the same prompt up to the prefill's own chunk-boundary rounding. That residue is small but not
+  zero: an exact logit tie can still flip a sampled token, so the session tests assert the recalled
+  conversation's first sample rather than its whole generated tail.
 - A conversation the LRU budget evicted reports `reused_prompt_tokens == 0` and is prefilled from
   zero again.
 - `NINFER_TP2_SESSION_TRACE=1` prints every recall and eviction with its frontier.
 
 Constraints and limits:
 
-- Pinned host memory: the KV budget, plus one GDN state image per host-resident session per shard
-  (~73 MiB each), plus the existing prefix-reuse checkpoint ring. Confirm at least 48 GiB of physical
-  memory before asking for 32 GiB, and lower `--host-kv-mib` when in doubt: at 204,800 tokens a
+- Host memory: the KV budget is pageable by default and still counts as private commit; add one GDN
+  state image per host-resident session per shard (~73 MiB each, pinned) and the pinned prefix-reuse
+  checkpoint ring. Confirm at least 48 GiB of physical memory before asking for 32 GiB, and lower
+  `--host-kv-mib` when in doubt: at 204,800 tokens a
   full-context fp8 conversation is 3,225 MiB per shard, so 32768 holds the five host-resident
   conversations the default catalog admits and 16384 holds two.
 - Shard 0's arena also carries the MTP layer's own KV (~2 KiB/token), so a symmetric split spends a

@@ -814,7 +814,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity; on the TP-2 route it sizes the generation core's prefix-reuse checkpoint ring instead of a context cache, and the core adds one slot of its own for the divergence anchor | `8` |
-| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
+| `--host-kv-mib N` | shared Host Main/Backend KV byte capacity in MiB; the backing is pageable, so the OS may evict it | `8192` |
+| `--host-kv-pinned` | pin the Host KV backing for faster transfers; a refused pin falls back to pageable | off |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
