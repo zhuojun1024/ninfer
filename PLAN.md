@@ -382,22 +382,87 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
     `session_capture_shared_state` 按 `RecallState`（Frontier/PromptEnd/Shared）成对搬运目标 GDN 与 draft ring；
     `snapshot_host_checkpoint` 记录 `dflash_frontier`；`execute_walk` 新增 `begin_dflash_state`（None→zero、
     LiveState→no-op、DeviceSnapshot/HostCheckpoint→按镜像恢复，HostCheckpoint 校验 `dflash_frontier == position`）；
-    发布/取消/publish 前用 `flush_dflash_context` 提交 pending staging；`extent==0` 不再回退 plain step 而是走真实
-    轮次（否则最后一列的 draft 残差缺失，frontier 处留洞）；复用扫描对 DFlash2 打开（移除 `!dflash2_enabled_` 残留守卫）；
+    发布/取消/publish 前用 `flush_dflash_context` 提交 pending staging；`extent==0` 保持「真实轮次」（否则最后一列的
+    draft 残差缺失、frontier 处留洞）；复用扫描对 DFlash2 打开（移除 `!dflash2_enabled_` 残留守卫）；
   - `tests/models/qwen3_5/test_tp2_sessions.cpp`：路由参数化 `plain|mtp|dflash2`（默认只跑前两条），DFlash2 用
     `draft_tokens=7` + fp8 KV。
   - 验收：`ninfer_qwen3_5_tp2_dflash_append_test` K=7 `0xbad27a494a9bc853`、K=5 `0xbee487264ca8ffb8` 不变；
     `ninfer_qwen3_5_tp2_load_test` 三例通过；`ninfer_qwen3_5_tp2_sessions_test` plain/mtp 全绿。
-  - **未通过项（决定不重新打开保留）**：`NINFER_TEST_ROUTE=dflash2` 的 sessions 仍失败。实测召回的状态本身能逐位
-    恢复：shared_b 的 DeviceSnapshot@512 路径与 from-scratch oracle 的 verify 轮次（base 640/641/642/644/646、每轮
-    接受数、提交 token）逐项一致；失败在 prompt-end 召回（`RecallState::PromptEnd`，边界 64 不是 prefill chunk 256 的
-    整数倍）：此时后缀前向的列宽与 from-scratch walk 不同（24 vs 88 列），fp8 目标 logits 在合成 prompt 的近似并列处
-    翻转（同一对 token 220/198），贪心答案分叉（rerendered 得到 `[2752 11 220 …]`，期望 `[2752 11 198 …]`）。同一列宽
-    差异对 plain/MTP 不翻转，所以它们通过。按 §3.6 的决策规则，DFlash2 未达到保留属性 ⇒ `model_instance.cpp` 的
-    DFlash2 保留禁用保留，且不在该路线声称「召回逐位一致」。最终状态下重跑 `NINFER_TEST_ROUTE=dflash2` 得到
-    `[mem] host sessions capacity 0 | retention disabled` 与 `FAIL (dflash2): a recalled conversation reused 0
-    prompt tokens, expected 71`（保留关闭后跨会话召回按设计不发生；device 快照的会话内前缀复用仍开启，draft 镜像
-    照常搬运）。
+  - **召回边界诊断（本轮，先诊断后动手）**：DFlash2 的召回边界来自 `tp2_generation_core.cpp:1965-2045` 的复用扫描；
+    对齐扫描只接受 `boundary % reuse_grid == 0`（`reuse_grid = min(max(prefill_chunk,64), maximum) = 256`），但
+    `:2021-2045` 的兜底分支在 `reuse==0` 时**去掉 grid 限制**重扫同一批边界（live frontier / `cached_boundaries_` /
+    host checkpoints），于是 prompt-end 召回把 reuse 定在 64（64 不是 256 的整数倍）。prefill chunk 循环
+    （`:2455` 的 `for (t0 = reuse; …)` 与 `:2489` 的 `length = min(prefill_chunk, prompt_tokens - t0)`）**把 chunk
+    锚在 reuse**，所以召回后缀的首块只有 24 列，而 from-scratch walk 的同一段是 88 列（一块）。fp8 目标 logits 在
+    合成 prompt 的近似并列处翻转（同一对 token 220/198），贪心答案在 rerendered 分叉（`[2752 11 220 …]` vs
+    `[2752 11 198 …]`）。列宽差异对 plain/MTP 不翻转，所以它们通过。三条诊断实测：
+    - chunk 256 + 保留 ON：grid 对齐的 `shared_b`@512（DeviceSnapshot）与 oracle 逐轮一致并通过；失败在 prompt-end 的 64。
+    - chunk 128（归一化后生效值）：连 grid 对齐的 `shared_b` 也在最后一个 token 翻转（198 vs 220）⇒ 边界是否在 grid 上
+      **不是**唯一因素，chunk 宽度本身也参与。
+    - 强制 DFlash2 全程 `extent=0`（只跑目标轮）：`shared_a_first` 即分叉（`got [197 197 92 198 198 198 1464 198]`
+      vs `expected [197 197 92 198 695 197 197 92]`）⇒ 目标侧单独跑**也不**复现 oracle 的窗口轮次。
+    **机制结论**：DFlash2 的生成 token 依赖每轮的 verify 窗口布局，而窗口布局由「提议 → 稀疏接受 → 提交前缀」驱动；
+    召回点的 chunk 宽度改了后缀 walk 的窗口序列，接受计数随之改变，输出在近似并列处翻转。所以「把 chunk 锚在绝对边界、
+    只在 reuse 点截断第一块」并不能让 prompt<chunk 的召回与从头一致（`:2489` 的 first block 仍是 `[reuse, prompt)`），
+    也不能靠「draft 判失效」保证逐位一致（见上条 `extent=0` 诊断）。
+  - **兜底契约（已实现，本轮选定 B）**：召回边界不在 prefill grid 上时，`tp2_generation_core.cpp:2044-2052` 设
+    `dflash_draft_declined_`（`reuse != 0 && reuse % reuse_grid != 0`），该请求的每个 DFlash2 轮次 `extent=0`
+    （`:2778-2788`），即只跑目标轮；目标侧 KV/GDN 复用**照常**（状态镜像仍按 `begin_dflash_state` 恢复）。契约通过
+    `include/ninfer/types.h` 的 `GenerationResult::draft_context_declined` 暴露，由
+    `test_tp2_sessions.cpp` 的 `draft_declined`/`compare_recall` 断言。理由：draft 只负责提议，每个 token 仍要过目标
+    verify；draft 上下文无效只掉接受率，不影响目标自身 token 的合法性。
+  - **未通过项（决定不重新打开保留）**：grid 对齐的 `shared_b`@512 召回与从头 walk 分叉，形态固定：
+    engine `[1703 220 248046 198 248045 198 248045 198]` vs oracle `[1703 220 248046 198 248045 198 248045 220]`
+    —— **前 7 个 token 与每个 verify 轮的 base/extent/licensed 逐项一致，只有最后一轮的 token 不同**；也就是说**召回路径
+    本身是干净的**（状态、KV/GDN、边界、轮次序列都能复现），分叉落在 DFlash2 窗口的最后一个 **`extent=0` 钳位轮**
+    （8 列全部钳到 anchor 的同一位置，`:2784-2826`）。该轮**在同一二进制上也不可复现**：`b6-acc2-dflash2.log`
+    （FAIL）与 `b6-rep1/rep2.log`（PASS）是同一次构建的结果；同一二进制连跑 5 次（`build-win/b6-det-1..5.log`）得
+    1 次通过（`b6-det-1`）、4 次失败（`b6-det-2..5`），4 次失败的 `got` **逐字符相同**
+    （`[1703 220 248046 198 248045 198 248045 198]`，oracle 末位 220）⇒ 失败**有偏**而非纯随机。
+    ⇒ DFlash2 的生成在本引擎里**不可复现**：钳位轮的近似并列处存在竞态/未同步读（同一输入翻转 198/220），
+    与「DFlash2 窗口 ≠ 单 token decode」同属窗口形状这条根因，但**它是实现缺陷而非纯数值形状限制**。
+  - **结论（一行）**：**不是召回边界/状态缺陷，而是 DFlash2 verify 窗口钳位轮（`extent=0`）的不可复现性** ——
+    召回路径把状态/KV/GDN/边界/轮次序列都复现了（前 7 个 token 与每轮 base/extent/licensed 逐项一致），翻转只发生在
+    窗口的最后一个钳位轮，且该轮在**同一二进制上也会随机翻转**（3 次运行 1 次失败）。按 §3.6 决策规则 DFlash2 未达到
+    保留属性 ⇒ `model_instance.cpp:105-118` 的 DFlash2 保留禁用**保留**，该路线不声称「召回逐位一致」；且
+    `NINFER_TEST_ROUTE=dflash2` 的契约断言在钳位轮翻转时仍会 FAIL（本路线不在默认路由集合内）。
+  - **收口契约**：最终状态下 `NINFER_TEST_ROUTE=dflash2` 得到 `[mem] host sessions capacity 0 | retention disabled`
+    并 **exit 0**（`route_keeps_retention` + `compare_recall`）：保留关闭 ⇒ 不发生跨会话召回，每条召回场景期望复用 0
+    token（返回会话整段 prefill），唯一允许的非零复用是共享系统前缀经 device 快照的前缀复用（`shared_b` 512）；plain/mtp
+    保持原有逐位复用断言。`draft_context_declined` 兜底契约保留（它是正确的改进：只损失接受率，不损失正确性）。
+  - **后续若要打开保留，需要先解决**：DFlash2 verify 窗口 **`extent=0` 钳位轮**的逐位可复现性。本轮把该轮的 KV/注意力
+    索引链查清，并**推翻初版猜测**（钳位列不是读到上一轮被拒提案的 KV）：
+    - 钳位列的构造在 `src/ops/kernel/speculative_round.cuh:33-37`：`verify_ids[j>extent]=anchors[row]`、
+      `positions[j>extent]=base_positions[row]+extent` ⇒ 钳位列是**第 `extent` 列的精确副本**（同 token、同位置）；
+    - cache 槽位与 RoPE 位置绑到同一个钳位数组（`src/models/qwen3_5/execution/text.cpp:2193-2194`，`cache0`/`rope0`
+      都用 `bind0.positions`），KV 槽位由该位置经页表得出 ⇒ 钳位列读的是**第 `extent` 列自己的槽位**，不是别处的陈旧行；
+    - 写侧被掩码：`small_t_fp8.cuh:94-98,191`（`valid_tokens=min(valid_columns[batch]-column_begin,TokenTile)`，只有前
+      `extent+1` 列写 KV）；读窗上界是钳位后的 `last_pos+1`（`:147-159`）；sink/append 同样被 `target_valid_columns`
+      掩码（`execution/draft.cpp:578-660`、`program/dflash_round.cpp:339-385`）⇒ **钳位轮在目标窗口内确定且掩码正确**；
+    - 于是跨运行变量只剩 TP-2 的**跨卡 allreduce 传输**：本机 `cudaDeviceCanAccessPeer(0↔1)==0`（探针
+      `build-win/tmp_peer_probe.cu`），走的是 `src/core/tp/device_pair.cu:95-170` 的 in-kernel mapped-host
+      arrival-token 握手（窗口 `[V,8]` logits 合并是 `ar_slices==5` 的多块路径，`:200-205,448-466`），这是该路线里唯一
+      的异步跨卡机制。本轮试过 A/B：临时给 `NINFER_TP2_AR_STRATEGY` 加 `host` 值强制走 host staging（`:492-527`），
+      但该路径**不是有效对照** —— 5 次全部 FAIL，且连第一个「fresh conversation」场景都产出乱码（`got [15 15 …]`、
+      `expected [548 271 1919 5686 …]` 这类跨运行完全不同的输出），说明 host-staging 的 D2H 并未覆盖生产 kernel（该回退
+      路径长期未用、已失效）；因此 A/B 结论为**无效**，跨卡传输嫌疑**未排除也未证实**。该临时开关已回退（`device_pair.cu`
+      在最终工作树里无 diff），不留在源码里；
+    - 判定落地前**不改钳位轮语义**（等于改兜底/接受语义），也不打开保留；在那之前不做 §3.6 的 B7 提速。
+  - **本轮收口（放行门关闭；取代上方 429–432 行的旧收口契约）**：按产品决策把 TP-2 上的 `--spec dflash2` 改回
+    **构造期明确拒绝**（`src/runtime/engine/model_instance.cpp:105-124`，消息含 `dflash2 is withheld`），B1–B6 实现与测试
+    全部保留在树内（B6 的复用/快照代码成为不可达路径，直到重新放行）；`NINFER_TEST_ROUTE=dflash2` 现在改为断言该拒绝
+    （测试 main 内的 refusal 检查）而不是跑场景。理由按实测更正为三句：**不是**钳位轮读陈旧 KV（见上），也**不是**跨卡
+    传输（新增位精确探针 `tests/test_tp_device_pair.cpp`：每个规模 64 次换数据 + 200 深度排队，规模含 20 KiB / 1 MiB /
+    80 KiB 窗口层 / 2433024 B 的 `[V,8]` 5-slice logits 合并，`DevicePair(0,1)` 上 **5 个规模全部逐位一致 PASS，3.5 s**，
+    `p2p_available=0`；同服务器 plain/MTP 5 次运行保持逐位复用断言）；真正的跨运行变量是**经 checkpoint/快照恢复的前缀
+    复用走法**：同进程 oracle 的 `shared_b` 是全量 prefill 且 10/10 稳定在 `220`，engine 的 `shared_b`（复用 512 共享系统
+    前缀后 prefill 128）10 次里翻转 6 次、坏值恒为 `198`（`tests/models/qwen3_5/test_tp2_sessions.cpp:398-411`，:401 的 512
+    复用断言通过；`dflash2` 连跑 5 次为 `P P F P F`，日志 `build-win/b6-fin-1..5.log`）。重新放行的前置条件（二选一）：
+    (a) 让恢复路径产出的 ring 与全量 prefill 的 ring 逐位一致——定位链是 `begin_dflash_state` / `snapshot_dflash_state` /
+    `session_capture_shared_state`（`src/runtime/engine/tp2_generation_core.cpp:2158-2210,2424-2465`），需要把失败那一次的
+    engine 与 oracle 逐轮对齐；(b) 产品上接受「DFlash2 不参与前缀复用」，即把 B6 移除的 `!dflash2_enabled_` 复用守卫加回、
+    回到 B5 的已知良好配置（测试的复用期望值需按路线门控）。重新放行时删除上面的 refusal 断言并恢复 `docs/serving.md`
+    的路线说明（当前为「TP-2 上 `--spec dflash2` 构造期拒绝」）。
 - **B6 状态与保留（见上方 B6 结果）**：draft ring/pending features 已随会话召回保存恢复（复用 MTP 的 host slab
   先例），`dflash_graph_profiles` 已接；「会话切换后召回逐位一致」对本路线不成立，保留保持禁用；
 - **B7 性能验收**：双卡吞吐对 90–180 tok/s 目标 + 与 MTP 的对比 + plain/mtp 无回归。

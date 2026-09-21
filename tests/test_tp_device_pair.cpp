@@ -7,7 +7,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <string>
 #include <utility>
@@ -34,67 +36,157 @@ std::pair<int, int> pick_devices() {
     return {0, 1};
 }
 
-int check_allreduce(ninfer::tp::DevicePair& pair, std::size_t count_bytes) {
+std::uint16_t bits_of(__nv_bfloat16 value) {
+    std::uint16_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+// One payload size, repeated with fresh operands. The repetition is what makes the
+// transport's ordering observable: a peer read that resolved to an earlier call's
+// staging slot agrees with the current operands only by accident, while a read that
+// resolved to the previous cache line of the same slot cannot agree at all. Every
+// path (in-kernel, peer-copy and host staging) must produce the identical
+// elementwise BF16 rounding add on both shards, so the check is bit for bit.
+int check_allreduce(ninfer::tp::DevicePair& pair, std::size_t count_bytes, int iterations) {
     const std::size_t elements = count_bytes / 2;
-    std::mt19937 rng(0x5EED);
-    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
-    std::vector<float> ref_a(elements), ref_b(elements);
-    std::vector<__nv_bfloat16> bf_a(elements), bf_b(elements);
-    for (std::size_t i = 0; i < elements; ++i) {
-        ref_a[i] = dist(rng);
-        ref_b[i] = dist(rng);
-        bf_a[i]  = __float2bfloat16(ref_a[i]);
-        bf_b[i]  = __float2bfloat16(ref_b[i]);
-    }
-    // DeviceBuffer allocates on the current device; each shard buffer must live
-    // on its own device, so bind before each allocation and each read-back.
     pair.a().bind_to_current_thread();
     ninfer::DeviceBuffer buf_a(count_bytes);
-    buf_a.copy_from_host(bf_a.data(), count_bytes);
     pair.b().bind_to_current_thread();
     ninfer::DeviceBuffer buf_b(count_bytes);
-    buf_b.copy_from_host(bf_b.data(), count_bytes);
 
-    // The host-staging allreduce enqueues its H2D copies on the caller's
-    // compute streams; mirror production by driving it on per-device streams
-    // and settling them before the default-stream read-back.
+    // The allreduce enqueues on the caller's compute streams; mirror production by
+    // driving it on per-device streams and settling them before the read-back.
     cudaStream_t stream_a = nullptr, stream_b = nullptr;
     pair.a().bind_to_current_thread();
     cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
     pair.b().bind_to_current_thread();
     cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
-    pair.allreduce(buf_a.p, buf_b.p, count_bytes, stream_a, stream_b);
+
+    std::mt19937 rng(0x5EEDu + static_cast<unsigned>(count_bytes % 65521u));
+    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
+    std::vector<__nv_bfloat16> bf_a(elements), bf_b(elements);
+    std::vector<__nv_bfloat16> got_a(elements), got_b(elements);
+
+    int failures = 0;
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        for (std::size_t i = 0; i < elements; ++i) {
+            bf_a[i] = __float2bfloat16(dist(rng));
+            bf_b[i] = __float2bfloat16(dist(rng));
+        }
+        pair.a().bind_to_current_thread();
+        buf_a.copy_from_host(bf_a.data(), count_bytes);
+        pair.b().bind_to_current_thread();
+        buf_b.copy_from_host(bf_b.data(), count_bytes);
+
+        pair.allreduce(buf_a.p, buf_b.p, count_bytes, stream_a, stream_b);
+        pair.a().bind_to_current_thread();
+        cudaStreamSynchronize(stream_a);
+        pair.b().bind_to_current_thread();
+        cudaStreamSynchronize(stream_b);
+
+        pair.a().bind_to_current_thread();
+        buf_a.copy_to_host(got_a.data(), count_bytes);
+        pair.b().bind_to_current_thread();
+        buf_b.copy_to_host(got_b.data(), count_bytes);
+
+        for (std::size_t i = 0; i < elements; ++i) {
+            const __nv_bfloat16 expected =
+                __float2bfloat16(__bfloat162float(bf_a[i]) + __bfloat162float(bf_b[i]));
+            if (bits_of(got_a[i]) != bits_of(expected) || bits_of(got_b[i]) != bits_of(expected)) {
+                if (failures < 4) {
+                    std::cerr << "allreduce[" << count_bytes << "] iteration " << iteration
+                              << " element " << i << ": expected " << __bfloat162float(expected)
+                              << ", shard a " << __bfloat162float(got_a[i]) << ", shard b "
+                              << __bfloat162float(got_b[i]) << '\n';
+                }
+                ++failures;
+                break;
+            }
+        }
+    }
+    pair.a().bind_to_current_thread();
+    cudaStreamDestroy(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamDestroy(stream_b);
+    return failures;
+}
+
+// The production pattern: many allreduces queued back to back on each shard's own
+// stream, with no host synchronization between them. Each device then runs ahead of
+// the other by as much as its own queue allows, which is the only condition under
+// which the two parity slots of the mapped-host staging can be reused while the peer
+// still reads them. Every call owns its own device buffers so the queued calls cannot
+// overwrite each other's operands, and the whole queue is verified bit for bit.
+int check_allreduce_queue(ninfer::tp::DevicePair& pair, std::size_t count_bytes, int calls) {
+    const std::size_t elements = count_bytes / 2;
+    cudaStream_t stream_a = nullptr, stream_b = nullptr;
+    pair.a().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
+    pair.b().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
+
+    std::mt19937 rng(0xA11C0u + static_cast<unsigned>(count_bytes % 65521u));
+    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
+    std::vector<__nv_bfloat16> bf_a(elements), bf_b(elements);
+    std::vector<std::unique_ptr<ninfer::DeviceBuffer>> buf_a, buf_b;
+    for (int call = 0; call < calls; ++call) {
+        for (std::size_t i = 0; i < elements; ++i) {
+            bf_a[i] = __float2bfloat16(dist(rng));
+            bf_b[i] = __float2bfloat16(dist(rng));
+        }
+        pair.a().bind_to_current_thread();
+        buf_a.push_back(std::make_unique<ninfer::DeviceBuffer>(count_bytes));
+        buf_a.back()->copy_from_host(bf_a.data(), count_bytes);
+        pair.b().bind_to_current_thread();
+        buf_b.push_back(std::make_unique<ninfer::DeviceBuffer>(count_bytes));
+        buf_b.back()->copy_from_host(bf_b.data(), count_bytes);
+        pair.allreduce(buf_a.back()->p, buf_b.back()->p, count_bytes, stream_a, stream_b);
+    }
     pair.a().bind_to_current_thread();
     cudaStreamSynchronize(stream_a);
     pair.b().bind_to_current_thread();
     cudaStreamSynchronize(stream_b);
-    cudaStreamDestroy(stream_a);
-    cudaStreamDestroy(stream_b);
 
-    pair.a().bind_to_current_thread();
-    std::vector<__nv_bfloat16> got_a(elements);
-    buf_a.copy_to_host(got_a.data(), count_bytes);
-    pair.b().bind_to_current_thread();
-    std::vector<__nv_bfloat16> got_b(elements);
-    buf_b.copy_to_host(got_b.data(), count_bytes);
-
+    // Re-derive the operands with the same generator so the check sees each call's
+    // own inputs without holding them all on the host at once.
+    std::mt19937 verify_rng(0xA11C0u + static_cast<unsigned>(count_bytes % 65521u));
+    std::vector<__nv_bfloat16> expect_b(elements), got(elements);
     int failures = 0;
-    for (int which = 0; which < 2; ++which) {
-        const auto& got = which == 0 ? got_a : got_b;
+    for (int call = 0; call < calls; ++call) {
         for (std::size_t i = 0; i < elements; ++i) {
-            const float expected = __bfloat162float(__float2bfloat16(ref_a[i])) +
-                                   __bfloat162float(__float2bfloat16(ref_b[i]));
-            const float actual   = __bfloat162float(got[i]);
-            const float tol      = 0.01f * std::max(1.0f, std::abs(expected));
-            if (std::abs(actual - expected) > tol) {
-                if (failures < 4) {
-                    std::cerr << "allreduce[" << which << "] element " << i << ": expected "
-                              << expected << ", got " << actual << '\n';
+            bf_a[i] = __float2bfloat16(dist(verify_rng));
+            bf_b[i] = __float2bfloat16(dist(verify_rng));
+        }
+        expect_b = bf_b;
+        for (int which = 0; which < 2; ++which) {
+            if (which == 0) {
+                pair.a().bind_to_current_thread();
+                buf_a[call]->copy_to_host(got.data(), count_bytes);
+            } else {
+                pair.b().bind_to_current_thread();
+                buf_b[call]->copy_to_host(got.data(), count_bytes);
+            }
+            for (std::size_t i = 0; i < elements; ++i) {
+                const __nv_bfloat16 expected =
+                    __float2bfloat16(__bfloat162float(bf_a[i]) + __bfloat162float(expect_b[i]));
+                if (bits_of(got[i]) != bits_of(expected)) {
+                    if (failures < 4) {
+                        std::cerr << "allreduce-queue[" << count_bytes << "] call " << call << " shard "
+                                  << which << " element " << i << ": expected "
+                                  << __bfloat162float(expected) << ", got "
+                                  << __bfloat162float(got[i]) << '\n';
+                    }
+                    ++failures;
+                    break;
                 }
-                ++failures;
             }
         }
     }
+    pair.a().bind_to_current_thread();
+    cudaStreamDestroy(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamDestroy(stream_b);
     return failures;
 }
 
@@ -119,17 +211,27 @@ int main() {
         ninfer::tp::DevicePair pair(dev_a, dev_b);
         std::cout << "p2p_available=" << pair.p2p_available() << '\n';
         // 20480 bytes = 10240 BF16 elements, the 27B hidden allreduce size.
-        failures += check_allreduce(pair, 20480);
+        failures += check_allreduce(pair, 20480, 64);
         // Small and larger shapes.
-        failures += check_allreduce(pair, 16);
-        failures += check_allreduce(pair, 1 << 20);
+        failures += check_allreduce(pair, 16, 64);
+        failures += check_allreduce(pair, 1 << 20, 64);
+        // The decode window shapes the DFlash2 verify allreduces: one hidden
+        // column per window position, then the full [vocab, width] logits merge
+        // (152064 x 8 BF16 = 2433024 bytes, which the size-keyed transport splits
+        // into five slices).
+        failures += check_allreduce(pair, 81920, 64);
+        failures += check_allreduce(pair, 2433024, 64);
+        // The same shapes as a deep queue on both shards, which is how a layer
+        // stack issues them.
+        failures += check_allreduce_queue(pair, 20480, 200);
+        failures += check_allreduce_queue(pair, 81920, 200);
         // Move semantics: a moved-from pair must not retain p2p state.
         ninfer::tp::DevicePair moved(std::move(pair));
         if (pair.p2p_available()) {
             std::cerr << "moved-from pair retained p2p state\n";
             ++failures;
         }
-        failures += check_allreduce(moved, 20480);
+        failures += check_allreduce(moved, 20480, 8);
     }
     if (failures == 0) { std::cout << "PASS\n"; return 0; }
     std::cerr << failures << " failures\n";

@@ -2022,7 +2022,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // shorter than one chunk) has no grid-aligned candidate at all, and the aligned scan above
         // would drop all the way to a full prefill. Keeping the deepest boundary is better: the
         // recalled state and KV are still this prompt's own, and only the suffix chunking differs
-        // from a from-scratch walk. Rescan the same boundaries without the grid restriction.
+        // from a from-scratch walk. Rescan the same boundaries without the grid restriction. The
+        // suffix chunking is what the DFlash2 route cannot accept (the declined-draft flag below).
         if (reuse == 0) {
             auto take = [&](std::uint32_t position, std::size_t slot, ReuseSource source) {
                 if (position != 0 && position <= shared_prefix && position < prompt_tokens &&
@@ -2044,6 +2045,15 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             }
         }
     }
+    // The target state at the reused boundary is this prompt's own prefix, but the draft ring beside
+    // it is not necessarily the one a from-scratch walk would hold there: the fallback above may pick
+    // a boundary inside a prefill chunk, where the walk that froze the ring chunked its suffix
+    // differently. That ring still proposes against the same tokens, so the target verify keeps every
+    // emitted token sound, but the accepted counts (and with them the verify windows the emitted
+    // logits come from) would not match a from-scratch walk. Decline the masked draft for this
+    // request; the target KV/GDN reuse stays. See GenerationResult::draft_context_declined.
+    dflash_draft_declined_ =
+        dflash2_enabled_ && reuse != 0 && reuse % reuse_grid != 0;
     if (prefill_trace) { scan_done = Clock::now(); }
     if (reuse_trace) {
         std::size_t valid_checkpoints = 0;
@@ -2207,7 +2217,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     if (streaming) {
         sink->start(GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
     }
-    result.reused_prompt_tokens = reuse;
+    result.reused_prompt_tokens   = reuse;
+    result.draft_context_declined = dflash_draft_declined_;
 
     // Sampling config, device-resident, for ops::sample.
     ops::SamplingConfig sampling_config = make_sampling_config(request.sampling);
@@ -2768,8 +2779,13 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 budget_remaining > 1 ? budget_remaining - 1U : 0U;
             const std::uint32_t capacity_left =
                 position + 1U < options_.max_context ? options_.max_context - position - 1U : 0U;
+            // A declined draft runs every round target-only: the window still forwards the anchor
+            // and the verify still taps its residual into the pending staging, but no proposal is
+            // licensed, so each round commits the target's own single token.
             const std::uint32_t extent =
-                std::min({dflash_drafts_, max_by_budget, capacity_left});
+                dflash_draft_declined_
+                    ? 0U
+                    : std::min({dflash_drafts_, max_by_budget, capacity_left});
             const std::int32_t width = static_cast<std::int32_t>(dflash_drafts_) + 1;
             // extent == 0 is a real round here, exactly as it is on the single-device route
             // (decode.cpp:732 counts it as a fallback step but still runs the round): the window

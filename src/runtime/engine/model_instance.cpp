@@ -95,26 +95,32 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         }
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
         // The TP-2 core drives its own single-request round loop. MTP proposes from the artifact's
-        // own nextn head; DFlash2 owns a draft component the shard split materializes whole on
-        // shard 0, and the core runs its masked proposal, target verify, sparse acceptance and GDN
-        // fold itself (PLAN.md section 3.6, stage B5). DFlash v1 still has no TP-2 context layout,
-        // and its draft state would go through the per-layer path this core does not own.
+        // own nextn head. DFlash2 also owns a draft component the shard split materializes whole on
+        // shard 0, and the core implements its masked proposal, target verify, sparse acceptance and
+        // GDN fold (PLAN.md section 3.6, stages B5-B6), but its option gate is closed again - see the
+        // refusal below. DFlash v1 still has no TP-2 context layout, and its draft state would go
+        // through the per-layer path this core does not own.
         if (options.speculative.backend == SpeculativeBackend::DFlash) {
-            throw std::invalid_argument("TP-2 generation supports --spec mtp or --spec dflash2 only");
+            throw std::invalid_argument("TP-2 generation supports --spec mtp only");
         }
-        // Stage B6 does carry the DFlash2 draft ring through the core's prefix-reuse checkpoints,
-        // device snapshots and cross-session slabs, but the cross-session retention property it was
-        // meant to re-enable does not hold for this route yet: a prompt-end recall (a boundary that
-        // is not a multiple of the prefill chunk) forwards a suffix of a different width than a
-        // from-scratch walk, and the masked-draft window's fp8 target logits then flip a near tie in
-        // the session test's prompts, so the recalled answer diverges from the from-scratch answer.
-        // The route therefore keeps the stage-B5 retention disablement below; the draft images it
-        // still carries make the device snapshot and host checkpoint paths correct for a route that
-        // does not reach the session slabs. See PLAN.md section 3.6, "B6 result".
+        // Stage B6 carries the DFlash2 draft ring through the core's prefix-reuse checkpoints,
+        // device snapshots and cross-session slabs, and declines the masked draft where the recall
+        // boundary is not one a from-scratch walk reaches
+        // (GenerationResult::draft_context_declined). The route is still not shippable: on the
+        // grid-aligned shared-system-prompt switch the reused walk disagrees with a from-scratch
+        // prefill of the same prompt on its last token in about two runs out of five, always with
+        // the same wrong answer, because a walk that reaches the boundary through the core's
+        // checkpoints comes out on the other side of a near-tie than a walk that prefills it. The
+        // TP-2 exchange is not the cause - a bit-exact probe of the pair's allreduce over the decode
+        // window shapes passes, and plain and MTP stay bit-exact on the same server - and neither are
+        // the clamped verify columns, which duplicate the last licensed column and never read a
+        // stale KV slot. A route that emits that token is worse than no route, so it stays
+        // construction-refused until the preconditions recorded in PLAN.md 3.6 hold. The B1-B6
+        // implementation and its tests stay in tree; this gate is what keeps them unreachable.
         if (options.speculative.backend == SpeculativeBackend::DFlash2) {
-            options.context_cache.enabled = false;
-            options.context_cache.host_state_slots = 0;
-            options.context_cache.host_kv_capacity_bytes = 0;
+            throw std::invalid_argument(
+                "TP-2 generation supports --spec mtp only: --spec dflash2 is withheld because its "
+                "prefix reuse does not yet reproduce a from-scratch walk (PLAN.md 3.6, \"B6 result\")");
         }
         // Vision is available on the TP-2 route: the artifact's static shard split places the
         // Vision tower on the shard that holds the vision component (shard 1) and the MTP layer on

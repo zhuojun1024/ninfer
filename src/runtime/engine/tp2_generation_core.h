@@ -493,6 +493,11 @@ private:
     // previous round's verify window (append_pending). It never exceeds the target execution
     // frontier and lags it by at most one verify window.
     std::uint32_t dflash_context_frontier_ = 0;
+    // Set when this request reused a target prefix whose boundary is not on the prefill grid, so the
+    // recalled draft ring belongs to a differently chunked walk and cannot drive the verify window a
+    // from-scratch walk would produce. The request then runs target-only: the target prefix reuse
+    // stays, the masked draft does not. See GenerationResult::draft_context_declined.
+    bool dflash_draft_declined_ = false;
     // The first draft of the previous decode step, and whether there is one to compare. A draft
     // proposed at position p predicts the token at p+2, so the target's argmax at the next step is
     // exactly the acceptance oracle for it.
