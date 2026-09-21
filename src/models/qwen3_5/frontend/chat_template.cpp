@@ -150,6 +150,18 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source, std:
                                 std::move(special_tokens));
 }
 
+PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
+    // The Qwen3.8 chat template supports thinking and the low/medium/xhigh reasoning efforts;
+    // the local --reasoning-effort feature validates requests against this capability set.
+    PromptCapabilities result;
+    result.enable_thinking            = true;
+    result.reasoning_effort.low       = true;
+    result.reasoning_effort.medium    = true;
+    result.reasoning_effort.xhigh     = true;
+    result.reasoning_effort.default_effort = ReasoningEffort::XHigh;
+    return result;
+}
+
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
                                           ChatRenderOptions options,
                                           const PreparationControl& control) const {

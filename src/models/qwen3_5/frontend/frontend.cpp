@@ -911,6 +911,10 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
     return impl_->tokenizer->encode(text);
 }
 
+PromptCapabilities Frontend::prompt_capabilities() const noexcept {
+    return impl_ != nullptr ? impl_->chat_template.capabilities() : PromptCapabilities{};
+}
+
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,

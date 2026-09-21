@@ -400,6 +400,30 @@ enum class ReasoningEffort : std::uint8_t {
     return {};
 }
 
+struct ReasoningEffortCapabilities {
+    bool low    = false;
+    bool medium = false;
+    bool xhigh  = false;
+    std::optional<ReasoningEffort> default_effort;
+
+    [[nodiscard]] constexpr bool supports(ReasoningEffort effort) const noexcept {
+        switch (effort) {
+        case ReasoningEffort::Low:
+            return low;
+        case ReasoningEffort::Medium:
+            return medium;
+        case ReasoningEffort::XHigh:
+            return xhigh;
+        }
+        return false;
+    }
+};
+
+struct PromptCapabilities {
+    bool enable_thinking = false;
+    ReasoningEffortCapabilities reasoning_effort;
+};
+
 enum class PromptContinuationMode : std::uint8_t {
     NewAssistantTurn,
     ContinueFinalAssistant,

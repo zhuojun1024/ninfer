@@ -51,7 +51,7 @@ OpenAIChatRequest parse(Json body) { return parse_chat_completion_request(body, 
 
 ResolvedPromptSemantics semantics(const GenerationRequest& request) {
     ServeOptions server;
-    return resolve_prompt_semantics(request, server);
+    return resolve_prompt_semantics(request, server, ninfer::PromptCapabilities{});
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {

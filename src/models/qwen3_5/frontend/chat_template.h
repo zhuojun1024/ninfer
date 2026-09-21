@@ -134,6 +134,7 @@ public:
     [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
                                       ChatRenderOptions options         = {},
                                       const PreparationControl& control = {}) const;
+    [[nodiscard]] PromptCapabilities capabilities() const noexcept;
 
 private:
     CompiledChatTemplate(text::JinjaTemplate compiled, nlohmann::ordered_json special_tokens)

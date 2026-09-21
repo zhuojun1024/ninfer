@@ -63,7 +63,7 @@ std::string api_param(const std::function<void()>& action) {
 ResolvedPromptSemantics semantics(const GenerationRequest& request, bool default_thinking = true) {
     ServeOptions options;
     options.enable_thinking = default_thinking;
-    return resolve_prompt_semantics(request, options);
+    return resolve_prompt_semantics(request, options, ninfer::PromptCapabilities{});
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {

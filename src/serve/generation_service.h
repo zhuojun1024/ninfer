@@ -154,6 +154,7 @@ private:
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    ninfer::PromptCapabilities prompt_capabilities_;
 };
 
 } // namespace ninfer::serve

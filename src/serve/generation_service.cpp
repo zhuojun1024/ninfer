@@ -307,7 +307,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy) const {
     PreparedRequest prepared;
-    const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
+    const ResolvedPromptSemantics semantics =
+        resolve_prompt_semantics(request, options_, prompt_capabilities_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
     prepared.thinking_budget     = request_options.execution.thinking.budget;
@@ -380,7 +381,8 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     }
     const Clock::time_point deadline =
         Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
-    const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
+    const ResolvedPromptSemantics semantics =
+        resolve_prompt_semantics(request, options_, prompt_capabilities_);
     try {
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);

@@ -109,7 +109,8 @@ std::string render_tool_definition(const ToolDefinition& tool) {
 } // namespace
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
-                                                 const ServeOptions& server) {
+                                                 const ServeOptions& server,
+                                                 const ninfer::PromptCapabilities& capabilities) {
     using Json  = RequestJson;
     Json kwargs = request.chat_template_kwargs_json.empty()
                       ? Json::object()

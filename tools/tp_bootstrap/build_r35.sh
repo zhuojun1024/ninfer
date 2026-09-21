@@ -6,7 +6,7 @@ set -u
 SRC=/mnt/d/Documents/workbench/ninfer
 DST=/home/zhuojun/ninfer
 if command -v rsync > /dev/null 2>&1; then
-  for d in src tests apps include bench tools cmake; do
+  for d in src tests apps include bench tools cmake third_party; do
     [ -d "$SRC/$d" ] || continue
     rsync -a "$SRC/$d/" "$DST/$d/" || { echo "SYNC FAILED $d"; exit 1; }
   done
