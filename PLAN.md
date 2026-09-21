@@ -62,6 +62,7 @@
 | Round 17 | plain decode exact-batch graph（+12.6%）+ AR 按 payload 大小切传输策略（+0.63%）落地 |
 | Round 19 | shared_c 召回分歧根因定论（chunk 宽度经 `rewind_near_` 依赖引擎历史）；修复已落地并验证（§3.1） |
 | Round 20 | chunk 计划与 ring rewind 解耦（1a/1b/1c）：同一 prompt 不再依赖引擎历史，plain/mtp 逐位通过；边界敏感性定量（末块宽度不是变量、边界位置是、120 步 decode 零翻转）；host KV arena 改可分页 backing（`--host-kv-pinned` 才锁页，锁页被拒自动回退） |
+| DFlash2（单卡基准；TP-2 未适配） | 已完整实现并在**单卡 5090** 路线合格（`docs/maintainer/dflash.md`、`docs/performance/*`、bench corpus）；TP-2 路线**有意拒绝** `--spec dflash2`（`model_instance.cpp` 归一化报错，worklog §36.1 与 `:2438` 明确保留该限制）；上双卡属「MTP/dflash2 组件切分」级工作，未排期，见 §3.6 |
 
 **未达成的原有门槛（诚实记录）**：MTP3 ≥ 70 tok/s 未达到（纯 decode 上限 K=2 50.5–54.0）；
 TP-2 路径未跑 perplexity 评测（质量证据用同提示词多采样 A/B）；per-shard arena 的
@@ -149,6 +150,8 @@ system prompt 强制淘汰）：默认输出 `host KV arena shard 0/1: 2048.0 Mi
 **踩到并修掉的隐含陷阱**：`src/runtime/engine/model_instance.cpp` 的 TP-2 归一化用指定初始化器重建
 `ContextCacheOptions`，只搬运它显式列出的字段 ⇒ 新字段会被静默丢弃（本次 `host_kv_pinned` 就这样失效
 过一次，表现为 `--host-kv-pinned` 无效果、日志仍报 `pageable`）。给该结构加字段时必须同步这里。
+worklog §36.1 记录过同一函数的同类事故（当年 `--spec` 也被丢过一次）⇒ 这是同一函数的第二次；修改
+`ContextCacheOptions` 时必须连 `model_instance.cpp` 的指定初始化器一起改。
 
 ### 3.2 交付前收尾（归档 §7）
 
@@ -181,6 +184,31 @@ system prompt 强制淘汰）：默认输出 `host KV arena shard 0/1: 2048.0 Mi
 - 归档 §6：KV dtype 扫描补全（nvfp4/k8v4 只验证了可启动与吞吐，无质量数据）
 
 ---
+
+### 3.6 DFlash2 上 TP-2 的适配（未排期；证据与约束）
+
+**现状**：DFlash2 已完整实现、并在**单卡 5090** 路线合格（数学与状态见 `docs/maintainer/dflash.md`，性能与
+corpus 见 `docs/performance/*` 与 bench）；TP-2 路线**有意拒绝** `--spec dflash2`（`src/runtime/engine/
+model_instance.cpp` 的 TP-2 归一化直接抛 `TP-2 generation supports --spec mtp only`），且该限制被明确
+保留（worklog §36.1 `:713`「dflash/dflash2 明确报错」、`:2438`「DFlash 限制保留」）。
+
+**为什么不是开关**：把 MTP 接进 TP-2（worklog §36.1/36.2）实际动过：选项归一化、ctor 把 backend 与
+proposal_head 传给 `plan_load`、`tp_split_spec` 强制 `mtp/*` 复制、shard 0 打开 `enable_mtp` 并规划+物化
+MTP KV、alignment window 与 priming 顺序。而那只是 **1 层、约 0.2 GiB** 的 MTP；DFlash2 是 5 层 draft +
+selector rank/top-k + 卷积 tap/group（`docs/maintainer/dflash.md`），分片与复制决策重得多。
+
+**本机约束**：工件 23.7 GB **单卡装不下**（worklog `:57`）⇒ 本机没有单卡对照基线，双卡又尚未适配。归档对
+双卡的预期收益是 **DFlash2 90–180 tok/s**（worklog `:60`）—— 这是收益目标，也是做与不做的判据。
+
+**适配工作分解（初稿，待补细节）**：
+1. 判定归属：整份复制到两卡，还是与某 shard 共置、另一卡只做验证（对标 MTP 的「复制 + shard A 单卡提议」）；
+2. `tp_split_spec` 的复制/切分规则扩展（现只覆盖 `mtp/*`）；
+3. 每卡 DFlash2 权重 + KV + workspace 的规划与物化（16 GiB 预算里再挤，需实测台账）；
+4. 提议与验证回路：proposed token 的跨卡可见性、对齐与 priming 顺序（复用 MTP 经验）；
+5. 加载与校验：`DFlash2DraftModel` 配置、proposal head、`candidate_selector`、draft 计数 1..15；
+6. 验收：双卡数值正确性（对照单卡基线或 oracle）+ 吞吐目标 90–180 tok/s + 与 MTP 的对比。
+
+**前置否决条件**：若单卡 5090 上 DFlash2 相对 MTP 的收益不足以覆盖双卡的内存与复杂度，则本项直接关闭。
 
 ## 4. 上游 cherry-pick 计划（第一梯队 + 第二梯队）
 
