@@ -181,12 +181,33 @@ TP-2 路径未跑 perplexity 评测（质量证据用同提示词多采样 A/B�
 
 ## 5. 进度
 
-- [ ] 前置（工作树处理 + 基线记录）
-- [ ] 第一梯队-1 `a2b7ed11`
-- [ ] 第一梯队-2 `b9219f3f`
-- [ ] 第一梯队-3 `98dada0e`
-- [ ] 第一梯队-4 `8eaed538`
-- [ ] 第一梯队-5 `6cc95cc5`
-- [ ] 第二梯队-1 `1d8587bc`
-- [ ] 第二梯队-2 `05507ab0`
-- [ ] 第二梯队-3 `5f5fccab`
+- [x] 前置（工作树处理 + 基线记录）——Round 18 已提交 `9123217c`；PLAN 归档 `9a1e5ae3`
+- [x] 第一梯队-1 `a2b7ed11` → `322217ae`（干净）
+- [x] 第一梯队-2 `b9219f3f` → `c6c49b2d`（干净，17 文件 +5966）
+- [x] 第一梯队-3 `98dada0e` → `119e7f12`（7 冲突已解，75 文件）
+- [x] 第一梯队-4 `8eaed538` → `dd985028`（干净，19 文件）
+- [x] 第一梯队-5 `6cc95cc5` → `8a086f40`（干净，15 文件）
+- [x] 第二梯队-1 `1d8587bc` → `1ed82861`（干净，22 文件；Windows staging 保留）
+- [x] 第二梯队-2 `05507ab0` → `2a7ec6c5`（干净，2 文件）
+- [x] 第二梯队-3 `5f5fccab` → `4b1e8507`（2 冲突已解，19 文件）
+- [ ] WSL 构建 + op 测试 + 字节一致 + 前端夹具测试（后台 job pwsh-5 构建中）
+- [ ] Windows 构建（build-win2 全量，避开运行中 exe 的 LNK1104）
+- [ ] 端到端验证脚本 + 用户重启 + e2e
+
+### 5.1 `98dada0e` 冲突解决要点（本地 `--reasoning-effort` 特性接回上游 jinja 设计）
+
+- `serve_options.h`：`enable_thinking`/`preserve_thinking` 改 `std::optional<bool>`（模板拥有默认值），保留本地 `default_reasoning_effort`。
+- `engine.cpp`：采纳上游 `sampling_mode` 基于 `info.starts_in_reasoning`（渲染后判定），保留本地 `frontend_`/`capacity`；**重新加回** `Engine::prompt_capabilities()`（上游删除，本地 `--reasoning-effort` 启动校验需要）+ `engine.h` 声明。
+- `translate.cpp`：合并上游 kwargs 合并机制（`merge_boolean` + 模板 `reasoning_effort`）与本地 `effective_reasoning_effort` 计算 + effort 校验 switch（只接受模板支持的 low/medium/xhigh/none）；签名保持 3 参（request, server, capabilities）。
+- `translate.h`：`ResolvedPromptSemantics` 加回 `effective_reasoning_effort` 字段 + 3 参签名。
+- `generation_service.cpp`/`request_log.cpp`/`test_serve_options.cpp`：保留本地 `prompt_capabilities_` + `default_reasoning_effort` 校验/日志；测试补回 `prompt_capabilities` 定义 + 全部改 3 参。
+- `src/text/CMakeLists.txt`：本地 `UTF8PROC_STATIC`（Windows 修复）+ 上游 `ninfer_jinja` 目标两者都保留。
+
+### 5.2 `5f5fccab` 冲突解决要点（Windows TMA 描述符暂存 × 上游 partial M tile）
+
+- `nvfp4_w4a4_tma.cu`：采纳上游 ceiling 除法 `(tokens+kBlockM-1)/kBlockM` + 新 `tokens` 实参，保留本地 `#if defined(_WIN32)` staging 分支（`staged.get()` + `tokens`）。
+- `nvfp4_w4a4_tma.cuh`：kernel 签名加上游 `int token_count` 参数，保留本地 `#if defined(_WIN32)` 描述符引用 + tensormap publish/acquire 块；kernel body 已用 `token_count` 边界（auto-merge）。
+
+### 5.3 构建脚本修复
+
+- `tools/tp_bootstrap/build_r35.sh` 的 rsync 列表漏了 `third_party`（`b9219f3f` 新增 `third_party/llama-jinja/`），导致 WSL 侧 `ninfer_jinja` 目标缺失、CMake 配置失败；已补入 `third_party`。
