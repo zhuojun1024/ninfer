@@ -107,20 +107,21 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // device snapshots and cross-session slabs, and declines the masked draft where the recall
         // boundary is not one a from-scratch walk reaches
         // (GenerationResult::draft_context_declined). The route is still not shippable: on the
-        // grid-aligned shared-system-prompt switch the reused walk disagrees with a from-scratch
-        // prefill of the same prompt on its last token in about two runs out of five, always with
-        // the same wrong answer, because a walk that reaches the boundary through the core's
-        // checkpoints comes out on the other side of a near-tie than a walk that prefills it. The
-        // TP-2 exchange is not the cause - a bit-exact probe of the pair's allreduce over the decode
-        // window shapes passes, and plain and MTP stay bit-exact on the same server - and neither are
-        // the clamped verify columns, which duplicate the last licensed column and never read a
-        // stale KV slot. A route that emits that token is worse than no route, so it stays
+        // grid-aligned shared-system-prompt switch it disagrees with a from-scratch prefill of the
+        // same prompt on its last token in about two runs out of five, always with the same wrong
+        // answer - and it does so with the reuse scan closed for the route too, so prefix reuse is
+        // not the cause. Two identically configured Engine instances disagree: the one built second
+        // flips while the first stays put (PLAN.md 3.6, "B6 result"). The TP-2 exchange is not the
+        // cause - a bit-exact probe of the pair's allreduce over the decode window shapes passes,
+        // and plain and MTP stay bit-exact on the same server - and neither are the clamped verify
+        // columns, which duplicate the last licensed column and never read a stale KV slot. A route
+        // that emits that token is worse than no route, so it stays
         // construction-refused until the preconditions recorded in PLAN.md 3.6 hold. The B1-B6
         // implementation and its tests stay in tree; this gate is what keeps them unreachable.
         if (options.speculative.backend == SpeculativeBackend::DFlash2) {
             throw std::invalid_argument(
                 "TP-2 generation supports --spec mtp only: --spec dflash2 is withheld because its "
-                "prefix reuse does not yet reproduce a from-scratch walk (PLAN.md 3.6, \"B6 result\")");
+                "verify walk does not yet reproduce a from-scratch prefill (PLAN.md 3.6, \"B6 result\")");
         }
         // Vision is available on the TP-2 route: the artifact's static shard split places the
         // Vision tower on the shard that holds the vision component (shard 1) and the MTP layer on

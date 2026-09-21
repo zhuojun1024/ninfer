@@ -66,8 +66,9 @@ RTX 5060 Ti cards but not one.
 - `--spec mtp` is the speculative backend on this route; `--spec dflash` (the DFlash v1 masked
   draft) and `--spec dflash2` are rejected at construction, and `--vision` is supported. The TP-2
   DFlash2 loop is implemented and tested in tree (PLAN.md section 3.6, stages B5-B6), but its option
-  gate is closed: a walk that reaches a reused boundary through the core's checkpoints still does not
-  reproduce a from-scratch prefill, so the gate reopens only once that recall is reproducible.
+  gate is closed: its verify walk disagrees with a from-scratch prefill of the same prompt on the
+  shared-system-prompt switch in about two runs out of five even with prefix reuse disabled, so the
+  gate reopens only once that walk is reproducible.
 - KV capacity is page-aligned to `--max-context` (the core builds its own paged cache), and the
   context cache is disabled (the core owns its prefix-reuse snapshots).
 - The single-request CLI and the perplexity evaluator are single-GPU; only `ninfer-serve` accepts

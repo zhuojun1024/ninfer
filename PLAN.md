@@ -448,21 +448,31 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
       路径长期未用、已失效）；因此 A/B 结论为**无效**，跨卡传输嫌疑**未排除也未证实**。该临时开关已回退（`device_pair.cu`
       在最终工作树里无 diff），不留在源码里；
     - 判定落地前**不改钳位轮语义**（等于改兜底/接受语义），也不打开保留；在那之前不做 §3.6 的 B7 提速。
-  - **本轮收口（放行门关闭；取代上方 429–432 行的旧收口契约）**：按产品决策把 TP-2 上的 `--spec dflash2` 改回
-    **构造期明确拒绝**（`src/runtime/engine/model_instance.cpp:105-124`，消息含 `dflash2 is withheld`），B1–B6 实现与测试
-    全部保留在树内（B6 的复用/快照代码成为不可达路径，直到重新放行）；`NINFER_TEST_ROUTE=dflash2` 现在改为断言该拒绝
-    （测试 main 内的 refusal 检查）而不是跑场景。理由按实测更正为三句：**不是**钳位轮读陈旧 KV（见上），也**不是**跨卡
-    传输（新增位精确探针 `tests/test_tp_device_pair.cpp`：每个规模 64 次换数据 + 200 深度排队，规模含 20 KiB / 1 MiB /
-    80 KiB 窗口层 / 2433024 B 的 `[V,8]` 5-slice logits 合并，`DevicePair(0,1)` 上 **5 个规模全部逐位一致 PASS，3.5 s**，
-    `p2p_available=0`；同服务器 plain/MTP 5 次运行保持逐位复用断言）；真正的跨运行变量是**经 checkpoint/快照恢复的前缀
-    复用走法**：同进程 oracle 的 `shared_b` 是全量 prefill 且 10/10 稳定在 `220`，engine 的 `shared_b`（复用 512 共享系统
-    前缀后 prefill 128）10 次里翻转 6 次、坏值恒为 `198`（`tests/models/qwen3_5/test_tp2_sessions.cpp:398-411`，:401 的 512
-    复用断言通过；`dflash2` 连跑 5 次为 `P P F P F`，日志 `build-win/b6-fin-1..5.log`）。重新放行的前置条件（二选一）：
-    (a) 让恢复路径产出的 ring 与全量 prefill 的 ring 逐位一致——定位链是 `begin_dflash_state` / `snapshot_dflash_state` /
-    `session_capture_shared_state`（`src/runtime/engine/tp2_generation_core.cpp:2158-2210,2424-2465`），需要把失败那一次的
-    engine 与 oracle 逐轮对齐；(b) 产品上接受「DFlash2 不参与前缀复用」，即把 B6 移除的 `!dflash2_enabled_` 复用守卫加回、
-    回到 B5 的已知良好配置（测试的复用期望值需按路线门控）。重新放行时删除上面的 refusal 断言并恢复 `docs/serving.md`
-    的路线说明（当前为「TP-2 上 `--spec dflash2` 构造期拒绝」）。
+  - **本轮收口（试验 (b) 失败 ⇒ 路线回到构造期拒绝；取代上方 429–432 行与本条早期版本）**：按产品决策先实现了选项 (b)（把
+    DFlash2 从**复用扫描本身**摘出去、构造期 `host_checkpoint_stride_=0`、路线放行、测试断言 `reused=0`），但**实测证明前缀复用
+    不是成因**，故全部 (b) 改动已回退（`git checkout 61cd270d -- src/runtime/engine/tp2_generation_core.cpp/h
+    src/runtime/engine/model_instance.cpp tests/models/qwen3_5/test_tp2_sessions.cpp docs/serving.md`），路线恢复为**构造期拒绝**，
+    B1–B6 实现与测试照旧保留、`draft_context_declined` 契约与 B6 的 draft 状态搬运代码不动；拒绝消息与注释、`docs/serving.md`、
+    测试头注释的理由已同步改为「同一配置下 verify 走法逐 run 不同」，不再归因前缀复用。
+    **否定性证据**：`NINFER_TEST_ROUTE=dflash2` 连跑 5 次为 `P F P P F`（`build-win/b6c-dflash2-1..5.log`），失败仍是
+    `shared_b`（`test_tp2_sessions.cpp:406`）的 `got [1703 220 248046 198 248045 198 248045 198]` vs `…220`——与复用开启时
+    **逐字符相同**；而 :401 的复用期望（DFlash2 = 0）在失败run 里也通过，说明那几次确实没有复用。⇒ 上一轮「锁定到复用走法」的结论
+    **被本次实验否定**，B5「DFlash2 不参与复用即确定」的前提同样不成立。
+    **为什么这次能定**：把 DFlash2 从复用扫描里摘干净后（`reused=0`），坏值与复用开启时逐字符相同，失败发生在**两次全量
+    prefill** 之间 ⇒ 复用不是成因。新的定位：同一进程、同一批选项下，**两个 Engine 实例的 DFlash2 走法会给出不同结果**——oracle
+    实例（先构造）在 10 次运行里稳定 `220`，engine 实例（后构造）在 10 次里翻转 6 次；此前 10 次「有复用」运行同样只由 engine
+    实例出错（`build-win/b6-det-1..5.log`、`b6-fin-1..5.log`）。plain/MTP 同场景 5+2 次全部逐位一致；钳位轮索引链与位精确
+    allreduce 探针（`tests/test_tp_device_pair.cpp`：每规模 64 次换数据 + 200 深度排队，含 20 KiB / 1 MiB / 80 KiB 窗口层 /
+    2433024 B 的 `[V,8]` 5-slice 合并，`DevicePair(0,1)` 5 规模全部逐位一致 PASS、3.5 s、`p2p_available=0`）都已排除 ⇒ 剩下的
+    是「同一配置下逐 run 不同的那部分状态或时序」。
+    **重新放行的前置条件（下一步实验）**：在失败run 里把 engine 与 oracle 的 `shared_b` 逐轮对齐——`tp2_generation_core.cpp`
+    的 proposal/verify/argmax 段（:2813-2941）逐轮比较 licensed 列、verify 窗口 logits 与 KV/GDN 状态；并交换两个引擎的构造顺序
+    （oracle 后建），看差异是否跟随「后构造的实例」，以区分分配布局相关与走法本身相关。修好后再把复用断言按路线恢复。
+    其它验收（在 (b) 二进制上测得；回退后 plain/MTP 行为不变）：plain 2/2、mtp 2/2 逐位复用断言通过；append K=7
+    `0xbad27a494a9bc853`、K=5 `0xbee487264ca8ffb8` 未变；load 通过；5 次 dflash2 日志去掉 `[mem]` 行后，通过run 互为逐字节
+    相同（SHA256 `324835E9…`），失败run 互为相同（`8CF800…`）。
+    性能：**未重测 decode tok/s**——本轮改动只落在选项归一化与复用扫描，未触及任何 decode/attention/head/kernel 文件，复用只
+    影响 prefill，故 B5 记录的 TP-2 DFlash2 K=7 63.6 tok/s vs plain 35.1 tok/s（=1.81×；4096 context、单请求、greedy）不受影响。
 - **B6 状态与保留（见上方 B6 结果）**：draft ring/pending features 已随会话召回保存恢复（复用 MTP 的 host slab
   先例），`dflash_graph_profiles` 已接；「会话切换后召回逐位一致」对本路线不成立，保留保持禁用；
 - **B7 性能验收**：双卡吞吐对 90–180 tok/s 目标 + 与 MTP 的对比 + plain/mtp 无回归。

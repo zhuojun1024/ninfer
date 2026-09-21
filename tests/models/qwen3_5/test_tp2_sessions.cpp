@@ -31,7 +31,7 @@
 // and DFlash2 keeps its masked draft's local context ring there; all three travel through the same
 // eviction transaction and the same prefix-reuse checkpoints. The default set is plain and MTP;
 // DFlash2 runs only when NINFER_TEST_ROUTE names it, and that route is refused at construction
-// until its prefix reuse reproduces a from-scratch walk (PLAN.md section 3.6, "B6 result"), so that
+// until its verify walk reproduces a from-scratch prefill (PLAN.md section 3.6, "B6 result"), so that
 // route only asserts the refusal. The oracle in each round uses the same speculative configuration
 // with retention disabled.
 //
@@ -599,7 +599,7 @@ int main() {
                     return 1;
                 }
                 std::cout << "TP-2 DFlash2 route refusal passed: the option gate is closed until its "
-                             "prefix reuse reproduces a from-scratch walk\n";
+                             "verify walk reproduces a from-scratch prefill\n";
                 continue;
             }
             if (const int status = run_scenario(artifact, devices.first, devices.second, route);
