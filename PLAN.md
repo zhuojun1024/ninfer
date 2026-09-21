@@ -335,8 +335,13 @@ loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:7
   workspace 峰值 4.4 MiB（192 MiB 的 2%）、事件计时 **7.95 ms/次（K=7）、7.93 ms/次（K=5）**。**本轮未做**：selector 的
   Engine 发布、verify/接受/折叠、会话/checkpoint 状态（B4–B6）；因此 plan 的「贪心 DFlash2 == plain」端到端验收无法在本轮
   建立，B5 前不得声称。
-- **B4 selector 发布**：`linear_topk` + `hidden_projection` + `candidate_selector_path` ⇒ 验收：同 B3 的端到端一致性
-  + 接受率统计（不再沿用「与单卡一致」的口径）；
+- **B4 组装轮次（已完成，`b4e84056`）**：selector 数学在 B3 已随生产 `propose_dflash2_batch` 跑通；本阶段把整轮收敛成生产组件
+  `program/dflash_round.{h,cpp}`（draft 持久 context + 精确 B 的 decode frame + **独立 proposal arena** + 发布 K drafts /
+  candidate ids / proposal q / query ids+positions），core 的六个 shard 字段收敛为单个 `dflash_round`，sink 工厂改为委托，
+  单卡与双卡共用 `dflash2_proposal_workspace_bytes()`。**arena 归属坑已证明修好**：投毒 shard 0 常驻 `prefill_hidden` 后
+  再次 propose ⇒ 图案逐位存活、shard workspace 计数不变、组件 arena 峰值 4.4 MiB（K=7）/3.3 MiB（K=5），与 planner 预算
+  完全相同。验收：组装轮次逐位复现 B3 哈希（K=7 `0xbad27a494a9bc853`、K=5 `0xbee487264ca8ffb8`，跨二进制/跨进程），
+  单次提议 7.95 ms；context 90.4 MiB（较 B3 多 0.34 MiB，因组件按生产 `lanes=K+1=8` 分配 `pending_features`，暂无人读）；
 - **B5 验证/接受/折叠**：复用 `forward_tp2_window` + Verify + 稀疏拒绝采样（注意改用 DFlash2 的接受语义，MTP 是
   greedy 接受）⇒ 验收：端到端 token 与单卡基线一致；
 - **B6 状态与保留**：draft ring/pending features 随会话召回保存恢复（复用 MTP 的 host slab 先例，
