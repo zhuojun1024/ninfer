@@ -271,6 +271,25 @@ loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:7
   `tp2_generation_core.cpp:1261-1266`）+ 接 `dflash_graph_profiles` ⇒ 验收：会话切换后召回仍逐位一致；
 - **B7 性能验收**：双卡吞吐对 90–180 tok/s 目标 + 与 MTP 的对比 + plain/mtp 无回归。
 
+**理论性能差距（单卡 5090 vs 双卡 TP-2，DFlash2 K=7；roofline 合成，非实测）**：
+
+- **硬上限＝带宽比 2×**：两卡合计 896 GB/s = 一张 5090 的 1,792 GB/s 的一半（`docs/tp2-dual-5060ti.md:106-108`）。
+  实测每 shard 每前向流 10.15 GB ⇒ 地板 10.15/448 ≈ **22.7 ms/轮**；5090 地板 ≈ 20.3/1792 ≈ 11.3 ms。
+- **两条路线的效率实测相当**：TP-2 MTP K=2 是 38.2 ms/轮 ≈ 59% 地板；5090 DFlash2 192.5 tok/s、
+  acc 37.0% ⇒ 3.59 token/轮 ⇒ 18.6 ms ≈ 61% 地板 ⇒ 差距主要就是带宽比。
+- **DFlash2 特有的不利项**：draft（2.07 GiB）只在 shard 0 ⇒ 2.22/448 ≈ **5.0 ms/轮**（5090 上 1.24 ms，四倍）。
+- **DFlash2 特有的有利项**：MTP 在 TP-2 上最大的单项开销是 **7–10 ms 的 host 串行 draft 链**
+  （同文档 `:127-128`）；DFlash2 一次非因果掩码块前向并行产出全部提议 ⇒ 这条开销消失。
+- **估算**：(22.7 verify + 5.0 draft + 2.9 启动间隙 + ≈2.5 allreduce) ≈ **33 ms/轮 ÷ 3.59 ≈ 108 tok/s**
+  ⇒ 约 5090 的 **0.56×**，但对本机 MTP K=2 的 57 tok/s 是 **≈1.9×** —— 明显大于单卡上的 +19.5%，
+  因为被省掉的那条链在 TP-2 轮次里占比最大。
+- 对归档 **90–180 tok/s** 的修正：90 这一端与 roofline 相符；**180 不可达** —— 即使把启动间隙、allreduce、
+  draft 全部归零，理论上限也只有 3.59/0.0227 ≈ **158 tok/s**。
+- **D1 推论**：把 draft 切到两卡只能省约 1.5 ms/轮（≈5%），收益远小于复杂度 ⇒ **D1 只为内存做，不为速度做**。
+  提速杠杆是恢复 CUDA graph（−2.9 ms）、减少/融合 allreduce、draft 权重降精度。
+- 不确定性：acceptance 与 token/轮由数学决定、跨卡可迁移（残差逐位相同），但本机 draft 是 w4a4 而非
+  nvfp4 ⇒ 接受率会有小差；效率锚点取自 MTP 轮次；未计 prefill 与首轮抖动。
+
 **工件现状（已查）**：本机 `D:/LLM/qwen3_8_27b_w4a4_w8a8.ninfer` **不含** DFlash2（组件仅 text/vision/mtp，
 parameters=1422），但同目录已有 `qwen3_8_27b_w4a4_w8a8_dflash2.ninfer`（parameters=1513、objects=1218）⇒
 评估**不需要重新转换**，直接换工件即可。
