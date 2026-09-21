@@ -310,11 +310,18 @@ loader 不上电 draft 组件），且限制被明确保留（worklog §36.1 `:7
   `dflash_append_context`（scratch 已 scope）。门禁未动 ⇒ 运行期仍恒走 `NullTap`，sessions 的 plain 与
   mtp 都通过。**四个未决项**：① ring 未纳入 `session_store_active`/host slab/checkpoint（B6），lane 固定 0，
   且 prefix reuse 会让 draft context 空洞；② workspace 峰值未实测（chunk=1024 时 consumer 约 60 MB）；
-  ③ verify 的 batch 字段未接（B3/B4），`pending_features` 仅分配未使用；④ **B2 无法单独验证** ——
-  consumer 是 B3 的 `dflash_append_context`，而单卡 oracle 只能做 **draft-only**（草案 2.07 GiB 单卡放得下、
-  文本权重放不下），所以验收判据是「draft ring 的 K/V 与单卡 draft-only oracle 一致」；
-- **B3 提议前向**：masked 块 5 层滑动 + 动态卷积按 D1 执行 ⇒ 验收：`drafts/proposal_q` 与单卡 oracle 一致；
-- **B4 selector 发布**：`linear_topk` + `hidden_projection` + `candidate_selector_path` ⇒ 验收：提议 token 与单卡一致；
+  ③ verify 的 batch 字段未接（B3/B4），`pending_features` 仅分配未使用；④ **验收（TP-2-only，已完成）**：
+  `tests/models/qwen3_5/test_tp2_dflash_append.cpp` 经 loader-only 路径（`plan_load(DFlash2)` +
+  `materialize_model_tp2`，不经 Engine、门禁不动）驱动 sink ⇒ 装/不装 sink 的 prefill 末列 logits 逐位相同、
+  两 shard 之间也相同；consumer 1 次/轮、`captured_mask=0x1f`、positions 恰为 `[0,1024)`；ring 结构合理（live
+  全写、nonfinite=0、容量余量全零）；直调 append 与 sink 路径逐位相同；1024 一次 vs 2×512 两次逐位相同；
+  跨进程可复现（fnv1a=0x1a53fd824cd4e360）。arena 90.1 MiB、**workspace 峰值 113 MiB（59% of 192 MiB，
+  装/不装 sink 相同）** ⇒ 未决项②结案。**仍未证明** ring 的数值正确性 —— 单卡 oracle 经三条证据确认不可构造
+  （loader 无条件绑 text、`Parameters` 无条件准备整条 text 栈、整模型单卡放不下）；
+- **B3 提议前向**：masked 块 5 层滑动 + 动态卷积按 D1 执行 ⇒ 验收：提议对同一 features 确定可复现，且**贪心解码下
+  DFlash2 与 plain 的输出 token 序列完全一致**（投机只改速度、不改贪心结果，这条同时覆盖接受与折叠的正确性）；
+- **B4 selector 发布**：`linear_topk` + `hidden_projection` + `candidate_selector_path` ⇒ 验收：同 B3 的端到端一致性
+  + 接受率统计（不再沿用「与单卡一致」的口径）；
 - **B5 验证/接受/折叠**：复用 `forward_tp2_window` + Verify + 稀疏拒绝采样（注意改用 DFlash2 的接受语义，MTP 是
   greedy 接受）⇒ 验收：端到端 token 与单卡基线一致；
 - **B6 状态与保留**：draft ring/pending features 随会话召回保存恢复（复用 MTP 的 host slab 先例，
