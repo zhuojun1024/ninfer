@@ -485,6 +485,19 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
     **下一步（第 2–4 条）**：(2) 交换两个实例的构造顺序（oracle 后建）看差异是否跟随「后构造的实例」，并在失败run 里做
     engine/oracle 逐轮对齐（`tp2_generation_core.cpp:2813-2941` 的 proposal/verify/argmax 段）；(3) 投毒法逐个排查候选缓冲
     （draft ring / pending_features / round arena / GDN records / 快照槽 / paged KV），找出未被完全覆写的那一处；(4) 把 oracle 换成
+    **实验 A（轮次序列切分，已做，决定性）**：把 DFlash2 每轮的 proposal 窗口与 target 许可前缀按轮打印（临时钩子 `NINFER_TP2_DIAG_ROUNDS`，
+    已回退），solo 探针连跑 6 次（`build-win/b6h-round-1..6.log`）：
+    - 每次都是 **48 轮，逐轮文本完全一致，只有最后一轮（`shared_b` 的第 5 轮、position=646）不同**；
+    - 该轮 6 次运行的 **draft 窗口逐字节相同**：`window=[248045 248045 248045 248045 248045 248045 248045 248045] licensed=1`；
+    - 只有 **target 许可/提交的 token 不同**：5 次 `step=[198]`、1 次 `step=[248046]`。
+    ⇒ 按切分规则：**扰动在 target verify 侧，不在 proposal/draft 侧**；而且它只在这一个轮次上表现出来（其余 47 轮完全一致，说明整段状态轨迹
+    逐位相同、连接受前缀都一样）。该轮窗口全为同一 id（草稿塌缩/钳位轮），`licensed=1` 表示目标自己换掉了草稿 ⇒ 表决的是**该轮第 0 列 logits
+    的 argmax**，在 `198` 与 `248046` 之间以约 1 ulp 的差距翻转。
+    **判断与剩余可能**：状态轨迹（KV/GDN/ring）逐位相同 ⇒ 不是状态搬运、不是复用、不是草案路径、不是跨卡 allreduce（位精确探针）；嫌疑落在
+    该轮 target 窗口计算里**只影响末列 logits 的一处非确定读/归约**（未初始化或被上一轮残留污染的 workspace、verify 窗口缓冲、
+    `verify_window_host_`、或那张全同窗口下被钳位的行）。下一步（本轮未做）：投毒法（B，候选缓冲写图案看谁没被覆写）、构造顺序交换与
+    plain-oracle 控制组（C）、限时 `compute-sanitizer --tool initcheck`（D）；A 已经把范围压到「最后一轮第 0 列的 logits」，
+    最快的下一步是在该轮 dump 该列 top-k logits 与全部中间量（`window_hidden` 哈希、KV 行哈希）逐 run 比对。
     同进程的 plain engine 作控制组，判定是「两个 DFlash2 实例互相干扰」还是「任意第二个实例都受影响」。
     临时打开路线的改动已还原：`model_instance.cpp` 恢复构造期拒绝并重建验证（`dflash2 exit 0`、solo probe `exit 77`）。
 - **B6 状态与保留（见上方 B6 结果）**：draft ring/pending features 已随会话召回保存恢复（复用 MTP 的 host slab
