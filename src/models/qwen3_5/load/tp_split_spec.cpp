@@ -50,7 +50,8 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
     std::map<std::size_t, std::set<std::string>> names_by_object;
     for (const auto& [name, binding] : directory.bindings) {
         if (name.rfind("text/", 0) != 0 && name.rfind("mtp/", 0) != 0 &&
-            name.rfind("proposal/", 0) != 0 && name.rfind("vision/", 0) != 0) {
+            name.rfind("dflash2/", 0) != 0 && name.rfind("proposal/", 0) != 0 &&
+            name.rfind("vision/", 0) != 0) {
             continue;
         }
         for (const auto& p : binding.parts) { names_by_object[p.object.index].insert(name); }
@@ -81,14 +82,19 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
             return false;
         };
 
-        // Shard-local towers are placed before every shape rule so that their 1-D norms and biases
-        // travel with the matrices; their weights are tiny (one layer each) and no execution path on
-        // the other shard reads them, so splitting them would only add a second all-reduce.
-        if (has_prefix("mtp/") || has_prefix("vision/")) {
+        // Shard-local components are placed before every shape rule so that their 1-D norms and
+        // biases travel with the matrices and no draft object can be mistaken for a text one by
+        // shape. MTP, the DFlash2 masked draft and the Vision tower each run on one shard alone,
+        // so the other shard must not pay for their bytes: the proposal's conditioning input is
+        // bit-identical on both shards (the mixer outputs are all-reduced before the residual is
+        // captured), which makes halving them a second lockstep all-reduce for no gain. The
+        // DFlash2 selector additionally reads its whole-vocabulary codebooks, which a
+        // vocabulary-parallel split would not preserve.
+        if (has_prefix("mtp/") || has_prefix("dflash2/") || has_prefix("vision/")) {
             TPObjectSplit local;
             local.object.index = idx;
             local.kind         = WeightSplitKind::Replicated;
-            local.shards       = has_prefix("mtp/") ? 0x1U : 0x2U;
+            local.shards       = has_prefix("vision/") ? 0x2U : 0x1U;
             spec.splits.push_back(std::move(local));
             continue;
         }

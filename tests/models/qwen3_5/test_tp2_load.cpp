@@ -38,7 +38,7 @@ std::pair<int, int> pick_devices() {
 
 void check_shard_shapes(const qwen::execution::Parameters& parameters, const qwen::Model& model,
                         int shard, bool expect_mtp, bool expect_split_head,
-                        bool expect_proposal_split, bool expect_vision) {
+                        bool expect_proposal_split, bool expect_dflash2, bool expect_vision) {
     const auto& weights = model.weights();
     if (expect_vision) {
         // The Vision tower is the other shard-local component: the static split keeps it on shard 1,
@@ -92,6 +92,38 @@ void check_shard_shapes(const qwen::execution::Parameters& parameters, const qwe
             }
         } else if (model.has_weight(weights.mtp->input_projection)) {
             throw std::runtime_error("shard 1 materialized the shard-local MTP layer");
+        }
+    }
+    if (expect_dflash2) {
+        // The DFlash2 masked draft is the third shard-local component: it drafts on shard 0 alone,
+        // and it stays replicated whole there because the conditioning features are bit-identical
+        // on both shards and the selector's top-k spans the whole-vocabulary codebook.
+        if (!weights.draft.has_value()) {
+            throw std::runtime_error("shard " + std::to_string(shard) +
+                                     " has no draft weights under --spec dflash2");
+        }
+        const auto& draft = *weights.draft;
+        if (shard == 0) {
+            if (!model.has_weight(draft.feature_projection)) {
+                throw std::runtime_error("shard 0 did not materialize the DFlash2 draft");
+            }
+            const auto& feature = model.weight(draft.feature_projection).view;
+            if (feature.shape[0] != 5120 || feature.shape[1] != 25600) {
+                throw std::runtime_error("shard 0 DFlash2 feature_projection is not replicated");
+            }
+            const auto& q = model.weight(draft.layers[0].attention.query).view;
+            if (q.shape[0] != 4096 || q.shape[1] != 5120) {
+                throw std::runtime_error("shard 0 DFlash2 draft query is not replicated");
+            }
+            if (!draft.selector.has_value()) {
+                throw std::runtime_error("shard 0 DFlash2 draft has no selector weights");
+            }
+            const auto& codebook = model.weight(draft.selector->predecessor_codebook).view;
+            if (codebook.shape[0] != 248320 || codebook.shape[1] != 256) {
+                throw std::runtime_error("shard 0 DFlash2 predecessor codebook is not [248320,256]");
+            }
+        } else if (model.has_weight(draft.feature_projection)) {
+            throw std::runtime_error("shard 1 materialized the shard-local DFlash2 draft");
         }
     }
     const auto layer0   = weights.text.layers[0];
@@ -178,15 +210,17 @@ int main(int argc, char** argv) {
                 const std::string backend = value();
                 if (backend == "mtp") {
                     options.speculative = SpeculativeBackend::Mtp;
+                } else if (backend == "dflash2") {
+                    options.speculative = SpeculativeBackend::DFlash2;
                 } else {
-                    throw std::invalid_argument("--spec supports mtp only");
+                    throw std::invalid_argument("--spec supports mtp and dflash2");
                 }
             } else if (arg == "--lm-head-draft") {
                 options.proposal_head = ProposalHead::Optimized;
             } else if (arg == "--vision") {
                 options.vision = true;
             } else if (arg == "--help") {
-                std::cout << "--artifact PATH [--spec mtp] [--lm-head-draft] [--vision]\n";
+                std::cout << "--artifact PATH [--spec mtp|dflash2] [--lm-head-draft] [--vision]\n";
                 return 0;
             } else {
                 throw std::invalid_argument("unknown argument " + arg);
@@ -210,13 +244,14 @@ int main(int argc, char** argv) {
         // Construct both shard Parameters: this is the blocker validated this round.
         qwen::execution::Parameters parameters0(*model0);
         qwen::execution::Parameters parameters1(*model1);
-        const bool expect_mtp   = options.speculative == SpeculativeBackend::Mtp;
-        const bool expect_split = !expect_mtp || options.proposal_enabled();
+        const bool expect_mtp     = options.speculative == SpeculativeBackend::Mtp;
+        const bool expect_dflash2 = options.speculative == SpeculativeBackend::DFlash2;
+        const bool expect_split   = !options.speculative_enabled() || options.proposal_enabled();
         const bool expect_proposal_split = options.proposal_enabled();
         check_shard_shapes(parameters0, *model0, 0, expect_mtp, expect_split, expect_proposal_split,
-                           options.vision);
+                           expect_dflash2, options.vision);
         check_shard_shapes(parameters1, *model1, 1, expect_mtp, expect_split, expect_proposal_split,
-                           options.vision);
+                           expect_dflash2, options.vision);
         std::cout << path.filename().string() << ": TP-2 dual-shard load passed "
                   << "devices=" << dev0 << "," << dev1 << " layers="
                   << model0->weights().text.layers.size() << " shard_gate=[8704,5120] "

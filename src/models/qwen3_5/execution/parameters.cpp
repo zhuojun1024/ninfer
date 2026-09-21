@@ -277,7 +277,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     if (w.vision && source.has_weight(w.vision->patch_embedding)) {
         vision = with_context("vision", [&] { return prepare.vision(*w.vision); });
     }
-    if (w.draft) {
+    if (w.draft && source.has_weight(w.draft->feature_projection)) {
         draft = with_context(std::string(model.options().speculative_component()),
                              [&] { return prepare.draft(*w.draft); });
     }
