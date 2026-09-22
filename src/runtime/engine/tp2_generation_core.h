@@ -277,7 +277,7 @@ private:
     // One MTP proposal window on shard 0: the layer's column at this position embeds the anchor
     // token (the one just sampled) and predicts the token after it; the rest of the window follows
     // autoregressively on the MTP layer. Returns mtp_drafts_ draft token ids.
-    std::vector<TokenId> mtp_propose_window(Shard& shard, Tensor& mtp_input, const Tensor& anchor,
+    std::vector<TokenId> mtp_propose_window(Shard& shard, Tensor& mtp_input, std::int32_t anchor,
                                             std::uint32_t position, DeviceArena& ws);
 
     // The prefill feature sink for the shard that owns the masked draft: it captures the target
@@ -364,21 +364,39 @@ private:
     // One plain (non-speculative) decode step at the given position. The launch mechanism is the
     // decode step mode: a captured graph by default, the eager forward for either A/B partner.
     // Returns this shard's [V,1] logits, allocated where the captured layout expects it.
+    // The whole per-round MTP draft chain on shard 0: the anchor and its two position scalars
+    // copied in from the pinned buffer, the batch forward, the autoregressive steps, and the drafts
+    // copied back to the pinned buffer. Both launch mechanisms run exactly this body - a capture
+    // records it without executing, so the capture round then launches the graph it captured.
+    void mtp_chain_body(Shard& shard, Tensor& mtp_input, const std::int32_t* pins,
+                        std::int32_t* host_drafts, const WindowGraph& bucket, DeviceArena& ws);
+    void capture_mtp_chain_graph(WindowGraph& graph, Tensor& mtp_input, const std::int32_t* pins,
+                                 std::int32_t* host_drafts, DeviceArena& ws);
     Tensor run_plain_decode_step(std::int32_t token, std::uint32_t position);
     void capture_decode_graph(WindowGraph& graph, const std::int32_t* token,
                               const std::int32_t* position, Tensor& logits);
+
+    // A captured step bakes a bucket-wide attention envelope, so the eager partners stay reachable:
+    // EagerBucket isolates the launch mechanism from the envelope, and EagerExact reproduces the
+    // pre-graph behaviour of an exact visible extent. The plain decode step and the MTP draft chain
+    // are the same kind of object and share this switch.
+    enum class StepLaunchMode { Graph, EagerBucket, EagerExact };
 
     std::vector<WindowGraph> verify_graphs_;
     std::unique_ptr<PinnedHostBuffer> verify_window_host_;
     bool verify_graph_enabled_ = false;
 
-    // Plain decode steps. A captured step bakes a bucket-wide attention envelope, so the eager
-    // partners stay reachable: EagerBucket isolates the launch mechanism from the envelope, and
-    // EagerExact reproduces the pre-graph behaviour of an exact visible extent.
-    enum class DecodeStepMode { Graph, EagerBucket, EagerExact };
+    // The MTP draft chain, captured per envelope bucket like the verify window. One pinned
+    // [anchor, position, position+1, drafts(K)] buffer carries every per-round input and output.
+    // NINFER_TP2_MTP_CHAIN_GRAPH selects the launch mechanism like NINFER_TP2_DECODE_GRAPH.
+    std::vector<WindowGraph> mtp_chain_graphs_;
+    std::unique_ptr<PinnedHostBuffer> mtp_chain_host_;
+    StepLaunchMode mtp_chain_mode_ = StepLaunchMode::Graph;
+
+    // Plain decode steps.
     std::vector<WindowGraph> decode_graphs_;
     std::unique_ptr<PinnedHostBuffer> decode_window_host_;
-    DecodeStepMode decode_step_mode_ = DecodeStepMode::Graph;
+    StepLaunchMode decode_step_mode_ = StepLaunchMode::Graph;
 
     // Total seconds spent loading and materializing both shards (for LoadSummary).
     double load_seconds_ = 0.0;

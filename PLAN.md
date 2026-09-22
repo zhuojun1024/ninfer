@@ -687,6 +687,41 @@ append K=7/K=5/ring 三金值不变。**教训**：「签名先行、体转发�
 20.3→22.6 tok/s；decode_short 20.6→23.0 tok/s（+11.7%）；prefill 三段持平；MTP K=2 对照 67.9/64.8 tok/s（B 基线带 66–72 内）无回归。
 轮时差与 MTP 窗口图的 -4.3 ms 同量级（B7 判据 −4~4.5 ms/轮达标）；合成文本接受率 ~1 tok/轮 ⇒ 吞吐增益 +11%（判据 +15% 为 MTP 口径推算，
 实测口径下合理）。
+
+**E 轮（MTP draft 链图化，进行中）**：目标＝把 MTP 的 draft 链（K=2 实测 7–10 ms/轮，docs/tp2-dual-5060ti.md:127-128 的最大单笔开销）
+整链捕获进 CUDA Graph（llama.cpp 同款：整轮含链全图）。选它的理由：纯启动方式变化、**不动数值契约**（C 轮已证 graph≡eager 逐位）、
+复用 C 轮全部机制（WindowGraph/桶/pinned 输入/memcpy 节点）。步骤：① 侦察 `mtp_forward_batch`/`mtp_forward_ar_step`（text.cpp）的捕获面——
+per-round 值（:1119/:1121 两个 `set_i32_scalar` 必须改 pinned 传递，C 轮教训）、host 同步点、采样/状态地址稳定性；② 整链一张图/桶
+（K 步 + D2D hidden 接力 + `increment_i32_scalar` + 采样），per-round 输入走 pinned（anchor、position）+ 稳定设备张量
+（`mtp_anchor_hidden`/采样状态/MTP KV slab），`drafts` 出设备张量 + 轮内一次 D2H；桶可复用 ordinary_graph_profiles（envelope 是路由提示、
+宽度不改数值——C1 实证）；③ graph on/off 逐字节 A/B（`NINFER_TP2_MTP_CHAIN_GRAPH=0` 对照）+ sessions 三路由 + append 金值不变；
+④ bench MTP K=2 对照（基线 38.2 ms/轮、67.9/64.8 tok/s）；⑤ 文档 + 提交。判定：链出 drafts 逐位不变 ⇒ 窗口/接受/轨迹全不动；
+预期 38.2→~30 ms/轮、MTP decode +15–20%。
+E2 进度：`tools/win_port/r52_ab.ps1`（r52 同五提示、greedy top_k=1、hash=sha256(content||reasoning)[:16]）已建，**pre-E 金值**（当前构建、
+--spec mtp 131072 fp8 KV）：req0 `9f4abde908470928`(stop/130)、req1 `a956f217d6a6250c`(length/436)、req2 `847d706198441ac9`(length/608)、
+req3 `49800780a7666b44`(stop/69)、req4 `46698bd3a4f115ee`(stop/634)。验收＝三臂一致（pre == eager(NINFER_TP2_MTP_CHAIN_GRAPH=0) == graph）。
+捕获面结论：`mtp_forward_batch/ar_step`→`mtp_forward_core`→`stem/tail` 全设备算子无同步；per-round 值仅 :1119-:1121 三个 set_i32_scalar
+（token/position/position+1）→ 改 pinned+copy_i32；envelope 是 host 结构进发射计划 → 桶化（内核 active-splits 从设备 positions 推导且
+归约器同源 ⇒ 加宽按构造无害，C1 先例）；stem 的 embedding_tp2（列切）+ split-head proposal_argmax 走 pair ⇒ capture_group 双流。
+
+**E 轮结果（验收完成，待 bench/文档/提交）**：实现＝pinned `[anchor, position, position+1, drafts(K)]` 缓冲 + memcpy 节点、`mtp_chain_body`
+单一实现三路共用（eager×2 + capture）、`capture_mtp_chain_graph` capture_group 双流、watermark 复用 verify 窗口 select/reusable/launch；
+三态开关 `NINFER_TP2_MTP_CHAIN_GRAPH`（unset=graph / `0`=eager(bucket) / `exact`=eager(exact)，与 `NINFER_TP2_DECODE_GRAPH` 同约定；
+`DecodeStepMode` 更名 `StepLaunchMode` 两处共用）。**验收证据：graph / eager(bucket) / eager(exact) 三臂五条哈希逐位一致；且 git-stash
+二分（HEAD 旧构建 vs 新构建）逐位一致 ⇒ 改动金值中性、图捕获逐位无损；exact 逐步 envelope == bucket 全宽 envelope ⇒ 链步数值对
+envelope 中性（C1 同类再证）**。干净金值（复现 5 次、跨两构建）：req0 `5b4a978335a95cbb`(stop/186)、req1 `2072b4db667b861d`(length/449)、
+req2 `3ce32871d0a13d34`(length/571)、req3 `56fd6e3da523651d`(stop/200)、req4 `cc73c73125c6f621`(stop/629)。
+**教训（最初 pre 基线离群的根因）**：逗号优先级 bug 的首探针在同一服务器先发过一条拼接乱码长请求，其 prefill 以不同分块形状算出的
+37-token 模板前缀 KV 被金样复用（「KV 行带归约形状 ulp」契约）⇒ 全程 near-tie 漂移；stash 二分自证改动无辜后定位到此。
+**贪心金值必须在干净服务器上采集（此前零请求）**——已写入 `r52_ab.ps1` 头注释。
+**E 轮回归补记（零字节推进陷阱）**：sessions 暴露——捕获体某侧 scratch 全是作用域内分配（净增量 0），重放侧 `alloc_bytes(0)` 被
+`DeviceArena::alloc_bytes` 拒绝（"arena allocation must be nonzero"）；服务流净增量非零故金值全绿，会话流（recall/分块重 prefill）
+净零、首个重放即炸。三处窗口/链重放推进点已按 `position_arena` 的 `target > used` 成例把 0 视为 no-op；sessions 三路由全过
+（plain/mtp/dflash2，mtp 的 `2 layouts` 属性保持）。
+**E 轮性能定论**（`NINFER_TP2_TIMING=1` 固定贪心轨迹 A/B，四次运行同轨迹 94 轮/180 提交）：链步 eager 3.73/3.69 → 图化 3.50/3.50 ms；
+整轮 34.30/34.09 → 33.99/33.95 ms ⇒ 捕获消掉 ~0.2–0.3 ms/轮主机发射间隙（decode ≈ +0.7%），**不是** E5 预估的 +15–20%：旧"7–10 ms 链"
+是更慢轮次的减法分解，实测链为 3.5–3.7 ms 真实 MTP 层 GPU 工作、发射间隙本就多被掩盖。bench_serve 跨运行 decode 率无法分辨（nonce
+换内容 ⇒ 接受率/轮数漂移），以组件 A/B 为准。
 - 不确定性：acceptance 与 token/轮由数学决定、跨卡可迁移（残差逐位相同），但本机 draft 是 w4a4 而非
   nvfp4 ⇒ 接受率会有小差；效率锚点取自 MTP 轮次；未计 prefill 与首轮抖动。
 

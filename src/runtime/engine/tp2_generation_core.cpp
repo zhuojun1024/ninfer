@@ -375,6 +375,15 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         const char* env        = std::getenv("NINFER_TP2_VERIFY_GRAPH");
         verify_graph_enabled_  = env == nullptr || env[0] != '0';
     }
+    {
+        const char* env = std::getenv("NINFER_TP2_MTP_CHAIN_GRAPH");
+        if (env != nullptr && std::strcmp(env, "0") == 0) {
+            mtp_chain_mode_ = StepLaunchMode::EagerBucket;
+        } else if (env != nullptr && std::strcmp(env, "exact") == 0) {
+            mtp_chain_mode_ = StepLaunchMode::EagerExact;
+        }
+        if (!pair_.in_kernel_allreduce()) { mtp_chain_mode_ = StepLaunchMode::EagerExact; }
+    }
     if (mtp_enabled_ || dflash2_enabled_) {
         // The verify window is assembled in this portable pinned buffer every round: the capture
         // path reads it through memcpy nodes, and the eager path reads it directly. MTP assembles
@@ -407,6 +416,23 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
             verify_graphs_.push_back(std::move(graph));
         }
     }
+    if (mtp_enabled_) {
+        // The draft chain is the same kind of object as the verify window: one captured sequence per
+        // envelope bucket whose only per-round inputs are the anchor token and its position scalars.
+        // They reach it through this pinned [anchor, position, position+1, drafts(K)] buffer, which
+        // memcpy nodes re-read on every replay, and the chain publishes its drafts back into the
+        // trailing slots. The buckets cover the chain's widest step (the last autoregressive one).
+        mtp_chain_host_ = std::make_unique<PinnedHostBuffer>(
+            static_cast<std::size_t>(3 + mtp_drafts_) * sizeof(std::int32_t), true);
+        for (const auto& profile :
+             qwen::detail::mtp_graph_profiles(options_.max_context, mtp_drafts_)) {
+            WindowGraph graph;
+            graph.visible_begin = profile.min + 1U;
+            graph.visible_end   = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                options_.max_context, static_cast<std::uint64_t>(profile.max) + mtp_drafts_ + 1U));
+            mtp_chain_graphs_.push_back(std::move(graph));
+        }
+    }
 
     // The plain (non-speculative) decode step is the same kind of object as the verify window: one
     // token, the same launch sequence per round, and its only per-round inputs are the decoded token,
@@ -418,12 +444,12 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     {
         const char* env = std::getenv("NINFER_TP2_DECODE_GRAPH");
         if (env != nullptr && std::strcmp(env, "0") == 0) {
-            decode_step_mode_ = DecodeStepMode::EagerBucket;
+            decode_step_mode_ = StepLaunchMode::EagerBucket;
         } else if (env != nullptr && std::strcmp(env, "exact") == 0) {
-            decode_step_mode_ = DecodeStepMode::EagerExact;
+            decode_step_mode_ = StepLaunchMode::EagerExact;
         }
-        if (!pair_.in_kernel_allreduce()) { decode_step_mode_ = DecodeStepMode::EagerExact; }
-        if (decode_step_mode_ != DecodeStepMode::EagerExact) {
+        if (!pair_.in_kernel_allreduce()) { decode_step_mode_ = StepLaunchMode::EagerExact; }
+        if (decode_step_mode_ != StepLaunchMode::EagerExact) {
             for (const auto& profile : qwen::detail::ordinary_graph_profiles(options_.max_context)) {
                 WindowGraph graph;
                 graph.visible_begin = profile.min + 1U;
@@ -433,11 +459,14 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         }
         decode_window_host_ = std::make_unique<PinnedHostBuffer>(
             static_cast<std::size_t>(2) * sizeof(std::int32_t), true);
-        std::fprintf(stderr, "[tp2-graph] plain decode step: %s | verify step: %s\n",
-                     decode_step_mode_ == DecodeStepMode::Graph        ? "graph"
-                     : decode_step_mode_ == DecodeStepMode::EagerBucket ? "eager(bucket)"
-                                                                        : "eager(exact)",
-                     verify_graph_enabled_ ? "graph" : "eager");
+        std::fprintf(stderr, "[tp2-graph] plain decode step: %s | verify step: %s | mtp chain: %s\n",
+                     decode_step_mode_ == StepLaunchMode::Graph        ? "graph"
+                     : decode_step_mode_ == StepLaunchMode::EagerBucket ? "eager(bucket)"
+                                                                       : "eager(exact)",
+                     verify_graph_enabled_ ? "graph" : "eager",
+                     mtp_chain_mode_ == StepLaunchMode::Graph        ? "graph"
+                     : mtp_chain_mode_ == StepLaunchMode::EagerBucket ? "eager(bucket)"
+                                                                     : "eager(exact)");
     }
 
     frontend_ = std::make_unique<qwen::Frontend>(
@@ -1011,9 +1040,11 @@ void TP2GenerationCore::run_verify_window(const std::int32_t* ids, std::int32_t 
             }
             launch_window_graph(*graph);
             // The captured body allocated its operands during capture; a replay does not run that
-            // host code, so advance both arenas by what the capture consumed.
-            (void)shard_a.workspace->alloc_bytes(graph->arena_bytes[0]);
-            (void)shard_b.workspace->alloc_bytes(graph->arena_bytes[1]);
+            // host code, so advance both arenas by what the capture consumed. A side the body only
+            // touched through scope-unwound scratch nets zero, and zero is a no-op here exactly as
+            // in position_arena.
+            if (graph->arena_bytes[0] > 0) { (void)shard_a.workspace->alloc_bytes(graph->arena_bytes[0]); }
+            if (graph->arena_bytes[1] > 0) { (void)shard_b.workspace->alloc_bytes(graph->arena_bytes[1]); }
         }
     }
     shard_a.context->set_gdn_state_action(qwen::execution::GdnStateAction::UpdateInPlace, nullptr);
@@ -1052,7 +1083,7 @@ Tensor TP2GenerationCore::run_plain_decode_step(std::int32_t token, std::uint32_
     Shard& shard_a = shard_a_;
     Shard& shard_b = shard_b_;
     const std::int32_t vocab = qwen::execution::dimension(shard_a.model->config().text.vocab_size);
-    if (decode_step_mode_ == DecodeStepMode::EagerExact) {
+    if (decode_step_mode_ == StepLaunchMode::EagerExact) {
         // The pre-graph route: the exact visible extent, with the token and the position baked into
         // the forward's own scalar kernels. Kept as the reference arm of the A/B.
         Tensor logits_a = shard_a.workspace->alloc(DType::BF16, {vocab, 1});
@@ -1064,7 +1095,7 @@ Tensor TP2GenerationCore::run_plain_decode_step(std::int32_t token, std::uint32_
     const std::uint32_t visible_end = position + 1U;
     WindowGraph* graph = select_window_graph(decode_graphs_, visible_end);
     if (graph == nullptr) { throw std::logic_error("TP-2 decode step coverage is incomplete"); }
-    const bool captured = decode_step_mode_ == DecodeStepMode::Graph;
+    const bool captured = decode_step_mode_ == StepLaunchMode::Graph;
     WindowGraph* reusable =
         captured ? reusable_window_graph(decode_graphs_, visible_end) : nullptr;
     // A replay must reproduce the addresses the capture baked into its kernel arguments, so both
@@ -1100,48 +1131,143 @@ Tensor TP2GenerationCore::run_plain_decode_step(std::int32_t token, std::uint32_
     launch_window_graph(*graph);
     // The captured body allocated its operands during capture; a replay does not run that host code,
     // so advance both arenas by what the capture consumed.
-    (void)shard_a.workspace->alloc_bytes(graph->arena_bytes[0]);
-    (void)shard_b.workspace->alloc_bytes(graph->arena_bytes[1]);
+    if (graph->arena_bytes[0] > 0) { (void)shard_a.workspace->alloc_bytes(graph->arena_bytes[0]); }
+    if (graph->arena_bytes[1] > 0) { (void)shard_b.workspace->alloc_bytes(graph->arena_bytes[1]); }
     return logits;
 }
 
-std::vector<TokenId> TP2GenerationCore::mtp_propose_window(Shard& shard, Tensor& mtp_input,
-                                                           const Tensor& anchor,
-                                                           std::uint32_t position,
-                                                           DeviceArena& ws) {
+void TP2GenerationCore::mtp_chain_body(Shard& shard, Tensor& mtp_input, const std::int32_t* pins,
+                                       std::int32_t* host_drafts, const WindowGraph& bucket,
+                                       DeviceArena& ws) {
     auto& ctx = *shard.context;
     const auto& config = shard.model->config().text;
     const std::int32_t hidden = qwen::execution::dimension(config.hidden_size);
     const std::int32_t vocab  = qwen::execution::dimension(config.vocab_size);
     shard.device.bind_to_current_thread();
     cudaStream_t stream = shard.device.stream;
-    Tensor positions = ws.alloc(DType::I32, {1});
-    ops::set_i32_scalar(positions, static_cast<std::int32_t>(position), stream);
+    // The three per-round scalars reach the chain through graph-capturable copies from the pinned
+    // buffer: a set_i32_scalar would bake the capture's values into its kernel, and every replay
+    // would run at the capture's position. The autoregressive position advances on the device.
+    Tensor anchor_dev  = ws.alloc(DType::I32, {1});
+    Tensor positions   = ws.alloc(DType::I32, {1});
     Tensor ar_position = ws.alloc(DType::I32, {1});
-    ops::set_i32_scalar(ar_position, static_cast<std::int32_t>(position) + 1, stream);
+    CUDA_CHECK(cudaMemcpyAsync(anchor_dev.data, pins, sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(positions.data, pins + 1, sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ar_position.data, pins + 2, sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, stream));
     Tensor drafts    = ws.alloc(DType::I32, {static_cast<std::int32_t>(mtp_drafts_)});
     Tensor ar_hidden = ws.alloc(DType::BF16, {hidden, 1});
     Tensor logits    = ws.alloc(DType::BF16, {vocab, 1});
-    const auto visible = static_cast<std::uint32_t>(position) + 1;
-    const ops::CausalAttentionExecutionEnvelope bridge{visible, visible};
+    // Graph and EagerBucket run one bucket-wide envelope for every step - the captured launch
+    // geometry must cover every replayed position the bucket contains. The envelope only sets split
+    // policy and chunking; the kernels derive their visible set from the device positions. EagerExact
+    // reproduces the pre-graph per-step envelopes as the A/B partner.
+    const bool exact = mtp_chain_mode_ == StepLaunchMode::EagerExact;
+    const auto step_envelope = [&](std::uint32_t visible) {
+        return ops::CausalAttentionExecutionEnvelope{exact ? visible : bucket.visible_begin,
+                                                     exact ? visible : bucket.visible_end};
+    };
+    const std::uint32_t base = static_cast<std::uint32_t>(pins[1]);
     Tensor draft0 = drafts.slice(0, 0, 1);
-    ctx.mtp_forward_batch(anchor, mtp_input, positions, bridge, ar_hidden, 0, &logits, &draft0);
+    ctx.mtp_forward_batch(anchor_dev, mtp_input, positions, step_envelope(base + 1U), ar_hidden, 0,
+                          &logits, &draft0);
     for (std::uint32_t i = 1; i < mtp_drafts_; ++i) {
         Tensor previous    = drafts.slice(0, static_cast<std::int32_t>(i) - 1, 1);
         Tensor next_draft  = drafts.slice(0, static_cast<std::int32_t>(i), 1);
         Tensor step_hidden = ws.alloc(DType::BF16, {hidden, 1});
-        const auto step_visible = static_cast<std::uint32_t>(position) + i + 1;
-        const ops::CausalAttentionExecutionEnvelope envelope{step_visible, step_visible};
-        ctx.mtp_forward_ar_step(previous, ar_hidden, ar_position, envelope, step_hidden, logits,
-                                next_draft);
+        ctx.mtp_forward_ar_step(previous, ar_hidden, ar_position, step_envelope(base + i + 1U),
+                                step_hidden, logits, next_draft);
         CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, step_hidden.data, ar_hidden.bytes(),
                                    cudaMemcpyDeviceToDevice, stream));
         ops::increment_i32_scalar(ar_position, stream);
     }
-    std::vector<TokenId> host(mtp_drafts_, 0);
-    CUDA_CHECK(cudaMemcpyAsync(host.data(), drafts.data, sizeof(TokenId) * mtp_drafts_,
+    // The drafts land in the pinned buffer: the round reads them after one sync, and a replay
+    // publishes a fresh set without running any host code.
+    CUDA_CHECK(cudaMemcpyAsync(host_drafts, drafts.data, sizeof(TokenId) * mtp_drafts_,
                                cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void TP2GenerationCore::capture_mtp_chain_graph(WindowGraph& graph, Tensor& mtp_input,
+                                                const std::int32_t* pins, std::int32_t* host_drafts,
+                                                DeviceArena& ws) {
+    Shard& shard_a = shard_a_;
+    Shard& shard_b = shard_b_;
+    shard_a.device.bind_to_current_thread();
+    graph.round_base[0]  = shard_a.round_base;
+    graph.round_base[1]  = shard_b.round_base;
+    graph.arena_begin[0] = ws.used();
+    graph.arena_begin[1] = shard_b.workspace->used();
+    // The chain runs on shard 0, but the column-split token embedding (and a split proposal head)
+    // enqueue pair work on both streams, so the capture records both like the verify window does.
+    DecodeGraphDefinition* definitions[2] = {&graph.definition[0], &graph.definition[1]};
+    cudaStream_t streams[2] = {shard_a.device.stream, shard_b.device.stream};
+    DecodeGraphDefinition::capture_group(definitions, streams, [&] {
+        mtp_chain_body(shard_a, mtp_input, pins, host_drafts, graph, ws);
+    });
+    graph.arena_bytes[0] = ws.used() - graph.arena_begin[0];
+    graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
+    shard_a.device.bind_to_current_thread();
+    graph.executable[0].instantiate(graph.definition[0]);
+    shard_b.device.bind_to_current_thread();
+    graph.executable[1].instantiate(graph.definition[1]);
+    shard_a.device.bind_to_current_thread();
+    graph.captured = true;
+}
+
+std::vector<TokenId> TP2GenerationCore::mtp_propose_window(Shard& shard, Tensor& mtp_input,
+                                                           std::int32_t anchor,
+                                                           std::uint32_t position,
+                                                           DeviceArena& ws) {
+    // Every per-round input reaches the chain through this pinned buffer: [anchor(1), position(1),
+    // position+1(1), drafts(K)]. The capture re-reads it through memcpy nodes on every replay and
+    // the chain publishes its drafts back into the trailing slots.
+    auto* pins            = static_cast<std::int32_t*>(mtp_chain_host_->data());
+    std::int32_t* host_drafts = pins + 3;
+    pins[0]               = anchor;
+    pins[1]               = static_cast<std::int32_t>(position);
+    pins[2]               = static_cast<std::int32_t>(position) + 1;
+    const std::uint32_t visible_end = position + mtp_drafts_ + 1U;
+    WindowGraph* bucket = select_window_graph(mtp_chain_graphs_, visible_end);
+    if (bucket == nullptr) {
+        throw std::logic_error("TP-2 MTP chain coverage is incomplete");
+    }
+    if (mtp_chain_mode_ != StepLaunchMode::Graph) {
+        // The eager routes run the same body: EagerBucket shares the captured sequence's bucket
+        // envelope (an A/B of the launch mechanism alone) and EagerExact reproduces the pre-graph
+        // per-step envelopes (an A/B of the envelope's reduction shape).
+        mtp_chain_body(shard, mtp_input, pins, host_drafts, *bucket, ws);
+    } else {
+        WindowGraph* graph = bucket;
+        if (reusable_window_graph(mtp_chain_graphs_, visible_end) == nullptr) {
+            // Capturing records the sequence without executing it, so the capture round still has to
+            // run the chain it just captured (through the graph, with the operands the capture
+            // allocated).
+            capture_mtp_chain_graph(*graph, mtp_input, pins, host_drafts, ws);
+            launch_window_graph(*graph);
+        } else {
+            if (ws.used() != graph->arena_begin[0] ||
+                shard_b_.workspace->used() != graph->arena_begin[1]) {
+                throw std::logic_error(
+                    "TP-2 MTP chain CUDA Graph replay found a different workspace layout");
+            }
+            launch_window_graph(*graph);
+            // The captured body allocated its operands during capture; a replay does not run that
+            // host code, so advance the arena by what the capture consumed. A side the body only
+            // touched through scope-unwound scratch nets zero, and zero is a no-op here exactly as
+            // in position_arena.
+            if (graph->arena_bytes[0] > 0) { (void)ws.alloc_bytes(graph->arena_bytes[0]); }
+            if (graph->arena_bytes[1] > 0) {
+                (void)shard_b_.workspace->alloc_bytes(graph->arena_bytes[1]);
+            }
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(shard.device.stream));
+    std::vector<TokenId> host(mtp_drafts_, 0);
+    for (std::uint32_t i = 0; i < mtp_drafts_; ++i) {
+        host[i] = static_cast<TokenId>(host_drafts[i]);
+    }
     return host;
 }
 
@@ -3004,11 +3130,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             // One window: [anchor, d0, ..., d_{K-1}] at consecutive positions from the anchor's. The
             // MTP layer's column at (anchor - 1) embeds the anchor token and predicts the token after
             // it, so its drafts become the window's columns 1..K.
-            Tensor anchor_dev = ws_a.alloc(DType::I32, {1});
-            ops::set_i32_scalar(anchor_dev, mtp_anchor, shard_a_.device.stream);
             const std::vector<TokenId> drafts =
-                mtp_propose_window(shard_a_, shard_a_.mtp_anchor_hidden, anchor_dev,
-                                   mtp_position - 1, ws_a);
+                mtp_propose_window(shard_a_, shard_a_.mtp_anchor_hidden,
+                                   static_cast<std::int32_t>(mtp_anchor), mtp_position - 1, ws_a);
             timing.record(1, shard_a_.device.stream);
             const std::int32_t width = static_cast<std::int32_t>(mtp_drafts_) + 1;
             // Every per-round input to the verify goes through the pinned window: the capture path

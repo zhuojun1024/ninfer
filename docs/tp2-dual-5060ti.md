@@ -123,9 +123,12 @@ throughput - and four things consume that on decode:
   ~2.9 ms of launch gaps; splitting heads doubles the collectives to 128 allreduces per token
   (~2.6 MB round trip, 9-18 us each); the fused `linear_swiglu`/`attn_input_proj` kernels are
   registered for full-model rows only and are bypassed on shard-local rows. llama.cpp captures the
-  whole round, draft chain included, in CUDA graphs (95-96 replays per 256-token answer).
+  whole round, draft chain included, in CUDA graphs (95-96 replays per 256-token answer). Both launch
+  gaps are recovered since: the verify window and the MTP draft chain are each captured per envelope
+  bucket (see "Verify CUDA graph" and "MTP draft-chain CUDA graph").
 - **Draft chain on the host.** Two drafts cost 7-10 ms of the 38.2 ms round on top of the ~30 ms
-  verify forward, so the MTP chain, not the kernels, is the largest single overhead.
+  verify forward, so the MTP chain, not the kernels, is the largest single overhead. Recovered since:
+  the chain is one captured sequence per envelope bucket (see "MTP draft-chain CUDA graph").
 
 Caveat: llama.cpp ran with the owner's exact command line and therefore its default batch/ubatch; a
 larger `-ub` was not tried and could move its prefill numbers.
@@ -296,6 +299,43 @@ stays in its 66-72 tok/s band (67.9/64.8), so the wiring costs neither route. Th
 delta matches the MTP window's -4.3 ms; the smaller throughput gain than MTP's +16.6% is the
 synthetic text's low acceptance, which leaves less output per round to speed up.
 
+## MTP draft-chain CUDA graph
+
+The MTP chain (split embedding, MTP-layer stem, the autoregressive hidden relay, the two draft
+proposals) ran as three host-serial forward calls per round. It is now one captured sequence per
+envelope bucket and per device, launched together through `capture_group` on the two shards'
+streams - the structure llama.cpp uses for its whole round. The three per-round scalars reach the
+chain from the pinned buffer's leading ints (`[anchor, position, position+1]`) through
+graph-capturable memcpy nodes: `set_i32_scalar` bakes its value into the setter kernel's launch
+arguments, so a replay would otherwise run at the capture's position. The autoregressive position
+advances on the device, the hidden relay moves on the device, and the drafts return through one D2H
+copy into the same pinned buffer. The captured body is the eager route's body verbatim.
+
+Replay bookkeeping exposed one real trap. A captured body's workspace advance is replayed as
+`alloc_bytes(captured_delta)` per side, and a side whose scratch is entirely scope-unwound nets
+zero - a legitimate value that `DeviceArena::alloc_bytes` rejects ("arena allocation must be
+nonzero"). The served flow nets a small positive peer-side delta and never saw it; the session flows
+(recall, chunked re-prefill) net zero and died at the first replay. All three window/chain replay
+advances now treat zero as a no-op, exactly as `position_arena` already did with its strict
+`target > used` comparison.
+
+`NINFER_TP2_MTP_CHAIN_GRAPH` selects the launch mode with the same convention as
+`NINFER_TP2_DECODE_GRAPH` (the shared enum is now `StepLaunchMode`): unset captures, `0` runs the
+same body eagerly against the bucket envelope, `exact` reproduces the pre-graph per-step envelopes.
+`exact` is also forced without the in-kernel allreduce transport.
+
+The acceptance is byte-exact and the performance claim is smaller than projected. Five greedy goldens
+are byte-identical across all three modes and against the pre-change build (git-stash A/B), the
+sessions suite passes on all three routes, and the deterministic-trajectory
+`NINFER_TP2_TIMING=1` A/B (identical 94-round / 180-token walks in all runs) measures the chain step
+at 3.73/3.69 ms eager versus 3.50/3.50 ms captured, the round at 34.30/34.09 -> 33.99/33.95 ms. The
+capture removes about 0.2-0.3 ms of host launch gap per round (~+0.7% decode), not the projected
+15-20%: the earlier "7-10 ms chain" figure was a subtraction from a slower round, and the
+instrumentation shows 3.5-3.7 ms of real MTP-layer work whose launch gaps were already mostly
+hidden behind it. `bench_serve` decode rates cannot settle this either - its unique nonces change
+the sampled content, which moves draft acceptance and the round count - so the component A/B above
+is the measurement of record.
+
 ## Proposal head
 
 `--lm-head-draft` switches the draft head from the weight-tied full output head (248,320 rows,
@@ -456,6 +496,7 @@ The context cache is disabled on this route -- the core owns the prefix-reuse sn
 | DFlash2 masked-draft round | `ninfer_qwen3_5_tp2_dflash_append_test` (`--k 7`, `--k 5`) | sink logits bit-identical with and without the sink; ring sane and reproducible (fnv1a `0x1a53fd824cd4e360`); direct/split append bit-identical; proposal deterministic (fnv1a `0xbad27a494a9bc853` at K=7, `0xbee487264ca8ffb8` at K=5) |
 | DFlash2 walk determinism | `ninfer_qwen3_5_tp2_dflash_solo_test` (independent processes) | one digest (`0x4bcc3994a5efba7d`) over 10 captured-graph runs with identical walk bodies, byte-identical again under `NINFER_TP2_VERIFY_GRAPH=0`; the recalled walk matches the from-scratch walk of the same prompt on its first sample in every run |
 | DFlash2 verify CUDA graph | solo A/B graph vs `NINFER_TP2_VERIFY_GRAPH=0`, `bench_serve.ps1` served route | walk digests byte-identical across routes (before the capture-forwarding fix 2 of 6 graph runs flipped the tail near tie); equal-output 128-token decode -10.2% wall (-4.9 ms/round), prefill flat, MTP K=2 control in its band |
+| MTP draft-chain CUDA graph | r52 greedy goldens in all three launch modes + git-stash pre-change A/B, `ninfer_qwen3_5_tp2_sessions_test`, `NINFER_TP2_TIMING=1` trajectory A/B | 5/5 byte-identical across graph/eager(bucket)/eager(exact) and the pre-change build; sessions pass on all three routes (after teaching the replay advances to accept a zero workspace delta); identical 94-round walks measure the chain step 3.7 -> 3.5 ms and the round 34.2 -> 34.0 ms |
 | Cross-session KV retention | `ninfer_qwen3_5_tp2_sessions_test` (`NINFER_TEST_ARTIFACT`; all three routes) | every route: a returning conversation recalled 71 prompt tokens and matched the oracle token for token where the draft pattern survives (the switch scenario on the prefill grid and the cancellation retry included); the LRU-evicted one reported `reused_prompt_tokens == 0`. DFlash2 with a declined draft pins the boundary crossing (first sample), whose target-only tail is a different draft pattern's walk. The MTP round's shard-0 arena reports `2 layouts` against shard 1's `1`, so its own KV slab travels with the session |
 
 "Exact" is bit for bit: the split Op output equals the same Op run with the full weight on the same
