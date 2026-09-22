@@ -539,10 +539,12 @@ client-executed functions; this does not add a remote MCP executor.
 NInfer renders these definitions in the Qwen prompt and parses model output into separate
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
-a later request. Only functions in the current effective tool set can become structured calls;
-undeclared model output remains ordinary text. `allowed_tools` with mode `auto` filters that set
-without changing declaration order, while `tool_choice:"none"` disables structured tool output even
-when the history contains earlier calls.
+a later request. Every recognized marker region becomes structured calls: a function name outside
+the current effective tool set is published for client validation instead of returning to ordinary
+text, and a region the output budget cut off keeps its calls plus the bytes generated for a last,
+unclosed parameter. `allowed_tools` with mode `auto` filters that set without changing declaration
+order, while `tool_choice:"none"` disables structured tool output even when the history contains
+earlier calls.
 
 NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
 `strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
@@ -894,10 +896,12 @@ they do not infer request behavior from process-global counter deltas.
 unspecified. `enable_thinking` records whether the response starts in thinking mode.
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
-call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
-preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
-`malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
-`trailing_content`. These counters contain no tool arguments or generated text.
+call count, published calls whose function name is outside the declared set, whether the marker
+region ended with the model output instead of its closing framing, empty non-string arguments
+omitted during normalization, schema-mismatched arguments preserved for consumer validation, and a
+stable text-fallback reason. Fallback reasons are `none`, `malformed_structure`,
+`duplicate_parameter`, `invalid_tool_name`, and `trailing_content`. These records contain no tool
+arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,

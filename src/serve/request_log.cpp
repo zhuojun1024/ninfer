@@ -87,6 +87,8 @@ const char* finish_reason_name(ninfer::FinishReason reason) {
 Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
     return Json{{"marker_seen", diagnostics.marker_seen},
                 {"structured_call_count", diagnostics.structured_call_count},
+                {"undeclared_tool_calls", diagnostics.undeclared_tool_calls},
+                {"truncated_region", diagnostics.truncated_region},
                 {"empty_arguments_omitted", diagnostics.empty_arguments_omitted},
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
                 {"fallback_reason",

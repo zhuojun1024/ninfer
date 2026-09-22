@@ -445,6 +445,8 @@ int main() {
     failures +=
         check(done.at("result").at("tool_call_parse").at("marker_seen") == false &&
                   done.at("result").at("tool_call_parse").at("structured_call_count") == 0 &&
+                  done.at("result").at("tool_call_parse").at("undeclared_tool_calls") == 0 &&
+                  done.at("result").at("tool_call_parse").at("truncated_region") == false &&
                   done.at("result").at("tool_call_parse").at("empty_arguments_omitted") == 0 &&
                   done.at("result").at("tool_call_parse").at("schema_mismatch_arguments") == 0 &&
                   done.at("result").at("tool_call_parse").at("fallback_reason") == "none",
@@ -498,6 +500,8 @@ int main() {
     normalized_tool_outcome.tool_call_parse = {
         .marker_seen               = true,
         .structured_call_count     = 1,
+        .undeclared_tool_calls     = 1,
+        .truncated_region          = true,
         .empty_arguments_omitted   = 1,
         .schema_mismatch_arguments = 2,
         .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
@@ -508,6 +512,10 @@ int main() {
         normalized_tool_done.at("result").at("tool_call_count") == 1 &&
             normalized_tool_done.at("result").at("tool_call_parse").at("structured_call_count") ==
                 1 &&
+            normalized_tool_done.at("result").at("tool_call_parse").at("undeclared_tool_calls") ==
+                1 &&
+            normalized_tool_done.at("result").at("tool_call_parse").at("truncated_region") ==
+                true &&
             normalized_tool_done.at("result").at("tool_call_parse").at("empty_arguments_omitted") ==
                 1 &&
             normalized_tool_done.at("result")

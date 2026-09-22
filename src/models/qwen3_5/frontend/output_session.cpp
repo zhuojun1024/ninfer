@@ -145,6 +145,7 @@ struct DecoderState {
     bool in_reasoning              = false;
     bool strip_content_leading     = false;
     bool terminal                  = false;
+    FinishReason terminal_reason   = FinishReason::None;
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
     std::optional<std::uint32_t> matched_stop_order;
@@ -296,7 +297,7 @@ void feed_token_bytes(DecoderState& state, std::string_view bytes, const StopPol
 }
 
 void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput& emitted,
-                 std::uint32_t committed_tokens) {
+                 std::uint32_t committed_tokens, FinishReason reason) {
     if (!state.utf8_pending.empty()) {
         // A token budget can end between byte-level tokens of one code point.
         // Publish the standard replacement character rather than an invalid
@@ -312,15 +313,17 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
     } else {
         close_channel(state, OutputChannel::Content, emitted);
     }
-    state.stop_pending = {};
-    state.terminal     = true;
+    state.stop_pending    = {};
+    state.terminal        = true;
+    state.terminal_reason = reason;
 }
 
-DecoderState terminal_state(DecoderState state) {
+DecoderState terminal_state(DecoderState state, FinishReason reason) {
     state.utf8_pending.clear();
     state.think_marker_pending.clear();
-    state.stop_pending = {};
-    state.terminal     = true;
+    state.stop_pending    = {};
+    state.terminal        = true;
+    state.terminal_reason = reason;
     return state;
 }
 
@@ -489,7 +492,8 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
                          &match);
 
         if (match.found) {
-            impl_->preview_state = terminal_state(std::move(impl_->preview_state));
+            impl_->preview_state =
+                terminal_state(std::move(impl_->preview_state), FinishReason::StopString);
             impl_->preview_state.matched_stop_order = match.declaration_order;
             impl_->preview_output                   = std::move(match.output);
             return complete(match.committed_tokens, FinishReason::StopString);
@@ -500,14 +504,16 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
                 impl_->preview_state  = std::move(before_state);
                 impl_->preview_output = std::move(before_output);
             }
-            terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+            terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count,
+                        FinishReason::StopToken);
             return complete(count, FinishReason::StopToken);
         }
     }
 
     const auto count = static_cast<std::uint32_t>(tokens.size());
     if (tokens.size() == total_budget_remaining) {
-        terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+        terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count,
+                    limit_reason);
         return complete(count, limit_reason);
     }
     if (impl_->preview_semantic.in_reasoning && impl_->preview_semantic.budget &&
@@ -619,7 +625,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     impl_->preview_execution_split_after.reset();
     impl_->preview_semantic.control_pending = false;
     impl_->preview_output.clear();
-    terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
+    terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0, reason);
     impl_->preview_ready = true;
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
 }
@@ -641,7 +647,11 @@ PublishedOutput OutputSession::commit_preview() {
         }
     }
     if (impl_->state.terminal) {
-        fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish();
+        // Only a spent output budget is our truncation: a clean stop keeps the strict parser
+        // interpretation and owns any malformed framing it produced.
+        const bool truncated = impl_->state.terminal_reason == FinishReason::OutputLimit ||
+                               impl_->state.terminal_reason == FinishReason::ContextCapacity;
+        fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish(truncated);
         impl_->tool_calls                            = std::move(terminal.tool_calls);
         impl_->tool_call_parse                       = terminal.diagnostics;
         if (!terminal.content.empty()) {

@@ -569,14 +569,111 @@ int test_strict_structure_and_active_tool_set() {
                        "duplicate parameter was silently overwritten");
 
     const std::string unknown_tool = tool_call("other", {{"value", "x"}});
-    failures +=
-        check_rejected(unknown_tool, contract, ninfer::ToolCallParseFallbackReason::UndeclaredTool,
-                       "undeclared tool name was accepted");
+    const auto undeclared          = fi::parse_qwen_tool_call_output(unknown_tool, 64, contract);
+    failures += check(undeclared.is_tool_call_response && undeclared.content.empty() &&
+                          undeclared.tool_calls.size() == 1 &&
+                          undeclared.tool_calls.front().name == "other" &&
+                          undeclared.diagnostics.undeclared_tool_calls == 1 &&
+                          undeclared.diagnostics.structured_call_count == 1 &&
+                          !undeclared.diagnostics.truncated_region &&
+                          undeclared.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                      "undeclared tool name was not published for client validation");
 
     const std::string invalid_name = tool_call("bad.name", {{"value", "x"}});
     failures += check_rejected(invalid_name, kLegacyContract,
                                ninfer::ToolCallParseFallbackReason::InvalidToolName,
                                "invalid function-name character was accepted");
+    return failures;
+}
+
+int test_truncated_region_keeps_structure() {
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}},
+                                                         {"count", Json{{"type", "integer"}}}});
+    const std::string complete = tool_call("configure", {{"value", "x"}, {"count", "12"}});
+    const std::string no_closer =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nab";
+    int failures = 0;
+
+    failures += check_rejected(no_closer, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "an unterminated region was accepted without a truncation");
+
+    const auto cut_name =
+        fi::parse_qwen_tool_call_output("<tool_call>\n<function=configure>\n", 64, contract, true);
+    failures += check(cut_name.is_tool_call_response && cut_name.content.empty() &&
+                          cut_name.tool_calls.size() == 1 &&
+                          cut_name.tool_calls.front().name == "configure" &&
+                          cut_name.tool_calls.front().arguments_json == "{}" &&
+                          cut_name.diagnostics.truncated_region &&
+                          cut_name.diagnostics.undeclared_tool_calls == 0,
+                      "a name cut before its parameters was not published");
+
+    const std::string cut_in_closer =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nab\n</param";
+    const auto cut_closer = fi::parse_qwen_tool_call_output(cut_in_closer, 64, contract, true);
+    failures +=
+        check(cut_closer.is_tool_call_response && cut_closer.tool_calls.size() == 1 &&
+                  cut_closer.tool_calls.front().arguments_json == "{\"value\":\"ab\"}" &&
+                  cut_closer.diagnostics.truncated_region,
+              "a parameter cut inside its own closing tag kept the tag bytes");
+
+    const auto cut_value = fi::parse_qwen_tool_call_output(no_closer, 64, contract, true);
+    failures += check(cut_value.is_tool_call_response && cut_value.tool_calls.size() == 1 &&
+                          cut_value.tool_calls.front().arguments_json == "{\"value\":\"ab\"}" &&
+                          cut_value.diagnostics.truncated_region,
+                      "a parameter without a closing tag was not published");
+
+    const std::string cut_marker = complete + "\n<tool_ca";
+    const auto kept = fi::parse_qwen_tool_call_output(cut_marker, 64, contract, true);
+    failures += check(kept.is_tool_call_response && kept.tool_calls.size() == 1 &&
+                          kept.tool_calls.front().name == "configure" &&
+                          kept.diagnostics.truncated_region,
+                      "a cut marker lost the calls captured before it");
+    failures += check_rejected(cut_marker, contract,
+                               ninfer::ToolCallParseFallbackReason::TrailingContent,
+                               "a cut marker was accepted without a truncation");
+
+    const std::string name_end_marker = "configure>";
+    const std::size_t name_end = complete.find(name_end_marker) + name_end_marker.size();
+    for (std::size_t prefix = name_end; prefix < complete.size(); ++prefix) {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(complete.substr(0, prefix), 64, contract, true);
+        if (!(parsed.is_tool_call_response && parsed.content.empty() &&
+              parsed.tool_calls.size() == 1 && parsed.tool_calls.front().name == "configure")) {
+            return failures +
+                   fail("a truncated prefix lost its structured call at " + std::to_string(prefix));
+        }
+    }
+    const auto full = fi::parse_qwen_tool_call_output(complete, 64, contract, true);
+    failures += check(full.tool_calls.size() == 1 && !full.diagnostics.truncated_region &&
+                          full.tool_calls.front().arguments_json == "{\"value\":\"x\",\"count\":12}",
+                      "a complete region changed under the truncation contract");
+    return failures;
+}
+
+int test_incremental_truncated_region() {
+    auto contract = output_contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const std::string text =
+        "Creating it.\n<tool_call>\n<function=configure>\n<parameter=value>\nab";
+    fi::ToolCallOutputDecoder decoder(std::move(contract), 64);
+    std::string visible;
+    visible += decoder.feed(text.substr(0, 20));
+    visible += decoder.feed(text.substr(20));
+    auto terminal = decoder.finish(true);
+
+    fi::ToolCallOutputDecoder clean(std::make_shared<fi::ToolCallOutputContract>(), 64);
+    std::string clean_visible = clean.feed(text);
+    auto clean_terminal       = clean.finish(false);
+    clean_visible += clean_terminal.content;
+
+    int failures = 0;
+    failures += check(visible == "Creating it." && terminal.content.empty() &&
+                          terminal.tool_calls.size() == 1 &&
+                          terminal.diagnostics.truncated_region,
+                      "a budget-truncated region was not published incrementally");
+    failures += check(clean_visible == text && clean_terminal.tool_calls.empty(),
+                      "a clean stop no longer restores an unterminated region");
     return failures;
 }
 
@@ -750,6 +847,8 @@ int main() {
     failures += test_schema_mismatches_remain_structured();
     failures += test_unsupported_schema_uses_legacy_policy();
     failures += test_strict_structure_and_active_tool_set();
+    failures += test_truncated_region_keeps_structure();
+    failures += test_incremental_truncated_region();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_conflicting_duplicate_tool_contracts_use_legacy_normalization();
     failures += test_all_or_nothing_structural_commit();

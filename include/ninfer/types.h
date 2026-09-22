@@ -304,14 +304,14 @@ struct GeneratedToolCall {
 };
 
 // Terminal interpretation of model-origin tool-call markup. Parameter schemas guide JSON
-// normalization but do not validate the call; only a structure/identity failure can return a
+// normalization but do not validate the call: a name outside the declared tool set keeps its
+// structured call for client validation, and only a structure/identity failure can return a
 // complete marker region to ordinary content.
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
     DuplicateParameter,
     InvalidToolName,
-    UndeclaredTool,
     TrailingContent,
 };
 
@@ -326,8 +326,6 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "duplicate_parameter";
     case ToolCallParseFallbackReason::InvalidToolName:
         return "invalid_tool_name";
-    case ToolCallParseFallbackReason::UndeclaredTool:
-        return "undeclared_tool";
     case ToolCallParseFallbackReason::TrailingContent:
         return "trailing_content";
     }
@@ -335,8 +333,14 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
 }
 
 struct ToolCallParseDiagnostics {
-    bool marker_seen                            = false;
-    std::uint32_t structured_call_count         = 0;
+    bool marker_seen                    = false;
+    std::uint32_t structured_call_count = 0;
+    // Published calls whose function name is outside the declared set. The call stays structured;
+    // rejecting or executing it belongs to the client.
+    std::uint32_t undeclared_tool_calls = 0;
+    // The marker region ended with the model output instead of its closing framing. A call cut
+    // inside a parameter keeps the bytes that were generated for that parameter.
+    bool truncated_region = false;
     std::uint32_t empty_arguments_omitted       = 0;
     std::uint32_t schema_mismatch_arguments     = 0;
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
