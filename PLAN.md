@@ -561,6 +561,33 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
     `ERROR SUMMARY: 4 errors` 全是这两类；探针本身仍正常 PASS（43 s、`shared_b` 原值、digest `0x4bcc3994a5efba7d`）⇒ P3 在本环境被排除
     （需管理员权限 + 设备支持）。⇒ **P1 与 P3 均不成立，门禁保持关闭**，按有界收口停手。
     **诊断轮 5（S1「彻底同步」实验，**假设成立**）**：只在 DFlash2 分支、在 `run_verify_window(...)`（`tp2_generation_core.cpp:2908`）之前插入一次性彻底同步
+    **收口轮（S1 修复落地 + 最终二进制验收；结论：未完全稳定，门禁保持关闭）**：
+    **收口轮 2（D 探因 + N=50 快速失败协议；未通过，门禁保持关闭）**：
+    (1) **D（窗口前向再下一层）**：读 `src/models/qwen3_5/execution/text.cpp:2162-2222`——每卡用**自己的 arena** 绑窗口（`make_bind` → H2D
+    `copy_i32(ids/positions)` 在该卡自己的 stream 上），紧接着 `embedding_tp2` + `run_layers_tp2`（配对层序列，peer 交换走
+    `src/core/tp/device_pair.cu` 的核内 mapped-host 握手），**中间没有任何 host 侧 staging/事件**；两卡 stream 在进入窗口前已被每轮有界同步排空
+    ⇒ **host 侧已无「最小必要依赖」可加**，残余不确定性在配对核内协议/归约里（需逐 kernel 查序，或在设备受支持/有管理员权限的环境跑 sanitizer）。
+    (2) **N=50 快速失败协议**（`build-win/b8-solo-*.log`，脚本遇首个不一致即停）：**第 10 次失败**——digest `0x4bb38194a5c5b9d5`、
+    tokens `[1703 220 248046 198 248045 198 248045 6558]`（其余 9 次均为 `0x4bcc3994a5efba7d`）。有界同步后三批汇总：`b6y`
+    (12 次 0 失败) + `b7b` (12 次 1 失败) + `b8` (第 10 次失败) = **34 次 2 次失败 ≈ 5.9%**（95% Wilson 区间约 1.6%–19%），
+    对照无同步基线约 20–30% ⇒ 该同步是**真实但不完整的修复**。
+    **统计界限（如实）**：即使将来 0/50，95% 置信下也只能界定每 run 翻转率 ≲6%，不能说「已证明确定」；本轮实测 ~6% 已直接否证稳定性。
+    (3) **未放行**：构造期拒绝保留，sessions/服务文档/refusal 文案/solo 转验收均未改；**K=7 decode tok/s 未测**。
+    **下一步**：对 `run_layers_tp2`/`device_pair` 的核内握手做逐 kernel 读写序检查（谁读了 peer 尚未写完的数据），或换到受支持设备/管理员环境跑 initcheck；
+    另可评估 (2) 的选项 B「近似并列保护」（语义新增，须单独声明触发比例/额外耗时/验收）。
+    (1) **落地**：把 S1 的彻底同步（两卡 `cudaStreamSynchronize` + `cudaDeviceSynchronize`，只在 DFlash2 分支、`run_verify_window` 之前，
+    `src/runtime/engine/tp2_generation_core.cpp`）作为**有界每轮同步**写进工作树（无 env 钩子；MTP/plain 不受影响）。
+    (2) **最终二进制 12 次协议**（`build-win/b7b-solo-1..12.log`）：**11/12 逐字节一致**——`shared_b` 全为
+    `[1703 220 248046 198 248045 198 248045 198]`、loghash `175A56CC3A333FA4`（11 次），**z-10 仍翻转为** `[… 248046]`
+    （loghash `6F0194D3FCF00981`）。对照 S1 批次（`b6y-sync-1..12`）当时是 12/12 ⇒ 该同步把翻转率从基线（10 次 2–3 种）显著压低
+    （两批合并 24 次仅 1 次），但**没有根除**：跨 stream / 跨卡写读序缺口是**主因之一**，残余来源仍在。
+    (3) **同批其它验收（全部通过）**：sessions plain `recall reused 71 prompt tokens bit-identically … passed`、mtp `passed`、
+    append K=7 `0xbad27a494a9bc853`、K=5 `0xbee487264ca8ffb8`、load `TP-2 dual-shard load passed devices=0,1 layers=64
+    head=[124160,5120] vocabulary-parallel`、`ninfer_tp_device_pair_test` **PASS**。
+    (4) **未放行**：构造期拒绝保留（`model_instance.cpp` 回到 HEAD），sessions dflash2 期望、`docs/serving.md`、refusal 文案、
+    solo 探针转验收均未改；**K=7 decode tok/s 未测**（修复未通过验收，不进入性能验收）。
+    **下一步**：对 `forward_tp2_window` 逐 kernel 查读写序（哪个 kernel 读了 peer 尚未写完的数据），或在有管理员权限/受支持设备的环境
+    跑 `compute-sanitizer --tool initcheck`；12/12 稳定后再做 (4) 的放行清单。
     ——`shard_a_.device.bind_to_current_thread(); cudaStreamSynchronize(a); cudaDeviceSynchronize();`，对 `shard_b` 同样一次，再 bind 回 a——临时钩子
     `NINFER_TP2_DIAG_SYNC`（**已回退**）。solo 探针**连跑 12 次**（`build-win/b6y-sync-1..12.log`）：**12/12 逐字节一致**——
     `shared_b` 全为 `[1703 220 248046 198 248045 198 248045 198]`、digest 全为 `0x4bcc3994a5efba7d`、去掉 `[mem]` 行后整篇日志

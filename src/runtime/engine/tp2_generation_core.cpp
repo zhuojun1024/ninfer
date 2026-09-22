@@ -2905,6 +2905,19 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 qwen::execution::DFlashFeatureSink verify_sink = round.make_verify_sink();
                 const ops::CausalAttentionExecutionEnvelope target_envelope{
                     position + 1U, position + static_cast<std::uint32_t>(width)};
+                // DFlash2's window is a device-side product, so both shards have to be drained
+                // before the paired layer sequence starts: otherwise the in-kernel allreduce
+                // handshake can interleave with an op one shard has not finished yet and the
+                // window logits come out a few bf16 ulps apart from run to run, which the
+                // near-tied last column then turns into a different token. MTP builds its window on
+                // the host and never meets this (PLAN.md section 3.6, "S1").
+                shard_a_.device.bind_to_current_thread();
+                CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                shard_b_.device.bind_to_current_thread();
+                CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                shard_a_.device.bind_to_current_thread();
                 run_verify_window(window_ids, static_cast<std::int32_t>(position), window_logits,
                                   window_hidden, &verify_sink);
                 timing.record(2, shard_a_.device.stream);
