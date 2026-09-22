@@ -121,10 +121,11 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
             // pair before the layer loop (the text forwards) and before the MTP stem's projection.
             split.kind = WeightSplitKind::RowParallel;
         } else if (has_name("proposal/head")) {
-            // The optimized proposal head is a reduced-vocabulary draft head: only shard 0 samples a
-            // draft from it, but the table itself is the same on both shards. Vocabulary-parallel
-            // when asked for, so each shard projects its own row block and the pair assembles the
-            // draft logits exactly as the target logits are assembled.
+            // The optimized proposal head is a reduced-vocabulary draft head. Vocabulary-parallel
+            // when asked for: each shard projects its own row block into its own stable top sixteen
+            // and the pair merges the two candidate lists, which is the whole table's top sixteen
+            // exactly. The MTP proposal merges the row blocks before its argmax; the masked draft
+            // merges the candidate lists with merge_topk_candidates.
             split.kind = options.split_proposal_head ? WeightSplitKind::ColumnParallel
                                                      : WeightSplitKind::Replicated;
         } else if (has_name("output_head")) {

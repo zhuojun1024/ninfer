@@ -23,6 +23,8 @@ constexpr std::int32_t kHidden    = 5120;
 constexpr std::int32_t kFullRows  = 248320;
 constexpr std::int32_t kValidRows = 248077;
 constexpr std::int32_t kShortRows = 131072;
+// One shard's half of the reduced proposal head under a vocabulary split.
+constexpr std::int32_t kHalfRows  = 65536;
 constexpr std::int32_t kTopK      = 16;
 constexpr int kMaxColumns         = 257;
 
@@ -115,6 +117,12 @@ const std::array<std::int32_t, 17> kFullWinnerRows{
 const std::array<std::int32_t, 17> kShortWinnerRows{
     3,     127,   511,   512,   1023,  4095,  8191,   15872,  16383,
     16384, 16895, 32767, 32768, 65535, 65536, 130560, 131071,
+};
+
+// Every winner row of the half table has to fall inside those 65536 rows.
+const std::array<std::int32_t, 17> kHalfWinnerRows{
+    3,     127,   511,   512,   1023,  4095,  8191,   15872,  16383,
+    16384, 16895, 32767, 32768, 65535, 65023, 65024, 65534,
 };
 
 float factor_for(std::size_t index) { return index >= 15 ? 17.0F : static_cast<float>(index + 1); }
@@ -394,24 +402,27 @@ int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
     return failures;
 }
 
-int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
-    FixtureWeight fixture = make_rowsplit(QType::Q4_G64_FP16, kShortRows);
-    for (std::size_t index = 0; index < kShortWinnerRows.size(); ++index) {
-        patch_rowsplit_row(fixture, QType::Q4_G64_FP16, kShortWinnerRows[index], factor_for(index));
+// Qualified at both reduced-head geometries: the whole table and one shard's half of it.
+template <std::size_t N>
+int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score, std::int32_t rows,
+           const std::array<std::int32_t, N>& winner_rows, const char* profile) {
+    FixtureWeight fixture = make_rowsplit(QType::Q4_G64_FP16, rows);
+    for (std::size_t index = 0; index < winner_rows.size(); ++index) {
+        patch_rowsplit_row(fixture, QType::Q4_G64_FP16, winner_rows[index], factor_for(index));
     }
-    std::vector<std::int32_t> host_map(kShortRows);
-    for (std::int32_t row = 0; row < kShortRows; ++row) { host_map[row] = kValidRows - 1 - row; }
+    std::vector<std::int32_t> host_map(rows);
+    for (std::int32_t row = 0; row < rows; ++row) { host_map[row] = kValidRows - 1 - row; }
     DeviceBuffer map(host_map.size() * sizeof(std::int32_t));
     map.copy_from_host(host_map.data(), map.bytes);
-    const auto expected = expected_order(kShortWinnerRows, &host_map);
+    const auto expected = expected_order(winner_rows, &host_map);
 
     const std::size_t capacity = ops::linear_topk_workspace_capacity_bytes(
-        QType::Q4_G64_FP16, kShortRows, kHidden, 1, kMaxColumns);
+        QType::Q4_G64_FP16, rows, kHidden, 1, kMaxColumns);
     GuardedDeviceBuffer graph_scratch(capacity);
     WorkspaceArena workspace(DeviceSpan{graph_scratch.data(), graph_scratch.bytes()});
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(std::int32_t));
     DeviceBuffer scores(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(float));
-    Tensor map_tensor(map.p, DType::I32, {kShortRows});
+    Tensor map_tensor(map.p, DType::I32, {rows});
     int failures = 0;
     for (int columns : test_columns()) {
         GuardedDeviceBuffer x(static_cast<std::size_t>(kHidden) * columns * 2);
@@ -432,7 +443,7 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
         ops::linear_topk(hidden_tensor, fixture.weight, map_tensor, ids_tensor, scores_tensor,
                          point_workspace, nullptr);
         cuda_synchronize();
-        failures += verify_invocation("q4-optimized", columns, ids_tensor, scores_tensor,
+        failures += verify_invocation(profile, columns, ids_tensor, scores_tensor,
                                       base_score, expected);
         failures += out_ids.verify_guards("ids tail");
         failures += out_scores.verify_guards("scores tail");
@@ -462,7 +473,7 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
             },
             stream);
         cuda_check(cudaStreamDestroy(stream), "linear_topk destroy graph stream");
-        failures += verify_invocation("q4-optimized graph", graph_columns, graph_ids, graph_scores,
+        failures += verify_invocation(profile, graph_columns, graph_ids, graph_scores,
                                       base_score, expected);
     }
     failures += graph_scratch.verify_guards("graph workspace tail");
@@ -491,7 +502,12 @@ int main() {
                              base_scores(QType::Q8_G32_FP16, host_hidden));
         failures += run_full(QType::FP8_E4M3FN_ROW_BF16, "fp8-full", hidden,
                              base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden));
-        failures += run_q4(hidden, base_scores(QType::Q4_G64_FP16, host_hidden));
+        failures +=
+            run_q4(hidden, base_scores(QType::Q4_G64_FP16, host_hidden), kShortRows,
+                   kShortWinnerRows, "q4-optimized");
+        failures +=
+            run_q4(hidden, base_scores(QType::Q4_G64_FP16, host_hidden), kHalfRows,
+                   kHalfWinnerRows, "q4-optimized-half");
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

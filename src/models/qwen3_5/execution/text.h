@@ -293,6 +293,15 @@ public:
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+
+    // TP-2 masked draft: stable top sixteen of the reduced proposal head when the table is
+    // vocabulary-split. Each shard ranks its own row block of the reduced vocabulary after the pair
+    // broadcasts the draft's hidden state, then the pair unions the thirty-two candidates and merges
+    // them back to the exact top sixteen of the whole table - the same list the replicated table
+    // produces. `candidate_ids`/`candidate_scores` are the I32/FP32 [16,U] results on this shard,
+    // which is the one that runs the masked draft; the peer's copy is scratch. Requires a registered
+    // peer whose proposal head holds the matching half of the rows.
+    void proposal_topk_tp2(const Tensor& hidden, Tensor& candidate_ids, Tensor& candidate_scores);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,

@@ -37,13 +37,14 @@ struct Q4KSplitTopKOutput {
     }
 };
 
-template <int Capacity>
+template <int OutputRows, int Capacity>
 void launch_ksplit(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
                    const LinearTopKWorkspace& workspace, cudaStream_t stream) {
-    using Geometry             = Q4LinearGeometry<131072, kLinearTopKHidden>;
+    using Geometry             = Q4LinearGeometry<OutputRows, kLinearTopKHidden>;
     using Schedule             = Q4KSplitMmaSchedule;
+    static_assert(OutputRows % Schedule::kRowsPerCta == 0);
     constexpr int kTileColumns = ((Capacity + 7) / 8) * 8;
-    constexpr int kBlocks      = Geometry::kOutputRows / Schedule::kRowsPerCta;
+    constexpr int kBlocks      = OutputRows / Schedule::kRowsPerCta;
     const Q4KSplitTopKOutput output{static_cast<std::uint64_t*>(workspace.partial_keys.data),
                                     static_cast<const std::int32_t*>(row_to_global_ids.data),
                                     workspace.producer_groups, hidden.ne[1]};
@@ -59,12 +60,17 @@ void launch_ksplit(const Tensor& hidden, const Weight& head, const Tensor& row_t
 using Launch = void (*)(const Tensor&, const Weight&, const Tensor&, const LinearTopKWorkspace&,
                         cudaStream_t);
 
-template <std::size_t... I>
+template <int OutputRows, std::size_t... I>
 constexpr auto make_launchers(std::index_sequence<I...>) {
-    return std::array<Launch, sizeof...(I)>{&launch_ksplit<8 * (1 + I)>...};
+    return std::array<Launch, sizeof...(I)>{&launch_ksplit<OutputRows, 8 * (1 + I)>...};
 }
 
-constexpr auto launchers = make_launchers(std::make_index_sequence<2>{});
+// The direct route puts one CTA on every sixteen head rows, so the table's row count only selects
+// the grid: the whole reduced head and one shard's half share every other parameter.
+constexpr auto launchers_whole =
+    make_launchers<kLinearTopKOptimizedRows>(std::make_index_sequence<2>{});
+constexpr auto launchers_half =
+    make_launchers<kLinearTopKOptimizedHalfRows>(std::make_index_sequence<2>{});
 
 } // namespace
 
@@ -72,6 +78,8 @@ void linear_topk_q4_launch(const Tensor& hidden, const Weight& head,
                            const Tensor& row_to_global_ids, const LinearTopKWorkspace& workspace,
                            cudaStream_t stream) {
     if (workspace.rows_per_producer == kLinearTopKDirectRows) {
+        const auto& launchers =
+            head.n == kLinearTopKOptimizedHalfRows ? launchers_half : launchers_whole;
         launchers[(hidden.ne[1] - 1) / 8](hidden, head, row_to_global_ids, workspace, stream);
     } else {
         linear_topk_q4_m64_launch(hidden, head, row_to_global_ids, workspace, stream);

@@ -634,6 +634,30 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 linear_scratch(layout, head, drafts * batch, drafts * batch);
                 return finish(layout);
             };
+            // A vocabulary-split reduced proposal head ranks each shard's half in that shard's own
+            // text workspace: the draft's hidden state, the half-head top-k scratch and the union of
+            // both candidate lists. Unsplit heads keep their round-arena path and reserve nothing.
+            const auto dflash_proposal_split_capacity = [&](std::int32_t width, std::int32_t batch) {
+                if (!parameters.proposal.has_value() ||
+                    plan.proposal_head != ProposalHead::Optimized) {
+                    return std::size_t{0};
+                }
+                const auto& head = parameters.proposal->head;
+                const std::int32_t rows = dimension(head.weight.n);
+                if (rows <= 0 || rows * 2 != dimension(parameters.proposal->rows)) {
+                    return std::size_t{0};
+                }
+                const std::int32_t columns = (width - 1) * batch;
+                WorkspaceLayoutBuilder layout;
+                matrix(layout, DType::BF16, dimension(config.hidden_size), columns);
+                matrix(layout, DType::I32, 16, columns);
+                matrix(layout, DType::FP32, 16, columns);
+                matrix(layout, DType::I32, 32, columns);
+                matrix(layout, DType::FP32, 32, columns);
+                scratch(layout, ops::linear_topk_workspace_capacity_bytes(
+                                    head.weight.qtype, rows, head.weight.k, columns, columns));
+                return finish(layout);
+            };
 
             out.dflash_context = dflash_context_capacity(chunk, 1, false);
             for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
@@ -652,6 +676,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                               dimension(parameters.model.resources().public_token_count), drafts,
                               drafts, batch, batch);
                 const std::size_t proposal = dflash_proposal_capacity(verify, batch);
+                out.dflash_proposal_split = std::max(out.dflash_proposal_split,
+                                                     dflash_proposal_split_capacity(verify, batch));
                 out.dflash_round =
                     std::max({out.dflash_round, finish(target), accept,
                               dflash_context_capacity(verify, batch, true), proposal});
@@ -661,7 +687,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     out.general_capacity =
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                  out.dflash_context, out.dflash_round, out.causal_score});
+                  out.dflash_context, out.dflash_round, out.dflash_proposal_split,
+                  out.causal_score});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(

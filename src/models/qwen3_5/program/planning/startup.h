@@ -63,6 +63,9 @@ struct WorkspacePlan {
     std::size_t mtp_round        = 0;
     std::size_t dflash_context   = 0;
     std::size_t dflash_round     = 0;
+    // Text-workspace capacity the vocabulary-split reduced proposal head needs on each shard: the
+    // masked draft's hidden-state broadcast, the half-head top-k and the candidate union.
+    std::size_t dflash_proposal_split = 0;
     std::size_t causal_score     = 0;
     std::size_t general_capacity = 0;
     std::optional<VisionWorkspacePlan> vision;

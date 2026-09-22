@@ -68,7 +68,7 @@ __launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void q4_m64_li
     const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ weight_codes,
     const std::uint8_t* __restrict__ weight_scales,
     const std::int32_t* __restrict__ row_to_global_ids, std::uint64_t* __restrict__ partial_keys,
-    std::int32_t producer_groups, std::int32_t columns) {
+    std::int32_t producer_groups, std::int32_t columns, std::int32_t head_rows) {
     constexpr int kKTiles       = kLinearTopKHidden / kBlockK;
     constexpr int kBlockRows    = 64;
     constexpr int kSortItems    = 2;
@@ -257,7 +257,7 @@ __launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void q4_m64_li
         for (int item = 0; item < 2; ++item) {
             const int local_row = reducer_lane * 2 + item;
             const int row       = row_begin + local_row;
-            if (row < kLinearTopKOptimizedRows)
+            if (row < head_rows)
                 keys[item] = score_id_order_key(reusable.reduction.scores[column][local_row],
                                                 row_to_global_ids[row]);
         }
@@ -296,7 +296,7 @@ void launch_tile(const Tensor& hidden, const Weight& head, const Tensor& row_to_
             static_cast<const std::uint8_t*>(head.scales),
             static_cast<const std::int32_t*>(row_to_global_ids.data),
             static_cast<std::uint64_t*>(workspace.partial_keys.data), workspace.producer_groups,
-            hidden.ne[1]);
+            hidden.ne[1], head.n);
     CUDA_CHECK(cudaGetLastError());
 }
 

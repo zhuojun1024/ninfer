@@ -50,16 +50,42 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
                  cudaStream_t stream);
 
 /**
- * @brief Projects through the optimized 131072-row proposal head and returns stable top sixteen
- * scores with shortlist rows mapped to global token ids.
+ * @brief Projects through the reduced proposal head (whole or one shard's half) and returns stable
+ * top sixteen scores with shortlist rows mapped to global token ids.
  *
  * @details The tensor contract is the same as the full-head overload except that `head` is
- * Q4_G64_FP16 `[131072,5120]` and every head row participates. `row_to_global_ids` is contiguous
- * I32 `[131072]`; it contains distinct ids in `[0,248077)` and maps each local head row to the id
- * used for output and tie-breaking. Artifact binding establishes the map's range and uniqueness.
+ * Q4_G64_FP16 with either all 131072 reduced rows or the 65536 rows one shard of a vocabulary
+ * split materializes, and every row of `head` participates. `row_to_global_ids` is contiguous I32
+ * with one entry per head row; it contains distinct ids in `[0,248077)` and maps each local head row
+ * to the id used for output and tie-breaking. Artifact binding establishes the map's range and
+ * uniqueness. Ranking is over the supplied rows only, so the halves of a split table rank exactly
+ * the candidates the whole table ranks; `merge_topk_candidates` then restores the whole table's
+ * stable top sixteen from the two halves.
  */
 void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
                  Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
                  cudaStream_t stream);
+
+/**
+ * @brief Merges two stable top-sixteen candidate lists into the stable top sixteen of their union.
+ *
+ * @details For any positive column count `U`, the four inputs are contiguous `[16,U]` tensors:
+ * `candidate_ids_*` are I32 global token ids in `[0,INT_MAX)` and `candidate_scores_*` are finite
+ * FP32 scores. `candidate_ids` and `candidate_scores` are contiguous `[16,U]` outputs. Every list
+ * uses `linear_topk`'s payload layout, which keeps a column's sixteen candidates contiguous: the
+ * element at rank r of column c is at `c * 16 + r`. Rows are
+ * ranked by descending score with exact score ties resolved by lower global token id - the same
+ * total order `linear_topk` returns - so merging the top sixteen of each half of a
+ * vocabulary-split head reproduces the whole head's stable top sixteen bit for bit. A reserved key
+ * sentinel orders below every valid candidate, so an input id of INT_MAX or a non-finite score is
+ * not a candidate; a slot the inputs cannot fill reports id INT_MAX and score 0.
+ *
+ * All tensors are preserved except that both outputs are completely overwritten, inputs and outputs
+ * must not overlap, and every tensor must be 16-byte aligned. The Op has no workspace, no internal
+ * device allocation and no persistent state.
+ */
+void merge_topk_candidates(const Tensor& candidate_ids_a, const Tensor& candidate_scores_a,
+                           const Tensor& candidate_ids_b, const Tensor& candidate_scores_b,
+                           Tensor& candidate_ids, Tensor& candidate_scores, cudaStream_t stream);
 
 } // namespace ninfer::ops

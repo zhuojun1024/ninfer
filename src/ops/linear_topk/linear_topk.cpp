@@ -18,7 +18,19 @@ enum class HeadProfile : std::uint8_t {
     Q8Full,
     Fp8Full,
     Q4Optimized,
+    Q4OptimizedHalf,
 };
+
+// The reduced proposal head's two admissible row counts: the whole table, or the half a TP-2 split
+// materializes on one shard. Both rank over their own rows with the same arithmetic.
+constexpr bool is_reduced_head(HeadProfile profile) {
+    return profile == HeadProfile::Q4Optimized || profile == HeadProfile::Q4OptimizedHalf;
+}
+
+constexpr std::int32_t reduced_head_rows(HeadProfile profile) {
+    return profile == HeadProfile::Q4OptimizedHalf ? detail::kLinearTopKOptimizedHalfRows
+                                                  : detail::kLinearTopKOptimizedRows;
+}
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -48,6 +60,9 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
     if (head_rows == detail::kLinearTopKOptimizedRows && qtype == QType::Q4_G64_FP16) {
         return HeadProfile::Q4Optimized;
     }
+    if (head_rows == detail::kLinearTopKOptimizedHalfRows && qtype == QType::Q4_G64_FP16) {
+        return HeadProfile::Q4OptimizedHalf;
+    }
     throw std::invalid_argument("linear_topk: unsupported head profile");
 }
 
@@ -58,7 +73,7 @@ struct Plan {
 };
 
 Plan plan_for(HeadProfile profile, int columns) {
-    if (profile == HeadProfile::Q4Optimized) {
+    if (is_reduced_head(profile)) {
         if (columns <= 16) return {16, 0};
         if (columns <= 32) return {64, 32};
         if (columns <= 48) return {64, 48};
@@ -119,11 +134,11 @@ void require_q8(const Weight& head) {
     if (!common) { throw std::invalid_argument("linear_topk: invalid Q8 full head"); }
 }
 
-void require_q4(const Weight& head) {
+void require_q4(const Weight& head, std::int32_t rows) {
     const bool common =
         head.qtype == QType::Q4_G64_FP16 && head.layout == QuantLayout::RowSplit &&
         head.scale_dtype == DType::FP16 && head.group_size == 64 && head.group == 64 &&
-        head.ndim == 2 && head.n == detail::kLinearTopKOptimizedRows &&
+        head.ndim == 2 && head.n == rows &&
         head.k == detail::kLinearTopKHidden && head.shape[0] == head.n && head.shape[1] == head.k &&
         head.padded_shape[0] == head.n && head.padded_shape[1] == head.k && head.qhigh == nullptr &&
         head.high_plane_bytes == 0 && aligned_to(head.qdata, 16) && aligned_to(head.scales, 16);
@@ -243,7 +258,7 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
                  cudaStream_t stream) {
     validate_io(hidden, candidate_ids, candidate_scores);
     const HeadProfile profile = resolve_profile(head.qtype, head.n, head.k);
-    if (profile == HeadProfile::Q4Optimized || valid_rows != detail::kLinearTopKFullValidRows) {
+    if (is_reduced_head(profile) || valid_rows != detail::kLinearTopKFullValidRows) {
         throw std::invalid_argument("linear_topk: invalid full-head profile or valid_rows");
     }
     if (profile == HeadProfile::Q8Full) {
@@ -259,12 +274,15 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
                  Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
                  cudaStream_t stream) {
     validate_io(hidden, candidate_ids, candidate_scores);
-    if (resolve_profile(head.qtype, head.n, head.k) != HeadProfile::Q4Optimized) {
+    // The reduced head is either the whole 131072-row table or the 65536-row half one shard of a
+    // vocabulary split materializes; both rank their own rows and map them through their own ids.
+    const HeadProfile profile = resolve_profile(head.qtype, head.n, head.k);
+    if (!is_reduced_head(profile)) {
         throw std::invalid_argument("linear_topk: invalid optimized-head profile");
     }
-    require_q4(head);
-    require_matrix(row_to_global_ids, DType::I32, detail::kLinearTopKOptimizedRows, 1,
-                   "row_to_global_ids", 4);
+    const std::int32_t rows = reduced_head_rows(profile);
+    require_q4(head, rows);
+    require_matrix(row_to_global_ids, DType::I32, rows, 1, "row_to_global_ids", 4);
     if (overlaps(hidden, row_to_global_ids) || overlaps(candidate_ids, row_to_global_ids) ||
         overlaps(candidate_scores, row_to_global_ids)) {
         throw std::invalid_argument("linear_topk: id map overlaps input or output");

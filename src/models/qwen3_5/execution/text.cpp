@@ -20,6 +20,7 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/linear_add.h"
@@ -843,6 +844,121 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
     }
+}
+
+// Vocabulary-split reduced proposal head (TP-2 masked draft). The table is halved by row, so each
+// shard ranks only its own half: it takes a copy of the draft's hidden state, projects its own row
+// block and returns its own sixteen candidates. The pair then unions the thirty-two candidates and
+// merges them back to the exact top sixteen of the whole table, which is the list the replicated
+// table would return. Only the shard that runs the masked draft keeps the merged candidates, so the
+// peer's copies and the union buffers are scratch in the peer's own workspace.
+void TextContext::proposal_topk_tp2(const Tensor& hidden, Tensor& candidate_ids,
+                                    Tensor& candidate_scores) {
+    if (peer_tp_ == nullptr || pair_tp_ == nullptr || proposal_head_ == nullptr ||
+        proposal_head_ids_ == nullptr) {
+        throw std::logic_error(
+            "proposal_topk_tp2: a split proposal head needs a registered peer and its id map");
+    }
+    TextContext& peer    = *peer_tp_;
+    tp::DevicePair& pair = *pair_tp_;
+    const std::int32_t rows    = dimension(proposal_head_->weight.n);
+    const std::int32_t columns = hidden.ne[1];
+    if (rows <= 0 || rows * 2 != proposal_head_n_ || shard_index_ < 0 || peer.shard_index_ < 0 ||
+        peer.shard_index_ == shard_index_ || peer.proposal_head_ == nullptr ||
+        peer.proposal_head_ids_ == nullptr || dimension(peer.proposal_head_->weight.n) != rows) {
+        throw std::logic_error(
+            "proposal_topk_tp2: a split proposal head needs half the rows on a peer that holds "
+            "the matching half");
+    }
+    const std::int32_t hidden_size = dimension(config_.hidden_size);
+    const std::int32_t candidates  = candidate_ids.ne[0];
+    require_tensor_shape(hidden, DType::BF16, {hidden_size, columns}, "proposal hidden");
+    require_tensor_shape(candidate_ids, DType::I32, {candidates, columns},
+                         "proposal candidate ids");
+    require_tensor_shape(candidate_scores, DType::FP32, {candidates, columns},
+                         "proposal candidate scores");
+
+    auto local_scope = work_.scope();
+    auto peer_scope  = peer.work_.scope();
+    ctx_.bind_to_current_thread();
+    Tensor hidden_local = work_.alloc(DType::BF16, {hidden_size, columns});
+    CUDA_CHECK(cudaMemcpyAsync(hidden_local.data, hidden.data, hidden_local.bytes(),
+                               cudaMemcpyDeviceToDevice, ctx_.stream));
+    peer.ctx_.bind_to_current_thread();
+    Tensor hidden_peer = peer.work_.alloc(DType::BF16, {hidden_size, columns});
+    CUDA_CHECK(cudaMemsetAsync(hidden_peer.data, 0, hidden_peer.bytes(), peer.ctx_.stream));
+    ctx_.bind_to_current_thread();
+    pair.allreduce(hidden_local.data, hidden_peer.data, hidden_local.bytes(), ctx_.stream,
+                   peer.ctx_.stream);
+
+    // The rows this shard owns are the ones the split placed at its own offset of the whole table,
+    // so each side ranks its half through the matching window of the reduced id map.
+    ctx_.bind_to_current_thread();
+    Tensor ids_local    = work_.alloc(DType::I32, {candidates, columns});
+    Tensor scores_local = work_.alloc(DType::FP32, {candidates, columns});
+    Tensor map_local(static_cast<void*>(const_cast<std::int32_t*>(proposal_head_ids_) +
+                                        static_cast<std::int64_t>(shard_index_) * rows),
+                     DType::I32, {rows});
+    ops::linear_topk(hidden_local, proposal_head_->weight, map_local, ids_local, scores_local,
+                     work_, ctx_.stream);
+
+    peer.ctx_.bind_to_current_thread();
+    Tensor ids_peer    = peer.work_.alloc(DType::I32, {candidates, columns});
+    Tensor scores_peer = peer.work_.alloc(DType::FP32, {candidates, columns});
+    Tensor map_peer(static_cast<void*>(const_cast<std::int32_t*>(peer.proposal_head_ids_) +
+                                       static_cast<std::int64_t>(peer.shard_index_) * rows),
+                    DType::I32, {rows});
+    ops::linear_topk(hidden_peer, peer.proposal_head_->weight, map_peer, ids_peer, scores_peer,
+                     peer.work_, peer.ctx_.stream);
+
+    // Union: this shard writes its candidates into the lower half of its union and the peer writes
+    // its own into the upper half, so the pair's sum holds all thirty-two on both shards.
+    const std::int64_t half_bytes =
+        static_cast<std::int64_t>(candidates) * columns * sizeof(std::int32_t);
+    ctx_.bind_to_current_thread();
+    Tensor union_ids    = work_.alloc(DType::I32, {2 * candidates, columns});
+    Tensor union_scores = work_.alloc(DType::FP32, {2 * candidates, columns});
+    CUDA_CHECK(cudaMemsetAsync(union_ids.data, 0, union_ids.bytes(), ctx_.stream));
+    CUDA_CHECK(cudaMemsetAsync(union_scores.data, 0, union_scores.bytes(), ctx_.stream));
+    CUDA_CHECK(cudaMemcpyAsync(union_ids.data, ids_local.data, ids_local.bytes(),
+                               cudaMemcpyDeviceToDevice, ctx_.stream));
+    CUDA_CHECK(cudaMemcpyAsync(union_scores.data, scores_local.data, scores_local.bytes(),
+                               cudaMemcpyDeviceToDevice, ctx_.stream));
+    peer.ctx_.bind_to_current_thread();
+    Tensor union_ids_peer    = peer.work_.alloc(DType::I32, {2 * candidates, columns});
+    Tensor union_scores_peer = peer.work_.alloc(DType::FP32, {2 * candidates, columns});
+    CUDA_CHECK(cudaMemsetAsync(union_ids_peer.data, 0, union_ids_peer.bytes(), peer.ctx_.stream));
+    CUDA_CHECK(
+        cudaMemsetAsync(union_scores_peer.data, 0, union_scores_peer.bytes(), peer.ctx_.stream));
+    Tensor union_ids_upper(
+        static_cast<std::uint8_t*>(union_ids_peer.data) +
+            static_cast<std::int64_t>(candidates) * columns * sizeof(std::int32_t),
+        DType::I32, {candidates, columns});
+    Tensor union_scores_upper(
+        static_cast<std::uint8_t*>(union_scores_peer.data) +
+            static_cast<std::int64_t>(candidates) * columns * sizeof(float),
+        DType::FP32, {candidates, columns});
+    CUDA_CHECK(cudaMemcpyAsync(union_ids_upper.data, ids_peer.data, ids_peer.bytes(),
+                               cudaMemcpyDeviceToDevice, peer.ctx_.stream));
+    CUDA_CHECK(cudaMemcpyAsync(union_scores_upper.data, scores_peer.data, scores_peer.bytes(),
+                               cudaMemcpyDeviceToDevice, peer.ctx_.stream));
+
+    ctx_.bind_to_current_thread();
+    pair.allreduce(union_ids.data, union_ids_peer.data, union_ids.bytes(), ctx_.stream,
+                   peer.ctx_.stream);
+    pair.allreduce(union_scores.data, union_scores_peer.data, union_scores.bytes(), ctx_.stream,
+                   peer.ctx_.stream);
+    // The collective leaves the peer device current; the merge runs on this shard.
+    ctx_.bind_to_current_thread();
+    Tensor ids_lower(union_ids.data, DType::I32, {candidates, columns});
+    Tensor scores_lower(union_scores.data, DType::FP32, {candidates, columns});
+    Tensor ids_upper(static_cast<std::uint8_t*>(union_ids.data) + half_bytes, DType::I32,
+                     {candidates, columns});
+    Tensor scores_upper(static_cast<std::uint8_t*>(union_scores.data) +
+                            static_cast<std::int64_t>(candidates) * columns * sizeof(float),
+                        DType::FP32, {candidates, columns});
+    ops::merge_topk_candidates(ids_lower, scores_lower, ids_upper, scores_upper, candidate_ids,
+                               candidate_scores, ctx_.stream);
 }
 
 void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,

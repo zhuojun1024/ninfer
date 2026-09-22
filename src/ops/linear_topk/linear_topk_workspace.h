@@ -15,6 +15,8 @@ inline constexpr std::int32_t kLinearTopKMergeFanIn      = 32;
 inline constexpr std::int32_t kLinearTopKFullRows        = 248320;
 inline constexpr std::int32_t kLinearTopKFullValidRows   = 248077;
 inline constexpr std::int32_t kLinearTopKOptimizedRows   = 131072;
+// One shard's half of the reduced proposal head when the TP-2 split halves its rows.
+inline constexpr std::int32_t kLinearTopKOptimizedHalfRows = 65536;
 inline constexpr std::int32_t kLinearTopKHidden          = 5120;
 
 struct LinearTopKWorkspace {

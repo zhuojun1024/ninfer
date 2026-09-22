@@ -373,7 +373,15 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                 ids_flat, scores, work, stream);
         } else {
             const auto& head = *state.execution.parameters.proposal;
-            if (head.token_ids) {
+            // TP-2 halves the reduced table between the shards, so each side ranks its own row block
+            // and the pair merges both candidate lists back to the whole table's stable sixteen.
+            const bool split_proposal_head =
+                state.tp_card != nullptr && head.token_ids.has_value() &&
+                head.head.weight.n > 0 &&
+                head.head.weight.n * 2 == state.tp_card->proposal_head_n();
+            if (split_proposal_head) {
+                state.tp_card->proposal_topk_tp2(hidden, ids_flat, scores);
+            } else if (head.token_ids) {
                 ops::linear_topk(hidden, head.head.weight, *head.token_ids, ids_flat, scores, work,
                                  stream);
             } else {

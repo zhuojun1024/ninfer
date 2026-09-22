@@ -964,6 +964,97 @@ SHA-256 双向校验。未采用"反量化成 safetensors 再用配方重转"的
 （≈52–53%），即组件不是差异来源。用户观察到的官方更高很可能出现在以 reasoning 为主的真实会话里，
 需按真实系统提示与更长预算复测。
 
+## 7. TP-2 两卡显存不平衡：方案 A（dflash2 提案头切分）与方案 B（selector 下移）
+
+### 7.1 问题与账目（实测，dflash2 K=7 + vision，--max-context 102400，已扣除账目里约 1 GiB 的驱动虚报）
+
+| | GPU0（shard 0） | GPU2（shard 1） |
+|---|---|---|
+| 实占 | 14636 MiB | 13434 MiB |
+| KV（fp8） | 1612.5 | 1612.5 |
+| 非 KV 固定开销 | **13023.5** | **11821.5** |
+
+KV 两卡必须同 token 数（按 head 切），上限由最重的卡决定：差 1202 MiB ≈ **76k token**；平衡后上限
+从约 190k 提到约 228k（**+38k token**）。262144 时 GPU0 需 17151（超 840 ⇒ OOM）而 GPU2 只需 15949 ——
+与"GPU0 OOM、GPU2 有余"的现象一致。KV 斜率 1612.5/102400 = 15.75 KiB/token/卡。
+
+### 7.2 为什么"整份搬组件"不赚（算术结论）
+
+固定开销里只有 dflash2 draft（工件 2123.6 MiB，实测 shard 0 多 1840）与 vision（826.5）是单卡独有，
+两者合计 2746.5 超过每卡对称余量 1373：draft→shard1 且 vision→shard0 时上限不变（14195），只搬一层更差。
+**唯一能赚的是"切开"某块**。
+
+### 7.3 方案 A（进行中）：dflash2 路线按词表切分 `proposal/head`
+
+- 收益：reduced proposal head Q4 [131072,5120] 340 MiB 两卡各半 ⇒ **每卡约 -170 MiB**，上下文 +~10.8k token；
+  精度不损失（候选与整份头逐位一致），速度不损失（每轮多 KB 级交换）。
+- 现状与门禁：`load.cpp:131-148` 的 `split_proposal_head` 排除 dflash2；`draft.cpp:362-385` 用融合
+  `ops::linear_topk` 假设整份头。先例是 MTP 的 `proposal_argmax`（text.cpp:796-836）+ `merge_local_row_blocks`。
+- 设计：新增小算子 `ops::merge_topk_candidates`（输入两列各 [16,U] 候选，按"分数降序、同分 global id 小者优先"
+  合并，规则与 `linear_topk` 契约一致）；提案时两卡各跑自己半表的 `linear_topk`，用 `DevicePair::allreduce`
+  把 hidden 广播到 peer、再把两列候选合成 [32,U] 交换，最后用新算子选 top-16。全局 top-16 ⊆ 两半 top-16 之并，
+  同分规则一致 ⇒ 逐位精确。
+- 待改文件：`load.cpp`（门禁+注释）、`execution/draft.cpp`（拆分分支）、`program/dflash_round.cpp`
+  （`dflash2_proposal_workspace_bytes`）、必要时 `program/planning/startup.cpp`（peer 侧容量）、
+  `load/tp_split_spec.{h,cpp}`（注释）、新算子与其 oracle 测试。
+
+### 7.4 方案 A 的验收标准
+
+1. 新算子 oracle 测试（host 朴素排序逐位比对）与 `ninfer_linear_tp2_split_grouped_head_test` 通过。
+2. **摘要不变**：`ninfer_qwen3_5_tp2_dflash_append_test` 仍是 `0xbad27a494a9bc853`（K=7）/ `0xbee487264ca8ffb8`（K=5）；
+   `ninfer_qwen3_5_tp2_dflash_solo_test` 仍是 `0x4bcc3994a5efba7d`。
+3. 账目：`proposal/head` 改动前在两卡都是复制的，所以**两卡各减半 170 MiB**（见 §7.7 实测）。
+4. 抽测贪心 dflash2：与改动前同命令同提示的输出逐字节一致（见 §7.7）。
+
+### 7.7 方案 A 实施结果（已完成）
+
+**改动**：`ops::merge_topk_candidates`（新算子 + oracle 测试）、`linear_topk` 支持 65536 行半表 profile、
+`TextContext::proposal_topk_tp2`、`draft.cpp` 拆分分支、`startup.cpp` 文本工作区预留、`load.cpp` 门禁开放、
+注释同步（`tp_split_spec.{h,cpp}`）。
+
+**账目 A/B（同一工件 `qwen3_8_27b_w4a4_w8a8_dflash2.ninfer`、同一命令 `--spec dflash2 --draft-tokens 7
+--lm-head-draft --vision --devices 0,1 --max-context 102400`，唯一变量是门禁开/关）**：
+
+| 项 | 门禁关（复制） | 门禁开（半表） | 差 |
+|---|---|---|---|
+| shard 0 `weights+ctx` | 13878.6 | 13708.6 | **−170.0** |
+| shard 1 `weights+ctx` | 12036.6 | 11866.6 | **−170.0** |
+| shard 0 `free` | 136.0 | 308.0 | +172.0 |
+| shard 1 `free` | 1338.0 | 1508.0 | +170.0 |
+| nvidia-smi GPU0 / GPU2 | 15158 / 13954 | 14986 / 13784 | −172 / −170 |
+
+上限由 shard 0 决定：+170 MiB ÷ 16.13 KiB/token ≈ **+10.8k token**（与设计预期一致）。
+`dflash2 proposal` 轮工作区顺带 7.4 → 4.4 MiB（半表 `linear_topk` 暂存更小）。
+
+**抽测（贪心，temperature 0，max_tokens 500，同提示）**：
+
+| 项 | 门禁关 | 门禁开 |
+|---|---|---|
+| completion_tokens | 385（stop token） | 385（stop token） |
+| dflash2 accepted | 252/931 (27.1%) | 252/931 (27.1%) |
+| decode tok/s | 66.3 | 66.9 |
+| 输出文本 sha256(前 32) | `2765879ab69653a592f330a335025ff9` | `2765879ab69653a592f330a335025ff9` |
+
+输出逐字节一致 + 接受计数一致 ⇒ 拆分路径的候选与整份头逐位等价（贪心确定性）。
+
+**踩到的坑（已修）**：`linear_topk` 的候选载荷是**按列连续**的（`merge.cu:82` 写 `column * 16 + rank`，
+`merge.cu:22` 同类），新算子最初按 `rank * columns + column` 索引，U=7 时整列错位，抽测接受率掉到 7.4%、
+tok/s 减半。修正后恢复到与改动前完全一致，并把该布局写进算子契约与 oracle 测试。
+
+### 7.5 方案 B（待办）：把 `dflash2/candidate_selector`（245 MiB）移到 shard 1
+
+selector 每 draft 轮只需一次（输入 hidden ~KB 级），搬到 shard 1 可再平衡约 245 MiB（+~15.6k token），
+代价是每轮一次 PCIe 往返，需先做微基准量化；`dflash2/feature_projection`（132.8 MiB）同理，但它服务 prefill
+（长提示要传特征），优先级更低。
+
+### 7.6 其他选项（未采纳，留档）
+
+- 不均匀 TP（KV head 1:3 + FFN 3:1）能一次吃掉 1202 MiB（+38k token），但 `tp_split_spec.cpp:138-143`
+  的 part 目前硬编码二等分、merge/collective 也按半块，属明确的产品改动。
+- `--spec mtp`（draft 仅 148 MiB）零代码即可开 262144（仓库实测行），代价是换 draft 后端。
+- KV 量化类（nvfp4/k8v4/int8）损精度，排除；关 `--vision` 只省轻卡，dflash2 下不提高上限。
+
+
 ### 6.5 验收
 
 - 新工具仅依赖 Python 标准库；`git diff --check` 干净。

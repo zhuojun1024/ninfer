@@ -135,13 +135,12 @@ materialize_model_tp2(LoadPlan&& plan, DeviceContext& device0, DeviceContext& de
         data->options.purpose == EnginePurpose::Generation &&
         (!data->options.speculative_enabled() || data->options.proposal_enabled());
     // The reduced proposal head is a draft-only table. MTP's proposal runs on shard 0 but merges
-    // the pair's row blocks in proposal_argmax, so halving the table saves memory. A masked draft
-    // (DFlash2) resolves its top-k against the whole reduced vocabulary on shard 0 alone:
-    // linear_topk matches an exact head-row profile and nothing merges the row blocks, so that
-    // route keeps the head replicated.
+    // the pair's row blocks in proposal_argmax, so halving the table saves memory. The masked draft
+    // (DFlash2) ranks each half through linear_topk and merges both candidate lists with
+    // merge_topk_candidates, which is the whole table's stable top sixteen exactly, so that route
+    // halves the table as well.
     const bool split_proposal_head =
-        data->options.purpose == EnginePurpose::Generation && data->options.proposal_enabled() &&
-        !data->options.dflash2();
+        data->options.purpose == EnginePurpose::Generation && data->options.proposal_enabled();
     const auto spec = loading::build_tp_split_spec(
         directory, data->config.text,
         loading::TpSplitOptions{.split_output_head   = split_text_head,

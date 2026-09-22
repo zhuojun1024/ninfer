@@ -12,7 +12,8 @@
 //   - mtp/*, dflash2/* and vision/*: Replicated but shard-local - the MTP layer and the DFlash2
 //     masked draft are placed on shard 0 alone and the Vision tower on shard 1 alone, because no
 //     execution path on the other shard reads them. The DFlash2 selector reads whole-vocabulary
-//     codebooks, so a vocabulary-parallel split would not preserve its top-k domain.
+//     codebooks, so a vocabulary-parallel split would not preserve its top-k domain; the reduced
+//     proposal head above is a separate table and is split.
 // Objects not classified are replicated to both shards.
 
 #include "artifact/schema.h"

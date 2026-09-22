@@ -13,6 +13,7 @@ set(ninfer_op_tests
   layer_norm
   embedding
   argmax
+  merge_topk_candidates
   gdn_gating
   gdn_gating_proj
   rope
