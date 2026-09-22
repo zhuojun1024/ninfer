@@ -511,6 +511,22 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
     `frame.target_hidden` 的真实字节数后做跨 run 哈希；限时 `compute-sanitizer --tool initcheck` 跑 solo 探针；或对窗口前向做逐 kernel 的
     race 检查（nsys/sanitizer）。
     临时钩子已用 `git checkout -- src/runtime/engine/tp2_generation_core.cpp src/runtime/engine/model_instance.cpp` 干净回退（工作树对这些文件
+    **诊断轮（1c 张量事实 + 工件对照）**：
+    (i) **张量事实**（`src/models/qwen3_5/program/round_buffers.cpp:214-218`）：`target_logits` = **BF16** `{output_rows=248320, columns, batch=1}`、
+    `target_hidden` = **BF16** `{hidden=5120, columns, batch}`；`tp2_generation_core.cpp:2844` 视图里的 `vocab` 是**全词表 248320**。
+    前两次 dump 用 `vocab*width*4`（假设 fp32）是 2 倍超界，`cudaErrorInvalidValue` 由此而来；改成 **2 字节/元素后拷贝成功**。
+    (ii) **但该 dump 的内容与 target 判定不一致**：host 端 top-5 的最大值只有 7.6–12.8、id 每次不同，而同一轮 `frame.target_argmax` 稳定是 `[198 …]`
+    ⇒ 读到的字节**不是 argmax 读的那批行**（写出端布局/偏移问题）。所以「输入缓冲不同 vs 计算内部非确定」这条切分**仍未成立**，
+    得到的 hash 不足以作结论（跨 run 变化只说明该 buffer 含未被写过的字节）。下一步需要的新手段：读 head 写出端
+    （`project_head_tp2` / `merge_local_row_blocks`）确认 stamp 的行范围与布局，再只对**判定真正读到的行**做哈希。
+    (iii) **工件对照**（同一二进制、同一场景、临时开门禁跑 solo 探针，每件 10 次；`build-win/b6n-{a,b,c}-1..10.log`）：
+    a) `qwen3_8_27b_w4a4_w8a8_dflash2`（用户转换）：9× `[1703 220 248046 198 248045 198 248045 198]`（digest `0x4bcc3994a5efba7d`）
+    + 1× 尾 token `6558`（`0x4bb38194a5c5b9d5`）⇒ **翻转**；
+    b) `qwen3_8_27b_w4a4_dflash2`（同模型另一种 w4a4）：**10/10 完全相同**（`0xad284a4b774b1cc3`）⇒ 不翻转；
+    c) **官方工件** `qwen3_8_27b_nvfp4`（README.md:18、docs/performance.md:22）：**10 次出现 4 种输出**（6× `2523`、1× `248046`、1× `3710`、2× `7734`）
+    ⇒ **官方工件同样翻转**。按预设解释规则：**「同二进制同输入必同输出」的引擎缺陷被官方工件坐实，与用户转换无关**；b 件稳定只说明暴露面
+    与该件的数值/并列位置相关。末轮候选累计出现过 7 个不同 token（198/220/248046/6558/2523/3710/7734）⇒ 该处 logits 间距在 bf16 量化最小刻度
+    附近（本 dump 未能给出可信数值）。
     回到 HEAD）；重建后 `NINFER_TEST_ROUTE=dflash2` refusal exit 0、solo 探针 exit 77。
     同进程的 plain engine 作控制组，判定是「两个 DFlash2 实例互相干扰」还是「任意第二个实例都受影响」。
     临时打开路线的改动已还原：`model_instance.cpp` 恢复构造期拒绝并重建验证（`dflash2 exit 0`、solo probe `exit 77`）。
