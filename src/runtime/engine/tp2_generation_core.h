@@ -347,12 +347,15 @@ private:
     void launch_window_graph(WindowGraph& graph);
     void capture_verify_graph(WindowGraph& graph, const std::int32_t* ids,
                               const std::int32_t* positions, Tensor& logits_columns,
-                              Tensor& hidden_columns);
+                              Tensor& hidden_columns,
+                              models::qwen3_5::execution::DFlashFeatureSink* sink,
+                              const std::int32_t* valid_columns);
     // The speculative verify window. sink, when non-null, is the masked-draft feature sink the
-    // target residual blocks are tapped into; it is only supported on the eager route, which is the
-    // one the DFlash2 backend selects (verify_graph_enabled_ stays false there). valid_columns is
-    // the number of leading window columns that own their cache slot (the masked-draft budget clamp
-    // duplicates the last valid column's position in the trailing columns); 0 appends every column.
+    // target residual blocks are tapped into; its device scatters travel with a captured window
+    // (stable addresses, per-round lane/column tensors re-read by the kernels) while its host
+    // bookkeeping ran on the capture's own execution. valid_columns is the number of leading window
+    // columns that own their cache slot (the masked-draft budget clamp duplicates the last valid
+    // column's position in the trailing columns); 0 appends every column.
     void run_verify_window(const std::int32_t* ids, std::int32_t first_position,
                            Tensor& logits_columns, Tensor& hidden_columns,
                            models::qwen3_5::execution::DFlashFeatureSink* sink = nullptr,

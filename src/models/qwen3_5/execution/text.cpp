@@ -2143,7 +2143,7 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
                                      const std::int32_t* ids, const std::int32_t* positions,
                                      ops::CausalAttentionExecutionEnvelope envelope,
                                      Tensor& logits_columns, Tensor* hidden_columns,
-                                     DFlashFeatureSink* sink, std::int32_t valid_columns) {
+                                     DFlashFeatureSink* sink, const std::int32_t* valid_columns) {
     const std::int32_t hidden = dimension(config_.hidden_size);
     const std::int32_t vocab  = dimension(config_.vocab_size);
     if (ids == nullptr || positions == nullptr) {
@@ -2189,9 +2189,9 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
         ops::set_i32_scalar(bind.kv_table_rows, 0, card.ctx_.stream);
         ops::set_i32_scalar(bind.state_source, 0, card.ctx_.stream);
         ops::set_i32_scalar(bind.state_destination, 0, card.ctx_.stream);
-        if (valid_columns > 0) {
+        if (valid_columns != nullptr) {
             bind.valid = arena.alloc(DType::I32, {1});
-            ops::set_i32_scalar(bind.valid, valid_columns, card.ctx_.stream);
+            copy_i32(valid_columns, bind.valid, card.ctx_.stream);
         }
         return bind;
     };

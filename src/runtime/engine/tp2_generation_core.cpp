@@ -371,30 +371,39 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     shard_a_.context->set_tp_peer(shard_b_.context.get(), &pair_);
     shard_b_.context->set_tp_peer(shard_a_.context.get(), &pair_);
 
-    if (mtp_enabled_ && pair_.in_kernel_allreduce()) {
+    if ((mtp_enabled_ || dflash2_enabled_) && pair_.in_kernel_allreduce()) {
         const char* env        = std::getenv("NINFER_TP2_VERIFY_GRAPH");
         verify_graph_enabled_  = env == nullptr || env[0] != '0';
     }
     if (mtp_enabled_ || dflash2_enabled_) {
         // The verify window is assembled in this portable pinned buffer every round: the capture
-        // path reads it through a memcpy node, and the eager path reads it directly. MTP assembles
+        // path reads it through memcpy nodes, and the eager path reads it directly. MTP assembles
         // it from the host proposal chain; DFlash2 reads the verify ids/positions the proposal
-        // published back from the frame. Both use the same [ids(W), positions(W)] layout.
+        // published back from the frame. Both use the same [ids(W), positions(W), valid(1)] layout;
+        // the trailing int carries the clamp extent, which varies per round and therefore reaches
+        // the captured graph the way ids/positions do.
         const std::uint32_t width = (mtp_enabled_ ? mtp_drafts_ : dflash_drafts_) + 1U;
         verify_window_host_ = std::make_unique<PinnedHostBuffer>(
-            static_cast<std::size_t>(2) * width * sizeof(std::int32_t), true);
+            static_cast<std::size_t>(2) * width * sizeof(std::int32_t) + sizeof(std::int32_t), true);
     }
-    if (mtp_enabled_) {
-        // The envelope buckets are the single-GPU MTP decode graph's split-policy boundaries, so a
+    if (mtp_enabled_ || dflash2_enabled_) {
+        // The envelope buckets are the single-GPU decode graph's split-policy boundaries, so a
         // window always covers the same attention route and launch geometry. The bucket is keyed by
         // the window's widest visible extent, which is what the envelope carries; both the capture
-        // and the eager reference use them, so the two differ only in how they are launched.
-        const std::uint32_t window_width = mtp_drafts_ + 1U;
-        for (const auto& profile :
-             qwen::detail::mtp_graph_profiles(options_.max_context, mtp_drafts_)) {
+        // and the eager reference use them, so the two differ only in how they are launched. The
+        // masked-draft route has its own profile set and target envelope: the single-GPU DFlash2
+        // graph captures {1, frontier + width} per profile.
+        const std::uint32_t window_width = (mtp_enabled_ ? mtp_drafts_ : dflash_drafts_) + 1U;
+        const auto profiles =
+            mtp_enabled_
+                ? qwen::detail::mtp_graph_profiles(options_.max_context, mtp_drafts_)
+                : qwen::detail::dflash_graph_profiles(SpeculativeBackend::DFlash2,
+                                                      options_.max_context, dflash_drafts_, 1);
+        for (const auto& profile : profiles) {
             WindowGraph graph;
-            graph.visible_begin = profile.min + 1U;
-            graph.visible_end = std::min(options_.max_context, profile.max + window_width);
+            graph.visible_begin = mtp_enabled_ ? profile.min + 1U : 1U;
+            graph.visible_end   = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                options_.max_context, static_cast<std::uint64_t>(profile.max) + window_width));
             verify_graphs_.push_back(std::move(graph));
         }
     }
@@ -909,7 +918,9 @@ void TP2GenerationCore::launch_window_graph(WindowGraph& graph) {
 
 void TP2GenerationCore::capture_verify_graph(WindowGraph& graph, const std::int32_t* ids,
                                              const std::int32_t* positions, Tensor& logits_columns,
-                                             Tensor& hidden_columns) {
+                                             Tensor& hidden_columns,
+                                             qwen::execution::DFlashFeatureSink* sink,
+                                             const std::int32_t* valid_columns) {
     Shard& shard_a = shard_a_;
     Shard& shard_b = shard_b_;
     const ops::CausalAttentionExecutionEnvelope envelope{graph.visible_begin, graph.visible_end};
@@ -928,8 +939,11 @@ void TP2GenerationCore::capture_verify_graph(WindowGraph& graph, const std::int3
     DecodeGraphDefinition* definitions[2] = {&graph.definition[0], &graph.definition[1]};
     cudaStream_t streams[2] = {shard_a.device.stream, shard_b.device.stream};
     DecodeGraphDefinition::capture_group(definitions, streams, [&] {
+        // The masked-draft sink and the clamp extent are part of the captured window: without the
+        // forwarding here the capture silently takes the default nullptr/nullptr and every replay
+        // runs the unmasked, sink-less sequence (the clamp KV-append race is back).
         shard_a.context->forward_tp2_window(*shard_b.context, pair_, ids, positions, envelope,
-                                           logits_columns, &hidden_columns);
+                                           logits_columns, &hidden_columns, sink, valid_columns);
     });
     graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
     graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
@@ -951,46 +965,43 @@ void TP2GenerationCore::run_verify_window(const std::int32_t* ids, std::int32_t 
     const auto* positions = ids + width;
     const std::uint32_t visible_end =
         static_cast<std::uint32_t>(first_position) + static_cast<std::uint32_t>(width);
+    // The clamp extent varies per round, so it reaches the forward (and a captured graph) through
+    // the pinned buffer's trailing int exactly like ids/positions: a set_i32_scalar would bake the
+    // capture-time value into the kernel and every replay would clamp to it.
+    auto* host_window             = static_cast<std::int32_t*>(verify_window_host_->data());
+    const std::int32_t* valid_ptr = nullptr;
+    if (valid_columns > 0) {
+        host_window[2 * width] = valid_columns;
+        valid_ptr              = host_window + 2 * width;
+    }
     if (!verify_graph_enabled_) {
         // The eager route runs the same window and the same envelope; only the launch differs. That
         // keeps NINFER_TP2_VERIFY_GRAPH=0 a true A/B of the captured sequence rather than a
         // comparison of two different attention routes.
-        // The masked-draft route builds no verify-graph buckets (it has no capture path), so its
-        // window runs under the exact envelope the bucket would have covered. MTP keeps the bucket
-        // the eager arm is compared against.
-        const ops::CausalAttentionExecutionEnvelope envelope =
-            verify_graphs_.empty()
-                ? ops::CausalAttentionExecutionEnvelope{
-                      static_cast<std::uint32_t>(first_position) + 1U, visible_end}
-                : [&] {
-                      const WindowGraph* bucket = select_window_graph(verify_graphs_, visible_end);
-                      if (bucket == nullptr) {
-                          throw std::logic_error("TP-2 verify window coverage is incomplete");
-                      }
-                      return ops::CausalAttentionExecutionEnvelope{bucket->visible_begin,
-                                                                   bucket->visible_end};
-                  }();
+        const WindowGraph* bucket = select_window_graph(verify_graphs_, visible_end);
+        if (bucket == nullptr) {
+            throw std::logic_error("TP-2 verify window coverage is incomplete");
+        }
+        const ops::CausalAttentionExecutionEnvelope envelope{bucket->visible_begin,
+                                                             bucket->visible_end};
         shard_a.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
                                               &shard_a.records);
         shard_b.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
                                               &shard_b.records);
         shard_a.context->forward_tp2_window(*shard_b.context, pair_, ids, positions, envelope,
-                                            logits_columns, &hidden_columns, sink, valid_columns);
+                                            logits_columns, &hidden_columns, sink, valid_ptr);
     } else {
-        if (sink != nullptr) {
-            // A captured window bakes the feature sink's scatter addresses but not the host-side
-            // capture calls, so the masked-draft verify always runs the eager route
-            // (verify_graph_enabled_ is only set for MTP).
-            throw std::logic_error("TP-2 masked-draft verify cannot use a captured window");
-        }
         WindowGraph* graph = select_window_graph(verify_graphs_, visible_end);
         if (graph == nullptr) {
             throw std::logic_error("TP-2 verify CUDA Graph coverage is incomplete");
         }
         if (reusable_window_graph(verify_graphs_, visible_end) == nullptr) {
             // Capturing records the sequence without executing it, so the capture round still has to
-            // run the window it just captured (with the operands the capture itself allocated).
-            capture_verify_graph(*graph, ids, positions, logits_columns, hidden_columns);
+            // run the window it just captured (with the operands the capture itself allocated). The
+            // masked-draft feature sink travels with the capture: its scatter addresses are baked
+            // and its per-round lane/column tensors are re-read by the kernels on every replay.
+            capture_verify_graph(*graph, ids, positions, logits_columns, hidden_columns, sink,
+                                 valid_ptr);
             launch_window_graph(*graph);
         } else {
             if (shard_a.workspace->used() != graph->arena_begin[0] ||
