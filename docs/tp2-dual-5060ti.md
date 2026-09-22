@@ -257,10 +257,16 @@ clamped columns neither append KV nor publish logits. `ninfer_qwen3_5_tp2_dflash
 acceptance: independent processes must print one identical digest over a nine-walk sequence, and
 its recalled walk must match the evicted (from-scratch) walk of the same prompt token for token.
 
-A recall whose boundary is not a multiple of the prefill chunk (256 by default) declines the masked
-draft for that request (`GenerationResult::draft_context_declined`): the ring beside the restored
-state belongs to a differently chunked walk, so its proposals cannot be licensed against a
-from-scratch walk's windows. The request runs target-only rounds. Those are deterministic and their
+A recall whose boundary is not a multiple of the prefill chunk (256 by default) cannot license the
+masked draft directly: the ring beside the restored state belongs to a differently chunked walk, so
+its proposals would not be licensed against a from-scratch walk's windows. The masked draft rounds
+such a boundary down to the aligned scan's result and replays the clip through the from-scratch chunk
+plan, which keeps the ring canonical and the draft live. That clip is at most one chunk, or sixteen
+tokens per token the request may still generate, so the prefill it costs (~1.6K tok/s) stays well
+below the decode it saves (~19 ms per generated token). Only a deeper mid-chunk lineage - one whose
+clip exceeds that bound - keeps the mid-chunk restore and declines the draft
+(`GenerationResult::draft_context_declined`, reported on stderr), running target-only rounds. Those
+are deterministic and their
 boundary crossing matches the oracle's, but target-only rounds are a different draft pattern from
 the oracle's full windows, and a changed draft pattern shifts which way near ties resolve (the same
 property the MTP section records for a changed draft cache dtype). What the decline costs is
@@ -353,8 +359,8 @@ configuration, two six-sample runs, one request at a time:
 
 Acceptance is derived from the `NINFER_TP2_TIMING=1` decode line
 (`[tp2-time] decode rounds=R committed=C`): accepted drafts are C - R out of R*K, where K is
-`--draft-tokens`. That is the only reliable source on this route: the response's `timings.draft_n`
-stays zero. Both routes were
+`--draft-tokens`. The response's `timings.draft_n` and `draft_n_accepted` now carry the same counts
+on this route. Both routes were
 non-degenerate on the essay prompt (no repeated-token runs); the coding prompt exhausted the token
 budget in reasoning on every sample, so its content is not comparable.
 

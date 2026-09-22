@@ -54,10 +54,15 @@ for ($i = 0; $i -lt $prompts.Count; $i++) {
         prompt = $prompts[$i]
         length = $text.Length
         tokens = $resp.usage.completion_tokens
+        # The speculative counters the response carries when the route drafted; they are the direct
+        # read on whether a request ran with its draft live or fell back to target-only rounds.
+        draft_n          = $resp.timings.draft_n
+        draft_n_accepted = $resp.timings.draft_n_accepted
         text   = $text
     }
     $lines += ($record | ConvertTo-Json -Depth 6 -Compress)
-    Write-Host ("prompt " + $i + ": len " + $text.Length + " tokens " + $resp.usage.completion_tokens)
+    Write-Host ("prompt " + $i + ": len " + $text.Length + " tokens " + $resp.usage.completion_tokens +
+        " draft_n " + $resp.timings.draft_n + " accepted " + $resp.timings.draft_n_accepted)
 }
 
 if ($OutFile) {

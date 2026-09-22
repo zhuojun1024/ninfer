@@ -2161,11 +2161,20 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // would drop all the way to a full prefill. Keeping the deepest boundary is better: the
         // recalled state and KV are still this prompt's own, and only the suffix chunking differs
         // from a from-scratch walk. Rescan the same boundaries without the grid restriction. The
-        // suffix chunking is what the DFlash2 route cannot accept (the declined-draft flag below).
+        // suffix chunking is what the DFlash2 route cannot accept (the declined-draft flag below),
+        // so the masked draft rounds such a boundary down to the aligned scan's result instead of
+        // trading its ring for the clip: the clip replay costs prefill work at ~1.6K tok/s while the
+        // draft saves ~19 ms of decode per generated token, so replaying up to sixteen clip tokens
+        // per budget token - and never less than one chunk - stays a clear win. Only a deeper
+        // mid-chunk lineage takes this branch, and it declines the draft below.
         if (reuse == 0) {
             auto take = [&](std::uint32_t position, std::size_t slot, ReuseSource source) {
                 if (position != 0 && position <= shared_prefix && position < prompt_tokens &&
                     position > reuse) {
+                    if (dflash2_enabled_ &&
+                        position <= std::max(reuse_grid, 16U * request.budget.remaining())) {
+                        return;
+                    }
                     reuse         = position;
                     reuse_slot    = slot;
                     reuse_source_ = source;
@@ -2192,6 +2201,14 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // request; the target KV/GDN reuse stays. See GenerationResult::draft_context_declined.
     dflash_draft_declined_ =
         dflash2_enabled_ && reuse != 0 && reuse % reuse_grid != 0;
+    if (dflash_draft_declined_) {
+        // Surface the trade loudly: this request runs target-only rounds for its whole generation,
+        // which is ~2x slower than the same request with a live masked draft.
+        std::fprintf(stderr,
+                     "[tp2-draft] masked draft declined: reuse boundary %u is not grid aligned "
+                     "(mid-chunk walk); this request runs target-only rounds\n",
+                     reuse);
+    }
     if (prefill_trace) { scan_done = Clock::now(); }
     if (reuse_trace) {
         std::size_t valid_checkpoints = 0;
@@ -2878,6 +2895,19 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // layout every time - which is what a captured verify graph bakes into its kernel arguments.
     shard_a_.round_base = ws_a.used();
     shard_b_.round_base = ws_b.used();
+    // The route and its spare capacity are fixed for the request, so the per-position acceptance
+    // histogram is sized once here - the same shape the single-device program publishes
+    // (decode.cpp sizes it from the route's draft window).
+    const std::uint32_t draft_window =
+        dflash2_enabled_ ? dflash_drafts_ : (mtp_enabled_ ? mtp_drafts_ : 0U);
+    result.speculative = SpeculativeStats{
+        .backend               = dflash2_enabled_ ? SpeculativeBackend::DFlash2
+                                 : (mtp_enabled_ ? SpeculativeBackend::Mtp
+                                                 : SpeculativeBackend::None),
+        .enabled               = draft_window != 0,
+        .draft_window          = draft_window,
+        .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+    };
     bool finished = false;
     while (!finished) {
         if (cancellation.requested()) {
@@ -3095,6 +3125,18 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 }
                 step.assign(licensed_host.begin(),
                             licensed_host.begin() + static_cast<std::ptrdiff_t>(licensed_count));
+                if (extent == 0) {
+                    result.speculative.fallback_steps += 1;
+                } else {
+                    result.speculative.rounds += 1;
+                    result.speculative.drafted_tokens += extent;
+                    result.speculative.accepted_tokens +=
+                        static_cast<std::uint32_t>(licensed_count - 1);
+                    for (std::int32_t i = 0; i < licensed_count - 1; ++i) {
+                        result.speculative
+                            .accepted_per_position[static_cast<std::size_t>(i)] += 1;
+                    }
+                }
             }
         } else if (!mtp_enabled_) {
             Tensor logits_a = run_plain_decode_step(current, position);
@@ -3254,6 +3296,13 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             }
             step.assign(licensed_host.begin(),
                         licensed_host.begin() + static_cast<std::ptrdiff_t>(licensed_count));
+            result.speculative.rounds += 1;
+            result.speculative.drafted_tokens += mtp_drafts_;
+            result.speculative.accepted_tokens +=
+                static_cast<std::uint32_t>(licensed_count - 1);
+            for (std::int32_t i = 0; i < licensed_count - 1; ++i) {
+                result.speculative.accepted_per_position[static_cast<std::size_t>(i)] += 1;
+            }
         }
         // A speculative round can license more tokens than the request still has budget for; the
         // output policy only ever commits a prefix of what it is shown.

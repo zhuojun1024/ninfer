@@ -738,6 +738,25 @@ req2 `3ce32871d0a13d34`(length/571)、req3 `56fd6e3da523651d`(stop/200)、req4 `
 "只有复读才命中"系误读：冷缓存下正常文本也命中（dump 实证），其余测量处于弃稿态（extent=0 无可接受）。
 换工件无效 ✓ 与结论一致（弃稿是运行时策略）。
 
+**修复 1+3 落地（本轮）**：
+- **可见性（1）**：TP-2 现在填充 `GenerationResult::speculative`（轮循环前言按路线预置
+  `accepted_per_position`/draft_window/backend，随后 dflash 与 MTP 两支各自累计 rounds/drafted/
+  accepted/per-position，口径与单卡 decode.cpp:139/732 一致）⇒ 响应 `timings.draft_n`/
+  `draft_n_accepted` 直接可用；弃稿时 stderr 打一行 `[tp2-draft] masked draft declined: …`。
+  坑：TP-2 的 `Request` 不是 `RequestRecord`（无 `speculative_stats`），且该向量从未分配 ⇒ 直接
+  `vec[i]+=1` 越界写导致 sessions 硬崩（输出全丢、exit 1）；改为累计进 `result.speculative` 并预置长度。
+- **深修（3）**：非网格回退（复用扫描 fallback，唯一产生非对齐 reuse 的入口）对 DFlash2 加门：
+  `position <= max(reuse_grid, 16×budget.remaining())` 时不取该边界，改用对齐扫描结果（通常 0）重放
+  clip —— 环保持规范分块走法、草稿全程在线。成本模型：clip 重算 ~0.6 ms/token（prefill ~1.6K tok/s）
+  vs 草稿省 ~19 ms/生成 token ⇒ 16× 余量下恒为净赚；超过才保留中块复用 + 弃稿（可见）。
+- **证据**：`ninfer_qwen3_5_tp2_sessions_test` 三路全过（EXIT=0；测试镜像新策略：
+  `draft_rounds_down()` + 浅 clip 断言 reuse==0 + `compare_recall` 第三类"从零重放"只钉边界首采样）；
+  dflash2 服务 + `greedy_probe`（7 条共享模板前缀请求，K=7）实测每轮 3.17 committed
+  （rounds=30/committed=95）、`draft_n` 187–276、accept 53–67、**无弃稿行**、prefill 188–388 ms
+  ⇒ 由 ~22 tok/s 升至 ~71 tok/s（修复前为 1.00 tok/轮）。
+- **契约说明**：从零重放的 recall 在热引擎中不保证与冷 oracle 逐 token 相同（`tools/win_port/r52_ab.ps1` 已
+  记录：缓存 KV 行携带产生它的 prefill 归约形状，ulp 级）——可验证的新契约是"草稿保持在线 + 边界首采样一致"。
+
 **工件现状（已查）**：本机 `D:/LLM/qwen3_8_27b_w4a4_w8a8.ninfer` **不含** DFlash2（组件仅 text/vision/mtp，
 parameters=1422），但同目录已有 `qwen3_8_27b_w4a4_w8a8_dflash2.ninfer`（parameters=1513、objects=1218）⇒
 评估**不需要重新转换**，直接换工件即可。

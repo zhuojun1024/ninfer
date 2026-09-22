@@ -1309,6 +1309,7 @@ Windows 原生移植（走 WSL2）、新架构支持。
   （主用途是散文/对话），回退只需去掉一个 flag。
 - 口径坑：TP-2 路径响应里的 `timings.draft_n` 恒为 0，接受率只能用 serve 日志的累计计数器
   `[mtp] round pos=… accepted=… rate=accepted/drafted`（drafted 恰为轮数×K）。
+  （后续修复：TP-2 现在填充 `SpeculativeStats`，响应直接带 `draft_n`/`draft_n_accepted`。）
 
 ## Round 51 — 14.9 GiB/卡的显存构成拆解
 
