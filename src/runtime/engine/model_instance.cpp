@@ -97,31 +97,13 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // The TP-2 core drives its own single-request round loop. MTP proposes from the artifact's
         // own nextn head. DFlash2 also owns a draft component the shard split materializes whole on
         // shard 0, and the core implements its masked proposal, target verify, sparse acceptance and
-        // GDN fold (PLAN.md section 3.6, stages B5-B6), but its option gate is closed again - see the
-        // refusal below. DFlash v1 still has no TP-2 context layout, and its draft state would go
-        // through the per-layer path this core does not own.
+        // GDN fold (PLAN.md section 3.6, stages B3-B6). Its verify window masks the budget-clamped
+        // columns out of the KV append, so the route reproduces a from-scratch walk token for token.
+        // DFlash v1 still has no TP-2 context layout, and its draft state would go through the
+        // per-layer path this core does not own.
         if (options.speculative.backend == SpeculativeBackend::DFlash) {
-            throw std::invalid_argument("TP-2 generation supports --spec mtp only");
-        }
-        // Stage B6 carries the DFlash2 draft ring through the core's prefix-reuse checkpoints,
-        // device snapshots and cross-session slabs, and declines the masked draft where the recall
-        // boundary is not one a from-scratch walk reaches
-        // (GenerationResult::draft_context_declined). The route is still not shippable: on the
-        // grid-aligned shared-system-prompt switch it disagrees with a from-scratch prefill of the
-        // same prompt on its last token in about two runs out of five, always with the same wrong
-        // answer - and it does so with the reuse scan closed for the route too, so prefix reuse is
-        // not the cause. Two identically configured Engine instances disagree: the one built second
-        // flips while the first stays put (PLAN.md 3.6, "B6 result"). The TP-2 exchange is not the
-        // cause - a bit-exact probe of the pair's allreduce over the decode window shapes passes,
-        // and plain and MTP stay bit-exact on the same server - and neither are the clamped verify
-        // columns, which duplicate the last licensed column and never read a stale KV slot. A route
-        // that emits that token is worse than no route, so it stays
-        // construction-refused until the preconditions recorded in PLAN.md 3.6 hold. The B1-B6
-        // implementation and its tests stay in tree; this gate is what keeps them unreachable.
-        if (options.speculative.backend == SpeculativeBackend::DFlash2) {
             throw std::invalid_argument(
-                "TP-2 generation supports --spec mtp only: --spec dflash2 is withheld because its "
-                "verify walk does not yet reproduce a from-scratch prefill (PLAN.md 3.6, \"B6 result\")");
+                "TP-2 generation supports --spec mtp and --spec dflash2 (not --spec dflash)");
         }
         // Vision is available on the TP-2 route: the artifact's static shard split places the
         // Vision tower on the shard that holds the vision component (shard 1) and the MTP layer on

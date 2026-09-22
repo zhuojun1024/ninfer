@@ -19,21 +19,19 @@
 // retry continues from the prefix the cancelled walk published.
 //
 // The from-scratch comparison is the strong claim: a reuse that changes the answer must not hide
-// behind a matching token count. The switch scenario and the cancellation retry agree with it token
-// for token. The third scenario, whose prompt is recalled behind a small unrelated request, agrees
-// only on the first sample; that gap is an open finding recorded in PLAN.md, not an accepted
-// behaviour, and it is why that one assertion is deliberately narrower than the others.
+// behind a matching token count. Every recall that keeps the oracle's draft pattern - the switch
+// scenario, the cancellation retry, and DFlash2 on the prefill grid - agrees token for token. A
+// recall whose masked draft is declined runs target-only rounds instead: a different draft pattern,
+// so its near ties resolve its own way and only its boundary crossing is pinned (compare_recall).
 //
 // A conversation that shares no tokens with the resident one is a switch even when nothing else can
 // serve it, so these scenarios also pin down what a switch costs when the host slabs are unusable.
 //
 // The scenario runs on three routes: plain, MTP and DFlash2. MTP keeps its own KV slab on shard 0
 // and DFlash2 keeps its masked draft's local context ring there; all three travel through the same
-// eviction transaction and the same prefix-reuse checkpoints. The default set is plain and MTP;
-// DFlash2 runs only when NINFER_TEST_ROUTE names it, and that route is refused at construction
-// until its verify walk reproduces a from-scratch prefill (PLAN.md section 3.6, "B6 result"), so that
-// route only asserts the refusal. The oracle in each round uses the same speculative configuration
-// with retention disabled.
+// eviction transaction and the same prefix-reuse checkpoints, and all three run by default.
+// NINFER_TEST_ROUTE narrows the run to one route when one needs a focused pass. The oracle in each
+// round uses the same speculative configuration with retention disabled.
 //
 // The artifact is selected with NINFER_TEST_ARTIFACT; two identical sm_120a devices are required.
 // Without either, the test skips with exit code 77.
@@ -105,19 +103,12 @@ constexpr std::uint32_t kPrefillChunk = 256;
 
 // A DFlash2 recall whose boundary is not on the prefill grid keeps the target KV/GDN reuse but
 // declines the masked draft for that request: the ring beside the restored state belongs to a
-// differently chunked walk, so the verify windows the emitted tokens come from would not match a
-// from-scratch walk's. The request runs target-only and only its first sample - the logits of the
-// reused prefix itself - is comparable, which is what the scenario pins for it (PLAN.md 3.6, "B6
-// result"). Every other route, and every aligned DFlash2 recall, is asserted bit for bit.
+// differently chunked walk, so its proposals cannot be licensed against a from-scratch walk's
+// windows. The request runs target-only rounds: deterministic in themselves, and their boundary
+// crossing matches the oracle, but the tail is a different draft pattern's walk (see compare_recall).
 bool draft_declined(Route route, std::uint32_t boundary) {
     return route == Route::DFlash2 && boundary != 0 && boundary % kPrefillChunk != 0;
 }
-
-// Whether the route takes part in cross-session retention. `normalize_engine_options` keeps the
-// DFlash2 disablement (PLAN.md section 3.6, "B6 result"): opening it does not yet pass the
-// retention property, so the route must never recall a returning conversation from a host slab.
-// The scenario then asserts that contract for DFlash2 instead of the recalled-prefix counts.
-bool route_keeps_retention(Route route) { return route != Route::DFlash2; }
 
 ninfer::EngineOptions engine_options(const char* artifact, int device_a, int device_b,
                                      bool retention, Route route) {
@@ -209,9 +200,15 @@ std::string tokens_text(const std::vector<TokenId>& tokens) {
 }
 
 // Pins a recall's answer against the from-scratch oracle. Every aligned recall - every route, and
-// DFlash2 on the prefill grid - has to match token for token. A declined DFlash2 recall (see
-// draft_declined) runs target-only, so only its first sample is pinned: that is the logits of the
-// reused prefix itself, which is exactly the property the retention carries.
+// DFlash2 on the prefill grid - has to match token for token: the walk keeps the oracle's draft
+// pattern, so its verify windows are the same execution shape and the KV rows they write are the
+// same bytes. A declined DFlash2 recall (see draft_declined) runs target-only rounds instead - a
+// different draft pattern and therefore a different execution shape, the same property that makes
+// MTP windows and plain decodes differ (docs/tp2-dual-5060ti.md) - and a changed draft pattern
+// shifts which way near ties resolve. The re-rendered-answer scenario demonstrates it
+// deterministically: its third token forks, identically in every run. The property a declined recall
+// still carries is the boundary crossing - its first sample is the logits of the reused prefix
+// itself - so that is what is pinned for it.
 int compare_recall(const std::string& label, const char* what, Route route, std::uint32_t boundary,
                    const ninfer::GenerationResult& got, const std::vector<TokenId>& expected) {
     const bool declined = draft_declined(route, boundary);
@@ -240,10 +237,7 @@ int compare_recall(const std::string& label, const char* what, Route route, std:
 // One full A/B/A/LRU scenario. Returns 0 on success, 1 on a failed assertion.
 int run_scenario(const char* artifact, int device_a, int device_b, Route route) {
     const std::string label = route_name(route);
-    // When retention is off the session slabs stay empty, so every returning conversation is a full
-    // prefill and the reuse counts fall to zero; the one reuse that survives is a stable system
-    // prefix a previous walk's own device snapshot still holds.
-    const bool cross_session_recall = route_keeps_retention(route);
+    // Every route keeps cross-session retention here; the oracle beside it runs retention-off.
 
     const std::vector<TokenId> opening    = make_prompt(1200, 64);
     const std::vector<TokenId> follow_up  = make_prompt(4000, 16);
@@ -351,15 +345,14 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     // A returns: the whole prefix comes back from the host slabs, so only the frontier token is
     // forwarded again.
     const ninfer::GenerationResult a_second = run(engine, a_continued);
-    const std::uint32_t a_second_reuse = cross_session_recall ? recalled_frontier : 0U;
+    const std::uint32_t a_second_reuse = recalled_frontier;
     if (a_second.reused_prompt_tokens != a_second_reuse) {
         return fail(label, "a recalled conversation reused " +
                               std::to_string(a_second.reused_prompt_tokens) +
                               " prompt tokens, expected " + std::to_string(a_second_reuse));
     }
     if (const int status = compare_recall(label, "a recalled conversation", route,
-                                          cross_session_recall ? recalled_frontier : 0U, a_second,
-                                          continued_answer);
+                                          recalled_frontier, a_second, continued_answer);
         status != 0) {
         return status;
     }
@@ -417,7 +410,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     const std::uint32_t shared_frontier =
         static_cast<std::uint32_t>(shared_a.size() + shared_answer.size()) - 1U;
     const ninfer::GenerationResult shared_a_second = run(engine, shared_a_continued);
-    const std::uint32_t shared_a_second_reuse = cross_session_recall ? shared_frontier : 0U;
+    const std::uint32_t shared_a_second_reuse = shared_frontier;
     if (shared_a_second.reused_prompt_tokens != shared_a_second_reuse) {
         return fail(label, "a conversation behind a shared system prompt reused " +
                                std::to_string(shared_a_second.reused_prompt_tokens) +
@@ -425,8 +418,8 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
                                std::to_string(shared_a_second_reuse));
     }
     if (const int status = compare_recall(label, "a conversation behind a shared system prompt",
-                                          route, cross_session_recall ? shared_frontier : 0U,
-                                          shared_a_second, shared_continued_answer);
+                                          route, shared_frontier, shared_a_second,
+                                          shared_continued_answer);
         status != 0) {
         return status;
     }
@@ -443,25 +436,21 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     }
     const ninfer::GenerationResult shared_c_first = run(engine, shared_c);
     const std::uint32_t shared_c_first_reuse =
-        cross_session_recall ? static_cast<std::uint32_t>(system_prompt.size()) : 0U;
+        static_cast<std::uint32_t>(system_prompt.size());
     if (shared_c_first.reused_prompt_tokens != shared_c_first_reuse) {
         return fail(label, "a conversation opening with a stored system prompt reused " +
                                std::to_string(shared_c_first.reused_prompt_tokens) +
                                " prompt tokens, expected " + std::to_string(shared_c_first_reuse));
     }
-    // The recalled walk agrees with the oracle on the first sample, which is the logits of the last
-    // prompt column over the recalled KV and GDN state - the whole point of the boundary. It is not
-    // asserted token for token: a recall that restores its KV from a host slab diverges from a
-    // from-scratch walk inside the generated tail (this case splits at the seventh of eight greedy
-    // tokens, into a repeating token the from-scratch walk does not produce), and the same
-    // comparison passes when the KV is still the one the device already held. That difference is
-    // tracked separately; see PLAN.md's TP-2 session note. The prefix/state themselves are pinned
-    // down by the frontier, prompt-end and switch scenarios above.
-
-    if (!shared_c_first.generated_token_ids.empty() && !shared_c_answer.empty() &&
-        shared_c_first.generated_token_ids.front() != shared_c_answer.front()) {
-        return fail(label, "a conversation behind a stored system prompt diverged from the oracle on "
-                           "its first sample");
+    // The recalled walk has to agree with the oracle token for token. This is the case that used to
+    // split inside its generated tail (PLAN.md 3.6, "B6 result"): the host-slab recall lands on the
+    // prefill grid, so its masked draft stays licensed and its verify windows have to reproduce a
+    // from-scratch walk exactly.
+    if (const int status = compare_recall(
+            label, "a conversation opening with a stored system prompt", route, shared_c_first_reuse,
+            shared_c_first, shared_c_answer);
+        status != 0) {
+        return status;
     }
 
     // A client that re-renders the answer it was handed never reproduces the sampled tokens, so the
@@ -474,8 +463,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     (void)run(engine, aside);
     const ninfer::GenerationResult rerendered_first = run(engine, rerendered);
     const std::uint32_t rerender_prompt_end = static_cast<std::uint32_t>(rerender_base.size());
-    const std::uint32_t rerendered_first_reuse =
-        cross_session_recall ? rerender_prompt_end : 0U;
+    const std::uint32_t rerendered_first_reuse = rerender_prompt_end;
     if (rerendered_first.reused_prompt_tokens != rerendered_first_reuse) {
         return fail(label, "a conversation behind a re-rendered answer reused " +
                                std::to_string(rerendered_first.reused_prompt_tokens) +
@@ -483,8 +471,8 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
                                std::to_string(rerendered_first_reuse));
     }
     if (const int status = compare_recall(label, "a conversation behind a re-rendered answer",
-                                          route, cross_session_recall ? rerender_prompt_end : 0U,
-                                          rerendered_first, rerendered_answer);
+                                          route, rerender_prompt_end, rerendered_first,
+                                          rerendered_answer);
         status != 0) {
         return status;
     }
@@ -502,7 +490,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     }
     const std::uint32_t interrupted_prefix = 256;
     const ninfer::GenerationResult retried = run(engine, interrupted);
-    const std::uint32_t retried_reuse = cross_session_recall ? interrupted_prefix : 0U;
+    const std::uint32_t retried_reuse = interrupted_prefix;
     if (retried.reused_prompt_tokens != retried_reuse) {
         return fail(label, "a retry of a cancelled prompt reused " +
                                std::to_string(retried.reused_prompt_tokens) +
@@ -531,16 +519,9 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
         }
     }
 
-    if (cross_session_recall) {
-        std::cout << "TP-2 session retention (" << label << ") passed: recall reused "
-                  << recalled_frontier
-                  << " prompt tokens bit-identically; LRU eviction forced a full prefill\n";
-    } else {
-        std::cout << "TP-2 session retention (" << label
-                  << ") passed: retention disabled, so no cross-session recall happened (every "
-                     "returning conversation full-prefilled from zero) and the only prompt tokens "
-                     "reused were the shared system prefix; LRU eviction forced a full prefill\n";
-    }
+    std::cout << "TP-2 session retention (" << label << ") passed: recall reused "
+              << recalled_frontier
+              << " prompt tokens bit-identically; LRU eviction forced a full prefill\n";
     return 0;
 }
 
@@ -559,14 +540,12 @@ int main() {
     }
 
     // NINFER_TEST_ROUTE=plain|mtp|dflash2 narrows the run to one route, which is what a failing
-    // route needs when each of the others costs a full model load. The default set is the two routes
-    // the retention property holds for; DFlash2 is opt-in and construction-refused until its prefix
-    // reuse reproduces a from-scratch walk (PLAN.md section 3.6, "B6 result").
+    // route needs when each of the others costs a full model load. The default set is all three.
     const char* selected_env   = std::getenv("NINFER_TEST_ROUTE");
     const std::string selected = selected_env == nullptr ? "" : selected_env;
     std::vector<Route> routes;
     if (selected.empty()) {
-        routes = {Route::Plain, Route::Mtp};
+        routes = {Route::Plain, Route::Mtp, Route::DFlash2};
     } else if (selected == "plain") {
         routes = {Route::Plain};
     } else if (selected == "mtp") {
@@ -580,28 +559,6 @@ int main() {
 
     try {
         for (const Route route : routes) {
-            if (route == Route::DFlash2) {
-                // The route is construction-refused while its prefix reuse does not reproduce a
-                // from-scratch walk (PLAN.md section 3.6, "B6 result"). The scenarios below stay in
-                // tree for the day it is reopened; this keeps the gate itself under test.
-                const ninfer::EngineOptions probe_options =
-                    engine_options(artifact, devices.first, devices.second, true, route);
-                bool refused = false;
-                try {
-                    const ninfer::Engine probe(probe_options);
-                } catch (const std::exception& error) {
-                    refused =
-                        std::string(error.what()).find("dflash2 is withheld") != std::string::npos;
-                }
-                if (!refused) {
-                    std::cerr << "FAIL: the DFlash2 route is reachable again while its recall is not "
-                                 "reproducible; see PLAN.md section 3.6\n";
-                    return 1;
-                }
-                std::cout << "TP-2 DFlash2 route refusal passed: the option gate is closed until its "
-                             "verify walk reproduces a from-scratch prefill\n";
-                continue;
-            }
             if (const int status = run_scenario(artifact, devices.first, devices.second, route);
                 status != 0) {
                 return status;

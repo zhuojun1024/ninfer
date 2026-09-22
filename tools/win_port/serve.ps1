@@ -2,6 +2,7 @@
 #
 #   pwsh -File tools/win_port/serve.ps1                  # start with the shipped recipe
 #   pwsh -File tools/win_port/serve.ps1 -Context 32768   # larger KV capacity
+#   pwsh -File tools/win_port/serve.ps1 -Spec dflash2 -DraftTokens 7   # DFlash2 masked draft
 #   pwsh -File tools/win_port/serve.ps1 -Plain           # no MTP/vision, plain decode
 #   pwsh -File tools/win_port/serve.ps1 -HostKvMiB 0     # no cross-session KV retention
 #   pwsh -File tools/win_port/serve.ps1 -Status          # processes, health, VRAM
@@ -19,6 +20,7 @@ param(
     [string] $Binary = "",
     [int] $Port = 8099,
     [int] $Context = 131072,
+    [ValidateSet("mtp", "dflash2")][string] $Spec = "mtp",
     [int] $DraftTokens = 2,
     [int] $HostKvMiB = 32768,
     [int] $PrivateContinuations = 6,
@@ -88,7 +90,7 @@ $arguments = @(
 if (-not $Plain) {
     $arguments += @(
         "--temperature", "0.7", "--top-k", "20", "--top-p", "0.80",
-        "--spec", "mtp", "--draft-tokens", "$DraftTokens", "--lm-head-draft",
+        "--spec", "$Spec", "--draft-tokens", "$DraftTokens", "--lm-head-draft",
         "--vision", "--reasoning-effort", "medium"
     )
 }

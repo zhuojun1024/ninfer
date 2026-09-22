@@ -1,13 +1,14 @@
-// Single-instance determinism probe for the TP-2 DFlash2 route (PLAN.md section 3.6, "B6 result").
+// Single-instance determinism acceptance for the TP-2 DFlash2 route (PLAN.md section 3.6).
 //
-// The session scenario compares a retention-enabled Engine against a from-scratch oracle Engine in
-// one process, and its shared-system-prompt switch flips about two runs out of five: the Engine built
-// second in the process disagrees with the one built first, while an identically configured walk in
-// the compiler's own order stays put. This probe builds ONE Engine, replays the same request sequence
-// on it (each continuation rendered from this engine's own answer, which is what a client does) and
-// prints every walk's generated tokens plus a digest of them all. Running it in independent processes
-// answers whether the product shape - one Engine per process - is deterministic at all, which is the
-// question that decides whether the route can be released.
+// The route's clamped verify windows once let their duplicated columns race the position owner's KV
+// slot and flipped a near tie about one run in four. This case builds ONE Engine, replays a request
+// sequence on it (each continuation rendered from this engine's own answer, which is what a client
+// does) and prints every walk's generated tokens plus a digest of them all. Independent processes
+// must print one identical digest and identical walk bodies. Inside a run, the recalled walk's
+// first sample has to match the evicted (from-scratch) walk of the same prompt - the boundary
+// crossing is the property the retention carries. The tails are only compared across runs: the
+// recalled walk runs target-only rounds after a draft decline, a different draft pattern whose near
+// ties resolve its own way against a full-window walk (docs/tp2-dual-5060ti.md).
 
 #include "ninfer/engine.h"
 
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -149,11 +151,18 @@ int main(int argc, char** argv) {
         append(a_continued, walk("opening", opening).generated_token_ids);
         append(a_continued, follow_up);
         walk("other_a", other_a);
-        walk("a_continued", a_continued);
+        const ninfer::GenerationResult recalled = walk("a_continued", a_continued);
         walk("other_b", other_b);
         walk("other_c", other_c);
         walk("other_d", other_d);
-        walk("a_continued_evicted", a_continued);
+        const ninfer::GenerationResult evicted = walk("a_continued_evicted", a_continued);
+        if (recalled.generated_token_ids.empty() || evicted.generated_token_ids.empty() ||
+            recalled.generated_token_ids.front() != evicted.generated_token_ids.front()) {
+            throw std::runtime_error(
+                "the recalled walk diverged from the from-scratch walk on its first sample: " +
+                tokens_text(recalled.generated_token_ids) + " vs " +
+                tokens_text(evicted.generated_token_ids));
+        }
         walk("shared_a", shared_a);
         walk("shared_b", shared_b);
 
@@ -161,14 +170,6 @@ int main(int argc, char** argv) {
         std::cout << "[solo] PASS\n";
         return 0;
     } catch (const std::exception& error) {
-        // The route is construction-refused while its walk is not deterministic (PLAN.md 3.6, "B6
-        // result"). This probe is the harness that measures it the moment that gate opens, so a
-        // refused route is a skip rather than a failure.
-        if (std::string(error.what()).find("dflash2 is withheld") != std::string::npos) {
-            std::cout << "skip: the DFlash2 route is construction-refused; this probe measures it "
-                         "once the option gate opens (PLAN.md 3.6)\n";
-            return 77;
-        }
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;
     }
