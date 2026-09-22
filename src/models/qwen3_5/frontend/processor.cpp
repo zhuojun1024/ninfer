@@ -110,7 +110,11 @@ Size smart_resize_video(int frames, int height, int width, std::uint64_t min_pix
         checked_mul(static_cast<std::uint64_t>(h), static_cast<std::uint64_t>(w), "video area"),
         "video pixels");
     if (volume > max_pixels) {
-        const double beta = std::sqrt(static_cast<double>(frames) * height * width / max_pixels);
+        // Scale the padded volume, not the raw frame count: the bound above is checked on
+        // padded_frames, so an odd frame count would otherwise overshoot max_pixels and the Vision
+        // item ceiling derived from it.
+        const double beta =
+            std::sqrt(static_cast<double>(padded_frames) * height * width / max_pixels);
         h = std::max(kFactor, static_cast<int>(std::floor(height / beta / kFactor)) * kFactor);
         w = std::max(kFactor, static_cast<int>(std::floor(width / beta / kFactor)) * kFactor);
     } else if (volume < min_pixels) {
@@ -270,7 +274,7 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
 }
 
 void add_budget(PreprocessStats& stats, const VisionItem& item);
-void enforce_media_item_resource_limits(const PreprocessStats& stats);
+void enforce_media_item_resource_limits(const PreprocessStats& stats, std::uint64_t item_tokens);
 void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options);
 
 // Miss builders run concurrently. Claim their aggregate extent before allocating the retained
@@ -305,7 +309,7 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
     out.item.grid     = {1, gh, gw};
     PreprocessStats item_stats;
     add_budget(item_stats, out.item);
-    enforce_media_item_resource_limits(item_stats);
+    enforce_media_item_resource_limits(item_stats, options.vision_item_tokens);
     request_budget.claim(out.item);
     const std::size_t elements = static_cast<std::size_t>(gh) * gw * kPatchFeatures;
     out.payload                = cache.allocate_payload(elements, control);
@@ -360,7 +364,7 @@ Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptio
     out.item.grid     = {gt, gh, gw};
     PreprocessStats item_stats;
     add_budget(item_stats, out.item);
-    enforce_media_item_resource_limits(item_stats);
+    enforce_media_item_resource_limits(item_stats, options.vision_item_tokens);
     request_budget.claim(out.item);
     const std::size_t elements = static_cast<std::size_t>(gt) * gh * gw * kPatchFeatures;
     out.payload                = cache.allocate_payload(elements, control);
@@ -610,12 +614,12 @@ void add_budget(PreprocessStats& stats, const VisionItem& item) {
                                          "vision attention pairs");
 }
 
-void enforce_media_item_resource_limits(const PreprocessStats& stats) {
-    if (stats.raw_patches > kMaximumVisionItemRawPatches) {
+void enforce_media_item_resource_limits(const PreprocessStats& stats, std::uint64_t item_tokens) {
+    if (stats.raw_patches > item_tokens * kRawPatchesPerVisionToken) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "single media item raw patches exceed Vision execution capacity");
     }
-    if (stats.vision_tokens > kMaximumVisionItemTokens) {
+    if (stats.vision_tokens > item_tokens) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "single media item tokens exceed Vision execution capacity");
     }
@@ -850,7 +854,8 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
       media_cache_(std::move(media_cache)) {
     if (options_.max_encoded_media_bytes == 0 || options_.max_decoded_pixels == 0 ||
         options_.max_decoded_video_pixels == 0 || options_.max_raw_patches == 0 ||
-        options_.max_vision_tokens == 0 || options_.image_min_pixels == 0 ||
+        options_.max_vision_tokens == 0 || options_.vision_item_tokens == 0 ||
+        options_.image_min_pixels == 0 ||
         options_.image_max_pixels < options_.image_min_pixels || options_.video_min_pixels == 0 ||
         options_.video_max_pixels < options_.video_min_pixels || !(options_.video_fps > 0.0) ||
         options_.video_min_frames <= 0 || options_.video_max_frames < options_.video_min_frames ||
@@ -891,7 +896,7 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
                                   : inspect_video_item(part->media.bytes, options_, policy);
             PreprocessStats item_stats;
             add_budget(item_stats, item);
-            enforce_media_item_resource_limits(item_stats);
+            enforce_media_item_resource_limits(item_stats, options_.vision_item_tokens);
             add_budget(stats, item);
             enforce_media_resource_limits(stats, options_);
             items.push_back(std::move(item));
@@ -1025,7 +1030,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         try {
             PreprocessStats item_stats;
             add_budget(item_stats, item);
-            enforce_media_item_resource_limits(item_stats);
+            enforce_media_item_resource_limits(item_stats, options_.vision_item_tokens);
             add_budget(stats, item);
             enforce_media_resource_limits(stats, options_);
         } catch (...) {

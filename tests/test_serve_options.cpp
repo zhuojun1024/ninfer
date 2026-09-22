@@ -33,6 +33,8 @@ int main() {
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
+    failures += check(defaults.vision_item_tokens == ninfer::kMaximumVisionItemTokens,
+                      "Vision item token ceiling default mismatch");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.context_cost_presets.empty(),
@@ -133,6 +135,25 @@ int main() {
                           dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
                           dflash_vision.speculative.draft_tokens == 15,
                       "serve options did not preserve combined DFlash and Vision features");
+
+    const ServeOptions item_ceiling =
+        parse({"ninfer-serve", "model.ninfer", "--vision", "--vision-item-tokens", "4096"});
+    failures += check(item_ceiling.vision_item_tokens == 4096,
+                      "--vision-item-tokens did not reach serving options");
+
+    bool item_ceiling_floor_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--vision-item-tokens", "1024"});
+    } catch (const std::invalid_argument&) { item_ceiling_floor_rejected = true; }
+    failures +=
+        check(item_ceiling_floor_rejected, "--vision-item-tokens accepted a value under the floor");
+
+    bool item_ceiling_ceiling_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--vision-item-tokens", "16385"});
+    } catch (const std::invalid_argument&) { item_ceiling_ceiling_rejected = true; }
+    failures += check(item_ceiling_ceiling_rejected,
+                      "--vision-item-tokens accepted a value above the ceiling");
 
     bool implicit_backend_rejected = false;
     try {
@@ -334,6 +355,9 @@ int main() {
                       "serve help omits --reasoning-effort");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
+    failures += check(serve_usage_text("ninfer-serve").find("--vision-item-tokens") !=
+                          std::string::npos,
+                      "serve help omits --vision-item-tokens");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");

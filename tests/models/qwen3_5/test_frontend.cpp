@@ -1116,6 +1116,61 @@ int test_template_file_execution() {
     return failures;
 }
 
+// The per-item Vision ceiling is an Engine option: lowering it shrinks the fixed Vision workspace,
+// and the processor must resize media into the smaller pixel budget instead of refusing it. A
+// 1536x1536 image is 2,359,296 pixels = 2304 merged tokens at the compiled 1024-pixels-per-token
+// geometry, so the default ceiling leaves it untouched and a 2048-token ceiling must shrink it.
+int test_vision_item_ceiling() {
+    constexpr int kSide                    = 1536;
+    const std::vector<std::uint8_t> pixels = block_ppm(kSide, kSide, 0x40);
+    const auto image_pads                  = [](const auto& output) {
+        const auto& data = FrontendFactory::inspect(output);
+        return std::count(data.token_ids.begin(), data.token_ids.end(), 248056);
+    };
+
+    const Frontend full = make_frontend(resources(), true);
+    int failures        = check(image_pads(full.prepare(image_text_input(pixels, "", "full.ppm"))) ==
+                                    2304,
+                                "the default Vision ceiling resized an image inside its budget");
+
+    ninfer::models::qwen3_5::FrontendOptions limited_options;
+    limited_options.vision_enabled     = true;
+    limited_options.max_context        = std::numeric_limits<std::uint32_t>::max();
+    limited_options.vision_item_tokens = 2'048;
+    const Frontend limited             = make_frontend(resources(), limited_options);
+    const auto limited_pads =
+        image_pads(limited.prepare(image_text_input(pixels, "", "limited.ppm")));
+    failures += check(limited_pads > 0 && limited_pads <= 2'048 && limited_pads < 2304,
+                      "a lowered Vision ceiling refused or failed to resize an oversized image");
+
+    // A single decoded frame is padded to a temporal pair, so the resize must scale that padded
+    // volume; otherwise the item overshoots the ceiling and is refused instead of resized.
+    ninfer::MessagePart video;
+    video.kind              = ninfer::MessagePartKind::Media;
+    video.media.kind        = ninfer::MediaKind::Video;
+    video.media.bytes       = block_ppm(kSide, kSide, 0x40);
+    video.media.media_type  = "image/x-portable-pixmap";
+    video.media.source_name = "ceiling-video.ppm";
+    ninfer::ChatMessage video_message;
+    video_message.role = ninfer::ChatRole::User;
+    video_message.parts.push_back(std::move(video));
+    ninfer::PromptInput video_input;
+    video_input.messages.push_back(std::move(video_message));
+    const auto video_prompt = limited.prepare(std::move(video_input));
+    const auto& video_data  = FrontendFactory::inspect(video_prompt);
+    const auto video_pads =
+        std::count(video_data.token_ids.begin(), video_data.token_ids.end(), 248057);
+    failures += check(video_pads > 0 && video_pads <= 2'048,
+                      "a lowered Vision ceiling refused an oversized video instead of resizing it");
+
+    ninfer::models::qwen3_5::FrontendOptions invalid_options = limited_options;
+    invalid_options.vision_item_tokens                       = 1'024;
+    failures +=
+        check(throws_invalid_argument([&] { (void)make_frontend(resources(), invalid_options); }),
+              "an out-of-range Vision ceiling was accepted by the frontend");
+    return failures;
+}
+
 int test_media_token_ids_come_from_tokenizer() {
     auto source    = resources();
     auto tokenizer = nlohmann::json::parse(source.tokenizer_json);
@@ -2177,6 +2232,7 @@ int main() {
     failures += test_selected_template_recovery_boundary();
     failures += test_official_resource_guards();
     failures += test_template_file_execution();
+    failures += test_vision_item_ceiling();
     failures += test_invalid_public_part_enums(frontend);
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_token_ids_come_from_tokenizer();

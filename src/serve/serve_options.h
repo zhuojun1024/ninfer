@@ -50,6 +50,8 @@ struct ServeOptions {
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
+    // Per-item merged Vision token ceiling; see EngineOptions::vision_item_tokens.
+    std::uint32_t vision_item_tokens = kMaximumVisionItemTokens;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
     std::optional<bool> enable_thinking;

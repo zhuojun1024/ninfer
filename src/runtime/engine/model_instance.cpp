@@ -34,6 +34,10 @@ void validate_options(const EngineOptions& options) {
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    if (options.vision_item_tokens < kMinimumVisionItemTokens ||
+        options.vision_item_tokens > kMaximumVisionItemTokens) {
+        throw std::invalid_argument("Engine vision_item_tokens must be within [2048, 16384]");
+    }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit:
         if (options.kv_capacity.explicit_tokens == 0) {
@@ -211,7 +215,8 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                                .max_context              = options.max_context,
                                .media_cache_bytes        = options.media_cache_bytes,
                                .media_live_bytes         = options.media_live_bytes,
-                               .media_preprocess_threads = options.media_preprocess_threads})),
+                               .media_preprocess_threads = options.media_preprocess_threads,
+                               .vision_item_tokens       = options.vision_item_tokens})),
       capacity(options.max_context) {}
 
 ModelInstance::~ModelInstance() = default;

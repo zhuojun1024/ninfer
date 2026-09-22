@@ -42,7 +42,11 @@ HTTP alias override and does not select or alter model execution.
 
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
 allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
-`--vision` when the server must accept image or video input. Speculative residency is likewise
+`--vision` when the server must accept image or video input. `--vision-item-tokens N`
+(2048..16384, default 16384) caps the merged Vision tokens one media item may occupy: the fixed
+Vision workspace is planned from that ceiling and the processor resizes larger media into the
+matching pixel budget instead of refusing it, so a lower ceiling trades maximum image/video
+resolution for device memory. Speculative residency is likewise
 frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined
 with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
@@ -346,8 +350,10 @@ OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
 media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
 has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore
-`min(--max-context, 32768)`. There is no fixed image/video item-count limit: item count is admitted
-through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
+`min(--max-context, 32768)`. One media item is further bounded by `--vision-item-tokens`, which is
+also the pixel budget its resize targets. There is no fixed image/video item-count limit: item count
+is admitted through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory
+budgets.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
 pool. Prepared payloads are keyed by SHA-256 of the acquired bytes plus modality, so repeated media
@@ -815,6 +821,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--reasoning-effort low\|medium\|xhigh` | process default effort for thinking-enabled requests that omit one | template default |
 | `--vision` | enable media input and load Vision GPU allocations | off |
+| `--vision-item-tokens N` | merged Vision tokens one media item may occupy (`2048..16384`); the Vision workspace is planned from it and larger media is resized into the matching pixel budget | `16384` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |

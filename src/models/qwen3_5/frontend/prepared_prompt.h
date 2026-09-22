@@ -26,9 +26,15 @@ inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
 inline constexpr std::uint64_t kMaximumPromptVisionTokens = 32'768;
 inline constexpr std::uint64_t kMaximumPromptVisionRawPatches =
     kMaximumPromptVisionTokens * kRawPatchesPerVisionToken;
-inline constexpr std::uint64_t kMaximumVisionItemTokens = 16'384;
+inline constexpr std::uint64_t kMaximumVisionItemTokens = ninfer::kMaximumVisionItemTokens;
 inline constexpr std::uint64_t kMaximumVisionItemRawPatches =
     kMaximumVisionItemTokens * kRawPatchesPerVisionToken;
+// Pixels one merged token covers. An image is a single temporal group; a video's temporal pair of
+// frames shares one merged token, so its resize volume budget is twice the image budget.
+inline constexpr std::uint64_t kVisionPatchPixels = 16ULL * 16ULL;
+inline constexpr std::uint64_t kImagePixelsPerVisionToken =
+    kRawPatchesPerVisionToken * kVisionPatchPixels;
+inline constexpr std::uint64_t kVideoPixelsPerVisionToken = kImagePixelsPerVisionToken * 2ULL;
 
 struct PreparedMediaPayload {
     // Exact row-major BF16 input consumed by the Vision patch projection.

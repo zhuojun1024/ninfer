@@ -28,6 +28,8 @@ struct Options {
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
+    // Per-item merged Vision token ceiling; lower values shrink the fixed Vision workspace.
+    std::uint32_t vision_item_tokens = kMaximumVisionItemTokens;
     bool use_cuda_graph = true;
 
     bool raw_output      = false;

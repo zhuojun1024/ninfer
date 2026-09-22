@@ -24,6 +24,11 @@ inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
+// Merged Vision tokens one media item may occupy. The route sizes its fixed Vision workspace from
+// this ceiling and the processor downsizes an item into the same budget, so lowering it trades
+// maximum image/video resolution for device memory instead of rejecting oversized media.
+inline constexpr std::uint32_t kMaximumVisionItemTokens = 16'384;
+inline constexpr std::uint32_t kMinimumVisionItemTokens = 2'048;
 inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
 
@@ -173,6 +178,9 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // Per-item merged Vision token ceiling. Lower values shrink the fixed Vision workspace and
+    // make the processor downsize larger media into the smaller pixel budget.
+    std::uint32_t vision_item_tokens       = kMaximumVisionItemTokens;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;

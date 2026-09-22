@@ -754,7 +754,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens));
+            std::min<std::uint64_t>(plan.capacity, plan.vision_item_tokens));
         out.vision = execution::VisionContext::plan_workspace(
             *parameters.model.config().vision, *parameters.vision, merged, out.general_capacity);
         out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
@@ -856,6 +856,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
+    impl->vision_item_tokens  = inputs.vision_item_tokens;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
@@ -926,6 +927,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
+        .vision_item_tokens  = options.vision_item_tokens,
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,
         .proposal_head       = options.speculative.proposal_head,

@@ -476,6 +476,7 @@ std::string format_server_start_json(
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},
+             {"vision_item_tokens", engine_options.vision_item_tokens},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},
              {"speculative_backend",

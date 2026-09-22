@@ -81,7 +81,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--reasoning-effort low|medium|xhigh] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--vision-item-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -101,6 +101,9 @@ std::string serve_usage_text(const char* argv0) {
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --vision-item-tokens N caps merged Vision tokens per media item\n"
+           "       (2048..16384); lowering it shrinks the fixed Vision workspace and\n"
+           "       downsizes larger media instead of rejecting it\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -308,6 +311,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-item-tokens") {
+            const int tokens = parse_nonnegative_int(require_value("--vision-item-tokens"),
+                                                     "vision-item-tokens");
+            if (tokens < static_cast<int>(kMinimumVisionItemTokens) ||
+                tokens > static_cast<int>(kMaximumVisionItemTokens)) {
+                throw std::invalid_argument("--vision-item-tokens must be in [2048,16384]");
+            }
+            options.vision_item_tokens = static_cast<std::uint32_t>(tokens);
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {

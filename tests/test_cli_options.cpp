@@ -61,6 +61,21 @@ int main() {
                           dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
                           dflash_vision.speculative.draft_tokens == 7,
                       "CLI did not preserve the combined DFlash and Vision startup features");
+    const ninfer::cli::Options item_ceiling =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision",
+               "--vision-item-tokens", "4096"});
+    failures += check(item_ceiling.vision_item_tokens == 4096,
+                      "CLI --vision-item-tokens did not reach the options");
+    failures += check(ninfer::cli::usage_text("ninfer-cli").find("--vision-item-tokens") !=
+                          std::string::npos,
+                      "CLI help omits --vision-item-tokens");
+    for (const auto tokens : {1024U, 16385U}) {
+        failures += check(rejects([&] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                           "--vision-item-tokens", std::to_string(tokens)});
+                          }),
+                          "CLI accepted an out-of-range --vision-item-tokens");
+    }
     for (const auto k : {1U, 2U, 7U, 15U}) {
         const auto dflash2 = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
                                     "dflash2", "--draft-tokens", std::to_string(k)});

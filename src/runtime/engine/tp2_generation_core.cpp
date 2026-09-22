@@ -476,7 +476,8 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
                              .max_context            = options.max_context,
                              .media_cache_bytes      = options.media_cache_bytes,
                              .media_live_bytes       = options.media_live_bytes,
-                             .media_preprocess_threads = options.media_preprocess_threads}));
+                             .media_preprocess_threads = options.media_preprocess_threads,
+                             .vision_item_tokens       = options.vision_item_tokens}));
     load_seconds_ = std::chrono::duration<double>(Clock::now() - load_start).count();
 }
 
@@ -660,7 +661,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         const auto& vision_config     = *shard.model->config().vision;
         const auto& vision_parameters = *shard.parameters->vision;
         std::uint32_t max_item        = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(capacity, qwen::kMaximumVisionItemTokens));
+            std::min<std::uint64_t>(capacity, options_.vision_item_tokens));
         for (;;) {
             vision_workspace_ = qwen::execution::VisionContext::plan_workspace(
                 vision_config, vision_parameters, max_item, kWorkspaceBytes);

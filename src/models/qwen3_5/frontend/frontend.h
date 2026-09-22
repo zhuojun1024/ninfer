@@ -25,6 +25,9 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    // Per-item merged Vision token ceiling. Lower values shrink this Engine's fixed Vision
+    // workspace; the processor downsizes larger media into the derived pixel budget.
+    std::uint32_t vision_item_tokens       = kMaximumVisionItemTokens;
 };
 
 namespace frontend {

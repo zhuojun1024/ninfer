@@ -91,7 +91,9 @@ GPU residency is frozen when the Engine starts:
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
 - `--vision` loads the weights, expands the one Program workspace for Vision encode/handoff, and
-  enables image/video input.
+  enables image/video input; `--vision-item-tokens N` (2048..16384) caps the merged Vision tokens
+  one media item may occupy, shrinking that workspace and resizing larger media into the smaller
+  pixel budget.
 - the one-request CLI uses root-only context mode, so it does not reserve an extra Device
   checkpoint StateImage or capture a continuation that no later request could consume.
 
@@ -216,6 +218,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--vision-item-tokens N` | merged Vision tokens one media item may occupy (`2048..16384`); lower values shrink the Vision workspace and resize larger media | `16384` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |

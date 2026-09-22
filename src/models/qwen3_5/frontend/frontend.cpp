@@ -141,7 +141,8 @@ void validate_pixel_pipeline(const Json& config, std::string_view resource) {
     }
 }
 
-fi::ProcessorOptions processor_options(const FrontendResources& resources) {
+fi::ProcessorOptions processor_options(const FrontendResources& resources,
+                                       std::uint32_t vision_item_tokens) {
     const Json image =
         parse_resource_json(resources.preprocessor_config_json, "preprocessor_config.json");
     const Json video = parse_resource_json(resources.video_preprocessor_config_json,
@@ -165,6 +166,15 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
     options.video_max_pixels = positive_u64(
         require_integer(video_size, "longest_edge", "video_preprocessor_config.json.size"),
         "video longest_edge");
+    // The item ceiling is the hard admission bound: an item over it is refused, not downscaled, so
+    // cap each resize budget at the pixels that ceiling can carry. Media above the artifact's own
+    // bound is then resized into the smaller budget instead of being rejected.
+    options.image_max_pixels =
+        std::min(options.image_max_pixels,
+                 static_cast<std::uint64_t>(vision_item_tokens) * kImagePixelsPerVisionToken);
+    options.video_max_pixels =
+        std::min(options.video_max_pixels,
+                 static_cast<std::uint64_t>(vision_item_tokens) * kVideoPixelsPerVisionToken);
     options.video_fps =
         number_or_default(video, "fps", "video_preprocessor_config.json", kVideoFps);
     options.video_min_frames = static_cast<int>(
@@ -570,11 +580,18 @@ public:
     Impl(const FrontendResources& resources, FrontendOptions options)
         : chat_template(compile_chat_template(resources, options.chat_template_path)),
           tokenizer(resources.tokenizer),
-          processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
+          processor(options.vision_enabled
+                        ? processor_options(resources, options.vision_item_tokens)
+                        : fi::ProcessorOptions{}),
           vision_enabled(options.vision_enabled), max_context(options.max_context) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
+        if (options.vision_item_tokens < kMinimumVisionItemTokens ||
+            options.vision_item_tokens > kMaximumVisionItemTokens) {
+            throw std::invalid_argument("frontend vision item tokens must be within [2048, 16384]");
+        }
+        processor.vision_item_tokens = options.vision_item_tokens;
         const std::uint64_t vision_tokens =
             std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
         processor.max_vision_tokens = vision_tokens;

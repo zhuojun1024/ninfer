@@ -84,6 +84,9 @@ struct ProcessorOptions {
     std::uint64_t image_max_pixels = 1024ULL * 1024ULL;
     std::uint64_t video_min_pixels = 128ULL * 32ULL * 32ULL;
     std::uint64_t video_max_pixels = 4ULL * 1024ULL * 1024ULL;
+    // Merged tokens one media item may occupy. The frontend derives the pixel budgets above from
+    // this ceiling, and the same value bounds one item's Vision workspace.
+    std::uint64_t vision_item_tokens = kMaximumVisionItemTokens;
     // Encoded bytes are aggregate per prompt. Decode limits are per item; the fixed worker pool
     // bounds concurrently decoded media.
     std::size_t max_encoded_media_bytes    = kMaximumPromptMediaBytes;
