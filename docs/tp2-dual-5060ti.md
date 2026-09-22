@@ -234,6 +234,68 @@ routes, and five prompts x up to 256 greedy tokens are byte-identical between th
 The graph's replay is also insensitive to added instrumentation, which is what made the round-boundary
 synchronization defect below visible in the first place.
 
+## DFlash2 masked draft
+
+`--spec dflash2 --draft-tokens K` (K in 1..15) runs the masked-draft round: a proposal over the
+target's captured prefill features, one target verify window over `K+1` columns, sparse acceptance
+against the target's own greedy tokens, and a GDN record/replay fold. The draft component (5 ring
+layers + selector) is materialized whole on shard 0 next to the 40 MiB context ring; the verify window
+and fold run on both shards exactly like the MTP window.
+
+The route is bit-reproducible: a recall of a conversation - from host slabs, a device snapshot or a
+prefix-reuse checkpoint - reproduces a from-scratch prefill of the same prompt token for token when
+it keeps the draft pattern (a boundary on the prefill grid). That
+property needed one fix worth naming: a budget-clamped window (the tail of a request, where only a
+prefix of the proposal can be licensed) pins its trailing columns on the last licensed column's
+absolute position, and those duplicate columns used to append KV like every other column - several
+warp writes racing the position owner's slot inside one launch, with torn FP8 codes. The window now
+binds the column mask `target_valid_columns` already carried (`extent + 1` columns own their slot), so
+clamped columns neither append KV nor publish logits. `ninfer_qwen3_5_tp2_dflash_solo_test` is the
+acceptance: independent processes must print one identical digest over a nine-walk sequence, and
+its recalled walk must match the evicted (from-scratch) walk of the same prompt token for token.
+
+A recall whose boundary is not a multiple of the prefill chunk (256 by default) declines the masked
+draft for that request (`GenerationResult::draft_context_declined`): the ring beside the restored
+state belongs to a differently chunked walk, so its proposals cannot be licensed against a
+from-scratch walk's windows. The request runs target-only rounds. Those are deterministic and their
+boundary crossing matches the oracle's, but target-only rounds are a different draft pattern from
+the oracle's full windows, and a changed draft pattern shifts which way near ties resolve (the same
+property the MTP section records for a changed draft cache dtype). What the decline costs is
+acceptance rate; what it protects is licensing - the output never depends on draft state that does
+not belong to the restored walk.
+
+### Verify CUDA graph
+
+The DFlash2 verify window is captured exactly like the MTP one (one graph per device per envelope
+bucket, now from `dflash_graph_profiles`), with one difference in how per-round values reach it: the
+clamp extent cannot ride in a kernel argument. `set_i32_scalar` bakes its value into the setter
+kernel's launch arguments, so every replay would clamp to whatever extent the capture round saw. The
+extent therefore travels through the pinned window buffer's trailing int (`[ids, positions, valid]`),
+which the graph's memcpy nodes re-read on every replay exactly like ids and positions. The feature
+sink travels with the capture as well: its scatter addresses are baked, and its per-round lane and
+column tensors are re-read by the kernels on every replay. `NINFER_TP2_VERIFY_GRAPH=0` runs the same
+window eagerly against the same bucket envelope, so the switch changes only how the kernels reach
+the GPU.
+
+The acceptance is byte-exact: the solo digest must be identical across independent processes under
+both routes, and it is - 6/6 graph runs and the eager run agree on `0x4bcc3994a5efba7d`. The first
+wiring attempt failed exactly this test and is worth recording: the capture's call forwarded neither
+the sink nor the extent (default arguments compiled quietly), so every replay ran the old unmasked,
+sink-less window and the budget-clamped rounds were back to the torn-KV race above - 2 of 6 runs
+flipped the tail near tie through precisely that race's value set (`198/220/13962` at the shared
+walk's last sample), while eager never moved. A default argument on a capture path is a silent
+downgrade: the captured shape is legal, every replay runs it, and only near ties in the output show
+the difference.
+
+Measured with bench_serve.ps1 against the served configuration (synthetic fill text, which this
+acceptance rejects to about one committed token per round): the equal-output 128-token decode at an
+8192-token context drops from 6267 ms eager to 5627 ms graph (-10.2%, about -4.9 ms per round),
+20.3 -> 22.6 tok/s; the short decode moves 20.6 -> 23.0 tok/s. Prefill is unchanged
+(1107/1565/1504 -> 1154/1564/1499 tok/s at 2048/8192/32768-token prompts) and the MTP K=2 control
+stays in its 66-72 tok/s band (67.9/64.8), so the wiring costs neither route. The -4.9 ms round-time
+delta matches the MTP window's -4.3 ms; the smaller throughput gain than MTP's +16.6% is the
+synthetic text's low acceptance, which leaves less output per round to speed up.
+
 ## Proposal head
 
 `--lm-head-draft` switches the draft head from the weight-tied full output head (248,320 rows,
@@ -384,14 +446,17 @@ The context cache is disabled on this route -- the core owns the prefix-reuse sn
 | Check | Command | Result |
 |---|---|---|
 | Greedy identity of the whole stack | `r52_ab.sh final` then `r52_cmp3.sh` | 5/5 prompts byte-identical to the pre-split build at 131,072 (`ab-embed`, itself identical to the pre-optimization `ab-control`) |
-| Route loading | `ninfer_qwen3_5_tp2_load_test` (plain, `--spec mtp`, `--spec mtp --lm-head-draft`) | expected shard shapes: head 124,160 / 248,320 rows, embedding `[248320,2560]`, proposal head `[65536,5120]` |
+| Route loading | `ninfer_qwen3_5_tp2_load_test` (plain, `--spec mtp`, `--spec mtp --lm-head-draft`, `--spec dflash2`, `--spec dflash2 --lm-head-draft`) | expected shard shapes: head 124,160 / 248,320 rows, embedding `[248320,2560]`, proposal head `[65536,5120]` |
 | TP-2 execution | `ninfer_qwen3_5_tp2_forward_test` | 11 probes shard-consistent, 32-step decode, prefill chunk-split invariant |
 | Vocabulary-parallel head | `ninfer_linear_tp2_split_fp8_head_test` | exact at `[248320,5120]` and `[16384,5120]` |
 | Grouped proposal head | `ninfer_linear_tp2_split_grouped_head_test` | exact at `[131072,5120]`, T=1 and T=2 |
 | Half-width FP8 embedding | `ninfer_embedding_test` | full sweep at `[248320,2560]` |
 | NVFP4 split Linear | `ninfer_linear_tp2_split_nvfp4_test` | passes |
 | Collective staging | `ninfer_tp_device_pair_test` | passes |
-| Cross-session KV retention | `ninfer_qwen3_5_tp2_sessions_test` (`NINFER_TEST_ARTIFACT`) | plain and MTP routes both pass: a returning conversation recalled 71 prompt tokens and matched the oracle token for token; the LRU-evicted one reported `reused_prompt_tokens == 0`. The MTP round's shard-0 arena reports `2 layouts` against shard 1's `1`, so its own KV slab travels with the session |
+| DFlash2 masked-draft round | `ninfer_qwen3_5_tp2_dflash_append_test` (`--k 7`, `--k 5`) | sink logits bit-identical with and without the sink; ring sane and reproducible (fnv1a `0x1a53fd824cd4e360`); direct/split append bit-identical; proposal deterministic (fnv1a `0xbad27a494a9bc853` at K=7, `0xbee487264ca8ffb8` at K=5) |
+| DFlash2 walk determinism | `ninfer_qwen3_5_tp2_dflash_solo_test` (independent processes) | one digest (`0x4bcc3994a5efba7d`) over 10 captured-graph runs with identical walk bodies, byte-identical again under `NINFER_TP2_VERIFY_GRAPH=0`; the recalled walk matches the from-scratch walk of the same prompt on its first sample in every run |
+| DFlash2 verify CUDA graph | solo A/B graph vs `NINFER_TP2_VERIFY_GRAPH=0`, `bench_serve.ps1` served route | walk digests byte-identical across routes (before the capture-forwarding fix 2 of 6 graph runs flipped the tail near tie); equal-output 128-token decode -10.2% wall (-4.9 ms/round), prefill flat, MTP K=2 control in its band |
+| Cross-session KV retention | `ninfer_qwen3_5_tp2_sessions_test` (`NINFER_TEST_ARTIFACT`; all three routes) | every route: a returning conversation recalled 71 prompt tokens and matched the oracle token for token where the draft pattern survives (the switch scenario on the prefill grid and the cancellation retry included); the LRU-evicted one reported `reused_prompt_tokens == 0`. DFlash2 with a declined draft pins the boundary crossing (first sample), whose target-only tail is a different draft pattern's walk. The MTP round's shard-0 arena reports `2 layouts` against shard 1's `1`, so its own KV slab travels with the session |
 
 "Exact" is bit for bit: the split Op output equals the same Op run with the full weight on the same
 device, which is the property the merge relies on. `temperature 0, top_k 1` is what makes the greedy

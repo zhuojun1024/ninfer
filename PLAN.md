@@ -627,12 +627,30 @@ split 归约器（固定顺序无 atomic）。**修复（已落地，验收中�
 仅 DFlash2 调用传入；MTP 传 0（不绑掩码、原路由逐位不变）。
 **A 轮验收（2026-09-22，全绿）**：① load ✓；② append 哈希**不变**（K=7 `0xbad27a494a9bc853`，prefill/proposal 侧未受修复影响，
 无需重基线）；③ sessions plain/mtp ✓（recall 71 逐位，无回归）；④ solo 探针独立进程连跑 **10/10 逐位一致**（digest 全为
-`0x4bcc3994a5efba7d`、9 条 walk tokens 全同；修复前 solo ~25%/run 翻转，10 连同概率仅 ~5%，证据充分）；⑤
-`NINFER_TEST_ROUTE=dflash2` 真场景（retention-engine vs from-scratch oracle）连跑 **5/5 全过**，含 grid 对齐 shared_b@512
-**全 token 逐位对齐**、71 边界 declined 首样本钉、重渲染答案场景 ⇒ **修复后「DFlash2 召回逐 token 复现 from-scratch」成立**，
-B6「未通过项」与 engine/oracle 分叉的根因即本缺陷。验证用临时改动（门禁放行、越过 sessions 绊线、route_keeps_retention 切 true）
+`0x4bcc3994a5efba7d`、9 条 walk tokens 全同；修复前 solo ~25%/run 翻转，10 连同概率仅 ~5%，证据充分）——其中
+**召回逐 token 复现**的直接证据是探针内配对：`a_continued`（复用 71、draft declined）与 `a_continued_evicted`（从头 prefill）
+8 token 全同；⑤ `NINFER_TEST_ROUTE=dflash2` 真场景连跑 **5/5 全过**（注意：当时三条 recall 均落 declined 边界，断言按 B6 中期
+契约只钉首样本；shared_c@512——即 B6 翻转位——也只钉首样本）。B 轮已把 declined 边界与 shared_c@512 **收紧为全 token 对比**
+作为放行回归；若全过，则「DFlash2 召回逐 token 复现 from-scratch」定案，B6「未通过项」根因即本缺陷。验证用临时改动（门禁放行、越过 sessions 绊线、route_keeps_retention 切 true）
 均已回退，正式树保持门禁关闭。**留给 B 的升级点**：撤销门禁与绊线；`route_keeps_retention(DFlash2)` 可切 true（保留属性已实证）；
 `draft_declined` 的 declined 边界目前仍只钉首样本，可尝试收紧为全 token 对比。
+
+**B 轮（放行，2026-09-22）**：门禁与 sessions 绊线已撤（`model_instance.cpp` 只留 DFlash v1 拒绝，文案改「--spec mtp and
+--spec dflash2」）；sessions 默认三路由、`route_keeps_retention` 收拢为全开（其三元期望分支一并删除）；solo 转验收用例（去拒绝
+跳过，运行内加 recalled-vs-evicted 首样本断言）。**收紧实验（关键新证据）**：把 shared_c@512 与 declined 边界从首样本钉收紧为
+全 token 对比后，shared_c@512（B6 翻转位）**全 token 通过**——A 轮修复在原分叉位实证；但 declined 边界的 rerender 场景在第 3 个
+token **稳定分叉**（5/5 逐 token 完全相同：got `[2752 11 220 16 24 24 15 82]` vs oracle `[2752 11 198 220 220 16 15 15]`），非残余
+抖动。机理：declined 请求跑 target-only 轮（1-valid 钳位窗）vs oracle 全 draft 轮（8-valid 窗）＝不同执行形状，注意力 KV 归约分片
+随窗口尾位而变、写出的 KV 行永久携带 ulp 差，近并列轨迹按「draft pattern 改变即漂移」类各自稳定（与 MTP≠plain 及 tp2 文档「a
+changed draft pattern shifts the trajectory on which near-ties are resolved」同类）。**结论**：declined 边界恢复首样本钉（边界穿越
+logits＝保留真正携带的属性），其尾部可复现性由 solo digest 跨进程保证；aligned 边界保持全 token 对比。append K=7/K=5 与 ring
+哈希同基线（`0xbad27a494a9bc853`/`0xbee487264ca8ffb8`/`0x1a53fd824cd4e360`）。文档已同步（tp2-dual-5060ti.md 新增 DFlash2
+小节、Verification 表三行；serving.md TP-2 限制段重写）。
+**B 轮验收（全绿）**：sessions 默认三路由 exit 0；`NINFER_TEST_ROUTE=dflash2` 5/5 全过；solo 10/10 全同 digest
+`0x4bcc3994a5efba7d`；append K=7/K=5 哈希同基线；load ✓。**K=7 decode tok/s（bench_serve 合成负载）= 20.2–20.7 tok/s**，
+同负载 MTP K=2 对照 66–72 tok/s；分解可见**每轮成本 ~48.8 ms/轮与 B5 口径一致（无回归）**，差异全在接受率（合成填充文本
+~1.0 tok/轮 vs B5 口径 4096-context 贪心 3.10 tok/轮 = 63.6 tok/s）。另一发现：DFlash2 的 verify step 仍是 eager（MTP 已 graph，
+日志 `[tp2-graph] verify step: eager`）——即 C（B7 图接线）的首要抓手。`serve.ps1` 增加 `-Spec mtp|dflash2` 使放行路线端到端可用。
 
 **理论性能差距（单卡 5090 vs 双卡 TP-2，DFlash2 K=7；roofline 合成，非实测）**：
 
@@ -650,6 +668,25 @@ B6「未通过项」与 engine/oracle 分叉的根因即本缺陷。验证用临
   draft 全部归零，理论上限也只有 3.59/0.0227 ≈ **158 tok/s**。
 - **D1 推论**：把 draft 切到两卡只能省约 1.5 ms/轮（≈5%），收益远小于复杂度 ⇒ **D1 只为内存做，不为速度做**。
   提速杠杆是恢复 CUDA graph（−2.9 ms）、减少/融合 allreduce、draft 权重降精度。
+
+**C 轮（B7 verify CUDA Graph 接线，2026-09-22）**：B7 前置侦察的 4 处未接线全改：总开关 `:374` 对 `mtp||dflash2` 生效；
+verify 桶在两分支共建（DFlash2 用 `dflash_graph_profiles`、目标包络 `{1, min(max_context, planned.max + draft_window + 1)}`）；
+`capture_verify_graph` 收 `sink`/`valid_columns` 并转发进捕获体；`throw` 撤除。钳位 extent 走 pinned 缓冲区尾部 int
+（`[ids(W), positions(W), valid(1)]`），捕获图以 memcpy 节点逐重放重读——**不能用 `set_i32_scalar`**：它把值烘进
+`set_i32_scalar_kernel` 的启动参数，重放会永远钳在捕获时的 extent。分两段 A/B（只动一个变量）：①「只切 envelope」（eager +
+桶包络）贪心逐字节 A/B 全绿（solo digest `0x4bcc3994a5efba7d` ×2 + sessions dflash2 过）⇒ 桶变量无害；② graph on/off 发现
+**图路径 2/6 翻转**（shared_b 尾 token 取值 `248045 198/220/13962` 三元组恰为 A 轮未掩码竞争的指纹）而 eager 0/13+。
+**C2 根因**：`capture_verify_graph` 签名先加了 `sink`/`valid_columns` 参数，但**捕获体里 `forward_tp2_window` 的调用没转发**——
+默认参数 `nullptr/nullptr` 让编译静默通过 ⇒ 捕获序列＝「无掩码＋无 sink」的旧窗口 ⇒ A 轮修复的钳位 KV 追加竞争在图路由复活
+（KV 撕裂 + `pending_features` 静默缺列）。修复＝捕获调用转发 `sink, valid_columns`（tp2_generation_core.cpp `capture_verify_graph`）。
+**C4 验收（修复后）**：solo 图路径独立进程 **10/10 逐位一致**（全 `0x4bcc3994a5efba7d`，修复前 2/6 翻转）、`NINFER_TP2_VERIFY_GRAPH=0`
+eager 同金值（graph≡eager 逐位）、sessions dflash2 4/4 过（recall 71 逐位）、sessions 默认三路由过（plain/mtp 无回归）、
+append K=7/K=5/ring 三金值不变。**教训**：「签名先行、体转发后补」的分段编辑必须
+成对落地；捕获路径上的默认参数是静默降级陷阱（错误形状合法、结果只在近并列处漂移）。
+**C5 性能（bench_serve 合成负载，同构建 graph/eager A/B）**：等输出 128-token decode@8192 **6267→5627 ms（-10.2%，折算 -4.9 ms/轮）**、
+20.3→22.6 tok/s；decode_short 20.6→23.0 tok/s（+11.7%）；prefill 三段持平；MTP K=2 对照 67.9/64.8 tok/s（B 基线带 66–72 内）无回归。
+轮时差与 MTP 窗口图的 -4.3 ms 同量级（B7 判据 −4~4.5 ms/轮达标）；合成文本接受率 ~1 tok/轮 ⇒ 吞吐增益 +11%（判据 +15% 为 MTP 口径推算，
+实测口径下合理）。
 - 不确定性：acceptance 与 token/轮由数学决定、跨卡可迁移（残差逐位相同），但本机 draft 是 w4a4 而非
   nvfp4 ⇒ 接受率会有小差；效率锚点取自 MTP 轮次；未计 prefill 与首轮抖动。
 
