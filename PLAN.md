@@ -551,6 +551,15 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
     被写了两遍 ⇒ **`equal=1` 不能作为「计算内部确定」的证据**（诚实结论：本判据未成立）。
     ⇒ P1 要成立，先要有一个**覆盖 pending feature staging 的轮状态恢复原语**（现有 `snapshot_state(..., kRoundScratchSlot)` 只覆盖
     KV/GDN 一类），或能在第二次跑前重建 pending staging；这正是下一步需要的具体新手段。
+    **诊断轮 4（P1b 同 sink 重跑与 initcheck，两者都未成立）**：
+    (a) **P1b**：第二次 verify 复用 round 自己的 sink（不新建 `make_verify_sink()`），自检**不通过**——4 次运行（`build-win/b6w-rerun-1..4.log`）
+    的 `shared_b` 仍是 `[1703 220 16 15 15 15 15 15]`（正确值 `[… 248045 198]`），轨迹照旧塌缩；`mismatch=20` 且 4 次完全相同（系统性而非随机）
+    ⇒ 两次之间的**状态差异是探针自己造成的**（第二次 verify 改写了后续轮次真正读到的状态，复用 sink 不足以消除），所以 `mismatch`
+    **不能**当作「计算内部非确定」的证据。要做出 P1，必须先有**覆盖 KV 记账/pending staging 的轮状态恢复原语**。
+    (b) **initcheck 在本机不可用**：`compute-sanitizer --tool initcheck`（`build-win/b6v-initcheck.log`）报
+    `Failed to initialize WDDM debugger interface. Please run EnableDebuggerInterface.bat as an administrator` 与 `Device not supported`，
+    `ERROR SUMMARY: 4 errors` 全是这两类；探针本身仍正常 PASS（43 s、`shared_b` 原值、digest `0x4bcc3994a5efba7d`）⇒ P3 在本环境被排除
+    （需管理员权限 + 设备支持）。⇒ **P1 与 P3 均不成立，门禁保持关闭**，按有界收口停手。
     回到 HEAD）；重建后 `NINFER_TEST_ROUTE=dflash2` refusal exit 0、solo 探针 exit 77。
     同进程的 plain engine 作控制组，判定是「两个 DFlash2 实例互相干扰」还是「任意第二个实例都受影响」。
     临时打开路线的改动已还原：`model_instance.cpp` 恢复构造期拒绝并重建验证（`dflash2 exit 0`、solo probe `exit 77`）。
