@@ -725,6 +725,19 @@ req2 `3ce32871d0a13d34`(length/571)、req3 `56fd6e3da523651d`(stop/200)、req4 `
 - 不确定性：acceptance 与 token/轮由数学决定、跨卡可迁移（残差逐位相同），但本机 draft 是 w4a4 而非
   nvfp4 ⇒ 接受率会有小差；效率锚点取自 MTP 轮次；未计 prefill 与首轮抖动。
 
+**DFlash2 22tok/s 根因（已实证，2026-09 诊断轮）**：非草稿质量问题，是**弃稿守卫被模板前缀缓存误触发**。
+复用扫描先取网格对齐边界（`reuse_grid = clamp(prefill_chunk, 64, ·)`=256）；对齐找不到时的**非对齐回退**
+（tp2_generation_core.cpp:2159-2184）取最深非对齐边界（聊天模板前缀 ~37-57 token 恒命中）⇒
+`dflash_draft_declined_ = reuse % reuse_grid != 0`（:2193）⇒ 每轮 `extent=0`（:2923）⇒ 草稿一个都不进验收、
+每轮只提交目标 1 token = 22-25 tok/s。实证（诊断 dump，同 K=7 服务）：冷缓存首请求 `extent=7`、每轮接受 0-3 个、
+2.29 tok/轮（提案质量正常，与文档 story 档同级）；第 2 个请求（模板前缀已缓存）**每轮 `extent=0 count=1`** = 1.00 tok/轮。
+守卫设计本意（:2186-2192 注释）：环属异构分块走法时其提案无法对从零走法的窗口许可。要害：**非对齐回退只覆盖
+"共享前缀不足一个 chunk"的场景（clip<256 token），为省这点 prefill 牺牲整个草稿（decode ~2×）**；且 :2100-2102
+设计注释自陈"向下取整最多多算一个 chunk"。修复方向（1+3）：clip≤1chunk 时向下取整保环规范（草稿在线），
+深 clip 保留弃稿但**可见**（TP-2 接通 speculative stats + draft_context_declined 展示）。
+"只有复读才命中"系误读：冷缓存下正常文本也命中（dump 实证），其余测量处于弃稿态（extent=0 无可接受）。
+换工件无效 ✓ 与结论一致（弃稿是运行时策略）。
+
 **工件现状（已查）**：本机 `D:/LLM/qwen3_8_27b_w4a4_w8a8.ninfer` **不含** DFlash2（组件仅 text/vision/mtp，
 parameters=1422），但同目录已有 `qwen3_8_27b_w4a4_w8a8_dflash2.ninfer`（parameters=1513、objects=1218）⇒
 评估**不需要重新转换**，直接换工件即可。
