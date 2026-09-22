@@ -527,6 +527,22 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
     ⇒ **官方工件同样翻转**。按预设解释规则：**「同二进制同输入必同输出」的引擎缺陷被官方工件坐实，与用户转换无关**；b 件稳定只说明暴露面
     与该件的数值/并列位置相关。末轮候选累计出现过 7 个不同 token（198/220/248046/6558/2523/3710/7734）⇒ 该处 logits 间距在 bf16 量化最小刻度
     附近（本 dump 未能给出可信数值）。
+    **诊断轮 2（head 写出端 + 有效行 dump）**：
+    (a) **head 写出端事实**：`src/models/qwen3_5/execution/text.cpp:1608-1641`（`project_head_tp2`）——`vocab = dimension(config_.vocab_size)`（=248320）、
+    `local = dimension(lm_head_->weight.n)`（=124160，每卡半区）；`local != vocab` 时每卡只把自己那半投到 `partial [local, columns]`，
+    再 `merge_local_row_blocks(...)`（:1640）把两半按词表偏移 stamp/sum 成完整 `[V,T]`；`program/round_buffers.cpp:214-218` 把
+    `target_logits` 定为 **BF16 {output_rows=248320, columns, batch}**。
+    (b) **有效行**：`tp2_generation_core.cpp:1888-1892`——lm_head 按 `vocab` 行打包，但只有前 `public_tokens` 行真实（运行时实测 **248077**）；
+    `src/ops/wrapper/argmax.cpp:37` 的 `argmax(logits,out,valid_rows,stream)` 要求 rank-2 `[vocab,T]`（:45）并用同一 valid_rows
+    ⇒ :2911 的 argmax 只扫 **[0, 248077)**。上一轮扫 `[0,248320)` 读到 head 永不写的打包行，这就是 dump 与 `target_argmax` 不一致的原因。
+    (c) **只扫有效行后仍不一致**（`b6p-logits-1..8.log`）：8 次 `pos=646 valid=248077 hidden=5120`，host top0 为
+    `31074/217312/125935/217282/62082/…`（bf16 `0x40e3–0x4126`，`gap_ulps=2..18`），而 8 次末 token 全是 `198`、`target_argmax=[198 …]`；
+    `logit_hash`/`hidden_hash` **每次运行都不同**。
+    (d) **双拷贝判别**（`b6q-logits-1..4.log`）：同一轮连续拷两次并同步，4/4 `same=1`（hash 与 top0 完全一致）⇒ **不是并发写者覆写（非 race）**，
+    而是我读到的地址/那一槽**不是 argmax 实际读的那块内存**。
+    ⇒ 切分仍未成立。下一步必须先在模型侧确认窗口 verify 的 head 把 logits 写进哪个 tensor/arena 槽（`forward_tp2_window` 入口、
+    `program/speculative/target_verification.cpp:18-41`、`round.frame()` 的槽位绑定），再用那个真实指针做跨 run 哈希；或限时
+    `compute-sanitizer --tool initcheck`。钩子已回退，门禁保持关闭。
     回到 HEAD）；重建后 `NINFER_TEST_ROUTE=dflash2` refusal exit 0、solo 探针 exit 77。
     同进程的 plain engine 作控制组，判定是「两个 DFlash2 实例互相干扰」还是「任意第二个实例都受影响」。
     临时打开路线的改动已还原：`model_instance.cpp` 恢复构造期拒绝并重建验证（`dflash2 exit 0`、solo probe `exit 77`）。
