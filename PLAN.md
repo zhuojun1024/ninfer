@@ -543,6 +543,14 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
     ⇒ 切分仍未成立。下一步必须先在模型侧确认窗口 verify 的 head 把 logits 写进哪个 tensor/arena 槽（`forward_tp2_window` 入口、
     `program/speculative/target_verification.cpp:18-41`、`round.frame()` 的槽位绑定），再用那个真实指针做跨 run 哈希；或限时
     `compute-sanitizer --tool initcheck`。钩子已回退，门禁保持关闭。
+    **诊断轮 3（P1「同状态重跑同一轮」，未成立）**：在 :2911 argmax 之后立刻再跑一次 `round.make_verify_sink()` +
+    `run_verify_window(...)` + `ops::argmax(...)`，比较两次的 `frame.target_argmax`（临时钩子 `NINFER_TP2_DIAG_RERUN`，已回退）。
+    4 次运行（`build-win/b6t-rerun-1..4.log`）：所有 48 轮都 `equal=1`，**但探针本身改变了走法**——`shared_b` 输出从
+    `[1703 220 248046 198 248045 198 248045 198]` 变成 `[1703 220 16 15 15 15 15 15]`，且走法在 `pos=643` 提前结束
+    ⇒ 第二次 verify 不是「同状态重跑」：KV 写虽幂等，但 `make_verify_sink()` 的残差收集是**追加**语义，round 的 pending staging
+    被写了两遍 ⇒ **`equal=1` 不能作为「计算内部确定」的证据**（诚实结论：本判据未成立）。
+    ⇒ P1 要成立，先要有一个**覆盖 pending feature staging 的轮状态恢复原语**（现有 `snapshot_state(..., kRoundScratchSlot)` 只覆盖
+    KV/GDN 一类），或能在第二次跑前重建 pending staging；这正是下一步需要的具体新手段。
     回到 HEAD）；重建后 `NINFER_TEST_ROUTE=dflash2` refusal exit 0、solo 探针 exit 77。
     同进程的 plain engine 作控制组，判定是「两个 DFlash2 实例互相干扰」还是「任意第二个实例都受影响」。
     临时打开路线的改动已还原：`model_instance.cpp` 恢复构造期拒绝并重建验证（`dflash2 exit 0`、solo probe `exit 77`）。
