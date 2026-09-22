@@ -877,3 +877,95 @@ parameters=1422），但同目录已有 `qwen3_8_27b_w4a4_w8a8_dflash2.ninfer`�
 ### 5.3 构建脚本修复
 
 - `tools/tp_bootstrap/build_r35.sh` 的 rsync 列表漏了 `third_party`（`b9219f3f` 新增 `third_party/llama-jinja/`），导致 WSL 侧 `ninfer_jinja` 目标缺失、CMake 配置失败；已补入 `third_party`。
+
+## 6. 官方 NVFP4 工件的 DFlash2 接受率更高：定位与"官方组件 + 本地 text"合成工件
+
+### 6.1 目标
+
+用户观察：官方工件 `D:/LLM/qwen3_8_27b_nvfp4.ninfer` 的 dflash2 接受率明显高于自转工件
+`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2.ninfer`，怀疑官方工件做了优化。要求把"官方工件的
+mtp+dflash2+vision"与 `D:/LLM/W4A16/NVFP4/W4A4+W8A8` 的权重合成为一个新工件用于对比测试。
+
+### 6.2 已确认事实（证据：直接解析两个工件的 v3 目录）
+
+| 项目 | 官方 `qwen3_8_27b_nvfp4.ninfer` | 自转 `qwen3_8_27b_w4a4_w8a8_dflash2.ninfer` |
+|---|---|---|
+| metadata.name | `qwen3.8-27b` | `qwen3.8-27b-w4a4-w8a8` |
+| recipe | 内置 `qwen3_8_27b_nvfp4` | `D:/LLM/w4a4_family_recipe.py` |
+| dflash2 源 | 维护机 BF16 目录 `.../Qwen3.8-27B/dflash2` | `W4A16\NVFP4\W4A4+W8A8\DFlash2-FP8` |
+| vision 绑定 | bf16 195 / q4 27 / q5 54 / q6 1 / q8 2（+162 非参对象） | 完全相同 |
+| mtp 绑定 | bf16 7 / q8 3（+6） | 完全相同 |
+| dflash2 绑定 | bf16 45 / q8 11（+35） | 完全相同 |
+| dflash2 config | `target_layer_ids=[5,19,33,47,61]`、`selector_rank=256`、`selector_top_k=16`、`conv_kernel_size=2` | 逐字段相同 |
+| text 绑定 | nvfp4 56 / fp8 74 | nvfp4 42 / fp8 88 |
+| proposal | q4 1 + int32 1 | 相同 |
+
+结论：**官方工件在 mtp/dflash2/vision 上没有任何"优化"**，三组件的格式、对象数、组件配置与自转
+工件逐字段一致。真实差异只有两点：(a) dflash2 的**来源检查点**（BF16 原始 vs FP8 中间产物，
+最终都存成 `q8_g32_fp16`，各 11 个 Q8 参数）；(b) text 的逐层表示（官方规则为"mlp 且
+layer<56 用 nvfp4、其余 fp8"，自转按源检查点每层已存编码导入）。本地不存在 BF16 DFlash2
+检查点（只有 `DFlash2-FP8`、`Qwen3.8-27B-DFlash2-EXL3-5.0bpw` 与若干 gguf），无法从源权重
+复刻官方 draft；但官方工件自身携带该 draft 的 Q8 字节。
+
+### 6.3 设计决策：逐对象字节移植，而不是重跑转换
+
+新增 `tools/convert/graft_components.py`。v3 目录中每个逻辑绑定指向一个对象，对象的
+`format/shape/layout/bytes` 由配方决定而与转换批次无关；实测两工件的 vision/mtp/dflash2
+绑定对象**缺失 0、格式差异 0、字节差异 0**（vision 279、mtp 10、dflash2 56 个对象，共 1.46 GiB），
+故可把 donor 对象字节直接覆盖到 base 载荷的对应位置（`entry_payload_start + object.offset`），
+无需反量化、无需二次量化、无需重排载荷。工具同时写入 `metadata.graft` 与可选
+`metadata.name`（JSON 区长度不变、空格补齐）、刷新 16 字节 `artifact_id`，并对每个移植对象做
+SHA-256 双向校验。未采用"反量化成 safetensors 再用配方重转"的备选：它会在 Q8 上再加一次
+量化往返，且 text 需重转 22 GB。
+
+### 6.4 步骤与进度
+
+1. [x] 解析两工件目录，确认组件一致性与可覆盖性（见 6.2）。
+2. [x] 实现 `tools/convert/graft_components.py`。
+3. [x] 生成 `D:/LLM/qwen3_8_27b_w4a4_w8a8_official_parts.ninfer`：411 个对象、2836.0 MiB
+   （bf16 274 / q4 54 / q5 54 / q6 1 / q8 28），工具内 SHA-256 双向校验全部一致。
+4. [x] 校验：Engine 正常加载（`engine ready` + `listening`，名字 `w4a4-w8a8-official-parts`）；移植对象
+   411/411 等于 donor；未移植对象 807 个中抽样 410 个（4.0 GiB）等于 base；bindings/components 表不变。
+5. [x] 接受率实测（同一提示、贪心、500 token 正文，dflash2 K=7，`--lm-head-draft`）：
+   正文阶段 official 44.6% / user 52.9% / grafted 52.2%；思考阶段见 §6.6。
+6. [x] 结论：合成工件跟随 text 而非 official 组件 ⇒ 接受率差异不来自 mtp/dflash2/vision。
+   若要从源权重真正复刻官方 draft，仍需获取其 BF16 DFlash2 源检查点。
+
+### 6.6 实测结果（同一提示、贪心、`--spec dflash2 --draft-tokens 7 --lm-head-draft`）
+
+| 工件 | 阶段 | req1 | req2 | req3 | 均值 |
+|---|---|---|---|---|---|
+| official `qwen3_8_27b_nvfp4.ninfer` | 正文 | 42.3% | 44.5% | 47.1% | 44.6% |
+| user `qwen3_8_27b_w4a4_w8a8_dflash2.ninfer` | 正文 | 50.7% | 54.0% | 53.9% | **52.9%** |
+| grafted `..._official_parts.ninfer` | 正文 | 47.3% | 55.3% | 54.0% | **52.2%** |
+| official | 思考（首轮 400 token 全思考） | 31.8% | 29.4% | 26.1% | 29.1% |
+
+思考阶段三工件统一复测（`build-win/acc3-*.jsonl`）：
+
+- official thinking-phase: 346/1066=32.5% | 347/1057=32.8% | 336/1137=29.6% => mean 31.6% | p1=111
+- user thinking-phase: 351/1034=33.9% | 369/905=40.8% | 368/906=40.6% => mean 38.4% | p1=102
+- grafted thinking-phase: 352/1027=34.3% | 368/912=40.4% | 368/906=40.6% => mean 38.4% | p1=102
+
+采样默认值复测（`build-win/acc4-*.jsonl`，每个工件 4 次请求、800 token、thinking 开启、temperature 0.7 / top-k 20 / top-p 0.8）：
+
+- official sampled: 39.2% | 37.5% | 29.0% | 42.9% => mean 37.2%
+- user sampled: 39.8% | 34.9% | 31.4% | 40.8% => mean 36.7%
+- grafted sampled: 45.5% | 38.1% | 47.1% | 42.3% => mean 43.2%
+
+单次离散 29–47%，4 次采样下差值的标准误约 3–4 个百分点，因此这一组只能说明「合成件不劣于两者」，
+不足以断言官方最高或最低；贪心两组（正文 52.2% vs 52.9%、思考 38.4% vs 38.4%）才是低方差证据。
+
+结论（组件维度）：合成工件（官方 mtp/dflash2/vision + 自转 text）在正文贪心、思考贪心两个低方差设置下与
+自转工件接受率基本一致，官方工件都最低 ⇒ **mtp/dflash2/vision 组件不是接受率差异的来源**，差异由 text（target）
+权重与提示内容共同决定。要复现用户观察到的「官方更高」，需要用其真实系统提示、采样设置与更长预算复测。
+
+观察：每个 serve 的 req#1 接受率都明显低于 req#2/req#3（如 grafted 47.3% vs 55.3%/54.0%），说明首个请求
+受冷启动影响，比较时应看 req#2/req#3。贪心正文阶段下 official 最低、grafted 与 user 基本一致
+（≈52–53%），即组件不是差异来源。用户观察到的官方更高很可能出现在以 reasoning 为主的真实会话里，
+需按真实系统提示与更长预算复测。
+
+### 6.5 验收
+
+- 新工具仅依赖 Python 标准库；`git diff --check` 干净。
+- 合成工件可加载并服务，且组件字节归属如上。
+- 接受率对比给出可复现的三组数字（同一提示与采样设置）。
