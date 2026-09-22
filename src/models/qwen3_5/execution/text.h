@@ -302,6 +302,15 @@ public:
     // which is the one that runs the masked draft; the peer's copy is scratch. Requires a registered
     // peer whose proposal head holds the matching half of the rows.
     void proposal_topk_tp2(const Tensor& hidden, Tensor& candidate_ids, Tensor& candidate_scores);
+
+    // TP-2 masked draft: the DFlash2 selector's codebooks live on the peer shard, so the draft state
+    // travels there, the selector runs on that shard's stream and the drafts and proposal q come back
+    // unchanged. `host_configs` are the batch's sampling configs from the host ingress, which the
+    // peer uploads to its own device. Requires a registered peer whose parameters hold the selector.
+    void dflash_selector_tp2(const Tensor& hidden, const Tensor& candidate_ids,
+                             const Tensor& candidate_scores, const Tensor& anchors,
+                             const Tensor& frontiers, const ops::SamplingConfig* host_configs,
+                             Tensor& draft_tokens, Tensor& proposal_q);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
@@ -454,6 +463,9 @@ private:
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
     const MtpParameters* mtp_                   = nullptr;
+    // DFlash2 selector weights when this shard materializes them (the one-device route, or the peer
+    // shard under TP-2); the masked draft's shard drives the peer's copy instead.
+    const SelectorParameters* selector_ = nullptr;
 };
 
 template <class Tap>

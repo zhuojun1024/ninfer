@@ -243,11 +243,6 @@ public:
                     return result;
                 }));
         }
-        if (w.selector) {
-            out.selector = SelectorParameters{linear(w.selector->hidden_projection),
-                                              tensor(w.selector->predecessor_codebook),
-                                              tensor(w.selector->successor_codebook)};
-        }
         return out;
     }
 
@@ -268,8 +263,9 @@ Parameters::Parameters(const Model& source) : model(source) {
         text.layers.push_back(with_context("text/layers/" + std::to_string(i),
                                            [&] { return prepare.block(w.text.layers[i]); }));
     }
-    // Shard-local components: the MTP layer is materialized on shard 0 alone and the Vision tower on
-    // shard 1 alone, so the shard that runs neither builds no parameter block for it (the model's
+    // Shard-local components: the MTP layer is materialized on shard 0 alone, the Vision tower on
+    // shard 1 alone, and under TP-2 the DFlash2 selector travels to shard 1 while the masked draft
+    // stays on shard 0, so a shard builds a block only for what it actually holds (the model's
     // logical bindings are shared, the device bytes are not).
     if (w.mtp && source.has_weight(w.mtp->input_projection)) {
         mtp = with_context("mtp", [&] { return prepare.mtp(*w.mtp); });
@@ -280,6 +276,15 @@ Parameters::Parameters(const Model& source) : model(source) {
     if (w.draft && source.has_weight(w.draft->feature_projection)) {
         draft = with_context(std::string(model.options().speculative_component()),
                              [&] { return prepare.draft(*w.draft); });
+    }
+    // The selector is shard-local, so the masked draft's shard reads the peer's through the registered
+    // pair instead of holding byte-identical codebooks of its own.
+    if (w.draft && w.draft->selector &&
+        source.has_weight(w.draft->selector->hidden_projection)) {
+        dflash_selector =
+            SelectorParameters{prepare.linear(w.draft->selector->hidden_projection),
+                               prepare.tensor(w.draft->selector->predecessor_codebook),
+                               prepare.tensor(w.draft->selector->successor_codebook)};
     }
     if (w.proposal) {
         proposal =

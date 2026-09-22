@@ -66,6 +66,9 @@ struct WorkspacePlan {
     // Text-workspace capacity the vocabulary-split reduced proposal head needs on each shard: the
     // masked draft's hidden-state broadcast, the half-head top-k and the candidate union.
     std::size_t dflash_proposal_split = 0;
+    // Text-workspace capacity the peer shard needs to run the shard-local DFlash2 selector: the
+    // transferred draft state, the selector projection and the path's own scratch.
+    std::size_t dflash_selector_peer = 0;
     std::size_t causal_score     = 0;
     std::size_t general_capacity = 0;
     std::optional<VisionWorkspacePlan> vision;

@@ -391,16 +391,30 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     ids_flat, scores, work, stream);
             }
         }
-        Tensor projected =
-            work.alloc(DType::BF16, {dimension(config.dflash2->selector_rank), mask_columns});
-        project(hidden, weights.selector->hidden_projection, projected, work, stream);
         Tensor drafts     = frame.draft_tokens.slice(1, 0, batch);
         Tensor proposal_q = frame.proposal_q.slice(2, 0, batch);
-        ops::candidate_selector_path(
-            candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
-            projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
-            weights.selector->predecessor_codebook, weights.selector->successor_codebook, frontiers,
-            frame.sampling, drafts, proposal_q, work, stream);
+        const auto* selector = state.execution.parameters.dflash_selector
+                                   ? &*state.execution.parameters.dflash_selector
+                                   : nullptr;
+        if (selector == nullptr) {
+            // TP-2 keeps the selector's codebooks on the peer shard: the draft state travels there,
+            // the selector runs on that shard and the drafts and proposal q come back byte for byte.
+            if (state.tp_card == nullptr) {
+                throw std::runtime_error("DFlash2 selector weights are unavailable on this shard");
+            }
+            state.tp_card->dflash_selector_tp2(hidden, candidates, scores, anchors, frontiers,
+                                               state.host_ingress.sampling.data(), drafts,
+                                               proposal_q);
+        } else {
+            Tensor projected =
+                work.alloc(DType::BF16, {dimension(config.dflash2->selector_rank), mask_columns});
+            project(hidden, selector->hidden_projection, projected, work, stream);
+            ops::candidate_selector_path(
+                candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
+                projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
+                selector->predecessor_codebook, selector->successor_codebook, frontiers,
+                frame.sampling, drafts, proposal_q, work, stream);
+        }
         work.reset();
     }
 }

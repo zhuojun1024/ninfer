@@ -190,6 +190,66 @@ int check_allreduce_queue(ninfer::tp::DevicePair& pair, std::size_t count_bytes,
     return failures;
 }
 
+// Byte-exact exchange: each shard must receive the peer's send buffer bit for bit, including lanes
+// that spell a signaling NaN, which a BF16 add would quiet. The payloads mix adversarial 16-bit
+// lanes with the I32 id / FP32 score bit patterns the split proposal head and the peer selector
+// transport carry. Both the single-block and the sliced in-kernel paths are covered by the sizes.
+int check_sendrecv(ninfer::tp::DevicePair& pair, std::size_t count_bytes, int iterations) {
+    const std::size_t words = count_bytes / 4;
+    constexpr std::uint16_t kAdversarial[] = {0x7C01, 0x7C3F, 0xFC01, 0xFC3F,
+                                              0xFFFF, 0x0001, 0x7F80, 0x0000};
+    constexpr std::size_t kLanes = sizeof(kAdversarial) / sizeof(kAdversarial[0]);
+    int failures = 0;
+    std::vector<std::uint32_t> host_a(words), host_b(words), got(words);
+
+    pair.a().bind_to_current_thread();
+    ninfer::DeviceBuffer send_a(count_bytes), recv_a(count_bytes);
+    cudaStream_t stream_a = nullptr;
+    cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
+    pair.b().bind_to_current_thread();
+    ninfer::DeviceBuffer send_b(count_bytes), recv_b(count_bytes);
+    cudaStream_t stream_b = nullptr;
+    cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
+
+    for (int iteration = 0; iteration < iterations && failures == 0; ++iteration) {
+        for (std::size_t i = 0; i < words; ++i) {
+            const std::uint16_t low = kAdversarial[(i + static_cast<std::size_t>(iteration)) % kLanes];
+            const std::uint16_t high =
+                static_cast<std::uint16_t>((i * 2654435761u + static_cast<std::size_t>(iteration) * 40503u) & 0xFFFFu);
+            host_a[i] = static_cast<std::uint32_t>(low) | (static_cast<std::uint32_t>(high) << 16);
+            host_b[i] = ~(host_a[i] + 0x9E3779B9u + static_cast<std::uint32_t>(iteration));
+        }
+        pair.a().bind_to_current_thread();
+        cudaMemcpyAsync(send_a.p, host_a.data(), count_bytes, cudaMemcpyHostToDevice, stream_a);
+        cudaMemsetAsync(recv_a.p, 0xA5, count_bytes, stream_a);
+        pair.b().bind_to_current_thread();
+        cudaMemcpyAsync(send_b.p, host_b.data(), count_bytes, cudaMemcpyHostToDevice, stream_b);
+        cudaMemsetAsync(recv_b.p, 0x5A, count_bytes, stream_b);
+        pair.sendrecv(send_a.p, recv_a.p, send_b.p, recv_b.p, count_bytes, stream_a, stream_b);
+        pair.a().bind_to_current_thread();
+        cudaMemcpyAsync(got.data(), recv_a.p, count_bytes, cudaMemcpyDeviceToHost, stream_a);
+        cudaStreamSynchronize(stream_a);
+        if (std::memcmp(got.data(), host_b.data(), count_bytes) != 0) {
+            std::cerr << "sendrecv[" << count_bytes << "] iteration " << iteration
+                      << ": shard a did not receive shard b's bytes\n";
+            ++failures;
+            break;
+        }
+        pair.b().bind_to_current_thread();
+        cudaMemcpyAsync(got.data(), recv_b.p, count_bytes, cudaMemcpyDeviceToHost, stream_b);
+        cudaStreamSynchronize(stream_b);
+        if (std::memcmp(got.data(), host_a.data(), count_bytes) != 0) {
+            std::cerr << "sendrecv[" << count_bytes << "] iteration " << iteration
+                      << ": shard b did not receive shard a's bytes\n";
+            ++failures;
+            break;
+        }
+    }
+    cudaStreamDestroy(stream_a);
+    cudaStreamDestroy(stream_b);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -225,6 +285,11 @@ int main() {
         // stack issues them.
         failures += check_allreduce_queue(pair, 20480, 200);
         failures += check_allreduce_queue(pair, 81920, 200);
+        // Byte-exact exchange at the shapes the split proposal head's candidate union and the peer
+        // selector transport use, then at the small and sliced staging classes.
+        failures += check_sendrecv(pair, 960, 64);
+        failures += check_sendrecv(pair, 64, 64);
+        failures += check_sendrecv(pair, 1 << 20, 16);
         // Move semantics: a moved-from pair must not retain p2p state.
         ninfer::tp::DevicePair moved(std::move(pair));
         if (pair.p2p_available()) {

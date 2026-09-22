@@ -43,6 +43,16 @@ public:
     void allreduce(void* data_a, void* data_b, std::size_t count_bytes,
                    cudaStream_t stream_a, cudaStream_t stream_b);
 
+    // Byte-exact exchange of count_bytes (multiple of 16): on return recv_a holds send_b's bytes and
+    // recv_b holds send_a's bytes, bit for bit. The in-kernel route reuses the all-reduce transport -
+    // same staging, arrival tokens and slicing - with a copy in place of the BF16 add, so it needs no
+    // host synchronization and is safe to capture into a CUDA Graph. Use it for any payload the BF16
+    // add would reinterpret: integer ids, FP32 scores, or bits that must survive unchanged. A side may
+    // pass the same buffer as its send and receive: it publishes its own bytes and returns the peer's,
+    // because the two halves are distinct.
+    void sendrecv(const void* send_a, void* recv_a, const void* send_b, void* recv_b,
+                  std::size_t count_bytes, cudaStream_t stream_a, cudaStream_t stream_b);
+
 private:
     DeviceContext a_;
     DeviceContext b_;

@@ -117,7 +117,6 @@ struct DraftParameters {
     LinearParameters feature_projection;
     Tensor context_norm, final_norm;
     std::vector<DraftBlockParameters> layers;
-    std::optional<SelectorParameters> selector;
     LinearParameters output_head;
 };
 
@@ -143,6 +142,10 @@ public:
     std::optional<MtpParameters> mtp;
     std::optional<VisionParameters> vision;
     std::optional<DraftParameters> draft;
+    // The DFlash2 masked draft's selector. It is shard-local like the draft itself, but TP-2 places
+    // its codebooks on the peer shard, so it is its own block: the shard that runs the masked draft
+    // drives the peer's copy when it does not hold one locally. The one-device route keeps its own.
+    std::optional<SelectorParameters> dflash_selector;
     std::optional<ProposalParameters> proposal;
 };
 

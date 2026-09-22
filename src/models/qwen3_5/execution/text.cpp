@@ -12,6 +12,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -323,6 +324,7 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
             &p.head, p.token_ids ? static_cast<const std::int32_t*>(p.token_ids->data) : nullptr,
             dimension(p.rows));
     }
+    if (parameters_.dflash_selector) { selector_ = &*parameters_.dflash_selector; }
 }
 
 TextContext::~TextContext() = default;
@@ -920,34 +922,35 @@ void TextContext::proposal_topk_tp2(const Tensor& hidden, Tensor& candidate_ids,
     Tensor union_scores = work_.alloc(DType::FP32, {2 * candidates, columns});
     CUDA_CHECK(cudaMemsetAsync(union_ids.data, 0, union_ids.bytes(), ctx_.stream));
     CUDA_CHECK(cudaMemsetAsync(union_scores.data, 0, union_scores.bytes(), ctx_.stream));
+    // Each shard publishes its own candidate list and receives the peer's through the pair's
+    // byte-exact exchange: the payloads are I32 ids and FP32 scores, and the all-reduce would
+    // reinterpret them as BF16, quieting any 16-bit lane that spells a signaling NaN. This shard
+    // keeps its own list in the union's lower half and the peer's in its upper half, which is the
+    // order the merge below reads.
+    ctx_.bind_to_current_thread();
     CUDA_CHECK(cudaMemcpyAsync(union_ids.data, ids_local.data, ids_local.bytes(),
                                cudaMemcpyDeviceToDevice, ctx_.stream));
     CUDA_CHECK(cudaMemcpyAsync(union_scores.data, scores_local.data, scores_local.bytes(),
                                cudaMemcpyDeviceToDevice, ctx_.stream));
-    peer.ctx_.bind_to_current_thread();
-    Tensor union_ids_peer    = peer.work_.alloc(DType::I32, {2 * candidates, columns});
-    Tensor union_scores_peer = peer.work_.alloc(DType::FP32, {2 * candidates, columns});
-    CUDA_CHECK(cudaMemsetAsync(union_ids_peer.data, 0, union_ids_peer.bytes(), peer.ctx_.stream));
-    CUDA_CHECK(
-        cudaMemsetAsync(union_scores_peer.data, 0, union_scores_peer.bytes(), peer.ctx_.stream));
-    Tensor union_ids_upper(
-        static_cast<std::uint8_t*>(union_ids_peer.data) +
-            static_cast<std::int64_t>(candidates) * columns * sizeof(std::int32_t),
-        DType::I32, {candidates, columns});
+    Tensor union_ids_upper(static_cast<std::uint8_t*>(union_ids.data) + half_bytes, DType::I32,
+                           {candidates, columns});
     Tensor union_scores_upper(
-        static_cast<std::uint8_t*>(union_scores_peer.data) +
+        static_cast<std::uint8_t*>(union_scores.data) +
             static_cast<std::int64_t>(candidates) * columns * sizeof(float),
         DType::FP32, {candidates, columns});
-    CUDA_CHECK(cudaMemcpyAsync(union_ids_upper.data, ids_peer.data, ids_peer.bytes(),
-                               cudaMemcpyDeviceToDevice, peer.ctx_.stream));
-    CUDA_CHECK(cudaMemcpyAsync(union_scores_upper.data, scores_peer.data, scores_peer.bytes(),
-                               cudaMemcpyDeviceToDevice, peer.ctx_.stream));
-
-    ctx_.bind_to_current_thread();
-    pair.allreduce(union_ids.data, union_ids_peer.data, union_ids.bytes(), ctx_.stream,
-                   peer.ctx_.stream);
-    pair.allreduce(union_scores.data, union_scores_peer.data, union_scores.bytes(), ctx_.stream,
-                   peer.ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    // The peer merges nothing, so its receive slot only has to exist: any [candidates, columns]
+    // window serves.
+    Tensor ids_peer_scratch = peer.work_.alloc(DType::I32, {candidates, columns});
+    Tensor scores_peer_scratch = peer.work_.alloc(DType::FP32, {candidates, columns});
+    const std::size_t ids_bytes =
+        static_cast<std::size_t>(candidates) * columns * sizeof(std::int32_t);
+    const std::size_t score_bytes =
+        static_cast<std::size_t>(candidates) * columns * sizeof(float);
+    pair.sendrecv(ids_local.data, union_ids_upper.data, ids_peer.data, ids_peer_scratch.data,
+                  ids_bytes, ctx_.stream, peer.ctx_.stream);
+    pair.sendrecv(scores_local.data, union_scores_upper.data, scores_peer.data,
+                  scores_peer_scratch.data, score_bytes, ctx_.stream, peer.ctx_.stream);
     // The collective leaves the peer device current; the merge runs on this shard.
     ctx_.bind_to_current_thread();
     Tensor ids_lower(union_ids.data, DType::I32, {candidates, columns});
@@ -959,6 +962,151 @@ void TextContext::proposal_topk_tp2(const Tensor& hidden, Tensor& candidate_ids,
                         DType::FP32, {candidates, columns});
     ops::merge_topk_candidates(ids_lower, scores_lower, ids_upper, scores_upper, candidate_ids,
                                candidate_scores, ctx_.stream);
+}
+
+
+// TP-2 masked draft with the DFlash2 selector on the peer shard. The masked draft produces the hidden
+// state and the candidate list on its own shard, hands both to the peer, and the peer runs the
+// selector exactly as the one-device route does - its own projection, its own codebooks, its own
+// sampling configs - then returns the drafts and proposal q. Each payload crosses byte for byte, so
+// the returned values are the ones the local selector would have produced.
+void TextContext::dflash_selector_tp2(const Tensor& hidden, const Tensor& candidate_ids,
+                                      const Tensor& candidate_scores, const Tensor& anchors,
+                                      const Tensor& frontiers, const ops::SamplingConfig* host_configs,
+                                      Tensor& draft_tokens, Tensor& proposal_q) {
+    if (peer_tp_ == nullptr || pair_tp_ == nullptr || selector_ != nullptr) {
+        throw std::logic_error("dflash_selector_tp2: this shard holds the selector");
+    }
+    TextContext& peer = *peer_tp_;
+    if (peer.selector_ == nullptr) {
+        throw std::logic_error("dflash_selector_tp2: the peer shard does not hold the selector");
+    }
+    if (host_configs == nullptr) {
+        throw std::invalid_argument("dflash_selector_tp2: sampling configs are required");
+    }
+    const std::int32_t top_k  = candidate_ids.ne[0];
+    const std::int32_t drafts = candidate_ids.ne[1];
+    const std::int32_t batch  = candidate_ids.ne[2];
+    const std::int32_t columns = drafts * batch;
+    const std::int32_t rank    = dimension(peer.selector_->hidden_projection.weight.n);
+    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), columns},
+                         "selector hidden");
+    require_tensor_shape(candidate_ids, DType::I32, {top_k, drafts, batch}, "selector candidates");
+    require_tensor_shape(candidate_scores, DType::FP32, {top_k, columns}, "selector scores");
+    require_tensor_shape(anchors, DType::I32, {batch}, "selector anchors");
+    require_tensor_shape(frontiers, DType::I32, {batch}, "selector frontiers");
+    require_tensor_shape(draft_tokens, DType::I32, {drafts, batch}, "selector drafts");
+    require_tensor_shape(proposal_q, DType::FP32, {top_k, drafts, batch}, "selector proposal q");
+
+    auto local_scope = work_.scope();
+    auto peer_scope  = peer.work_.scope();
+    const auto config_words = static_cast<std::int32_t>(
+        (static_cast<std::size_t>(batch) * sizeof(ops::SamplingConfig) + 3) / 4);
+    peer.ctx_.bind_to_current_thread();
+    Tensor hidden_peer     = peer.work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
+    Tensor candidates_peer = peer.work_.alloc(DType::I32, {top_k, drafts, batch});
+    Tensor scores_peer     = peer.work_.alloc(DType::FP32, {top_k, columns});
+    Tensor anchors_peer    = peer.work_.alloc(DType::I32, {batch});
+    Tensor frontiers_peer  = peer.work_.alloc(DType::I32, {batch});
+    Tensor configs_peer    = peer.work_.alloc(DType::I32, {config_words});
+    Tensor projected_peer  = peer.work_.alloc(DType::BF16, {rank, columns});
+    Tensor drafts_peer     = peer.work_.alloc(DType::I32, {drafts, batch});
+    Tensor q_peer          = peer.work_.alloc(DType::FP32, {top_k, drafts, batch});
+    ctx_.bind_to_current_thread();
+
+    // The draft's hidden state is bfloat16 on both sides, so the pair's in-kernel all-reduce carries
+    // it without a host round trip and without the signaling-NaN hazard a raw I32/FP32 payload would
+    // have: this shard's buffer plus the peer's zeroed buffer is exactly the broadcast.
+    peer.ctx_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemsetAsync(hidden_peer.data, 0, hidden_peer.bytes(), peer.ctx_.stream));
+    ctx_.bind_to_current_thread();
+    pair_tp_->allreduce(hidden.data, hidden_peer.data, hidden.bytes(), ctx_.stream,
+                        peer.ctx_.stream);
+    ctx_.bind_to_current_thread();
+    // The draft state travels to the selector's shard through the pair's byte-exact exchange, packed
+    // into one transfer: the payload is I32 ids and FP32 scores, which the BF16 all-reduce would
+    // reinterpret. The selector's outputs need a second exchange (they exist only after this one).
+    const auto align16 = [](std::size_t value) { return (value + 15U) & ~std::size_t{15U}; };
+    const std::size_t forward_bytes = align16(candidate_ids.bytes() + candidate_scores.bytes() +
+                                              anchors.bytes() + frontiers.bytes());
+    const std::size_t back_bytes    = align16(drafts_peer.bytes() + q_peer.bytes());
+    Tensor pack_forward = work_.alloc(DType::I32, {static_cast<std::int32_t>(forward_bytes / 4)});
+    Tensor recv_forward = work_.alloc(DType::I32, {static_cast<std::int32_t>(forward_bytes / 4)});
+    Tensor recv_back    = work_.alloc(DType::I32, {static_cast<std::int32_t>(back_bytes / 4)});
+    Tensor pack_back = peer.work_.alloc(DType::I32, {static_cast<std::int32_t>(back_bytes / 4)});
+    Tensor recv_pack_forward =
+        peer.work_.alloc(DType::I32, {static_cast<std::int32_t>(forward_bytes / 4)});
+    std::size_t packed = 0;
+    ctx_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(pack_forward.data, candidate_ids.data, candidate_ids.bytes(),
+                               cudaMemcpyDeviceToDevice, ctx_.stream));
+    packed = candidate_ids.bytes();
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(pack_forward.data) + packed,
+                               candidate_scores.data, candidate_scores.bytes(),
+                               cudaMemcpyDeviceToDevice, ctx_.stream));
+    packed += candidate_scores.bytes();
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(pack_forward.data) + packed, anchors.data,
+                               anchors.bytes(), cudaMemcpyDeviceToDevice, ctx_.stream));
+    packed += anchors.bytes();
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(pack_forward.data) + packed, frontiers.data,
+                               frontiers.bytes(), cudaMemcpyDeviceToDevice, ctx_.stream));
+    // This exchange's peer half carries nothing: the peer only has to send readable bytes, so it
+    // sends from the buffer it receives into (an in-place exchange is safe).
+    peer.ctx_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemsetAsync(recv_pack_forward.data, 0, forward_bytes, peer.ctx_.stream));
+    ctx_.bind_to_current_thread();
+    pair_tp_->sendrecv(pack_forward.data, recv_forward.data, recv_pack_forward.data,
+                       recv_pack_forward.data, forward_bytes, ctx_.stream, peer.ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    packed = 0;
+    CUDA_CHECK(cudaMemcpyAsync(candidates_peer.data, recv_pack_forward.data,
+                               candidate_ids.bytes(), cudaMemcpyDeviceToDevice, peer.ctx_.stream));
+    packed = candidate_ids.bytes();
+    CUDA_CHECK(cudaMemcpyAsync(scores_peer.data, static_cast<char*>(recv_pack_forward.data) + packed,
+                               candidate_scores.bytes(), cudaMemcpyDeviceToDevice,
+                               peer.ctx_.stream));
+    packed += candidate_scores.bytes();
+    CUDA_CHECK(cudaMemcpyAsync(anchors_peer.data,
+                               static_cast<char*>(recv_pack_forward.data) + packed, anchors.bytes(),
+                               cudaMemcpyDeviceToDevice, peer.ctx_.stream));
+    packed += anchors.bytes();
+    CUDA_CHECK(cudaMemcpyAsync(frontiers_peer.data,
+                               static_cast<char*>(recv_pack_forward.data) + packed,
+                               frontiers.bytes(), cudaMemcpyDeviceToDevice, peer.ctx_.stream));
+
+    peer.ctx_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(configs_peer.data, host_configs,
+                               static_cast<std::size_t>(batch) * sizeof(ops::SamplingConfig),
+                               cudaMemcpyHostToDevice, peer.ctx_.stream));
+    project(hidden_peer, peer.selector_->hidden_projection, projected_peer, peer.work_,
+            peer.ctx_.stream);
+    ops::candidate_selector_path(
+        candidates_peer, scores_peer.view({top_k, drafts, batch}),
+        projected_peer.view({rank, drafts, batch}), anchors_peer,
+        peer.selector_->predecessor_codebook, peer.selector_->successor_codebook, frontiers_peer,
+        static_cast<const ops::SamplingConfig*>(configs_peer.data), drafts_peer, q_peer,
+        peer.work_, peer.ctx_.stream);
+    ctx_.bind_to_current_thread();
+
+    // Second exchange: the selector's own outputs come back packed, and this shard's half of that
+    // exchange is a zeroed scratch the peer discards.
+    peer.ctx_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(pack_back.data, drafts_peer.data, drafts_peer.bytes(),
+                               cudaMemcpyDeviceToDevice, peer.ctx_.stream));
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(pack_back.data) + drafts_peer.bytes(),
+                               q_peer.data, q_peer.bytes(), cudaMemcpyDeviceToDevice,
+                               peer.ctx_.stream));
+    Tensor back_dummy = work_.alloc(DType::I32, {static_cast<std::int32_t>(back_bytes / 4)});
+    ctx_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemsetAsync(back_dummy.data, 0, back_bytes, ctx_.stream));
+    pair_tp_->sendrecv(back_dummy.data, recv_back.data, pack_back.data, pack_back.data, back_bytes,
+                       ctx_.stream, peer.ctx_.stream);
+    ctx_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(draft_tokens.data, recv_back.data, drafts_peer.bytes(),
+                               cudaMemcpyDeviceToDevice, ctx_.stream));
+    CUDA_CHECK(cudaMemcpyAsync(proposal_q.data,
+                               static_cast<char*>(recv_back.data) + drafts_peer.bytes(),
+                               q_peer.bytes(), cudaMemcpyDeviceToDevice, ctx_.stream));
 }
 
 void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,

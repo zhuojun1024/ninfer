@@ -654,8 +654,68 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 matrix(layout, DType::FP32, 16, columns);
                 matrix(layout, DType::I32, 32, columns);
                 matrix(layout, DType::FP32, 32, columns);
+                // The byte-exact selector hand-off packs the draft state and the selector's outputs into
+                // one exchange per direction, so this shard stages both directions.
+                const auto pack16 = [](std::size_t value) {
+                    return (value + 15U) & ~std::size_t{15U};
+                };
+                const std::size_t selector_forward = pack16(
+                    static_cast<std::size_t>(16) * columns * sizeof(std::int32_t) +
+                    static_cast<std::size_t>(16) * columns * sizeof(float) +
+                    2 * static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+                const std::size_t selector_back = pack16(
+                    static_cast<std::size_t>(width - 1) * batch * sizeof(std::int32_t) +
+                    static_cast<std::size_t>(16) * columns * sizeof(float));
+                matrix(layout, DType::I32, static_cast<std::int32_t>(selector_forward / 4), 1);
+                matrix(layout, DType::I32, static_cast<std::int32_t>(selector_forward / 4), 1);
+                matrix(layout, DType::I32, static_cast<std::int32_t>(selector_back / 4), 1);
+                matrix(layout, DType::I32, static_cast<std::int32_t>(selector_back / 4), 1);
                 scratch(layout, ops::linear_topk_workspace_capacity_bytes(
                                     head.weight.qtype, rows, head.weight.k, columns, columns));
+                return finish(layout);
+            };
+            // TP-2 moves the DFlash2 selector's codebooks to the peer shard, so the masked draft's
+            // shard hands the draft state over and the peer runs the selector on its own stream. The
+            // shard that holds the selector but no draft is exactly that peer, and its text arena
+            // carries the transferred inputs, the selector projection and the path's own scratch.
+            const auto dflash_selector_peer_capacity = [&](std::int32_t width, std::int32_t batch) {
+                if (!parameters.dflash_selector.has_value() || parameters.draft.has_value() ||
+                    !draft->dflash2.has_value()) {
+                    return std::size_t{0};
+                }
+                const std::int32_t drafts  = width - 1;
+                const std::int32_t columns = drafts * batch;
+                const auto top_k = static_cast<std::int32_t>(draft->dflash2->selector_top_k);
+                const std::int32_t rank =
+                    dimension(parameters.dflash_selector->hidden_projection.weight.n);
+                const auto config_words = static_cast<std::int32_t>(
+                    (static_cast<std::size_t>(batch) * sizeof(ops::SamplingConfig) + 3) / 4);
+                WorkspaceLayoutBuilder layout;
+                matrix(layout, DType::BF16, dimension(config.hidden_size), columns);
+                matrix(layout, DType::I32, top_k, columns);
+                matrix(layout, DType::FP32, top_k, columns);
+                matrix(layout, DType::I32, batch, 1);
+                matrix(layout, DType::I32, batch, 1);
+                matrix(layout, DType::I32, config_words, 1);
+                matrix(layout, DType::BF16, rank, columns);
+                matrix(layout, DType::I32, drafts, batch);
+                matrix(layout, DType::FP32, top_k * drafts, batch);
+                // The packed exchanges: this shard receives the draft state and sends the selector's
+                // outputs, so it stages one buffer per direction.
+                const auto pack16 = [](std::size_t value) {
+                    return (value + 15U) & ~std::size_t{15U};
+                };
+                const std::size_t selector_forward =
+                    pack16(static_cast<std::size_t>(top_k) * columns * sizeof(std::int32_t) +
+                           static_cast<std::size_t>(top_k) * columns * sizeof(float) +
+                           2 * static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+                const std::size_t selector_back =
+                    pack16(static_cast<std::size_t>(drafts) * batch * sizeof(std::int32_t) +
+                           static_cast<std::size_t>(top_k) * drafts * batch * sizeof(float));
+                matrix(layout, DType::I32, static_cast<std::int32_t>(selector_forward / 4), 1);
+                matrix(layout, DType::I32, static_cast<std::int32_t>(selector_back / 4), 1);
+                scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(
+                                    drafts, drafts, batch, batch));
                 return finish(layout);
             };
 
@@ -678,6 +738,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 const std::size_t proposal = dflash_proposal_capacity(verify, batch);
                 out.dflash_proposal_split = std::max(out.dflash_proposal_split,
                                                      dflash_proposal_split_capacity(verify, batch));
+                out.dflash_selector_peer =
+                    std::max(out.dflash_selector_peer, dflash_selector_peer_capacity(verify, batch));
                 out.dflash_round =
                     std::max({out.dflash_round, finish(target), accept,
                               dflash_context_capacity(verify, batch, true), proposal});
@@ -688,7 +750,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     out.general_capacity =
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
                   out.dflash_context, out.dflash_round, out.dflash_proposal_split,
-                  out.causal_score});
+                  out.dflash_selector_peer, out.causal_score});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(

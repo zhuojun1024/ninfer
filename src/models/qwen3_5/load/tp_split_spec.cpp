@@ -89,7 +89,19 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
         // bit-identical on both shards (the mixer outputs are all-reduced before the residual is
         // captured), which makes halving them a second lockstep all-reduce for no gain. The
         // DFlash2 selector additionally reads its whole-vocabulary codebooks, which a
-        // vocabulary-parallel split would not preserve.
+        // vocabulary-parallel split would not preserve - but the selector is the one draft component
+        // the peer can run: the masked draft hands the draft state over the registered pair and the
+        // peer returns the drafts and proposal q, so its bytes move to shard 1. The transfer is
+        // byte-exact (DevicePair::sendrecv) because the pair's all-reduce is BF16
+        // arithmetic and would rewrite a 16-bit lane that looks like a signaling NaN.
+        if (has_prefix("dflash2/candidate_selector/")) {
+            TPObjectSplit selector;
+            selector.object.index = idx;
+            selector.kind         = WeightSplitKind::Replicated;
+            selector.shards       = 0x2U;
+            spec.splits.push_back(std::move(selector));
+            continue;
+        }
         if (has_prefix("mtp/") || has_prefix("dflash2/") || has_prefix("vision/")) {
             TPObjectSplit local;
             local.object.index = idx;

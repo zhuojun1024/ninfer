@@ -66,8 +66,8 @@ std::size_t dflash2_proposal_workspace_bytes(const Parameters& parameters, const
     if (width < 2 || batch < 1 || capacity == 0) {
         throw std::invalid_argument("DFlash2 proposal workspace geometry is invalid");
     }
-    if (!parameters.draft.has_value() || !parameters.draft->selector.has_value()) {
-        throw std::invalid_argument("DFlash2 proposal workspace requires the selector weights");
+    if (!parameters.draft.has_value()) {
+        throw std::invalid_argument("DFlash2 proposal workspace requires the draft weights");
     }
     if (!parameters.model.config().draft.has_value() ||
         !parameters.model.config().draft->dflash2.has_value()) {
@@ -121,8 +121,8 @@ std::size_t dflash2_proposal_workspace_bytes(const Parameters& parameters, const
                     ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
                         dimension(draft.intermediate_size), width, width, batch, batch));
     }
-    // Tail: the packed final-norm hidden, the reduced head's top-k ids and scores, the selector
-    // projection and the sparse proposal.
+    // Tail: the packed final-norm hidden, the reduced head's top-k ids and scores, and - only when
+    // this shard holds the selector - its projection and the sparse proposal.
     (void)layout.alloc(DType::BF16, {dimension(target.hidden_size), mask_cols});
     (void)layout.alloc(DType::FP32, {dimension(draft.dflash2->selector_top_k), mask_cols});
     const LinearParameters& head = proposal_head == ProposalHead::Optimized
@@ -131,10 +131,15 @@ std::size_t dflash2_proposal_workspace_bytes(const Parameters& parameters, const
     add_scratch(layout, ops::linear_topk_workspace_capacity_bytes(
                             head.weight.qtype, head.weight.n, head.weight.k, mask_cols,
                             mask_cols));
-    (void)layout.alloc(DType::BF16, {dimension(draft.dflash2->selector_rank), mask_cols});
-    add_linear_scratch(layout, parameters.draft->selector->hidden_projection, mask_cols, mask_cols);
-    add_scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(drafts, drafts,
-                                                                              batch, batch));
+    // The selector is shard-local: when TP-2 moved its codebooks to the peer shard, the peer's text
+    // arena carries the projection and the path's scratch instead of this round arena.
+    if (parameters.dflash_selector.has_value()) {
+        (void)layout.alloc(DType::BF16, {dimension(draft.dflash2->selector_rank), mask_cols});
+        add_linear_scratch(layout, parameters.dflash_selector->hidden_projection, mask_cols,
+                           mask_cols);
+        add_scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(drafts, drafts,
+                                                                                  batch, batch));
+    }
     return layout.peak_bytes(1);
 }
 

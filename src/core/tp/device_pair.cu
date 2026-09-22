@@ -92,10 +92,16 @@ __device__ __forceinline__ uint4 add_bf16x8(uint4 a, uint4 b) {
 // kernel arguments, so a value-baked token would be replayed unchanged and a peer that is a call
 // ahead would satisfy its spin from the previous replay. A device counter that every replay
 // increments on both devices keeps the monotonic-token invariant inside a captured sequence.
-__global__ void ar_inplace_bf16(const __nv_bfloat16* local, __nv_bfloat16* out,
-                                char* host_mine_base, const char* host_other_base, int count,
-                                int* arrival_mine, int* arrival_other, int* order_mine,
-                                int* token_ptr, int slot_bytes, int groups, int fuse_bump) {
+// kAdd selects the reduction: true is the in-place all-reduce the TP-2 routes run, false is a
+// byte-exact exchange where `out` receives the peer's staged bytes unchanged. Both share the
+// staging, arrival-token and slice machinery; only phase 3 differs. The copy mode preserves every
+// 16-bit lane, so a payload whose lanes spell a signaling NaN - an I32 id, an FP32 score - travels
+// intact where the BF16 add would quiet it.
+template <bool kAdd>
+__global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
+                            char* host_mine_base, const char* host_other_base, int count,
+                            int* arrival_mine, int* arrival_other, int* order_mine,
+                            int* token_ptr, int slot_bytes, int groups, int fuse_bump) {
     // The token lives in mapped host memory (either device may run this call), where a per-thread
     // load would be a system-scope read per thread. One read per block is enough: the value is fixed
     // for the whole call, so publish it through shared memory. The single-block decode-sized call
@@ -154,17 +160,17 @@ __global__ void ar_inplace_bf16(const __nv_bfloat16* local, __nv_bfloat16* out,
         const uint4 o1 = other_groups[i + stride];
         const uint4 o2 = other_groups[i + 2 * stride];
         const uint4 o3 = other_groups[i + 3 * stride];
-        out_groups[i]                  = add_bf16x8(local_groups[i], o0);
-        out_groups[i + stride]         = add_bf16x8(local_groups[i + stride], o1);
-        out_groups[i + 2 * stride]     = add_bf16x8(local_groups[i + 2 * stride], o2);
-        out_groups[i + 3 * stride]     = add_bf16x8(local_groups[i + 3 * stride], o3);
+        out_groups[i]              = kAdd ? add_bf16x8(local_groups[i], o0) : o0;
+        out_groups[i + stride]     = kAdd ? add_bf16x8(local_groups[i + stride], o1) : o1;
+        out_groups[i + 2 * stride] = kAdd ? add_bf16x8(local_groups[i + 2 * stride], o2) : o2;
+        out_groups[i + 3 * stride] = kAdd ? add_bf16x8(local_groups[i + 3 * stride], o3) : o3;
     }
     for (; i < end; i += stride) {
-        out_groups[i] = add_bf16x8(local_groups[i], other_groups[i]);
+        out_groups[i] = kAdd ? add_bf16x8(local_groups[i], other_groups[i]) : other_groups[i];
     }
     if (blockIdx.x == 0) {
         for (int j = tail + threadIdx.x; j < count; j += stride) {
-            out[j] = __hadd(local[j], host_other[j]);
+            out[j] = kAdd ? __hadd(local[j], host_other[j]) : host_other[j];
         }
     }
 }
@@ -401,7 +407,7 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
     require_bytes(count_bytes);
     if (count_bytes == 0) { return; }
     // In-kernel path (WSL2, no P2P, mapped pinned available): both devices run
-    // ar_inplace_bf16 on their compute streams. Each writes its delta to its own
+    // ar_exchange<true> on their compute streams. Each writes its delta to its own
     // mapped host buffer, signals an arrival token, spins on the peer's token,
     // then reads the peer's buffer and sums in place. No host synchronization -
     // the cross-GPU barrier is the kernel's arrival-token spin. The kernel is
@@ -432,13 +438,13 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
             // kArThreads: a smaller block regressed, because the payload's cost is the mapped-host
             // round trip and the group loops want the parallelism.
             a_.bind_to_current_thread();
-            ar_inplace_bf16<<<1, kArThreads, 0, stream_a>>>(
+            ar_exchange<true><<<1, kArThreads, 0, stream_a>>>(
                 reinterpret_cast<const __nv_bfloat16*>(data_a),
                 reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(small_dev_a_),
                 static_cast<const char*>(small_dev_b_), count, arrival_a_, arrival_b_, order_a,
                 token_a_, static_cast<int>(kArSmallBytes), groups, 1);
             b_.bind_to_current_thread();
-            ar_inplace_bf16<<<1, kArThreads, 0, stream_b>>>(
+            ar_exchange<true><<<1, kArThreads, 0, stream_b>>>(
                 reinterpret_cast<const __nv_bfloat16*>(data_b),
                 reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(small_dev_b_),
                 static_cast<const char*>(small_dev_a_), count, arrival_b_, arrival_a_, order_b,
@@ -451,14 +457,14 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
         // double-buffer parity from that value, so a captured sequence needs no host-side counter.
         a_.bind_to_current_thread();
         bump_ar_token<<<1, 1, 0, stream_a>>>(token_a_);
-        ar_inplace_bf16<<<slices, kArThreads, 0, stream_a>>>(
+        ar_exchange<true><<<slices, kArThreads, 0, stream_a>>>(
             reinterpret_cast<const __nv_bfloat16*>(data_a),
             reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(dev_a_),
             static_cast<const char*>(dev_b_), count, arrival_a_, arrival_b_, order_a, token_a_,
             slot_bytes, groups, 0);
         b_.bind_to_current_thread();
         bump_ar_token<<<1, 1, 0, stream_b>>>(token_b_);
-        ar_inplace_bf16<<<slices, kArThreads, 0, stream_b>>>(
+        ar_exchange<true><<<slices, kArThreads, 0, stream_b>>>(
             reinterpret_cast<const __nv_bfloat16*>(data_b),
             reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(dev_b_),
             static_cast<const char*>(dev_a_), count, arrival_b_, arrival_a_, order_b, token_b_,
@@ -521,6 +527,91 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
     CUDA_CHECK(cudaMemcpyAsync(data_b, pinned, count_bytes, cudaMemcpyHostToDevice, stream_b));
     // No H2D barrier: the caller enqueues residual_add on stream_a/stream_b
     // immediately after, so it is ordered after these transfers.
+}
+
+void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, void* recv_b,
+                          std::size_t count_bytes, cudaStream_t stream_a, cudaStream_t stream_b) {
+    require_bytes(count_bytes);
+    if (count_bytes == 0) { return; }
+    // In-kernel transport: both devices run ar_exchange<false> on their compute streams. Each device
+    // publishes its own send bytes to its mapped host staging, signals an arrival token, spins on the
+    // peer's token, then copies the peer's staging slice into its receive buffer - no host
+    // synchronization, and the same token/parity discipline as the all-reduce, so an allreduce and a
+    // sendrecv may interleave within one round as long as both devices issue the same sequence.
+    if (in_kernel_available_ && count_bytes <= in_kernel_bytes_) {
+        const int count = static_cast<int>(count_bytes / 2);
+        const auto address = reinterpret_cast<std::uintptr_t>(send_a) |
+                             reinterpret_cast<std::uintptr_t>(recv_a) |
+                             reinterpret_cast<std::uintptr_t>(send_b) |
+                             reinterpret_cast<std::uintptr_t>(recv_b) |
+                             reinterpret_cast<std::uintptr_t>(dev_a_) |
+                             reinterpret_cast<std::uintptr_t>(dev_b_);
+        // require_bytes already bounds the payload to whole 16-byte groups; the pointer check only
+        // decides whether the vectorized group loops may be used.
+        const int groups = (address % 16 == 0) ? count / 8 : 0;
+        int*      order_a = reinterpret_cast<int*>(reinterpret_cast<char*>(arrival_a_) + kArSlotBytes);
+        int*      order_b = reinterpret_cast<int*>(reinterpret_cast<char*>(arrival_b_) + kArSlotBytes);
+        if (ar_size_keyed_ && small_available_ && count_bytes <= kArSmallBytes) {
+            a_.bind_to_current_thread();
+            ar_exchange<false><<<1, kArThreads, 0, stream_a>>>(
+                static_cast<const __nv_bfloat16*>(send_a), static_cast<__nv_bfloat16*>(recv_a),
+                static_cast<char*>(small_dev_a_), static_cast<const char*>(small_dev_b_), count,
+                arrival_a_, arrival_b_, order_a, token_a_, static_cast<int>(kArSmallBytes), groups, 1);
+            b_.bind_to_current_thread();
+            ar_exchange<false><<<1, kArThreads, 0, stream_b>>>(
+                static_cast<const __nv_bfloat16*>(send_b), static_cast<__nv_bfloat16*>(recv_b),
+                static_cast<char*>(small_dev_b_), static_cast<const char*>(small_dev_a_), count,
+                arrival_b_, arrival_a_, order_b, token_b_, static_cast<int>(kArSmallBytes), groups, 1);
+            return;
+        }
+        const int slices     = ar_slices(count_bytes);
+        const int slot_bytes = static_cast<int>(kInKernelArBytes);
+        a_.bind_to_current_thread();
+        bump_ar_token<<<1, 1, 0, stream_a>>>(token_a_);
+        ar_exchange<false><<<slices, kArThreads, 0, stream_a>>>(
+            static_cast<const __nv_bfloat16*>(send_a), static_cast<__nv_bfloat16*>(recv_a),
+            static_cast<char*>(dev_a_), static_cast<const char*>(dev_b_), count, arrival_a_,
+            arrival_b_, order_a, token_a_, slot_bytes, groups, 0);
+        b_.bind_to_current_thread();
+        bump_ar_token<<<1, 1, 0, stream_b>>>(token_b_);
+        ar_exchange<false><<<slices, kArThreads, 0, stream_b>>>(
+            static_cast<const __nv_bfloat16*>(send_b), static_cast<__nv_bfloat16*>(recv_b),
+            static_cast<char*>(dev_b_), static_cast<const char*>(dev_a_), count, arrival_b_,
+            arrival_a_, order_b, token_b_, slot_bytes, groups, 0);
+        return;
+    }
+    if (p2p_) {
+        a_.bind_to_current_thread();
+        b_.bind_to_current_thread();
+        // The send halves were produced on the caller's compute streams, which are independent of the
+        // DevicePair's own peer-copy streams; settle them so every copy reads a completed source half.
+        CUDA_CHECK(cudaStreamSynchronize(stream_a));
+        CUDA_CHECK(cudaStreamSynchronize(stream_b));
+        CUDA_CHECK(cudaMemcpyPeerAsync(recv_a, a_.device, send_b, b_.device, count_bytes, a_.stream));
+        CUDA_CHECK(cudaMemcpyPeerAsync(recv_b, b_.device, send_a, a_.device, count_bytes, b_.stream));
+        CUDA_CHECK(cudaStreamSynchronize(a_.stream));
+        CUDA_CHECK(cudaStreamSynchronize(b_.stream));
+        return;
+    }
+    // Host staging: the pinned buffer holds [a's send | b's send] and each receive copies the other
+    // half back. Only the two D2H transfers need a barrier, exactly as the all-reduce fallback does.
+    const std::size_t total = 2 * count_bytes;
+    if (!staging_ || staging_->size() < total) {
+        staging_ = std::make_unique<PinnedHostBuffer>(total);
+    }
+    char* pinned = static_cast<char*>(staging_->data());
+    a_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(pinned, send_a, count_bytes, cudaMemcpyDeviceToHost, stream_a));
+    b_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(pinned + count_bytes, send_b, count_bytes, cudaMemcpyDeviceToHost,
+                               stream_b));
+    CUDA_CHECK(cudaStreamSynchronize(stream_a));
+    CUDA_CHECK(cudaStreamSynchronize(stream_b));
+    a_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(recv_a, pinned + count_bytes, count_bytes, cudaMemcpyHostToDevice,
+                               stream_a));
+    b_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(recv_b, pinned, count_bytes, cudaMemcpyHostToDevice, stream_b));
 }
 
 ShardedTensor shard_view(const Tensor& full, int dim, std::int32_t local_len, int shard) {

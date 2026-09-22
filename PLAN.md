@@ -1041,6 +1041,48 @@ KV 两卡必须同 token 数（按 head 切），上限由最重的卡决定：�
 `merge.cu:22` 同类），新算子最初按 `rank * columns + column` 索引，U=7 时整列错位，抽测接受率掉到 7.4%、
 tok/s 减半。修正后恢复到与改动前完全一致，并把该布局写进算子契约与 oracle 测试。
 
+### 7.8 已提交代码中的一个隐患（工作项 B 一并修）
+
+`DevicePair::allreduce` 是两卡之间**唯一**的集合通信，其语义是 **BF16 逐元素相加**
+（`src/core/tp/device_pair.cu:21,95` 的 `add_bf16x8`/`__hadd`），并要求字节数为 16 的倍数
+（`device_pair.cu:209`）。方案 A 的 `proposal_topk_tp2` 用它搬运 **I32 候选 id 与 FP32 分数**：
+一侧 memset 0 后相加在数值上等于拷贝，但按 BF16 解释时，任何落在 signaling-NaN 模式
+（0x7C01–0x7FFF / 0xFC01–0xFFFF）的 16 位 lane 会被静默化而改变位模式——id（<248077）的低 16 位、
+FP32 分数的任一半字都可能命中，属低概率但真实的**静默错误**。本轮 E2E 逐字节一致只能说明这次没命中。
+
+**修法**（不碰 `allreduce` 本体）：`TextContext` 自持 pinned host staging（2 MiB）+ 事件，
+按 `cudaMemcpyAsync` D2H → `cudaEventSynchronize` → H2D 做**逐字节**跨卡搬运；A 的 union 交换与
+B 的 selector 搬运都走它。代价是每轮几次 host 事件同步（µs 级，一轮约 47 ms，占比 <0.1%），
+`DevicePair` 与 MTP/单设备路线完全不动。
+
+**待办（本轮不修，验证成本高）**：MTP 路线在 `text.cpp:486` 附近同样用 allreduce 搬 I32 proposal ids，
+属同一类 sNaN 位型风险。
+
+**B 期实测（selector 在 shard 1，host staging 仍 5 次同步）**：提案 7.946 → 8.418 ms（+5.9%）；
+K=7 `0xbad27a494a9bc853`、K=5 `0xbee487264ca8ffb8` 均不变；shard 0 draft 块 3655.4 → 3410.4 MiB（−245.0）。
+hidden（71.7 KB BF16）改走 in-kernel allreduce 后：同步 5→4 次、staging 73 KB→1.4 KB；余下 4 次需
+`DevicePair` 的逐字节 device 端拷贝变体才能消除。
+
+## 8. 工作项 B：把 DFlash2 selector 移到 shard 1（已完成，验收见 §8.9）
+
+目标：`dflash2/candidate_selector/*`（codebook 各 121.25 MiB + hidden_projection 2.5 MiB ≈ 245 MiB）
+从 shard 0 移到 shard 1 ⇒ shard 0 少 245 MiB ⇒ 上限 +~15.6k token；精度零损失是硬门槛。
+
+设计：
+1. `tp_split_spec.cpp`：在 `mtp/|dflash2/|vision/` 规则**之前**加 `dflash2/candidate_selector/` → `shards=0x2`；其余 dflash2 不动。
+2. 参数归属：selector 从 `DraftParameters::selector` 提升为顶层 `Parameters::dflash_selector`，按
+   `source.has_weight(...)` 决定本卡是否存在（vision/MTP 的 shard-local 先例）⇒ shard 0 无、shard 1 有、
+   单设备有（单设备继续本地跑）。
+3. `TextContext::dflash_selector_tp2`：hidden/candidates/scores/anchors/frontiers 送 peer，在 peer 上跑
+   `project` + `candidate_selector_path`，drafts/proposal_q 带回；sampling 用 host 侧
+   `host_ingress.sampling` 直接 H2D 到 peer（不经 BF16 相加）。
+4. 工作区：文本计划新增 `dflash_selector_peer` 预留（peer 侧缓冲 + selector 自己的
+   `candidate_selector_path_workspace_capacity_bytes`），按"本卡有 selector、无 draft"判定。
+5. 不改 selector 算子语义/算术。
+
+验收：append K=7 `0xbad27a494a9bc853` / K=5 `0xbee487264ca8ffb8`、solo EXIT=0、账目 A/B
+（shard 0 −245、shard 1 +245）、吞吐/接受率 A/B（>2% 回退如实上报）。
+
 ### 7.5 方案 B（待办）：把 `dflash2/candidate_selector`（245 MiB）移到 shard 1
 
 selector 每 draft 轮只需一次（输入 hidden ~KB 级），搬到 shard 1 可再平衡约 245 MiB（+~15.6k token），
@@ -1060,3 +1102,22 @@ selector 每 draft 轮只需一次（输入 hidden ~KB 级），搬到 shard 1 �
 - 新工具仅依赖 Python 标准库；`git diff --check` 干净。
 - 合成工件可加载并服务，且组件字节归属如上。
 - 接受率对比给出可复现的三组数字（同一提示与采样设置）。
+
+
+### 8.9 落地结果（sendrecv 与 B 的验收，全部实测）
+
+- **新增 `DevicePair::sendrecv`**（`core/tp/device_pair.{h,cu}`）：把既有 in-kernel 内核模板化为
+  `ar_exchange<kAdd>`，`kAdd=false` 时 phase 3 把 peer 的 staged 字节**逐位写入** `recv`；staging、
+  arrival token、slice、双缓冲机制全部复用 ⇒ 稳态**零主机同步**、可入 CUDA Graph、与 lockstep 兼容。
+  单测 `ninfer_tp_device_pair_test` 新增对抗性用例（signaling-NaN 位型 lane、I32/FP32 位型、960B/64B/1MiB
+  三档）**PASS**；本机 `p2p_available=0` ⇒ 走的正是 in-kernel 路径。
+- **A 的隐患已修**：`proposal_topk_tp2` 的候选 union 交换改走 `sendrecv`（I32 id / FP32 分数不再经 BF16 相加）。
+- **B 落地**：`tp_split_spec.cpp` 把 `dflash2/candidate_selector/*` 判给 shard 1；`dflash_selector_tp2`
+  用两次**打包**交换（正向 draft 状态、反向 selector 输出）替代原主机同步通道；`peer_stage_copy` 与其
+  pinned/event 状态已删除；工作区预留同步补齐。
+- **验收数字**：账目 shard 0 `weights+ctx` 13708.6 → **13462.6（−246.0）**、shard 1 11866.6 →
+  **12112.6（+246.0）**（两卡之和不变）；贪心同一提示输出 sha256 `2765879ab69653a592f330a335025ff9`
+  与 selector 在 shard 0 时**完全一致**，接受计数同为 `252/931 (27.1%)`；decode **66.7 tok/s**
+  （A 期基线 66.3–66.9，回退 <0.5%）；append 摘要 K=7 `0xbad27a494a9bc853`、K=5 `0xbee487264ca8ffb8`
+  不变；提案耗时 8.097/8.037 ms（A 基线 7.946/7.962，+1.3~1.7%，端到端不可测）。
+- 收益：shard 0 余量 +246 MiB ⇒ 上下文上限约 **+15.6k token**（16.13 KiB/token/卡）。

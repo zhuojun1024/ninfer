@@ -217,10 +217,11 @@ std::size_t linear_bytes(const qwen::execution::LinearParameters& parameter) {
     return weight_bytes(parameter.weight);
 }
 
-// Resident bytes of the whole shard-0 draft block that the proposal reads: the executable draft
-// weights plus the reduced proposal head it resolves its top-k against (load.cpp:142-144 keeps that
-// head whole for a masked draft).
-std::size_t draft_weight_bytes(const qwen::execution::DraftParameters& draft) {
+// Resident bytes of the whole draft block that the proposal reads on this shard: the executable
+// draft weights, the reduced proposal head it resolves its top-k against, and the selector when this
+// shard is the one that materialized it (TP-2 places it on the peer).
+std::size_t draft_weight_bytes(const qwen::execution::DraftParameters& draft,
+                               const qwen::execution::SelectorParameters* selector) {
     std::size_t total =
         linear_bytes(draft.feature_projection) + draft.context_norm.bytes() + draft.final_norm.bytes();
     for (const auto& layer : draft.layers) {
@@ -238,10 +239,9 @@ std::size_t draft_weight_bytes(const qwen::execution::DraftParameters& draft) {
                      linear_bytes(layer.mlp_conv->kernel_projection);
         }
     }
-    if (draft.selector) {
-        total += linear_bytes(draft.selector->hidden_projection) +
-                 draft.selector->predecessor_codebook.bytes() +
-                 draft.selector->successor_codebook.bytes();
+    if (selector != nullptr) {
+        total += linear_bytes(selector->hidden_projection) +
+                 selector->predecessor_codebook.bytes() + selector->successor_codebook.bytes();
     }
     total += linear_bytes(draft.output_head);
     return total;
@@ -945,13 +945,16 @@ int main(int argc, char** argv) {
         const double per_proposal_ms = static_cast<double>(elapsed_ms) / kTimedProposals;
 
         const auto& draft_weights = *parameters0.draft;
-        const std::size_t draft_bytes = draft_weight_bytes(draft_weights);
+        const qwen::execution::SelectorParameters* selector =
+            parameters0.dflash_selector ? &*parameters0.dflash_selector : nullptr;
+        const std::size_t draft_bytes = draft_weight_bytes(draft_weights, selector);
         const std::size_t head_bytes  = linear_bytes(draft_weights.output_head);
         const std::size_t codebook_bytes =
-            draft_weights.selector
-                ? draft_weights.selector->predecessor_codebook.bytes() +
-                      draft_weights.selector->successor_codebook.bytes()
+            selector != nullptr
+                ? selector->predecessor_codebook.bytes() + selector->successor_codebook.bytes()
                 : 0;
+        const std::size_t selector_projection_bytes =
+            selector != nullptr ? linear_bytes(selector->hidden_projection) : 0;
         // The arena the runtime core's own planner asks for at this geometry, for comparison with the
         // shipped-budget arena the test sizes the round with.
         const std::size_t planned_proposal_bytes = qwen::execution::dflash2_proposal_workspace_bytes(
@@ -974,16 +977,10 @@ int main(int argc, char** argv) {
             "(shared with the target)\n",
             static_cast<double>(linear_bytes(draft_weights.feature_projection)) / 1048576.0,
             static_cast<double>(draft_bytes - linear_bytes(draft_weights.feature_projection) -
-                                codebook_bytes - head_bytes -
-                                (draft_weights.selector
-                                     ? linear_bytes(draft_weights.selector->hidden_projection)
-                                     : 0)) /
+                                codebook_bytes - head_bytes - selector_projection_bytes) /
                 1048576.0,
             static_cast<double>(codebook_bytes) / 1048576.0,
-            static_cast<double>(draft_weights.selector
-                                    ? linear_bytes(draft_weights.selector->hidden_projection)
-                                    : 0) /
-                1048576.0,
+            static_cast<double>(selector_projection_bytes) / 1048576.0,
             static_cast<double>(head_bytes) / 1048576.0);
         std::printf("[mem]   qtypes: feature_projection=%s output_head=%s layer0.qkv=%s "
                     "layer0.down=%s codebook=%s\n",
@@ -991,9 +988,17 @@ int main(int argc, char** argv) {
                     qtype_name(draft_weights.output_head.weight.qtype),
                     qtype_name(draft_weights.layers.front().query_key_value.weight.qtype),
                     qtype_name(draft_weights.layers.front().mlp.down.weight.qtype),
-                    draft_weights.selector
-                        ? dtype_name(draft_weights.selector->predecessor_codebook.dtype)
-                        : "none");
+                    selector != nullptr ? dtype_name(selector->predecessor_codebook.dtype)
+                                        : "none");
+        std::printf("[mem]   peer selector: %s %.1f MiB\n",
+                    parameters1.dflash_selector ? "on shard 1" : "absent",
+                    static_cast<double>(
+                        parameters1.dflash_selector
+                            ? linear_bytes(parameters1.dflash_selector->hidden_projection) +
+                                  parameters1.dflash_selector->predecessor_codebook.bytes() +
+                                  parameters1.dflash_selector->successor_codebook.bytes()
+                            : 0) /
+                        1048576.0);
         std::printf("  proposal cost: %.3f ms/proposal (events, %d iterations)\n",
                     per_proposal_ms, kTimedProposals);
 
