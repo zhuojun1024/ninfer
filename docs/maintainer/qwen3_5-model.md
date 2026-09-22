@@ -306,7 +306,9 @@ rows are not assumed zero and do not become public tokens.
 
 Token spelling, special-token roles and EOS are derived from loaded resources. The frontend checks
 the tokenizer's supported BPE/normalization semantics and token-domain agreement. Template bytes
-select a compiled Qwen template; arbitrary Jinja execution is not implemented. Mode sampling
+are compiled and executed by the embedded Jinja engine, so the serialization comes from the
+artifact template or a startup `--chat-template FILE` override rather than from a fixed set of
+recognized Qwen templates. Mode sampling
 presets are architecture-owned, with explicit application/request overrides. Resource loading
 does not infer execution identity from tokenizer filenames, release names or sampling values.
 
