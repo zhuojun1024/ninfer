@@ -560,6 +560,17 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
     `Failed to initialize WDDM debugger interface. Please run EnableDebuggerInterface.bat as an administrator` 与 `Device not supported`，
     `ERROR SUMMARY: 4 errors` 全是这两类；探针本身仍正常 PASS（43 s、`shared_b` 原值、digest `0x4bcc3994a5efba7d`）⇒ P3 在本环境被排除
     （需管理员权限 + 设备支持）。⇒ **P1 与 P3 均不成立，门禁保持关闭**，按有界收口停手。
+    **诊断轮 5（S1「彻底同步」实验，**假设成立**）**：只在 DFlash2 分支、在 `run_verify_window(...)`（`tp2_generation_core.cpp:2908`）之前插入一次性彻底同步
+    ——`shard_a_.device.bind_to_current_thread(); cudaStreamSynchronize(a); cudaDeviceSynchronize();`，对 `shard_b` 同样一次，再 bind 回 a——临时钩子
+    `NINFER_TP2_DIAG_SYNC`（**已回退**）。solo 探针**连跑 12 次**（`build-win/b6y-sync-1..12.log`）：**12/12 逐字节一致**——
+    `shared_b` 全为 `[1703 220 248046 198 248045 198 248045 198]`、digest 全为 `0x4bcc3994a5efba7d`、去掉 `[mem]` 行后整篇日志
+    SHA256 前 16 位全为 `175A56CC3A333FA4`。对照（同一二进制/探针/工件、**无**同步）：`b6f`（10 次 3 种末 token）、`b6n-a`（10 次 2 种）。
+    ⇒ **确认（至少是主因）是 DFlash2 verify 窗口前的跨 stream / 跨卡写读序缺口**，与 B5 修掉的 D2H 未同步属同一类
+    （MTP 的窗口由 host 直接写，所以从不暴露）。
+    **下一步（第 2 条，未做，需要新的一轮）**：把这次「彻底同步」换成**精确依赖**（事件，或 `pair_`/`adopt_peer` 已有的同步原语，只对 DFlash2 生效），
+    然后按放行清单验收：solo 连跑 10 次逐字节一致、sessions dflash2 5 次全过、append K=7 `0xbad27a494a9bc853` / K=5 `0xbee487264ca8ffb8` 不变、
+    load 通过、给一个 K=7 decode tok/s 数字（预期微秒级开销、无可测损失），全绿再撤构造期拒绝、改 serving.md/PLAN/refusal 文案并把 solo 探针转为验收用例。
+    本轮的临时同步与开门禁改动都已回退，门禁保持关闭。
     回到 HEAD）；重建后 `NINFER_TEST_ROUTE=dflash2` refusal exit 0、solo 探针 exit 77。
     同进程的 plain engine 作控制组，判定是「两个 DFlash2 实例互相干扰」还是「任意第二个实例都受影响」。
     临时打开路线的改动已还原：`model_instance.cpp` 恢复构造期拒绝并重建验证（`dflash2 exit 0`、solo probe `exit 77`）。
