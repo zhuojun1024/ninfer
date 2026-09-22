@@ -943,7 +943,8 @@ void TP2GenerationCore::capture_verify_graph(WindowGraph& graph, const std::int3
 
 void TP2GenerationCore::run_verify_window(const std::int32_t* ids, std::int32_t first_position,
                                           Tensor& logits_columns, Tensor& hidden_columns,
-                                          qwen::execution::DFlashFeatureSink* sink) {
+                                          qwen::execution::DFlashFeatureSink* sink,
+                                          std::int32_t valid_columns) {
     Shard& shard_a = shard_a_;
     Shard& shard_b = shard_b_;
     const auto width    = static_cast<std::size_t>(logits_columns.ne[1]);
@@ -974,7 +975,7 @@ void TP2GenerationCore::run_verify_window(const std::int32_t* ids, std::int32_t 
         shard_b.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
                                               &shard_b.records);
         shard_a.context->forward_tp2_window(*shard_b.context, pair_, ids, positions, envelope,
-                                            logits_columns, &hidden_columns, sink);
+                                            logits_columns, &hidden_columns, sink, valid_columns);
     } else {
         if (sink != nullptr) {
             // A captured window bakes the feature sink's scatter addresses but not the host-side
@@ -2918,8 +2919,12 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
                 CUDA_CHECK(cudaDeviceSynchronize());
                 shard_a_.device.bind_to_current_thread();
+                // Only the columns that own their position may append KV: the budget clamp pins the
+                // trailing columns to the last valid column's position, and unmasked they would all
+                // write that one cache slot from the same launch (nondeterministic winner).
                 run_verify_window(window_ids, static_cast<std::int32_t>(position), window_logits,
-                                  window_hidden, &verify_sink);
+                                  window_hidden, &verify_sink,
+                                  static_cast<std::int32_t>(extent) + 1);
                 timing.record(2, shard_a_.device.stream);
                 ops::argmax(window_logits, frame.target_argmax, public_tokens,
                             shard_a_.device.stream);

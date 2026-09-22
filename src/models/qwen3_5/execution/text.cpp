@@ -1193,8 +1193,12 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
             a_batch, s);
     } else {
+        // Same optional column mask as the batched branch: a speculative window whose trailing
+        // columns are clamped to the last valid column's position must not have those duplicates
+        // append KV (they would race the position's owner inside one launch).
+        const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::causal_softmax_attention(
-            qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
+            qn, kn, v, cache_positions, valid, kv_table_rows,
             {dimension(cfg.attention->head_dim),
              dimension(cfg.attention->num_attention_heads),
              dimension(cfg.attention->num_key_value_heads)},
@@ -2139,7 +2143,7 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
                                      const std::int32_t* ids, const std::int32_t* positions,
                                      ops::CausalAttentionExecutionEnvelope envelope,
                                      Tensor& logits_columns, Tensor* hidden_columns,
-                                     DFlashFeatureSink* sink) {
+                                     DFlashFeatureSink* sink, std::int32_t valid_columns) {
     const std::int32_t hidden = dimension(config_.hidden_size);
     const std::int32_t vocab  = dimension(config_.vocab_size);
     if (ids == nullptr || positions == nullptr) {
@@ -2165,6 +2169,7 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
         Tensor kv_table_rows;
         Tensor state_source;
         Tensor state_destination;
+        Tensor valid;
         ops::CausalAttentionExecutionEnvelope envelope{1, 1};
     };
     // Both shards bind their own copies of the window: the pair has no peer access, and a captured
@@ -2184,6 +2189,10 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
         ops::set_i32_scalar(bind.kv_table_rows, 0, card.ctx_.stream);
         ops::set_i32_scalar(bind.state_source, 0, card.ctx_.stream);
         ops::set_i32_scalar(bind.state_destination, 0, card.ctx_.stream);
+        if (valid_columns > 0) {
+            bind.valid = arena.alloc(DType::I32, {1});
+            ops::set_i32_scalar(bind.valid, valid_columns, card.ctx_.stream);
+        }
         return bind;
     };
     const BindState bind0 = make_bind(*this, work_);
@@ -2192,6 +2201,7 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
     // positions coincide: this path carries no RoPE delta and no multimodal position table.
     ScopedPositions cache0(active_cache_positions_, bind0.positions);
     ScopedPositions rope0(active_rope_positions_, bind0.positions);
+    ScopedValue<const Tensor*> valid0(active_valid_columns_, &bind0.valid);
     ScopedEnvelope envelope0(active_causal_attention_envelope_, bind0.envelope);
     ScopedValue<const Tensor*> kv0(active_kv_table_rows_, &bind0.kv_table_rows);
     ScopedValue<const Tensor*> source0(active_linear_state_source_slots_, &bind0.state_source);
@@ -2199,6 +2209,7 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
                                             &bind0.state_destination);
     ScopedPositions cache1(peer.active_cache_positions_, bind1.positions);
     ScopedPositions rope1(peer.active_rope_positions_, bind1.positions);
+    ScopedValue<const Tensor*> valid1(peer.active_valid_columns_, &bind1.valid);
     ScopedEnvelope envelope1(peer.active_causal_attention_envelope_, bind1.envelope);
     ScopedValue<const Tensor*> kv1(peer.active_kv_table_rows_, &bind1.kv_table_rows);
     ScopedValue<const Tensor*> source1(peer.active_linear_state_source_slots_,

@@ -611,6 +611,29 @@ loader 不上电 draft 组件），限制被明确保留（worklog §36.1 `:713`
   最大风险：建桶会让 **eager 分支也改用 bucket envelope**（`:960-971`），而 DFlash2 的输出对 verify 窗口布局敏感 ⇒ 必须先做「只切 envelope」的贪心逐字节 A/B，再做 graph on/off，否则同时改了两个变量。
   判据：graph arm 的 verify ≈ 30.6 ms（MTP 同宽实测）、比 eager 低 4~4.5 ms/轮、等输出吞吐约 +15%；硬前提 `pair_.in_kernel_allreduce()`；若否决 envelope 变化则捕获走不通且无等价替代（可动的只有 <0.1 ms 的 D2H+sync）。
 
+**根因定案与修复（A 轮，2026-09-22；取代上方各诊断轮的"剩余可能"）**：钳位轮不可复现的根因已定位并修复——
+**TP-2 的 `forward_tp2_window` 从未绑定 `active_valid_columns_`/`active_sequence_batch_`** ⇒ `attn_mix` 走非 batch 分支、KV append
+完全无掩码（`small_t_fp8` 以 `Masked=false` 实例化 ⇒ `valid_tokens=TokenTile`，窗口每列都写 KV）。而 DFlash2 的预算钳位窗口把尾列钉在
+最后有效列的**同一绝对位置**（`speculative_round.cuh:36` `positions[off]=base+(j<=extent?j:extent)`；TP-2 侧 `tp2_generation_core.cpp:2821-2826`
+同义）⇒ 同一次窗口前向里多个 warp 并发写**同一个 paged-KV 槽**（FP8 code + scale 逐字节撕裂、last-writer-wins）⇒ 该槽内容运行间不确定 ⇒
+本轮与后续所有读到该槽的 logits 抖动 ⇒ 近似并列处 `target_argmax[0]` 翻转。该机制完整解释全部已知事实：翻转只出现在钳位轮
+（`extent<k`，即预算尾部轮次）；失败有偏（warp 交错有偏）；错值多变（8 列 K/V 皆可胜出）；构造顺序影响翻转率（时序/L2 状态）；
+官方工件同样翻转；S1 同步只改交错统计不根除；单卡合格（`target_verify_batch_impl` 绑定掩码 ⇒ 尾列不写 KV）；MTP/plain 稳定
+（MTP 窗口位置连续 `:3002-3008`、plain T=1，均无共享槽）；两个 Engine 实例翻转率不同。**本轮已排除**：`ar_inplace_bf16` 握手
+（双缓冲奇偶 + 自旋发布门控，时序闭环）、`argmax`（固定全序 CAS，逐位确定）、`speculative_accept_sparse_drafts`
+（`raw_greedy`/greedy-无惩罚直读 `target_tokens`；管线路径 `col>extent` 早退使 finalize 计数恰为 extent+1，extent=0 时读自己写的槽）、
+split 归约器（固定顺序无 atomic）。**修复（已落地，验收中）**：① `attn_mix` else 分支与 batch 分支同式消费 `active_valid_columns_`；
+② `forward_tp2_window`/`run_verify_window` 新增 `valid_columns`（= `target_valid_columns[0]` = extent+1，钳位列禁写 KV、其 logits 置零），
+仅 DFlash2 调用传入；MTP 传 0（不绑掩码、原路由逐位不变）。
+**A 轮验收（2026-09-22，全绿）**：① load ✓；② append 哈希**不变**（K=7 `0xbad27a494a9bc853`，prefill/proposal 侧未受修复影响，
+无需重基线）；③ sessions plain/mtp ✓（recall 71 逐位，无回归）；④ solo 探针独立进程连跑 **10/10 逐位一致**（digest 全为
+`0x4bcc3994a5efba7d`、9 条 walk tokens 全同；修复前 solo ~25%/run 翻转，10 连同概率仅 ~5%，证据充分）；⑤
+`NINFER_TEST_ROUTE=dflash2` 真场景（retention-engine vs from-scratch oracle）连跑 **5/5 全过**，含 grid 对齐 shared_b@512
+**全 token 逐位对齐**、71 边界 declined 首样本钉、重渲染答案场景 ⇒ **修复后「DFlash2 召回逐 token 复现 from-scratch」成立**，
+B6「未通过项」与 engine/oracle 分叉的根因即本缺陷。验证用临时改动（门禁放行、越过 sessions 绊线、route_keeps_retention 切 true）
+均已回退，正式树保持门禁关闭。**留给 B 的升级点**：撤销门禁与绊线；`route_keeps_retention(DFlash2)` 可切 true（保留属性已实证）；
+`draft_declined` 的 declined 边界目前仍只钉首样本，可尝试收紧为全 token 对比。
+
 **理论性能差距（单卡 5090 vs 双卡 TP-2，DFlash2 K=7；roofline 合成，非实测）**：
 
 - **硬上限＝带宽比 2×**：两卡合计 896 GB/s = 一张 5090 的 1,792 GB/s 的一半（`docs/tp2-dual-5060ti.md:106-108`）。

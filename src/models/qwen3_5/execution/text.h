@@ -208,10 +208,15 @@ public:
     // graph. ids and positions are [T] int32 arrays of window tokens and their absolute cache/RoPE
     // positions; both must stay valid (and stable in address) for as long as the captured graph
     // exists. envelope must cover the window's inclusive key extent.
+    // valid_columns is the number of leading window columns that own their cache slot. Columns
+    // beyond it are clamp duplicates (the same absolute position as the last valid column) and are
+    // kept from appending KV and from publishing logits; 0 leaves every column appending, which is
+    // what a window of distinct positions (the MTP window) wants.
     void forward_tp2_window(TextContext& peer, tp::DevicePair& pair, const std::int32_t* ids,
                             const std::int32_t* positions,
                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits_columns,
-                            Tensor* hidden_columns = nullptr, DFlashFeatureSink* sink = nullptr);
+                            Tensor* hidden_columns = nullptr, DFlashFeatureSink* sink = nullptr,
+                            std::int32_t valid_columns = 0);
 
     // Registers the peer shard's context and the device pair. The tensor-parallel driver sets this
     // on both shards once, so operations that only run on one shard (the MTP stem) can still drive
