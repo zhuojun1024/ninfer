@@ -5,6 +5,8 @@
 #   pwsh -File tools/win_port/serve.ps1 -Spec dflash2 -DraftTokens 7   # DFlash2 masked draft
 #   pwsh -File tools/win_port/serve.ps1 -Plain           # no MTP/vision, plain decode
 #   pwsh -File tools/win_port/serve.ps1 -HostKvMiB 0     # no cross-session KV retention
+#   pwsh -File tools/win_port/serve.ps1 -ChatTemplate D:/LLM/chat_template.jinja   # custom chat template
+#   pwsh -File tools/win_port/serve.ps1 -VisionItemTokens 4096   # smaller Vision workspace
 #   pwsh -File tools/win_port/serve.ps1 -Status          # processes, health, VRAM
 #   pwsh -File tools/win_port/serve.ps1 -Stop            # stop every ninfer-serve process
 #
@@ -28,7 +30,9 @@ param(
     [switch] $Background,
     [string] $LogFile = "",
     [string] $FfmpegRoot = "D:/ffmpeg-dev/expanded/ffmpeg-master-latest-win64-gpl-shared",
-    [string] $LibcurlRoot = "D:/curl-dev/expanded/curl-8.22.0_1-win64-mingw"
+    [string] $LibcurlRoot = "D:/curl-dev/expanded/curl-8.22.0_1-win64-mingw",
+    [string] $ChatTemplate = "",
+    [int] $VisionItemTokens = 16384
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,6 +72,8 @@ if (-not $Binary) {
     $Binary = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "build-win/apps/ninfer-serve.exe"
 }
 if (-not (Test-Path $Binary)) { throw "server binary not found: $Binary (run tools/win_port/build.ps1 first)" }
+if ($VisionItemTokens -lt 2048 -or $VisionItemTokens -gt 16384) { throw "VisionItemTokens must be in [2048,16384]" }
+if ($ChatTemplate -and -not (Test-Path $ChatTemplate)) { throw "chat template not found: $ChatTemplate" }
 if (-not $LogFile) { $LogFile = Join-Path (Split-Path -Parent $Binary) "serve-win.log" }
 
 # The server loads avcodec/swscale and libcurl at run time, so both DLL directories must be visible.
@@ -87,6 +93,8 @@ $arguments = @(
     "--max-private-continuations", "$PrivateContinuations",
     "--log-level", "info"
 )
+if ($ChatTemplate) { $arguments += @("--chat-template", $ChatTemplate) }
+if ($VisionItemTokens -ne 16384) { $arguments += @("--vision-item-tokens", "$VisionItemTokens") }
 if (-not $Plain) {
     $arguments += @(
         "--temperature", "0.7", "--top-k", "20", "--top-p", "0.80",
