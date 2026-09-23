@@ -601,7 +601,7 @@ worklog Round 35b/35c（`docs/tp2-dual-5060ti-worklog.md:636-691`）早已实测
 
 | # | 杠杆 | 作用项 | 预估收益 | 前置/风险 |
 |---|---|---|---|---|
-| **L1** | **GQA 感知 prompt 内核**：让共享同一 KV 头的 6 个 Q 头共用一份 KV 数据流（现在 `grid=(tokens/64, QHeads=12)`，每块只处理 1 个 Q 头，单卡 2 个 KV 头被各读 6 遍） | `b·d`：深上下文 attention，245k 处占 **70%** | 深上下文 **1.5–1.8×**（245k: 569 → ~830–1,000 tok/s） | 先过 ncu 测量门确认 6× 冗余是否真落到 DRAM；只改调度与数据复用，**不动物理累加顺序 ⇒ 可与现内核逐位一致** |
+| **L1** | **GQA 感知 prompt 内核**：让共享同一 KV 头的 6 个 Q 头共用一份 KV 数据流（现在 `grid=(tokens/64, QHeads=12)`，每块只处理 1 个 Q 头，单卡 2 个 KV 头被各读 6 遍） | `b·d`：深上下文 attention，245k 处占 **70%** | 深上下文 **1.5–1.8×**（245k: 569 → ~830–1,000 tok/s） | 先过测量门确认 6× 冗余是否真落到 DRAM；只改调度与数据复用，**不动物理累加顺序 ⇒ 可与现内核逐位一致**。**（2026-09-23 测量门否证 ⇒ 已取消，见下）** |
 | **L2** | **AR 与 MMA 重叠**（环形 staging + 事件同步 + 子块流水） | `a`：深度无关项，其中 AR ≈ 65% | 浅层上限 **~1.5×**（1,905 → ~4,760 tok/s 上限） | 跨卡 rendezvous 死锁风险，属大重构（worklog Round 35c 已评估） |
 
 > 硬件杠杆（卡 1 从芯片组 Gen4 x4 槽移到 CPU 直连 Gen5 x8）不在表内：零代码但需主板槽位，收益 1.78×（浅/中上下文），与 L1/L2 可叠加。
@@ -615,3 +615,74 @@ worklog Round 35b/35c（`docs/tp2-dual-5060ti-worklog.md:636-691`）早已实测
    KV tile 仍按 Bc=64 顺序流过；**每行看到的 KV tile 顺序与累加顺序不变** ⇒ 目标是与现内核逐位一致。
 3. **实现**：只改 `prompt_k8v4`（生产 dtype）；其余四种 dtype 的 prompt 内核暂保持现路径（同构，后续同步）。
 4. **验证**：OP 级 FP32/FP64 oracle（12/2/d256 深包络）+ 同步 `causal_attention_workspace_capacity_bytes` + 模型级金值（`tp2_dflash_solo`/`append` 摘要）+ 复跑 §3.12 深度曲线作性能对照。
+
+**L1 测量门结论（2026-09-23，已否证 ⇒ 不改内核）**：用现成的 op 级基准 `bench/ops/causal_softmax_attention_bench`（本次为它补上生产分片几何 `d256-h12-kv2`——op 与测试本就支持，bench 落后）在 W=1024（Prompt 路线）、h12-kv2 下实测，245,760 深度单层：
+
+| KV dtype | 耗时 | 达成 math | 唯一 KV 字节 |
+|---|---|---|---|
+| bf16 | 82,927 µs | 37.4 TFLOP/s | **482.0 MB** |
+| int8 | 83,207 µs | 37.2 | 248.5 MB |
+| fp8 | **73,782 µs** | 42.0 | 242.9 MB |
+| nvfp4 | 82,270 µs | 37.7 | 135.6 MB |
+| k8v4（生产） | 73,910 µs | 41.9 | 189.2 MB |
+
+**KV 字节跨 3.5×，耗时只差 13%**：fp8 比 k8v4 多 28% 字节却同耗时；nvfp4 少 28% 字节反而慢 11%；bf16 字节 2.55× 只慢 12%
+⇒ **内核不是 KV 带宽受限，而是计算/ALU 受限** ⇒ 去掉 6× 请求冗余不会有时间收益，**L1 按原设计取消**（内核代码未动，符合门禁约定）。
+
+**顺带确定的天花板**：同机 T=1024 下 `ninfer_fp8_linear_add_bench`（A8, K=17408）**85.9 TFLOP/s**、`ninfer_q4_linear_swiglu_bench`（W4A4）**44.1 TFLOP/s**；
+attention 的 QK^T 与 PV 各约 21 TFLOP/s（合计 41.9）。与纯 FP8 GEMM 比每个 attention GEMM 只到 24%，
+但 k8v4 与 fp8 同耗时说明**差距不只在 MMA dtype**，而在内核结构（k8v4 的 PV 走 FP16、Hadamard 旋转/行缩放、softmax、smem 流量）。
+⇒ 若仍要攻 attention，唯一形态是**计算路径效率**（FP8 PV + 减少 ALU 遍数），且**必须先有 profiler**：本机**未安装 Nsight Compute（ncu）**，黑盒计时已到极限。
+预期：attention 完全消除 ⇒ 245k 处 569 → ~1,900 tok/s（3.3× 上限）；现实减半 ⇒ ~1.4×。
+
+**基线留档**（W=1024、h12-kv2、k8v4、单层 median）：8,192 → 2,637 µs；32,768 → 9,924；65,536 → 19,630；131,072 → 39,602；245,760 → 73,880。
+线性度极好，且 ×16 层 = 1.18 s/chunk，与 §3.12 模型级 1.26 s/chunk 只差 6% ⇒ 两条独立测量互证。
+复跑：`ninfer_causal_softmax_attention_bench.exe --entry cached --geometry d256-h12-kv2 --kv-dtype k8v4 --tokens 1024 --context 8192,32768,65536,131072,245760 --execution eager --cache cold`。
+**构建注意**：`-DNINFER_BUILD_BENCHMARKS=ON` 在 Windows 上会让默认目标失败（`bench/context_cost/model_context_fixture.cpp:400` 用了 MSVC 不支持的 `__int128`），
+本次只按目标构建（`cmake --build build-win --target ninfer_causal_softmax_attention_bench`）；该缓存开关已复位为 OFF，不影响常规构建。
+
+**L1 后续（2026-09-23）：profiler 已就绪，但被驱动权限挡住**
+
+- 已安装 Nsight Compute 2025.4.1（winget `Nvidia.Nsight.Compute`），`ncu --version` 正常；但非管理员进程读性能计数器被拒：
+  `ERR_NVGPUCTRPERM`（target device 0）。解锁二选一：① 用**管理员** PowerShell 运行 ncu；
+  ② NVIDIA 控制面板 → Desktop → Enable Developer Settings → Developer → Manage GPU Performance Counters → 允许所有用户访问 → 应用（持久生效）。
+- 无计数器可得的归因（已完成）：
+  * **W 扫描**（深度 65,536、k8v4、h12-kv2）：W=256 → 31.7、512 → 41.8、1024 → 41.8、2048 → 45.4 TFLOP/s
+    ⇒ **W=1024 已在平台区**；把 prefill chunk 上限从 1024 提到 2048 只值 ~9%，不是杠杆。
+  * **同机 GEMM 天花板**（T=1024）：FP8 A8 **85.9**、W4A4 **44.1** TFLOP/s；attention 平台约 45（QK+PV 合计），
+    而 QK^T / PV 各约 21–23 ⇒ QK^T(FP8) ≈ 其 dtype 天花板的 25%，PV(FP16) ≈ 50%。
+  * 4-bit K 路径（nvfp4-K vs fp8-K）贵 +11%；bf16（完全无反量化）反而慢 12% ⇒ **MMA dtype 比反量化更主导**。
+- **候选改动（待 profile 确认后再动，遵守门禁）**：把 prompt 内核的 KV tile 宽度 `Bc` 从 64 提到 128
+  （QK^T 的 N 维翻倍、KV 循环次数减半；smem 由 ~99 KB 增至 ~165 KB，仍可单块容纳）。
+
+**L1 实验记录（2026-09-23）：两条低成本路径均被硬件墙挡死，内核已回退**
+
+ncu 对 `causal_attention_prompt_k8v4_kernel`（W=1024、65,536 深度、k8v4、h12-kv2）的实测：
+
+| 指标 | 值 | 含义 |
+|---|---|---|
+| Compute (SM) Throughput | **63.54%** | 计算为主 |
+| Tensor 管线 | **63.5%（最高）** | 张量管线是最忙资源 |
+| **DRAM Throughput** | **1.09%** | KV 流量基本全被 L2 吸收 |
+| L2 / L1 吞吐 | 10.10% / 40.43% | 都不是瓶颈 |
+| Issue Slots Busy / IPC | 30.89% / 1.39 | 不是发射受限 |
+| 最大 stall | 等数学管线 4.0/11.5 周期（34.4%） | 张量管线排队 |
+| Occupancy | 理论=实际 **33.33%**（16/48 warp） | 1 block/SM |
+| Block Limit | 寄存器 1 / smem 1 | 双重限制 |
+| 寄存器/线程 · 动态 smem | **100** · 85.12 KB（配置 102.40 KB） | — |
+
+⇒ **"减 6× KV 冗余"彻底证伪**（DRAM 1%）；真瓶颈是张量管线 + 33% 占用。
+
+两次实验（均先过 oracle 正确性）：
+1. **Warps 16→32**（同 smem 内翻倍 warp，寄存器上限随之压到 64）：正确性 **PASS**，性能 **−12%**（65k: 19.63→22.17 ms；245k: 73.88→82.43 ms）。
+   原因结构性：1024 线程的块被 64K 寄存器文件硬顶在 ≤64 寄存器/线程，而内核需 ~100 ⇒ spilling。**死路**。
+2. **Bc 64→128**（加宽 KV tile 改善 MMA 形状，smem 85,120→151,808 B）：**无法启动**，
+   `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` 返回 `cudaErrorInvalidValue` ⇒ 消费级 Blackwell **单块动态 smem 上限 ~100 KB**。**死路**。
+
+**结论**：该内核已贴住本机硬件边界（张量管线最忙、DRAM 空闲、占用被"寄存器文件 + 100 KB smem"同时锁死）。
+剩余可做的都更大且收益有限：Br=32/256 线程的 tile 重构争取 2–4 block/SM（受寄存器支配）、PV 改 FP8、压缩非张量 FP32 指令（占指令 11%，ncu 提示 ~3.6%）。
+上限：attention 项约 1.2–1.4× ⇒ 245k 端到端 ~1.1–1.3×、50k ~1.05–1.1×。
+⇒ **性价比排序更明确：硬件移槽（浅/中 1.78×，零代码）> L2（AR/MMA 重叠，浅层 ~1.5×）> attention 重构（深上下文，收益最小、风险最大）。**
+
+**顺带修复**：`bench/context_cost/model_context_fixture.cpp` 的 `__int128` 改为等价的 uint64 溢出检查（两个累加项各自不溢出，只需检查其和），
+`-DNINFER_BUILD_BENCHMARKS=ON` 现在在 Windows 可正常构建（已用默认目标 `cmake --build build-win` 验证通过）。
