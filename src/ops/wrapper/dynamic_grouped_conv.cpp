@@ -2,6 +2,7 @@
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
+#include "ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
 
 #include <array>
@@ -50,25 +51,45 @@ void require_kernel_projection_weight(const Weight& weight) {
     }
 }
 
-std::uint64_t required_q8_payload_bytes(std::int32_t input_rows) {
-    const std::uint64_t rows       = kHidden;
-    const std::uint64_t columns    = static_cast<std::uint64_t>(input_rows);
-    const std::uint64_t code_bytes = rows * columns;
-    const std::uint64_t groups     = columns / 32U;
-    return code_bytes + rows * groups * sizeof(std::uint16_t);
+struct ProjectionPlanes {
+    std::uint64_t code_bytes;
+    std::uint64_t high_bytes;
+    std::uint64_t scale_bytes;
+};
+
+ProjectionPlanes projection_planes(QType qtype, std::int32_t input_rows) {
+    const std::uint64_t rows    = kHidden;
+    const std::uint64_t columns = static_cast<std::uint64_t>(input_rows);
+    switch (qtype) {
+    case QType::Q8_G32_FP16: {
+        const std::uint64_t groups = columns / 32U;
+        return {rows * columns, 0, rows * groups * sizeof(std::uint16_t)};
+    }
+    case QType::Q5_G64_FP16: {
+        const std::uint64_t groups = columns / 64U;
+        return {rows * groups * 32U, rows * groups * 8U, rows * groups * sizeof(std::uint16_t)};
+    }
+    default:
+        throw std::invalid_argument("linear dynamic grouped conv add: invalid projection_weight");
+    }
 }
 
 void require_finish_projection_weight(const Weight& weight, std::int32_t input_rows) {
-    const std::uint64_t payload_bytes = required_q8_payload_bytes(input_rows);
-    if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
-        weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
-        weight.ndim != 2 || weight.n != kHidden || weight.k != input_rows ||
-        weight.shape[0] != kHidden || weight.shape[1] != input_rows || weight.shape[2] != 1 ||
-        weight.shape[3] != 1 || weight.padded_shape[0] != kHidden ||
+    const ProjectionPlanes planes = projection_planes(weight.qtype, input_rows);
+    const bool codec_compatible =
+        (weight.qtype == QType::Q8_G32_FP16 && weight.group_size == 32 && weight.group == 32 &&
+         weight.qhigh == nullptr && weight.high_plane_bytes == 0) ||
+        (weight.qtype == QType::Q5_G64_FP16 && weight.group_size == 64 && weight.group == 64 &&
+         weight.qhigh != nullptr && weight.high_plane_bytes >= planes.high_bytes &&
+         aligned_to(weight.qhigh, 16));
+    const std::uint64_t payload_bytes = planes.code_bytes + planes.high_bytes + planes.scale_bytes;
+    if (!codec_compatible || weight.layout != QuantLayout::RowSplit ||
+        weight.scale_dtype != DType::FP16 || weight.ndim != 2 || weight.n != kHidden ||
+        weight.k != input_rows || weight.shape[0] != kHidden || weight.shape[1] != input_rows ||
+        weight.shape[2] != 1 || weight.shape[3] != 1 || weight.padded_shape[0] != kHidden ||
         weight.padded_shape[1] != input_rows || weight.padded_shape[2] != 1 ||
-        weight.padded_shape[3] != 1 || weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
-        weight.payload_bytes < payload_bytes || !aligned_to(weight.qdata, 16) ||
-        !aligned_to(weight.scales, 16)) {
+        weight.padded_shape[3] != 1 || weight.payload_bytes < payload_bytes ||
+        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument("linear dynamic grouped conv add: invalid projection_weight");
     }
 }
@@ -95,14 +116,12 @@ bool overlaps(const Range& lhs, const Range& rhs) {
 void require_finish_nonoverlap(const Tensor& x, const Weight& projection_weight,
                                const Tensor& base_kernel, const Tensor& finish_delta,
                                const Tensor& residual, const WorkspaceArena& workspace) {
-    const std::size_t code_bytes =
-        static_cast<std::size_t>(kHidden) * static_cast<std::size_t>(x.ne[0]);
-    const std::size_t scale_bytes = static_cast<std::size_t>(kHidden) *
-                                    static_cast<std::size_t>(x.ne[0] / 32) * sizeof(std::uint16_t);
-    const std::array<Range, 7> ranges{{
+    const ProjectionPlanes planes = projection_planes(projection_weight.qtype, x.ne[0]);
+    const std::array<Range, 8> ranges{{
         {x.data, x.bytes(), "x"},
-        {projection_weight.qdata, code_bytes, "projection codes"},
-        {projection_weight.scales, scale_bytes, "projection scales"},
+        {projection_weight.qdata, planes.code_bytes, "projection codes"},
+        {projection_weight.qhigh, planes.high_bytes, "projection high plane"},
+        {projection_weight.scales, planes.scale_bytes, "projection scales"},
         {base_kernel.data, base_kernel.bytes(), "base_kernel"},
         {finish_delta.data, finish_delta.bytes(), "finish_delta"},
         {residual.data, residual.bytes(), "residual"},
@@ -185,13 +204,24 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
                                                        finish_delta, workspace, stream);
 }
 
-std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(std::int32_t input_rows,
+std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(QType qtype,
+                                                                     std::int32_t input_rows,
                                                                      std::int32_t min_width,
                                                                      std::int32_t max_width,
                                                                      std::int32_t min_batch_size,
                                                                      std::int32_t max_batch_size) {
-    return detail::q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-        input_rows, min_width, max_width, min_batch_size, max_batch_size);
+    switch (qtype) {
+    case QType::Q8_G32_FP16:
+        return detail::q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+            input_rows, min_width, max_width, min_batch_size, max_batch_size);
+    case QType::Q5_G64_FP16:
+        return detail::q5_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+            input_rows, min_width, max_width, min_batch_size, max_batch_size);
+    default:
+        break;
+    }
+    throw std::invalid_argument(
+        "linear dynamic grouped conv add workspace: unsupported projection weight qtype");
 }
 
 void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_weight,
@@ -217,8 +247,20 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
     require_finish_projection_weight(projection_weight, input_rows);
     require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual, workspace);
 
-    detail::q8_linear_dynamic_grouped_conv_add_dispatch(x, projection_weight, base_kernel,
-                                                        finish_delta, residual, workspace, stream);
+    switch (projection_weight.qtype) {
+    case QType::Q8_G32_FP16:
+        detail::q8_linear_dynamic_grouped_conv_add_dispatch(x, projection_weight, base_kernel,
+                                                            finish_delta, residual, workspace,
+                                                            stream);
+        return;
+    case QType::Q5_G64_FP16:
+        detail::q5_linear_dynamic_grouped_conv_add_dispatch(x, projection_weight, base_kernel,
+                                                            finish_delta, residual, workspace,
+                                                            stream);
+        return;
+    default:
+        throw std::invalid_argument("linear dynamic grouped conv add: invalid projection_weight");
+    }
 }
 
 } // namespace ninfer::ops

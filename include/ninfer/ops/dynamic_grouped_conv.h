@@ -68,11 +68,12 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch
- * pair in the inclusive intervals. input_rows is 4096 or 17408, widths lie in [2,16], and batch
- * sizes in [1,8]. Capacity follows every shape-selected production route.
+ * pair in the inclusive intervals. qtype is the projection_weight codec (Q8_G32_FP16 or
+ * Q5_G64_FP16), input_rows is 4096 or 17408, widths lie in [2,16], and batch sizes in [1,8].
+ * Capacity follows every shape-selected production route of that codec.
  */
 [[nodiscard]] std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-    std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
+    QType qtype, std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
     std::int32_t min_batch_size, std::int32_t max_batch_size);
 
 /**
@@ -88,21 +89,23 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  *       + I(i>0) * (base_kernel[h,1,1] + finish_delta[g,1,i,b]) * z[h,i-1,b].
  *
  * Logical shapes / supported domain:
- *   x is contiguous BF16 [C,W,B]; projection_weight is Q8_G32_FP16 RowSplit [5120,C] with
- *   unpadded C; base_kernel is contiguous BF16 [5120,2,2] with axes [channel,tap,side];
+ *   x is contiguous BF16 [C,W,B]; projection_weight is Q8_G32_FP16 or Q5_G64_FP16 RowSplit
+ *   [5120,C] with unpadded C; base_kernel is contiguous BF16 [5120,2,2] with axes
+ *   [channel,tap,side];
  *   finish_delta is contiguous BF16 [320,2,W,B]; and residual is contiguous BF16 [5120,W,B].
  *   W is in [2,16] and B in [1,8]. Position zero has no previous-tap contribution: the Op never
  * reads another request or an earlier round.
  *
  * Numeric:
- *   The oracle decodes each signed Q8 value with its stored FP16 group scale and evaluates the
- *   complete formula in FP64 from represented inputs. The projection is a private intermediate;
+ *   The oracle decodes each signed code with its stored FP16 group scale - 8-bit codes at group
+ *   32 for Q8_G32_FP16, 5-bit codes at group 64 for Q5_G64_FP16 - and evaluates the complete
+ *   formula in FP64 from represented inputs. The projection is a private intermediate;
  *   the contract does not prescribe its storage or arithmetic precision. The implementation
  *   writes the final residual in BF16.
  *
  * Effects:
  *   Updates every element of residual in place and preserves x, projection_weight, base_kernel,
- *   and finish_delta. All operand storage, both weight planes, and live workspace must be pairwise
+ *   and finish_delta. All operand storage, every weight plane, and live workspace must be pairwise
  *   non-overlapping. The Op has no persistent state side effect.
  *
  * Workspace:

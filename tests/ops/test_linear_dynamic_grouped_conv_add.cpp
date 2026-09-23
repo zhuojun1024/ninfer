@@ -179,7 +179,8 @@ int verify_preserved(std::string_view label, const DeviceBuffer& device,
                         std::vector<std::uint16_t>(expected.begin(), expected.end()));
 }
 
-int run_profile(std::int32_t input_rows) {
+int run_profile(QType qtype, std::int32_t input_rows) {
+    const char* const codec       = qtype == QType::Q5_G64_FP16 ? "q5" : "q8";
     const std::vector<float> activation = make_activation(input_rows);
     std::vector<std::uint16_t> activation_bits(activation.size());
     std::transform(activation.begin(), activation.end(), activation_bits.begin(), f32_to_bf16);
@@ -191,7 +192,8 @@ int run_profile(std::int32_t input_rows) {
     weight_options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
     weight_options.row_split_codes = quantized_weight::RowSplitCodePattern::Hashed;
     input_projection::DevicePackedWeight projection_weight(quantized_weight::make_patterned_weight(
-        QType::Q8_G32_FP16, kHidden, input_rows, 503U + static_cast<std::uint32_t>(input_rows),
+        qtype, kHidden, input_rows,
+        503U + static_cast<std::uint32_t>(input_rows) + (qtype == QType::Q5_G64_FP16 ? 1009U : 0U),
         weight_options));
     const std::vector<double> projection =
         projection_oracle(projection_weight.host, activation, input_rows);
@@ -200,7 +202,7 @@ int run_profile(std::int32_t input_rows) {
     DeviceBuffer base_device       = to_device(base_kernel);
     DeviceBuffer delta_device      = to_device(finish_delta);
     const std::size_t capacity     = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-        input_rows, 2, 16, 1, kMaximumBatch);
+        qtype, input_rows, 2, 16, 1, kMaximumBatch);
 
     Tensor base(base_device.p, DType::BF16, {kHidden, kTaps, kSides});
     const Weight weight = projection_weight.view();
@@ -210,7 +212,7 @@ int run_profile(std::int32_t input_rows) {
             const std::size_t bytes =
                 static_cast<std::size_t>(kHidden) * width * batch_size * sizeof(std::uint16_t);
             const auto exact = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                input_rows, width, width, batch_size, batch_size);
+                qtype, input_rows, width, width, batch_size, batch_size);
             if (exact > capacity)
                 throw std::runtime_error("workspace interval does not cover exact shape");
             GuardedDeviceBuffer scratch(exact);
@@ -253,7 +255,8 @@ int run_profile(std::int32_t input_rows) {
                 } else
                     launch(nullptr);
                 cuda_synchronize();
-                const std::string label = "dynamic conv add C=" + std::to_string(input_rows) +
+                const std::string label = std::string("dynamic conv add ") + codec + " C=" +
+                                          std::to_string(input_rows) +
                                           " W=" + std::to_string(width) +
                                           " B=" + std::to_string(batch_size) +
                                           " graph=" + std::to_string(replay);
@@ -269,12 +272,11 @@ int run_profile(std::int32_t input_rows) {
             }
         }
 
-    failures +=
-        verify_preserved("linear dynamic grouped conv add x", activation_device, activation_bits);
-    failures += verify_preserved("linear dynamic grouped conv add base", base_device, base_kernel);
-    failures +=
-        verify_preserved("linear dynamic grouped conv add delta", delta_device, finish_delta);
-    failures += projection_weight.verify_preserved("linear dynamic grouped conv add weight");
+    const std::string prefix = std::string("linear dynamic grouped conv add ") + codec;
+    failures += verify_preserved(prefix + " x", activation_device, activation_bits);
+    failures += verify_preserved(prefix + " base", base_device, base_kernel);
+    failures += verify_preserved(prefix + " delta", delta_device, finish_delta);
+    failures += projection_weight.verify_preserved(prefix + " weight");
     return failures;
 }
 
@@ -286,7 +288,10 @@ int main() {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
-        const int failures = run_profile(4096) + run_profile(17408);
+        const int failures = run_profile(QType::Q8_G32_FP16, 4096) +
+                             run_profile(QType::Q8_G32_FP16, 17408) +
+                             run_profile(QType::Q5_G64_FP16, 4096) +
+                             run_profile(QType::Q5_G64_FP16, 17408);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_dynamic_grouped_conv_add\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

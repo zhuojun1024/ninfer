@@ -101,9 +101,12 @@ std::size_t dflash2_proposal_workspace_bytes(const Parameters& parameters, const
                          dimension(draft.attention.num_key_value_heads)},
                         dimension(draft.sliding_window.value_or(0)), {0, capacity}, width, width,
                         batch));
-        add_scratch(layout,
-                    ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                        dimension(draft.attention.query_width()), width, width, batch, batch));
+        for (const auto& block : parameters.draft->layers) {
+            add_scratch(layout,
+                        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                            block.output.weight.qtype, dimension(draft.attention.query_width()),
+                            width, width, batch, batch));
+        }
     }
     {
         // One MLP branch: the second dynamic convolution and the SwiGLU projection.
@@ -116,10 +119,11 @@ std::size_t dflash2_proposal_workspace_bytes(const Parameters& parameters, const
                         ops::linear_swiglu_workspace_capacity_bytes(
                             projection.weight.qtype, projection.weight.n, projection.weight.k,
                             projection.policy, columns, columns));
+            add_scratch(layout,
+                        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                            block.mlp.down.weight.qtype, dimension(draft.intermediate_size), width,
+                            width, batch, batch));
         }
-        add_scratch(layout,
-                    ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                        dimension(draft.intermediate_size), width, width, batch, batch));
     }
     // Tail: the packed final-norm hidden, the reduced head's top-k ids and scores, and - only when
     // this shard holds the selector - its projection and the sparse proposal.
