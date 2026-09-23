@@ -920,7 +920,17 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     static const std::unordered_set<std::string> allowed = {"effort", "context", "summary",
                                                             "generate_summary", "mode"};
     reject_nonnull_unknown_members(reasoning, allowed, "reasoning");
-    for (const char* key : {"context", "summary", "generate_summary", "mode"}) {
+    if (reasoning.contains("summary") && !reasoning.at("summary").is_null() &&
+        !reasoning.at("summary").is_string()) {
+        bad_request("reasoning.summary must be a string", "reasoning");
+    }
+    // reasoning.summary asks for a server-written summary of the reasoning. This engine returns the
+    // reasoning text itself with an empty summary, which is exactly what a client that omits the
+    // field receives, so the request is accepted and the field ignored rather than rejected: the
+    // OpenAI Responses client library attaches it (as "auto") to every request that also carries an
+    // effort. The remaining options stay rejected, because they change reasoning input or retained
+    // state and their absence from the response would not tell the client.
+    for (const char* key : {"context", "generate_summary", "mode"}) {
         if (reasoning.contains(key) && !reasoning.at(key).is_null()) {
             bad_request("reasoning." + std::string(key) +
                             " changes reasoning input or output and is not supported",
@@ -1189,10 +1199,18 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("the requested additional response fields have no available response "
-                        "representation",
-                        "include", "include_not_supported");
+        // "reasoning.encrypted_content" asks for encrypted reasoning metadata to echo back. This
+        // engine has no representation for it and returns none - the same response a client that
+        // never asks for it receives - so the entry is accepted and ignored; the OpenAI Responses
+        // client library adds it to every request that carries a reasoning effort. Any other entry
+        // still fails: those ask for output this server cannot produce at all.
+        for (const Json& entry : body.at("include")) {
+            if (!entry.is_string() ||
+                entry.get<std::string>() != "reasoning.encrypted_content") {
+                bad_request("the requested additional response fields have no available response "
+                            "representation",
+                            "include", "include_not_supported");
+            }
         }
     }
     if (body.contains("stream_options") && !body.at("stream_options").is_null()) {

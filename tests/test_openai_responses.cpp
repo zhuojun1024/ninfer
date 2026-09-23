@@ -711,6 +711,36 @@ int test_namespace_tools() {
     return failures;
 }
 
+// The OpenAI Responses client library attaches reasoning.summary and
+// include: ["reasoning.encrypted_content"] to every request that also carries a reasoning effort.
+// Both ask for optional response content this engine has no representation for and therefore does
+// not return - the same response a client that omits them receives - so they are accepted and
+// ignored instead of failing the request. Everything else in those two fields still fails.
+int test_reasoning_summary_and_include_are_ignored() {
+    int failures = 0;
+    Json body    = {{"model", "m"},
+                    {"input", "hello"},
+                    {"reasoning", Json{{"effort", "medium"}, {"summary", "auto"}}},
+                    {"include", Json::array({"reasoning.encrypted_content"})}};
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    failures += check(request.prompt.generation.reasoning_effort == RequestedReasoningEffort::Medium,
+                      "the effort is still parsed when a summary request rides along");
+
+    body["include"] = Json::array({"reasoning.encrypted_content", "message.output_text.logprobs"});
+    failures +=
+        check(api_code([&] { (void)parse_openai_responses_create_request(body, limits()); }) ==
+                  "include_not_supported",
+              "an include entry with no representation still fails");
+
+    body = {{"model", "m"}, {"input", "hello"}, {"reasoning", Json{{"context", "all_turns"}}}};
+    failures +=
+        check(api_code([&] { (void)parse_openai_responses_create_request(body, limits()); }) ==
+                  "reasoning_option_not_supported",
+              "a reasoning option that changes input or retained state still fails");
+    return failures;
+}
+
 int test_explicit_rejections() {
     const Json base = {{"model", "m"}, {"input", "hello"}};
     int failures    = 0;
@@ -992,6 +1022,7 @@ int main() {
     failures += test_assistant_item_boundaries_and_errors();
     failures += test_tools_and_effective_subset();
     failures += test_namespace_tools();
+    failures += test_reasoning_summary_and_include_are_ignored();
     failures += test_explicit_rejections();
     failures += test_previous_response_call_graph();
     failures += test_response_object();
