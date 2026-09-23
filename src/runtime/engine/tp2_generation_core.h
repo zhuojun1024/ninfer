@@ -323,6 +323,9 @@ private:
         std::uint32_t visible_begin = 0;
         std::uint32_t visible_end   = 0;
         bool captured               = false;
+        // Rendezvous id channel for this graph (see DevicePair::create_ar_channel): the host publishes
+        // a fresh id block before every replay, and the graph's memcpy node carries it in.
+        tp::DevicePair::ArChannel ar_channel = tp::DevicePair::kNoArChannel;
         DecodeGraphDefinition definition[2];
         DecodeGraphExecutable executable[2];
         // Workspace watermark the capture ran at, per shard, and the arena offsets it recorded. A

@@ -939,6 +939,10 @@ TP2GenerationCore::reusable_window_graph(std::vector<WindowGraph>& graphs,
 // enqueued back to back with the round's other work, and the two devices order themselves through
 // the in-kernel allreduce's arrival tokens.
 void TP2GenerationCore::launch_window_graph(WindowGraph& graph) {
+    // Publish this launch's rendezvous id block before the replay: the graph's memcpy node reads the
+    // pinned cell, so every replay runs on ids that were never used before and no arrival slot left
+    // over from an earlier round can satisfy a spin.
+    pair_.arm_round(graph.ar_channel);
     shard_a_.device.bind_to_current_thread();
     graph.executable[0].launch(shard_a_.device.stream);
     shard_b_.device.bind_to_current_thread();
@@ -966,8 +970,12 @@ void TP2GenerationCore::capture_verify_graph(WindowGraph& graph, const std::int3
                                           &shard_a.records);
     shard_b.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
                                           &shard_b.records);
+    if (graph.ar_channel == tp::DevicePair::kNoArChannel) {
+        graph.ar_channel = pair_.create_ar_channel();
+    }
     DecodeGraphDefinition* definitions[2] = {&graph.definition[0], &graph.definition[1]};
     cudaStream_t streams[2] = {shard_a.device.stream, shard_b.device.stream};
+    pair_.begin_capture(graph.ar_channel);
     DecodeGraphDefinition::capture_group(definitions, streams, [&] {
         // The masked-draft sink and the clamp extent are part of the captured window: without the
         // forwarding here the capture silently takes the default nullptr/nullptr and every replay
@@ -975,6 +983,7 @@ void TP2GenerationCore::capture_verify_graph(WindowGraph& graph, const std::int3
         shard_a.context->forward_tp2_window(*shard_b.context, pair_, ids, positions, envelope,
                                            logits_columns, &hidden_columns, sink, valid_columns);
     });
+    pair_.end_capture();
     graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
     graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
     shard_a.device.bind_to_current_thread();
@@ -1066,10 +1075,15 @@ void TP2GenerationCore::capture_decode_graph(WindowGraph& graph, const std::int3
     // so unlike the verify window it neither records nor replays anything.
     DecodeGraphDefinition* definitions[2] = {&graph.definition[0], &graph.definition[1]};
     cudaStream_t streams[2] = {shard_a.device.stream, shard_b.device.stream};
+    if (graph.ar_channel == tp::DevicePair::kNoArChannel) {
+        graph.ar_channel = pair_.create_ar_channel();
+    }
+    pair_.begin_capture(graph.ar_channel);
     DecodeGraphDefinition::capture_group(definitions, streams, [&] {
         shard_a.context->forward_tp2_decode_window(*shard_b.context, pair_, token, position,
                                                   envelope, logits);
     });
+    pair_.end_capture();
     graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
     graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
     shard_a.device.bind_to_current_thread();
@@ -1204,9 +1218,14 @@ void TP2GenerationCore::capture_mtp_chain_graph(WindowGraph& graph, Tensor& mtp_
     // enqueue pair work on both streams, so the capture records both like the verify window does.
     DecodeGraphDefinition* definitions[2] = {&graph.definition[0], &graph.definition[1]};
     cudaStream_t streams[2] = {shard_a.device.stream, shard_b.device.stream};
+    if (graph.ar_channel == tp::DevicePair::kNoArChannel) {
+        graph.ar_channel = pair_.create_ar_channel();
+    }
+    pair_.begin_capture(graph.ar_channel);
     DecodeGraphDefinition::capture_group(definitions, streams, [&] {
         mtp_chain_body(shard_a, mtp_input, pins, host_drafts, graph, ws);
     });
+    pair_.end_capture();
     graph.arena_bytes[0] = ws.used() - graph.arena_begin[0];
     graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
     shard_a.device.bind_to_current_thread();
@@ -1393,7 +1412,7 @@ void TP2GenerationCore::abort_if_ar_stalled() {
     // the trigger: the decode paths drain only shard A before reading their sample, so the mirroring
     // shard is legitimately a call or two behind at that point and its skew would false-positive.
     if (!pair_.ar_stalled()) { return; }
-    const long long skew = pair_.ar_token_skew();
+    const std::uint64_t stalled_id = pair_.ar_last_id();
     for (Shard* shard : {&shard_a_, &shard_b_}) {
         shard->device.bind_to_current_thread();
         CUDA_CHECK(cudaStreamSynchronize(shard->device.stream));
@@ -1405,8 +1424,8 @@ void TP2GenerationCore::abort_if_ar_stalled() {
     cached_state_valid_ = false;
     throw RequestError(
         RequestErrorKind::Unavailable,
-        "TP-2 allreduce stalled (token skew " + std::to_string(skew) +
-            "): the request was failed and the reusable context was discarded");
+        "TP-2 allreduce stalled at rendezvous id " + std::to_string(stalled_id) +
+            ": the request was failed and the reusable context was discarded");
 }
 
 void TP2GenerationCore::invalidate_host_checkpoints() {
