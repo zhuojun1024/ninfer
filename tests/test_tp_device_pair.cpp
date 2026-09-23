@@ -292,8 +292,13 @@ int check_graph_queue(ninfer::tp::DevicePair& pair, std::size_t graph_bytes, std
     send_b.copy_from_host(host_b.data(), graph_bytes);
     add_b.copy_from_host(eager_b.data(), eager_bytes);
 
+    // One rendezvous id channel for this graph. The host publishes a fresh id block before every
+    // replay, which is what lets the transport tell two replays apart; a reused id would let the
+    // peer's stale staging satisfy the spin.
+    const auto channel = pair.create_ar_channel();
     cudaGraph_t graph_a = nullptr, graph_b = nullptr;
     cudaGraphExec_t exec_a = nullptr, exec_b = nullptr;
+    pair.begin_capture(channel);
     pair.a().bind_to_current_thread();
     cudaStreamBeginCapture(stream_a, cudaStreamCaptureModeThreadLocal);
     pair.b().bind_to_current_thread();
@@ -307,31 +312,45 @@ int check_graph_queue(ninfer::tp::DevicePair& pair, std::size_t graph_bytes, std
     cudaStreamEndCapture(stream_b, &graph_b);
     cudaGraphInstantiate(&exec_a, graph_a, 0);
     cudaGraphInstantiate(&exec_b, graph_b, 0);
+    pair.end_capture();
 
+    int failures = 0;
     for (int replay = 0; replay < replays; ++replay) {
+        // Fresh operands every replay. This is what makes a stale rendezvous id observable: with the
+        // same bytes every time, a replay that skipped the peer's write would still read a buffer
+        // holding the expected values and the check would pass.
+        for (std::size_t i = 0; i < graph_elements; ++i) {
+            host_a[i] = __float2bfloat16(dist(rng));
+            host_b[i] = __float2bfloat16(dist(rng));
+        }
+        pair.a().bind_to_current_thread();
+        send_a.copy_from_host(host_a.data(), graph_bytes);
+        pair.b().bind_to_current_thread();
+        send_b.copy_from_host(host_b.data(), graph_bytes);
+        // An eager collective interleaved with the replay: the two must draw ids from disjoint ranges.
         pair.allreduce(add_a.p, add_b.p, eager_bytes, stream_a, stream_b);
+        pair.arm_round(channel);
         pair.a().bind_to_current_thread();
         cudaGraphLaunch(exec_a, stream_a);
         pair.b().bind_to_current_thread();
         cudaGraphLaunch(exec_b, stream_b);
-    }
-    pair.a().bind_to_current_thread();
-    cudaStreamSynchronize(stream_a);
-    pair.b().bind_to_current_thread();
-    cudaStreamSynchronize(stream_b);
+        pair.a().bind_to_current_thread();
+        cudaStreamSynchronize(stream_a);
+        pair.b().bind_to_current_thread();
+        cudaStreamSynchronize(stream_b);
 
-    pair.a().bind_to_current_thread();
-    recv_a.copy_to_host(got_a.data(), graph_bytes);
-    int failures = 0;
-    for (std::size_t i = 0; i < graph_elements; ++i) {
-        if (bits_of(got_a[i]) != bits_of(host_b[i])) {
-            if (failures < 4) {
-                std::cerr << "graph queue[" << graph_bytes << "] replay " << replays << " element "
-                          << i << ": expected " << __bfloat162float(host_b[i]) << ", got "
-                          << __bfloat162float(got_a[i]) << '\n';
+        pair.a().bind_to_current_thread();
+        recv_a.copy_to_host(got_a.data(), graph_bytes);
+        for (std::size_t i = 0; i < graph_elements; ++i) {
+            if (bits_of(got_a[i]) != bits_of(host_b[i])) {
+                if (failures < 4) {
+                    std::cerr << "graph queue[" << graph_bytes << "] replay " << replay << " element "
+                              << i << ": expected " << __bfloat162float(host_b[i]) << ", got "
+                              << __bfloat162float(got_a[i]) << '\n';
+                }
+                ++failures;
+                break;
             }
-            ++failures;
-            break;
         }
     }
 
@@ -391,8 +410,9 @@ int check_ar_timeout(ninfer::tp::DevicePair& pair, std::size_t count_bytes) {
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
                                                              before)
             .count();
+    const std::uint64_t stalled_id = pair.ar_last_id();
     std::cout << "ar timeout[" << count_bytes << "]: gave up after " << waited_ms
-              << " ms, token skew " << pair.ar_token_skew() << '\n';
+              << " ms at rendezvous id " << stalled_id << '\n';
     if (waited_ms < 100) {
         std::cerr << "ar timeout[" << count_bytes << "]: returned without waiting on the deadline\n";
         ++failures;
@@ -400,11 +420,6 @@ int check_ar_timeout(ninfer::tp::DevicePair& pair, std::size_t count_bytes) {
 
     if (!pair.ar_stalled()) {
         std::cerr << "ar timeout[" << count_bytes << "]: the bounded spin did not report a stall\n";
-        ++failures;
-    }
-    if (pair.ar_token_skew() == 0) {
-        std::cerr << "ar timeout[" << count_bytes
-                  << "]: one side never launched but the call counters agree\n";
         ++failures;
     }
     // While the pair is tripped, every further collective must bail at entry instead of waiting out
@@ -428,8 +443,14 @@ int check_ar_timeout(ninfer::tp::DevicePair& pair, std::size_t count_bytes) {
         ++failures;
     }
     pair.clear_ar_stall();
-    if (pair.ar_stalled() || pair.ar_token_skew() != 0) {
-        std::cerr << "ar timeout[" << count_bytes << "]: clear_ar_stall did not re-arm the pair\n";
+    if (pair.ar_stalled()) {
+        std::cerr << "ar timeout[" << count_bytes << "]: clear_ar_stall did not clear the trip\n";
+        ++failures;
+    }
+    // The ids are what makes a stalled round recoverable in place: the next collective must not
+    // reuse the id the stalled one ran with, or its spin could be satisfied by a stale arrival slot.
+    if (pair.ar_last_id() == stalled_id) {
+        std::cerr << "ar timeout[" << count_bytes << "]: the rendezvous id was reused after a stall\n";
         ++failures;
     }
 
