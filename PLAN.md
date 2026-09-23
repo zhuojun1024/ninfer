@@ -268,6 +268,19 @@ shard 0 的 MTP 权重 430 MiB + KV 516 MiB。每轮成本构成、D1–D4 决�
 - [ ] **全 draft NVFP4**（约 −0.95 GiB）：先给转换器加 BF16/FP8→NVFP4 方法（现只有 `import_encoded` 能产 NVFP4），
       再补上面三条的 NVFP4 profile；`linear_pair` 与 draft 版 `attn_input_proj` 仍是 Q8-only，全量化必须动它们。
 
+**组合实验件（r57，2026-09-23）**：三个已验证量化合并为最终实验件
+`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer`（22,947.1 MiB，**−715.6 MiB** vs 基线
+23,662.7，= 451.6+50.8+213.3 精确求和；21 对象：gate/up ×10 `q4_g64_fp16`、
+feature_projection/down/output ×11 `q5_g64_fp16`；`attention/{query,key,value,context_*}`
+[6144,5120]、draft 版 `attn_input_proj`/`linear_pair` 等仍 Q8——属杠杆#4 范围）。
+override `tools/tp_bootstrap/r57_draft_all_override.py`（含计数校验）+
+`tools/tp_bootstrap/r57_convert_draftall.ps1`（CONVERT_EXIT=0，290 s）。
+**r57 实测**（Windows 8099，K=7 贪心探针 7×160，日志 `build-win/r56/`）：账本 shard 0
+weights+ctx 13462.6 → **12748.6**（−714.0 MiB，粒度吸收 1.6；三杠杆单独测量之和 712.0 的 2 MiB
+差为各自粒度取整方式不同），free 102.0 → **816.0 MiB**（≈ +45k token 上限）；shard 1 不变 810.0 ✓；
+接受率 **25.3%**（706/2791）vs 基线 24.59%（无下降）；吞吐 56.9 tok/s（+0.9%）。
+命名 `qwen3.8-27b-w4a4-w8a8-draftall`。
+
 **升级为受契约保护的特性前必须补的验证（本次未做）**：
 
 - [ ] DFlash2 三件套针对新 artifact 重基线：`ninfer_qwen3_5_tp2_dflash_append_test`（K=7/K=5 金值）、
