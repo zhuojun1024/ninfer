@@ -370,16 +370,37 @@ req#35–#39（客户端约每 5 分钟重试）被接受但永不推进 ⇒ 6 �
       同轮 `decode 120.4 tok/s / dflash2 accepted 782/1,200 (65.2%)` 与 Phase 1 的 120.0/65.2% 完全一致（无性能回退）；
       看门狗 dump 同时出现 `12884914887`(通道 3) 与 `4611686018427390359`(eager `1<<62`+) ⇒ 多通道与双区间并存互不干扰。
 
-**Phase 3 —— 大 payload 事件路径（A/B 决定，选做）**
-- [ ] 照上游形态实现 D2H/H2D 分块 + 专用 non-blocking copy stream + compute stream 上 add，跨流安全靠
-      `dev_tmp_kernel_done` / `host_large_read_done` 两条 event 栅栏（`allreduce.cu:1184-1206、1222-1223`）；
-      chunk = `clamp(nbytes/4, 512 KiB, 2 MiB)`（`allreduce.cu:419-432`）。
-- [ ] 采用条件：1.9k/7.2k/28.5k/65k 提示的 prefill 吞吐 ≥ 现 sliced 路径，且能删除 8 slice write-order 链
-      （`device_pair.cu:143-145`）；否则不做。
+**Phase 3 —— 大 payload 事件路径（A/B 决定）** ❌ 已否决（2026-09-23，实测定案）
+- [x] 决定测量：**不写完整实现**，因为候选路径的**地板**已经超过现路径的**全部成本**。事件路径与 sliced 路径搬的是同样的字节
+      （每设备 D2H 本地 delta + H2D 对端 delta，都过同一条 PCIe），所以先量 copy engine 在该 payload 形态下的天花板即可判定。
+      探针：`NINFER_TP2_AR_COPY_BENCH=1 build-win/tests/ninfer_tp_device_pair_test.exe`
+      （`check_copy_engine_ceiling`：按计划的 `chunk = clamp(nbytes/4, 512 KiB, 2 MiB)` 分块，**每设备两条 copy stream 让双向同时在飞**；
+      串行单流版本实测 3.315 vs 双向 3.316 ms ⇒ copy engine 不会因双向并发变快，故该数字是可靠地板）。
+      实测：**10 MiB → 3.32 ms/次（两向合计 6.33 GB/s）；24 MiB → 8.86 ms（5.68 GB/s）**。
+      现 sliced 路径同一 10 MiB delta 实测 **2.70 ms**（≈7.4 GB/s，链路地板 2.66 ms 的 98.5%）。
+      ⇒ 候选路径尚未计入 event 栅栏（约 80 µs/次固定）与 add 输入所需的额外设备往返，就已慢约 23%：
+      "prefill 吞吐 ≥ 现 sliced 路径"不可能满足。第二个条件（删除 8-slice write-order 链）随之不成立——write-order 链正是现路径
+      吃到链路地板的原因，删掉它只会更慢。
+      范围说明：prefill 每层 payload 被 `--prefill-chunk 1024` 钉在 10 MiB，与提示长度无关，所以按 payload 形态做微观测量即可判定
+      （现路径已在链路地板 1.5% 以内 ⇒ 端到端不可能有 >1.5% 的收益，而候选在传输层就差 23%）。
+- [x] 结论：照计划 **"否则不做"**——不实现事件路径，不动 sliced 路径与 write-order 链。若日后换平台（PCIe 双向带宽更不对称、
+      或 SM 访问 mapped host 更慢的机型）可重跑该探针复核。
 
-**Phase 4 —— 可选（有数值门槛）**
-- [ ] partial 合并可行性审计：审 9 个调用点是否存在"两个独立 partial 后接同一 elementwise ADD"；存在才评估，
-      且必须先过 FP64 oracle（BF16 非结合会破坏逐位摘要）。
+**Phase 4 —— partial 合并可行性审计** ✅ 已审结（2026-09-23）：**形态不存在，门槛未触发，不做**
+- [x] 审计范围：9 个模型侧调用点（`text.cpp:409/475/822/893/950/952/2288`、`text.h:496/509`）。判据：是否存在
+      **两个独立 partial 各自归约后送进同一个 elementwise ADD**——只有这种形态才能压成"本地两 partial 先相加 → 一次 collective → 一次 add"。
+      逐点分类：
+      | 调用点 | 实际形态 | 可合并 |
+      |---|---|---|
+      | `text.h:496` mixer delta → residual_add | 行并行 partial → 一次 allreduce → `x += delta` | **否**：紧随的 MLP（`text.h:505`）读的是**就地更新后**的 `x`，两次 add 严格依赖 |
+      | `text.h:509` MLP delta → residual_add | 同上 | **否**：同上；下一层 mixer 又依赖本层结果 |
+      | `text.cpp:409 / 475 / 822 / 893 / 2288` | 一侧**零填充**、另一侧为本地数据拷贝 ⇒ 实为 replicate/gather（add-over-zeros） | **否**：不存在两个独立 partial；且 `__hadd(x,0)==x` 逐位成立，这里本就不是部分和归约点 |
+      | `text.cpp:950 / 952` | 背靠背两次 `sendrecv`（ids + scores） | **否**：结果是 top-k **选择式合并**，不是 elementwise ADD |
+- [x] 结论：**形态不存在** ⇒ 按门槛"存在才评估"不进入评估，**FP64 oracle 不触发**，无实现改动。附带记录（审计副产品，均判定不做）：
+      - replicate 类 5 处改为 `sendrecv` 逐位等价（对端全零），但成本由搬运字节主导、内核内 add 几乎免费 ⇒ 无可测收益。
+      - `950/952` 合并为一次需打包 I32/FP32 两种 dtype，省下的只是一次握手（每轮几十 µs / 37 ms 轮时 ⇒ ~0.1%）。
+      - 推论：每 decode round 约 128 次 collective 里，96 次是 48 层 × 2 次**真**部分和归约，且每个结果都有依赖它的消费者
+        ⇒ **在不改数学的前提下不可约减**；这也解释了为什么 transport 的优化空间只在每次 collective 的成本上（Phase 1–3 已封口）。
 
 **进度**
 
@@ -403,7 +424,9 @@ req#35–#39（客户端约每 5 分钟重试）被接受但永不推进 ⇒ 6 �
       `ninfer_tp_device_pair_test`（含新注入用例）**PASS**；`ninfer_qwen3_5_tp2_dflash_solo_test`（solo digest）**PASS**；`ninfer_qwen3_5_tp2_dflash_append_test`（K=7/K=5 哈希）**PASS**；3× `ninfer_linear_tp2_split_*` **PASS**；
       `tp2_sessions_test`(plain recall 序列分叉)、`dflash2_real_test`(1.7 s cudaMalloc OOM)、`dflash_real_test`(0xc0000409 快败) 三项**在改动前 HEAD 上逐字节/同码复现** ⇒ 既有问题与本次无关
       （sessions 即 worklog 记的"热引擎从零重放不保证与冷 oracle 逐 token 相同"的 ulp 非契约；另两项为 artifact/环境类，docs 未收录这两个用例名）。
-- [x] **Phase 2（2026-09-23）**：见上方 Phase 2 清单（id 权威化完成，验收证据同处；改动未提交，待用户确认）。
+- [x] **Phase 2（2026-09-23）**：见上方 Phase 2 清单（id 权威化完成，已提交 `de74d966`/`b9c5d11c`/`634df875`）。
+- [x] **Phase 3（2026-09-23）**：见上方 Phase 3 清单——**实测否决，不做**（copy engine 地板 3.32 ms vs 现路径 2.70 ms）。
+- [x] **Phase 4（2026-09-23）**：见上方 Phase 4 清单——**形态不存在，门槛未触发，不做**（9 个调用点逐点分类，FP64 oracle 未触发）。
       **部署注意**：`build-win/apps/ninfer-serve.exe` **不会**自动同步到 `C:\ninfer\`，需手动复制；PE 时间戳使每次链接的 hash 都不同，比对以"部署件与 build-win 产出 `Get-FileHash` 相等"为准（本轮已同步，`108AD767…`）。
 - [x] 停掉卡死进程并留档日志（2026-09-23；显存立即清零；残留自旋内核约 2 分钟后自行回落）
 - [x] 测量前置确认：两卡空闲占用已归零（2026-09-23 21:49，无需重启）
