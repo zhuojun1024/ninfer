@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -365,6 +366,96 @@ int check_graph_queue(ninfer::tp::DevicePair& pair, std::size_t graph_bytes, std
     return failures;
 }
 
+// Measures what the copy engines can do with the production large-payload shape, as the floor for
+// the event-based large-payload path (PLAN Phase 3). That candidate moves exactly these bytes - a
+// D2H of the local delta and an H2D of the peer's - so its cost cannot come in under this, and the
+// sliced in-kernel path it would replace is already within 2% of the link's raw bound. Print-only,
+// enabled by NINFER_TP2_AR_COPY_BENCH=1, because it measures a design decision rather than behavior.
+int check_copy_engine_ceiling(ninfer::tp::DevicePair& pair, std::size_t count_bytes, int iterations) {
+    // Chunking and stream layout follow the candidate: the plan's chunk size, and one stream per
+    // direction per device so both directions are in flight at once. That is what the candidate's
+    // event handoff allows (an H2D starts as soon as the peer's chunk lands), and PCIe runs both
+    // directions at once, so a probe that serializes them measures something the candidate need not do.
+    const std::size_t chunk = std::min<std::size_t>(
+        std::max<std::size_t>(count_bytes / 4, 512ULL << 10), 2ULL << 20);
+    const int chunks = static_cast<int>((count_bytes + chunk - 1) / chunk);
+
+    pair.a().bind_to_current_thread();
+    ninfer::DeviceBuffer src_a(count_bytes);
+    ninfer::DeviceBuffer scratch_a(count_bytes);
+    void* host_a = nullptr;
+    void* peer_a = nullptr;
+    cudaHostAlloc(&host_a, count_bytes, cudaHostAllocPortable);
+    cudaHostAlloc(&peer_a, count_bytes, cudaHostAllocPortable);
+    cudaStream_t d2h_a = nullptr, h2d_a = nullptr;
+    cudaStreamCreateWithFlags(&d2h_a, cudaStreamNonBlocking);
+    cudaStreamCreateWithFlags(&h2d_a, cudaStreamNonBlocking);
+    pair.b().bind_to_current_thread();
+    ninfer::DeviceBuffer src_b(count_bytes);
+    ninfer::DeviceBuffer scratch_b(count_bytes);
+    void* host_b = nullptr;
+    void* peer_b = nullptr;
+    cudaHostAlloc(&host_b, count_bytes, cudaHostAllocPortable);
+    cudaHostAlloc(&peer_b, count_bytes, cudaHostAllocPortable);
+    cudaStream_t d2h_b = nullptr, h2d_b = nullptr;
+    cudaStreamCreateWithFlags(&d2h_b, cudaStreamNonBlocking);
+    cudaStreamCreateWithFlags(&h2d_b, cudaStreamNonBlocking);
+
+    const auto issue = [&] {
+        pair.a().bind_to_current_thread();
+        for (int c = 0; c < chunks; ++c) {
+            const std::size_t offset = static_cast<std::size_t>(c) * chunk;
+            const std::size_t bytes  = std::min(chunk, count_bytes - offset);
+            cudaMemcpyAsync(static_cast<char*>(host_a) + offset,
+                            static_cast<const char*>(src_a.p) + offset, bytes,
+                            cudaMemcpyDeviceToHost, d2h_a);
+            cudaMemcpyAsync(static_cast<char*>(scratch_a.p) + offset,
+                            static_cast<const char*>(peer_a) + offset, bytes,
+                            cudaMemcpyHostToDevice, h2d_a);
+        }
+        pair.b().bind_to_current_thread();
+        for (int c = 0; c < chunks; ++c) {
+            const std::size_t offset = static_cast<std::size_t>(c) * chunk;
+            const std::size_t bytes  = std::min(chunk, count_bytes - offset);
+            cudaMemcpyAsync(static_cast<char*>(host_b) + offset,
+                            static_cast<const char*>(src_b.p) + offset, bytes,
+                            cudaMemcpyDeviceToHost, d2h_b);
+            cudaMemcpyAsync(static_cast<char*>(scratch_b.p) + offset,
+                            static_cast<const char*>(peer_b) + offset, bytes,
+                            cudaMemcpyHostToDevice, h2d_b);
+        }
+    };
+    for (int i = 0; i < 5; ++i) { issue(); }
+
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < iterations; ++i) { issue(); }
+    pair.a().bind_to_current_thread();
+    cudaStreamSynchronize(d2h_a);
+    cudaStreamSynchronize(h2d_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamSynchronize(d2h_b);
+    cudaStreamSynchronize(h2d_b);
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() /
+        iterations;
+    const double gbps = 2.0 * static_cast<double>(count_bytes) / (ms * 1e6);
+    std::cout << "copy engine ceiling[" << (count_bytes >> 20) << " MiB, " << chunks << " chunks]: "
+              << ms << " ms per call (both directions), " << gbps
+              << " GB/s counting both directions\n";
+
+    pair.a().bind_to_current_thread();
+    cudaFreeHost(host_a);
+    cudaFreeHost(peer_a);
+    cudaStreamDestroy(d2h_a);
+    cudaStreamDestroy(h2d_a);
+    pair.b().bind_to_current_thread();
+    cudaFreeHost(host_b);
+    cudaFreeHost(peer_b);
+    cudaStreamDestroy(d2h_b);
+    cudaStreamDestroy(h2d_b);
+    return 0;
+}
+
 // A collective whose peer side never launches must give up on its deadline instead of spinning
 // forever: the stall is reported, both streams still drain, and after clear_ar_stall() the same
 // transport produces the elementwise sum again. The divergence is injected - the peer launch of one
@@ -536,6 +627,10 @@ int main() {
         failures += check_graph_queue(pair, 960, 2 << 20, 16, 20);
         // A skipped peer launch must give up on the deadline and re-arm, not hang the process.
         failures += check_ar_timeout(pair, 20480);
+        if (std::getenv("NINFER_TP2_AR_COPY_BENCH") != nullptr) {
+            failures += check_copy_engine_ceiling(pair, 10 << 20, 40);
+            failures += check_copy_engine_ceiling(pair, 24 << 20, 20);
+        }
         // Move semantics: a moved-from pair must not retain p2p state.
         ninfer::tp::DevicePair moved(std::move(pair));
         if (pair.p2p_available()) {
