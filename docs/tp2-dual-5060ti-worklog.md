@@ -4642,3 +4642,36 @@ selector 每 draft 轮只需一次（输入 hidden ~KB 级），搬到 shard 1 �
   （A 期基线 66.3–66.9，回退 <0.5%）；append 摘要 K=7 `0xbad27a494a9bc853`、K=5 `0xbee487264ca8ffb8`
   不变；提案耗时 8.097/8.037 ms（A 基线 7.946/7.962，+1.3~1.7%，端到端不可测）。
 - 收益：shard 0 余量 +246 MiB ⇒ 上下文上限约 **+15.6k token**（16.13 KiB/token/卡）。
+
+## 9. TP-2 双卡自旋挂死排查（2026-09-23）：根因定案并修复——token 计数器跨卡假共享
+
+- **现象**（用户多次实遇 + r56 finish5 A/B 臂两次）：`ninfer-serve` 存活（/health 200）、无错误日志、两卡
+  SM 100%、宿主轮循环不再推进；日志冻结在新请求 `[tp2-time] rounds=1` 之前 ⇒ **挂死位于新请求第一个
+  DFlash2 轮内**（propose 的 6 次合算或 verify 图重放处）。与 Round 34 的并发打乱同症状、不同根因。
+- **复现与取证**：op 纯队列压力 40 轮（~3.2 万合算、深队列、大小路径混跑）零命中；**图重放压力**
+  （新增 `check_graph_queue`：捕获队列 20 次重放 + 急切合算交错，位精确校验）40 轮内 run 30 命中
+  （`build-win/r57d/hang-stress-30.err` 现场）；serve 级 40 次臂（base/finish5 交替、每臂 7 请求）零命中
+  ⇒ 放大器是**双卡 token bump 的并发窗口**（图重放把两次计数自增压到最近；生产 verify 图每轮 128 连发
+  fuse bump 同理）。
+- **现场签名**（`NINFER_TP2_AR_WATCHDOG=1` stall-dump，平时零 mapped 访问）：
+  `calls=944 last=2097152 tok=[1549,1548] arrA=[1549×4 …] arrB=[1548×4 …]`。调用序列经全量审计为
+  **构造性成对匹配**（13 处合算调用点均单主机决策、双流成对启动；decode step/verify/mtp chain 三图单元均
+  `capture_group` 双流成组；DFlash2 轮走 `dflash_propose_batch` 急切路径），却出现**一侧计数丢一次
+  bump**——丢更新位点即两卡并发 RMW 的同一缓存行。
+- **根因**：`token_host_` 为 8 字节单分配、`token_b_ = token_a_ + 1`：两卡每次合算各自 RMW 自己的 int
+  （小路径 fuse bump 内核自增、大路径 `bump_ar_token`），mapped host 内存跨设备不一致，**任一侧的整行
+  写回会抹掉另一侧刚落的增量**（观测形状 `tok=[N+1, N]` 即后者被抹）。计数错一档后**每次**合算双方
+  `arrival_other[b] != token` 永久互旋（decode 小路径单 block、无 order 链、自旋点唯一），全程无错误
+  可见——宿主线程停在轮末 `cudaStreamSynchronize`，永远走不到下一个 CUDA_CHECK。llama.cpp 的
+  host-staging token 一贯 64B 间隔防假共享（llamacpp-notes:156）；本实现 arrival/order/staging 均每卡
+  独立分配（无跨卡写共享，安全），唯 token 对违反该纪律，且它还是全设计中唯一的跨卡写共享缓存行。
+- **修复**：`kArTokenStrideBytes = 64`，两计数器各占独立缓存行（`core/tp/device_pair.cu`），数据通路
+  零改动；watchdog 读取按 stride 适配。
+- **验收（2026-09-23，2×RTX 5060 Ti、sm_120a、Windows 原生）**：① `ninfer_tp_device_pair_test` PASS
+  （含 `check_graph_queue` 三种形态位精确）；② 修复后图压力 **60 轮 0 挂死**（修复前同电池 40 轮命中 1）；
+  ③ serve 位一致对照臂 `drafted=2843 accepted=699 (24.59%)`、逐 prompt 344/109、399/102、337/110、
+  396/100、495/87、379/104、493/87 与 r55/r56 基线**逐项一致**，吞吐 56.6 tok/s（基线 56.4，无回归）。
+- **保留工具**：`DevicePair::start_ar_watchdog`（`NINFER_TP2_AR_WATCHDOG=1`，调用计数停滞才 dump
+  tok/arr/order，签名解码：tok 不等＝计数失配；tok 相等且 arr 均发布＝可见性；槽新旧混杂＝协议竞态）、
+  `tests/test_tp_device_pair.cpp::check_graph_queue`、`tools/tp_bootstrap/r57_spin_stress.ps1`
+  （op 级压力循环）、`tools/tp_bootstrap/r57_spin_repro.ps1`（serve 级复现循环、工件交替、挂死自动取证）。
