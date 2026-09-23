@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -345,6 +346,128 @@ int check_graph_queue(ninfer::tp::DevicePair& pair, std::size_t graph_bytes, std
     return failures;
 }
 
+// A collective whose peer side never launches must give up on its deadline instead of spinning
+// forever: the stall is reported, both streams still drain, and after clear_ar_stall() the same
+// transport produces the elementwise sum again. The divergence is injected - the peer launch of one
+// collective is skipped - which is the failure class the bound exists for.
+int check_ar_timeout(ninfer::tp::DevicePair& pair, std::size_t count_bytes) {
+    if (!pair.in_kernel_allreduce()) {
+        std::cout << "SKIP ar timeout: the in-kernel transport is unavailable\n";
+        return 0;
+    }
+    const std::size_t elements = count_bytes / 2;
+    pair.a().bind_to_current_thread();
+    ninfer::DeviceBuffer buf_a(count_bytes);
+    pair.b().bind_to_current_thread();
+    ninfer::DeviceBuffer buf_b(count_bytes);
+    cudaStream_t stream_a = nullptr, stream_b = nullptr;
+    pair.a().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
+    pair.b().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
+
+    std::mt19937 rng(0x7E50u + static_cast<unsigned>(count_bytes % 65521u));
+    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
+    std::vector<__nv_bfloat16> bf_a(elements), bf_b(elements);
+    std::vector<__nv_bfloat16> got_a(elements), got_b(elements);
+    for (std::size_t i = 0; i < elements; ++i) {
+        bf_a[i] = __float2bfloat16(dist(rng));
+        bf_b[i] = __float2bfloat16(dist(rng));
+    }
+    pair.a().bind_to_current_thread();
+    buf_a.copy_from_host(bf_a.data(), count_bytes);
+    pair.b().bind_to_current_thread();
+    buf_b.copy_from_host(bf_b.data(), count_bytes);
+
+    int failures = 0;
+    pair.set_ar_fault_skip_peer_call(1);
+    const auto before = std::chrono::steady_clock::now();
+    pair.allreduce(buf_a.p, buf_b.p, count_bytes, stream_a, stream_b);
+    pair.a().bind_to_current_thread();
+    cudaStreamSynchronize(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamSynchronize(stream_b);
+    const auto waited_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                             before)
+            .count();
+    std::cout << "ar timeout[" << count_bytes << "]: gave up after " << waited_ms
+              << " ms, token skew " << pair.ar_token_skew() << '\n';
+    if (waited_ms < 100) {
+        std::cerr << "ar timeout[" << count_bytes << "]: returned without waiting on the deadline\n";
+        ++failures;
+    }
+
+    if (!pair.ar_stalled()) {
+        std::cerr << "ar timeout[" << count_bytes << "]: the bounded spin did not report a stall\n";
+        ++failures;
+    }
+    if (pair.ar_token_skew() == 0) {
+        std::cerr << "ar timeout[" << count_bytes
+                  << "]: one side never launched but the call counters agree\n";
+        ++failures;
+    }
+    // While the pair is tripped, every further collective must bail at entry instead of waiting out
+    // another deadline, or a desynchronized round would pay one timeout per allreduce.
+    pair.set_ar_fault_skip_peer_call(0);
+    const auto tripped_before = std::chrono::steady_clock::now();
+    pair.allreduce(buf_a.p, buf_b.p, count_bytes, stream_a, stream_b);
+    pair.a().bind_to_current_thread();
+    cudaStreamSynchronize(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamSynchronize(stream_b);
+    const auto tripped_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                             tripped_before)
+            .count();
+    std::cout << "ar timeout[" << count_bytes << "]: tripped pair bailed after " << tripped_ms
+              << " ms\n";
+    if (tripped_ms > 500) {
+        std::cerr << "ar timeout[" << count_bytes
+                  << "]: a tripped pair waited again instead of bailing at entry\n";
+        ++failures;
+    }
+    pair.clear_ar_stall();
+    if (pair.ar_stalled() || pair.ar_token_skew() != 0) {
+        std::cerr << "ar timeout[" << count_bytes << "]: clear_ar_stall did not re-arm the pair\n";
+        ++failures;
+    }
+
+    pair.set_ar_fault_skip_peer_call(0);
+    pair.a().bind_to_current_thread();
+    buf_a.copy_from_host(bf_a.data(), count_bytes);
+    pair.b().bind_to_current_thread();
+    buf_b.copy_from_host(bf_b.data(), count_bytes);
+    pair.allreduce(buf_a.p, buf_b.p, count_bytes, stream_a, stream_b);
+    pair.a().bind_to_current_thread();
+    cudaStreamSynchronize(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamSynchronize(stream_b);
+    pair.a().bind_to_current_thread();
+    buf_a.copy_to_host(got_a.data(), count_bytes);
+    pair.b().bind_to_current_thread();
+    buf_b.copy_to_host(got_b.data(), count_bytes);
+    for (std::size_t i = 0; i < elements; ++i) {
+        const __nv_bfloat16 expected =
+            __float2bfloat16(__bfloat162float(bf_a[i]) + __bfloat162float(bf_b[i]));
+        if (bits_of(got_a[i]) != bits_of(expected) || bits_of(got_b[i]) != bits_of(expected)) {
+            std::cerr << "ar timeout[" << count_bytes << "]: element " << i
+                      << " differs after re-arm\n";
+            ++failures;
+            break;
+        }
+    }
+
+    if (failures == 0) {
+        std::cout << "ar timeout[" << count_bytes << "]: stalled, re-armed, sum matches\n";
+    }
+    pair.a().bind_to_current_thread();
+    cudaStreamDestroy(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamDestroy(stream_b);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -390,6 +513,8 @@ int main() {
         failures += check_graph_queue(pair, 960, 20480, 32, 20);
         failures += check_graph_queue(pair, 2 << 20, 2 << 20, 8, 20);
         failures += check_graph_queue(pair, 960, 2 << 20, 16, 20);
+        // A skipped peer launch must give up on the deadline and re-arm, not hang the process.
+        failures += check_ar_timeout(pair, 20480);
         // Move semantics: a moved-from pair must not retain p2p state.
         ninfer::tp::DevicePair moved(std::move(pair));
         if (pair.p2p_available()) {
