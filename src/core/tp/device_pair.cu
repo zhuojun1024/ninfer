@@ -8,7 +8,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace ninfer::tp {
@@ -219,6 +223,92 @@ void require_bytes(std::size_t count_bytes) {
 
 } // namespace
 
+// Watched state for the spin diagnostics: the host-visible token counters and the two arrival/order
+// arrays of the in-kernel transport. The watchdog thread reads them with memcpy because the devices
+// write them concurrently.
+struct DevicePair::ArWatchState {
+    const int* token               = nullptr;
+    const unsigned char* arrival_a = nullptr;
+    const unsigned char* arrival_b = nullptr;
+    std::atomic<unsigned long long> calls      = 0;
+    std::atomic<unsigned long long> last_bytes = 0;
+    std::atomic<bool> stop = false;
+    std::thread thread;
+};
+
+// Stops and joins this pair's watchdog before the mapped arrays are freed. The thread holds only a
+// raw pointer to the state block, which outlives it because the join happens first.
+void DevicePair::stop_ar_watchdog() {
+    if (!watch_) { return; }
+    watch_->stop.store(true);
+    if (watch_->thread.joinable()) { watch_->thread.join(); }
+}
+
+namespace {
+
+// One arrival/order slot: 32 ints of arrival at the front of the array, 32 ints of write-order
+// chain at byte kArSlotBytes (see the ar_exchange launch sites).
+int watch_slot(const unsigned char* base, int index) {
+    int value = 0;
+    std::memcpy(&value, base + static_cast<std::size_t>(index) * sizeof(int), sizeof(int));
+    return value;
+}
+
+} // namespace
+
+void DevicePair::note_ar_call(std::size_t count_bytes) {
+    if (!watch_) { return; }
+    watch_->last_bytes.store(count_bytes, std::memory_order_relaxed);
+    watch_->calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DevicePair::start_ar_watchdog() {
+    if (!watch_ || std::getenv("NINFER_TP2_AR_WATCHDOG") == nullptr) { return; }
+    ArWatchState* raw = watch_.get();
+    watch_->thread    = std::thread([raw] {
+        // The mapped arrays are read only while the transport is provably stalled (the host-side
+        // call counter not advancing for a tick), so a healthy run's token/arrival lines see no
+        // extra traffic from the diagnostics themselves.
+        unsigned long long last_calls = 0;
+        bool stalled                  = false;
+        while (!raw->stop.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (raw->stop.load(std::memory_order_relaxed)) { break; }
+            const unsigned long long calls = raw->calls.load(std::memory_order_relaxed);
+            if (calls == last_calls) {
+                if (!stalled) {
+                    stalled = true;
+                    std::fprintf(stderr, "[ar-watch] stalled at calls=%llu\n", calls);
+                }
+            } else {
+                last_calls = calls;
+                stalled    = false;
+                continue;
+            }
+            int tok[2] = {0, 0};
+            std::memcpy(tok, raw->token, sizeof(tok));
+            int slots[4][8] = {};
+            for (int i = 0; i < 8; ++i) {
+                slots[0][i] = watch_slot(raw->arrival_a, i);
+                slots[1][i] = watch_slot(raw->arrival_a, 32 + i);
+                slots[2][i] = watch_slot(raw->arrival_b, i);
+                slots[3][i] = watch_slot(raw->arrival_b, 32 + i);
+            }
+            std::fprintf(stderr,
+                         "[ar-watch] calls=%llu last=%llu tok=[%d,%d] "
+                         "arrA=[%d %d %d %d %d %d %d %d] ordA=[%d %d %d %d %d %d %d %d] "
+                         "arrB=[%d %d %d %d %d %d %d %d] ordB=[%d %d %d %d %d %d %d %d]\n",
+                         raw->calls.load(), raw->last_bytes.load(), tok[0], tok[1],
+                         slots[0][0], slots[0][1], slots[0][2], slots[0][3], slots[0][4],
+                         slots[0][5], slots[0][6], slots[0][7], slots[1][0], slots[1][1],
+                         slots[1][2], slots[1][3], slots[1][4], slots[1][5], slots[1][6],
+                         slots[1][7], slots[2][0], slots[2][1], slots[2][2], slots[2][3],
+                         slots[2][4], slots[2][5], slots[2][6], slots[2][7], slots[3][0],
+                         slots[3][1], slots[3][2], slots[3][3], slots[3][4], slots[3][5],
+                         slots[3][6], slots[3][7]);
+        }
+    });}
+
 DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) {
     if (device_a == device_b) {
         throw std::invalid_argument("tp DevicePair: devices must be distinct");
@@ -315,9 +405,17 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
             token_b_ = nullptr;
         }
     }
+    if (in_kernel_available_) {
+        watch_            = std::make_shared<ArWatchState>();
+        watch_->token     = token_host_;
+        watch_->arrival_a = static_cast<const unsigned char*>(arrival_host_a_);
+        watch_->arrival_b = static_cast<const unsigned char*>(arrival_host_b_);
+        start_ar_watchdog();
+    }
 }
 
 DevicePair::~DevicePair() {
+    stop_ar_watchdog();
     if (p2p_) {
         a_.bind_to_current_thread_noexcept();
         b_.bind_to_current_thread_noexcept();
@@ -379,6 +477,9 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     token_host_          = other.token_host_;
     token_a_             = other.token_a_;
     token_b_             = other.token_b_;
+    stop_ar_watchdog();
+    watch_               = std::move(other.watch_);
+    watch_               = std::move(other.watch_);
     ar_size_keyed_       = other.ar_size_keyed_;
     small_available_     = other.small_available_;
     small_host_a_        = other.small_host_a_;
@@ -423,6 +524,7 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
     // copy-engine transport were both measured against the plain single-block version; slicing
     // recovers the interleave loss (see ar_slices) while the copy engines were slower.
     if (in_kernel_available_ && count_bytes <= in_kernel_bytes_) {
+        note_ar_call(count_bytes);
         const int count = static_cast<int>(count_bytes / 2);
         const auto address =
             reinterpret_cast<std::uintptr_t>(data_a) | reinterpret_cast<std::uintptr_t>(data_b) |
@@ -539,6 +641,7 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
     // synchronization, and the same token/parity discipline as the all-reduce, so an allreduce and a
     // sendrecv may interleave within one round as long as both devices issue the same sequence.
     if (in_kernel_available_ && count_bytes <= in_kernel_bytes_) {
+        note_ar_call(count_bytes);
         const int count = static_cast<int>(count_bytes / 2);
         const auto address = reinterpret_cast<std::uintptr_t>(send_a) |
                              reinterpret_cast<std::uintptr_t>(recv_a) |

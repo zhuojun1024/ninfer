@@ -23,6 +23,13 @@ public:
     DevicePair(DevicePair&& other) noexcept;
     DevicePair& operator=(DevicePair&& other) noexcept;
 
+    // Spawns an env-gated (NINFER_TP2_AR_WATCHDOG=1) diagnostics thread that prints the mapped
+    // token/arrival/order state to stderr twice a second, so a stuck in-kernel transport can be
+    // classified after the fact: unequal tokens mean the two sides' call sequences diverged, equal
+    // tokens with published arrivals mean a spin failed to observe the peer's write, and a stale
+    // order slot means the slice write-order chain broke.
+    void start_ar_watchdog();
+
     const DeviceContext& a() const noexcept { return a_; }
     const DeviceContext& b() const noexcept { return b_; }
     bool p2p_available() const noexcept { return p2p_; }
@@ -95,6 +102,13 @@ private:
     void* small_host_b_ = nullptr; // cudaFreeHost handle for device b's decode-sized staging
     void* small_dev_a_  = nullptr; // device-side pointer (device a) for small_host_a_
     void* small_dev_b_  = nullptr; // device-side pointer (device b) for small_host_b_
+    // Diagnostics state for the in-kernel transport (see start_ar_watchdog). Held through a
+    // shared_ptr because the detached watchdog thread only reads the mapped arrays and may outlive
+    // moves of the pair.
+    struct ArWatchState;
+    std::shared_ptr<ArWatchState> watch_;
+    void note_ar_call(std::size_t count_bytes);
+    void stop_ar_watchdog();
 };
 
 // Non-owning view of one shard of a tensor split along dim. The local tensor
