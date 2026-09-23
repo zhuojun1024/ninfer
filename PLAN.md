@@ -239,7 +239,7 @@ shard 0 的 MTP 权重 430 MiB + KV 516 MiB。每轮成本构成、D1–D4 决�
       Q8 路线零漂移。判定：**维持 opt-in**，升契约特性前仍欠 §3.7 末尾三件套验证。
       **已知 flake（既有问题，用户确认偶发多次遇到）**：首次 finish5 臂在 req#2 流中途概率性挂死
       （两卡 SM 100% 自旋等 handoff、/health 200、日志无报错；桌面进程已排除），重跑即过；
-      挂死机理待专项排查（用户指示暂缓，日志留存 `build-win/r56/serve-finish5-hang1.log`）。
+      挂死机理待专项排查（用户指示暂缓，日志留存 `build-win/r56/serve-finish5-hang1.log`）；**该专项已由 §3.8 接手**（2026-09-23 第二次复现后定案为设备侧自旋，处置见 §3.8）。
 - [x] **`feature_projection` 新 profile**（5120×25600，132.8 MiB）：已落地（r55，2026-09-23）。
       更正：该 tensor 走 plain `linear` op（`project` → `ops::linear`），不是 `linear_add`。
       新增 `src/ops/linear/q5/shapes/n5120_k25600.cu`（selector 镜像 n5120_k17408：T=1 simt_r8_c4、
@@ -287,3 +287,107 @@ weights+ctx 13462.6 → **12748.6**（−714.0 MiB，粒度吸收 1.6；三杠�
       `ninfer_qwen3_5_tp2_dflash_solo_test`（digest）、`ninfer_qwen3_5_tp2_sessions_test`（保留断言）。
 - [ ] 采样模式（temperature>0）接受率/吞吐 A/B：分布精确性由算法保证，但 q 变化会影响采样下的接受率。
 - [ ] Q4 gate_up 在该形状上的 op oracle，以及「按存储 scale 独立解码」检查（AGENTS.md 的数值契约）。
+
+---
+
+### 3.8 TP-2 会合协议重构（2026-09-23；事故驱动，进行中）
+
+**事故（第二次复现，且已定位到设备侧自旋）**：2026-09-23 21:02:56，Windows 3456，`qwen3.8-27b-w4a4-draftall`
+（245760 / k8v4 / DFlash2 K=5 / 4 会话 host KV）。req#34 在 prefill 2,189 tok + decode 158 tok 后冻结：
+两卡 SM 100%、显存 12,962/12,558 MiB 恒定、`/health` 200、host 恰好 1 个核连续跑满、日志零输出；
+req#35–#39（客户端约每 5 分钟重试）被接受但永不推进 ⇒ 6 条请求被静默吞掉（`--max-pending-requests 16`）。
+日志留档 `build-win/serve-hang-2026-09-23.log`（30,559 B），现场快照 `build-win/live-serve-snapshot.log`。
+**杀进程后两卡仍报 100% / 2805 MHz / 22–25 W / 0 MiB 且无 compute 进程** ⇒ 卡住的是设备侧自旋内核
+（`__nanosleep` 轮询的低功耗签名）。进程终止不会立刻回收：21:45 杀进程，21:47 两卡仍 100%/2805 MHz/~25 W，21:49 自行回落到 180 MHz/0%/4–7 W ⇒ 设备侧自旋的又一佐证；测量前先确认两卡回到 0%（本次已确认，无需重启）。
+
+**与下午修复的关系（结论：不是漏打补丁）**：部署件 `C:\ninfer\ninfer-serve.exe` = `build-win/apps/ninfer-serve.exe`
+（202,497,024 B，14:23:32），二进制内含 `NINFER_TP2_AR_WATCHDOG` 与 `graph queue[` 字面量 ⇒ 14:50–14:51
+那批提交（`12760cb8` 看门狗 → `f8d33f13` cache-line 修复 → `fe96c13d` 图重放测试）在链接时已在树内；
+14:24–14:30 的 r57e（图压力 60/60 PASS）与 r57f（serve 复检）跑的就是它。⇒ 本次是**同类现象的另一条路径**：
+`src/core/tp/device_pair.cu:191-197` 只堵掉「两计数器同 cache line 互相写回覆盖」这一条漏 bump。
+
+**三条设计缺陷（根因判断）**：
+
+- **D1 会合标识＝两卡各自 RMW 的自增计数器**（`device_pair.cu:208`、`:116-119`）：把"两卡永久锁步"当成
+  不可验证、不可恢复的分布式不变量。且本平台无法用原子修——`atomicAdd_system()` 需要
+  `hostNativeAtomicSupported`，PCIe 消费卡没有（llama.cpp `ggml/src/ggml-cuda/allreduce.cu:56-58`）。
+- **D2 等待严格相等且无上界**（`:153-158`）：唯一失败模式是活锁，且能带走整个服务。
+- **D3 会合落在最不可控的一致性域**（两块 GPU 写同一块 mapped host memory），每 token 约 128 次。
+
+**关键决策（对照 llama.cpp ar3-opt 与上游 `allreduce.cu`；细节见 `docs/tp2-dual-5060ti-llamacpp-notes.md`）**：
+
+1. **借"谁来发号"，不借架构**。采用 host 权威 id，但**不**采用 llama.cpp 的图级 meta 架构
+   （每 decode step 约 81 段 host lockstep）：同机 3 卡实测 44.5 tok/s vs 本引擎 2 卡约 100 tok/s，
+   且违反本仓库 "Models own finite execution composition" 的 ownership。
+2. **id 送达复用本引擎已有机制**：host 每轮写 pinned `base` → 图内 memcpy node 拷进 device 标量 →
+   内核算 `id = base + call_index`（`call_index` 为捕获参数，跨 replay 恒定）。与 `valid_columns` 同路
+   （`src/models/qwen3_5/execution/text.h:203-216`、`tp2_generation_core.cpp:998-1006`）。
+   **必须走 memcpy node，不能按值当 kernel 实参**——llama.cpp 的形态一旦入图会重放冻结值，自旋条件被
+   上一轮残留值满足 ⇒ 不等待直接读，静默算错（比挂死更难查）。
+3. **大 payload 事件路径只作 A/B 候选**，不预设替换：sliced 已在链路地板（2.70 vs 2.66 ms）；上游
+   copy-engine 固定开销约 80 µs 对 SM kernel stage A 约 30 µs，故其 1 MB 阈值。
+4. **补两边都没有的**：有界自旋 + 失败语义 + 退化路径。partial 合并（`ggml-backend-meta.cpp:2126-2180`，
+   已核实）BF16 下非结合、与逐位摘要契约冲突，本轮不做。
+
+**改动清单**：
+
+**Phase 1 —— 止血（不动协议，可独立上线）**
+- [ ] `device_pair.cu`：自旋加 `clock64()` 上界（env `NINFER_TP2_AR_TIMEOUT_MS`，默认 2000，0=关），超时后
+      `__threadfence_system()` + 置 mapped `stalled` 标志并让所有 block 退出；扩展现有 `ArWatchState`
+      （`:236-244`）承载该标志。
+- [ ] `allreduce`/`sendrecv` 返回状态；超时后 host 排空两条流、复位 arrival/order/parity，失败该请求并
+      **毒化该会话上下文**（要求重新 prefill，避免用半写 KV 继续），服务保持存活。
+- [ ] host 侧每轮不变式检查：`token_a_ == token_b_`（两个 mapped 计数器 host 可直读），不等即 dump 并失败。
+- [ ] 验收：故障注入（人为让一侧少一次合算／丢一次发布）必须表现为"该请求 5xx + 服务存活 + 下一请求正常"；
+      真实 agent 流量连续 ≥1 h 无永久挂死；prefill/decode A/B 回退 ≤1%。
+
+**Phase 2 —— id 权威化（删掉整类 desync）**
+- [ ] `device_pair.{h,cu}`：删除 `token_host_/token_a_/token_b_`、`bump_ar_token`、`fuse_bump` 小通路与
+      `ar_size_keyed_` 策略开关；新增 `begin_capture()/end_capture(n_calls)/set_round_base(base)` 与每设备
+      pinned base cell + device 标量；`ar_exchange` 的 `token_ptr` 换成 `(base_dev, call_index)`。
+- [ ] `src/core/decode_graph.{h,cpp}`：不改语义，仅由调用方在 `capture_group` 前后调用 transport 的 capture
+      钩子（显式优先于用 `cudaStreamIsCapturing` 隐式判定）。
+- [ ] `src/runtime/engine/tp2_generation_core.cpp`：三个捕获点接钩子——`capture_verify_graph`（:949）、
+      `capture_decode_graph`（:1055）、`capture_mtp_chain_graph`（:1193）；三块 pinned window
+      （`tp2_generation_core.h:386-398`）各带一个 `base`；`launch_window_graph`（:941）前写 base。
+      9 个模型侧 `pair.allreduce/sendrecv` 调用点**不需要改**（id 由 transport 自持）。
+- [ ] 验收：`ninfer_tp2_device_pair_test`（含 `check_graph_queue`）+ 60 轮图压力零挂死；DFlash2 solo digest 与
+      append K=7/K=5 金值不变；r57 贪心探针接受率与吞吐不退化。
+
+**Phase 3 —— 大 payload 事件路径（A/B 决定，选做）**
+- [ ] 照上游形态实现 D2H/H2D 分块 + 专用 non-blocking copy stream + compute stream 上 add，跨流安全靠
+      `dev_tmp_kernel_done` / `host_large_read_done` 两条 event 栅栏（`allreduce.cu:1184-1206、1222-1223`）；
+      chunk = `clamp(nbytes/4, 512 KiB, 2 MiB)`（`allreduce.cu:419-432`）。
+- [ ] 采用条件：1.9k/7.2k/28.5k/65k 提示的 prefill 吞吐 ≥ 现 sliced 路径，且能删除 8 slice write-order 链
+      （`device_pair.cu:143-145`）；否则不做。
+
+**Phase 4 —— 可选（有数值门槛）**
+- [ ] partial 合并可行性审计：审 9 个调用点是否存在"两个独立 partial 后接同一 elementwise ADD"；存在才评估，
+      且必须先过 FP64 oracle（BF16 非结合会破坏逐位摘要）。
+
+**进度**
+
+- [x] **Phase 1a 传输层（2026-09-23）**：`device_pair.{h,cu}` 加 `%globaltimer` deadline（`NINFER_TP2_AR_TIMEOUT_MS`，默认 2000，0=关）、每侧 mapped `stall` 标志、
+      协作式退出（thread 0 经 shared 发布、全 block 一起 return，避免 `__syncthreads` 死锁）、`ar_stalled()/ar_token_skew()/clear_ar_stall()`
+      （复位=两计数器取大值 + 清零 arrival/order 槽）、以及测试用故障注入 `set_ar_fault_skip_peer_call()`。
+      新用例 `tests/test_tp_device_pair.cpp::check_ar_timeout`（跳过一次对端启动）实测：**gave up after 2000 ms, token skew 1 →
+      复位后逐位正确**，`ninfer_tp_device_pair_test` PASS（其余 allreduce/sendrecv/图重放/move 用例全过）。
+      ⚠️ **1a 不能单独上线**：超时内核在 phase 3 之前返回，调用方只拿到本地偏和 ⇒ 会把"响亮挂死"变成"静默算错"；已与 1b 同批完成。
+      另修一个 1a 自身的严重缺陷：内核入口先读**两侧** trip 标志，已 trip 立即退出——否则首次超时后 token 永久错位，同一轮后续 ~128 次合算会各烧 2 s（≈4 分钟/轮）才等到 host 检测。
+- [x] **Phase 1b 引擎层（2026-09-23）**：`TP2GenerationCore::abort_if_ar_stalled()`（`tp2_generation_core.cpp`，声明在 `tp2_generation_core.h`）在**每轮收敛点**
+      （`request.budget.remaining()`/output policy 之前、任何 token 送达客户端之前）与 prefill 首个 token 采样后检测；触发条件**只用 trip 标志**——
+      plain decode 路径只排空 shard A，镜像 shard 落后 1~2 次合算属正常，用 token 偏差判会误报 503，偏差只写进错误消息当取证；
+      触发后排空两卡 → `clear_ar_stall()` → `invalidate_host_checkpoints()` + `session_invalidate_active()` → `RequestError(Unavailable)` ⇒ **HTTP 503 + 下一请求重新 prefill**。
+      故障注入入口：`NINFER_TP2_AR_FAULT_SKIP_PEER_CALL=<n>`（env，构造期读；诊断用）。
+      **服务级验收**（新件已部署 `C:\ninfer\ninfer-serve.exe`，验收时 hash `001446D4…`；注入 3000）：`[ar-watch] calls=3114 … tok=[34054,34053]`（偏差 1）
+      → `WARN req#2 failed during generation | HTTP 503 | service unavailable` → 错误体 `TP-2 allreduce stalled (token skew 1)…`
+      → 复位后 dump `tok=[34054,34054]`、arrival/order 全 0 → **后续两条请求 1 s 内 HTTP 200**。Phase 1 完成。
+      记录教训：本次验收原文只留在本节与当次会话——`C:\ninfer\serve-win.log` 被随后的干净重启覆盖；后续验收先 `--request-log-jsonl` 或先复制日志。
+      **回归矩阵**（artifact `D:/LLM/qwen3_8_27b_w4a4_dflash2_draftall.ninfer`；每项都做了"改动后 / git-stash 改动前 HEAD"两次）：
+      `ninfer_tp_device_pair_test`（含新注入用例）**PASS**；`ninfer_qwen3_5_tp2_dflash_solo_test`（solo digest）**PASS**；`ninfer_qwen3_5_tp2_dflash_append_test`（K=7/K=5 哈希）**PASS**；3× `ninfer_linear_tp2_split_*` **PASS**；
+      `tp2_sessions_test`(plain recall 序列分叉)、`dflash2_real_test`(1.7 s cudaMalloc OOM)、`dflash_real_test`(0xc0000409 快败) 三项**在改动前 HEAD 上逐字节/同码复现** ⇒ 既有问题与本次无关
+      （sessions 即 worklog 记的"热引擎从零重放不保证与冷 oracle 逐 token 相同"的 ulp 非契约；另两项为 artifact/环境类，docs 未收录这两个用例名）。
+      **部署注意**：`build-win/apps/ninfer-serve.exe` **不会**自动同步到 `C:\ninfer\`，需手动复制；PE 时间戳使每次链接的 hash 都不同，比对以"部署件与 build-win 产出 `Get-FileHash` 相等"为准（本轮已同步，`108AD767…`）。
+- [x] 停掉卡死进程并留档日志（2026-09-23；显存立即清零；残留自旋内核约 2 分钟后自行回落）
+- [x] 测量前置确认：两卡空闲占用已归零（2026-09-23 21:49，无需重启）
+- [ ] Phase 1 · Phase 2 · Phase 3 · Phase 4
