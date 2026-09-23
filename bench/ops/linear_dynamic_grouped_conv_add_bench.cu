@@ -2,6 +2,7 @@
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
 #include "ninfer_bench_common.h"
+#include "ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
 #include "quantized_weight.cuh"
 
@@ -33,6 +34,7 @@ struct Options {
     int width               = 0;
     std::int32_t input_rows = 0;
     std::int32_t batch_size = 0;
+    QType qtype             = QType::Q8_G32_FP16;
     int warmup              = 8;
     int repeat              = 40;
     std::size_t flush_bytes = kDefaultFlushBytes;
@@ -54,6 +56,15 @@ Options parse_args(int argc, char** argv) {
             options.repeat = std::atoi(next("repeat"));
         } else if (!std::strcmp(argv[index], "--k")) {
             options.input_rows = std::atoi(next("K"));
+        } else if (!std::strcmp(argv[index], "--qtype")) {
+            const char* qtype = next("qtype");
+            if (!std::strcmp(qtype, "q8")) {
+                options.qtype = QType::Q8_G32_FP16;
+            } else if (!std::strcmp(qtype, "q5")) {
+                options.qtype = QType::Q5_G64_FP16;
+            } else {
+                throw std::invalid_argument("qtype must be q8 or q5");
+            }
         } else if (!std::strcmp(argv[index], "--batch")) {
             options.batch_size = std::atoi(next("batch"));
         } else if (!std::strcmp(argv[index], "--flush-mib")) {
@@ -61,7 +72,8 @@ Options parse_args(int argc, char** argv) {
             if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
             options.flush_bytes = static_cast<std::size_t>(mib) << 20;
         } else if (!std::strcmp(argv[index], "--help") || !std::strcmp(argv[index], "-h")) {
-            std::printf("usage: %s [--width 2..16] [--k 4096|17408] [--batch 1..8] [--warmup N] "
+            std::printf("usage: %s [--width 2..16] [--k 4096|17408] [--qtype q8|q5] "
+                        "[--batch 1..8] [--warmup N] "
                         "[--repeat N] "
                         "[--flush-mib N]\n",
                         argv[0]);
@@ -89,10 +101,10 @@ void run_profile(std::int32_t input_rows, const Options& options, DeviceBuffer& 
     DeviceBuffer base  = make_bf16(static_cast<std::size_t>(kHidden) * kTaps * kSides);
     DeviceBuffer delta = make_bf16(static_cast<std::size_t>(kGroups) * kTaps * kMaximumWidth * 8);
     DeviceBuffer residual        = make_bf16(static_cast<std::size_t>(kHidden) * kMaximumWidth * 8);
-    PackedQuantizedWeight packed = make_row_split_weight(QType::Q8_G32_FP16, kHidden, input_rows,
+    PackedQuantizedWeight packed = make_row_split_weight(options.qtype, kHidden, input_rows,
                                                          input_rows, {0x31U, 0x00U, 0x1800U});
-    const std::size_t capacity =
-        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(input_rows, 2, 16, 1, 8);
+    const std::size_t capacity = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+        options.qtype, input_rows, 2, 16, 1, 8);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
     Tensor base_kernel(base.p, DType::BF16, {kHidden, kTaps, kSides});
 
@@ -123,8 +135,11 @@ void run_profile(std::int32_t input_rows, const Options& options, DeviceBuffer& 
                             batch_size, cols, route, timing.median_us, timing.min_us, timing.p95_us,
                             tflops, bandwidth, graph.nodes(), workspace.peak_used());
             };
-            const char* route = ops::detail::q8_linear_dynamic_grouped_conv_add_route_name(
-                input_rows, width, batch_size);
+            const char* route = options.qtype == QType::Q5_G64_FP16
+                                    ? ops::detail::q5_linear_dynamic_grouped_conv_add_route_name(
+                                          input_rows, width, batch_size)
+                                    : ops::detail::q8_linear_dynamic_grouped_conv_add_route_name(
+                                          input_rows, width, batch_size);
             measure(route, [&](cudaStream_t capture_stream) {
                 ops::linear_dynamic_grouped_conv_add(x, packed.weight, base_kernel, finish_delta,
                                                      residual_view, workspace, capture_stream);
