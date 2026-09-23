@@ -250,6 +250,101 @@ int check_sendrecv(ninfer::tp::DevicePair& pair, std::size_t count_bytes, int it
     return failures;
 }
 
+// One captured send-receive queue replayed many times, with an eager all-reduce queued between
+// replays (the production interleave of graphed verify windows and eager propose collectives).
+// The graph body's receives are byte exact and identical every replay, so the final readback is
+// checkable; a transport whose two sides ever disagree on the call sequence hangs the sync below,
+// which is the regression this guards.
+int check_graph_queue(ninfer::tp::DevicePair& pair, std::size_t graph_bytes, std::size_t eager_bytes,
+                      int calls, int replays) {
+    pair.a().bind_to_current_thread();
+    ninfer::DeviceBuffer send_a(graph_bytes), recv_a(graph_bytes);
+    ninfer::DeviceBuffer add_a(eager_bytes);
+    pair.b().bind_to_current_thread();
+    ninfer::DeviceBuffer send_b(graph_bytes), recv_b(graph_bytes);
+    ninfer::DeviceBuffer add_b(eager_bytes);
+    cudaStream_t stream_a = nullptr, stream_b = nullptr;
+    pair.a().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
+    pair.b().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
+
+    std::mt19937 rng(0xC0FFEEu + static_cast<unsigned>(graph_bytes % 65521u));
+    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
+    const std::size_t graph_elements = graph_bytes / 2;
+    const std::size_t eager_elements = eager_bytes / 2;
+    std::vector<__nv_bfloat16> host_a(graph_elements), host_b(graph_elements);
+    std::vector<__nv_bfloat16> eager_a(eager_elements), eager_b(eager_elements);
+    std::vector<__nv_bfloat16> got_a(graph_elements);
+    for (std::size_t i = 0; i < graph_elements; ++i) {
+        host_a[i] = __float2bfloat16(dist(rng));
+        host_b[i] = __float2bfloat16(dist(rng));
+    }
+    for (std::size_t i = 0; i < eager_elements; ++i) {
+        eager_a[i] = __float2bfloat16(dist(rng));
+        eager_b[i] = __float2bfloat16(dist(rng));
+    }
+    pair.a().bind_to_current_thread();
+    send_a.copy_from_host(host_a.data(), graph_bytes);
+    add_a.copy_from_host(eager_a.data(), eager_bytes);
+    pair.b().bind_to_current_thread();
+    send_b.copy_from_host(host_b.data(), graph_bytes);
+    add_b.copy_from_host(eager_b.data(), eager_bytes);
+
+    cudaGraph_t graph_a = nullptr, graph_b = nullptr;
+    cudaGraphExec_t exec_a = nullptr, exec_b = nullptr;
+    pair.a().bind_to_current_thread();
+    cudaStreamBeginCapture(stream_a, cudaStreamCaptureModeThreadLocal);
+    pair.b().bind_to_current_thread();
+    cudaStreamBeginCapture(stream_b, cudaStreamCaptureModeThreadLocal);
+    pair.a().bind_to_current_thread();
+    for (int call = 0; call < calls; ++call) {
+        pair.sendrecv(send_a.p, recv_a.p, send_b.p, recv_b.p, graph_bytes, stream_a, stream_b);
+    }
+    cudaStreamEndCapture(stream_a, &graph_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamEndCapture(stream_b, &graph_b);
+    cudaGraphInstantiate(&exec_a, graph_a, 0);
+    cudaGraphInstantiate(&exec_b, graph_b, 0);
+
+    for (int replay = 0; replay < replays; ++replay) {
+        pair.allreduce(add_a.p, add_b.p, eager_bytes, stream_a, stream_b);
+        pair.a().bind_to_current_thread();
+        cudaGraphLaunch(exec_a, stream_a);
+        pair.b().bind_to_current_thread();
+        cudaGraphLaunch(exec_b, stream_b);
+    }
+    pair.a().bind_to_current_thread();
+    cudaStreamSynchronize(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamSynchronize(stream_b);
+
+    pair.a().bind_to_current_thread();
+    recv_a.copy_to_host(got_a.data(), graph_bytes);
+    int failures = 0;
+    for (std::size_t i = 0; i < graph_elements; ++i) {
+        if (bits_of(got_a[i]) != bits_of(host_b[i])) {
+            if (failures < 4) {
+                std::cerr << "graph queue[" << graph_bytes << "] replay " << replays << " element "
+                          << i << ": expected " << __bfloat162float(host_b[i]) << ", got "
+                          << __bfloat162float(got_a[i]) << '\n';
+            }
+            ++failures;
+            break;
+        }
+    }
+
+    cudaGraphExecDestroy(exec_a);
+    cudaGraphExecDestroy(exec_b);
+    cudaGraphDestroy(graph_a);
+    cudaGraphDestroy(graph_b);
+    pair.a().bind_to_current_thread();
+    cudaStreamDestroy(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamDestroy(stream_b);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -290,6 +385,11 @@ int main() {
         failures += check_sendrecv(pair, 960, 64);
         failures += check_sendrecv(pair, 64, 64);
         failures += check_sendrecv(pair, 1 << 20, 16);
+        // Captured queues replayed between eager calls: small fuse exchanges, sliced large
+        // exchanges (write-order chain, separate token bump), and the two classes interleaved.
+        failures += check_graph_queue(pair, 960, 20480, 32, 20);
+        failures += check_graph_queue(pair, 2 << 20, 2 << 20, 8, 20);
+        failures += check_graph_queue(pair, 960, 2 << 20, 16, 20);
         // Move semantics: a moved-from pair must not retain p2p state.
         ninfer::tp::DevicePair moved(std::move(pair));
         if (pair.p2p_available()) {
