@@ -88,7 +88,10 @@ private:
     // call ahead satisfy its spin from the previous replay. They live in mapped pinned host memory
     // rather than on a device heap because the caller decides which shard drives a pair: the stream
     // an allreduce runs on is not necessarily a_, and a device allocation would then be dereferenced
-    // from the other device's context.
+    // from the other device's context. The two counters live one cache line apart (see
+    // kArTokenStrideBytes in device_pair.cu): both devices read-modify-write their own int on every
+    // call, and adjacent ints on one line lose increments to the peer's non-coherent line
+    // write-back, which desynchronizes the tokens and spins both devices forever.
     int* token_host_ = nullptr; // cudaFreeHost handle
     int* token_a_    = nullptr; // device pointer into token_host_
     int* token_b_    = nullptr; // device pointer into token_host_

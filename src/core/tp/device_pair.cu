@@ -188,6 +188,13 @@ constexpr int kArThreads               = 1024;
 constexpr int kArMaxSlices             = 8;
 constexpr std::size_t kArSlotBytes     = 128; // one cache line per slot array (kArMaxSlices ints)
 constexpr std::size_t kArTokenBytes    = 2 * kArSlotBytes; // arrival array, then write-order chain
+// One cache line per side's arrival token. Both devices read-modify-write their own counter on
+// every call and the mapped host path is not coherent between peers, so two counters sharing one
+// line let a peer's line write-back drop the other's increment (observed through the AR watchdog:
+// tok=[N+1, N] with matched call sequences, then both sides spin forever on the token mismatch).
+// The same 64-byte spacing keeps llama.cpp's host-staging arrival tokens apart
+// (docs/tp2-dual-5060ti-llamacpp-notes.md).
+constexpr std::size_t kArTokenStrideBytes = 64;
 
 // Decode-sized staging for the size-keyed transport. A single token's [hidden, 1] delta is a few
 // KiB: the 24 MiB prefill slots are almost all waste, and sharing them would let a small call's
@@ -286,7 +293,9 @@ void DevicePair::start_ar_watchdog() {
                 continue;
             }
             int tok[2] = {0, 0};
-            std::memcpy(tok, raw->token, sizeof(tok));
+            std::memcpy(&tok[0], raw->token, sizeof(int));
+            std::memcpy(&tok[1], reinterpret_cast<const char*>(raw->token) + kArTokenStrideBytes,
+                        sizeof(int));
             int slots[4][8] = {};
             for (int i = 0; i < 8; ++i) {
                 slots[0][i] = watch_slot(raw->arrival_a, i);
@@ -355,15 +364,19 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
                         // The tokens are host memory mapped into both devices, so whichever shard
                         // drives the pair may bump and read them.
                         bool tokens = false;
-                        if (cudaHostAlloc(reinterpret_cast<void**>(&token_host_), 2 * sizeof(int),
-                                          cudaHostAllocPortable | cudaHostAllocMapped) ==
-                            cudaSuccess) {
+                        if (cudaHostAlloc(reinterpret_cast<void**>(&token_host_),
+                                          2 * kArTokenStrideBytes, cudaHostAllocPortable |
+                                             cudaHostAllocMapped) == cudaSuccess) {
                             tokens = cudaHostGetDevicePointer(reinterpret_cast<void**>(&token_a_),
                                                               token_host_, 0) == cudaSuccess;
                             if (tokens) {
                                 token_host_[0] = 0;
-                                token_host_[1] = 0;
-                                token_b_       = token_a_ + 1;
+                                *reinterpret_cast<int*>(
+                                    static_cast<char*>(static_cast<void*>(token_host_)) +
+                                    kArTokenStrideBytes) = 0;
+                                token_b_ = reinterpret_cast<int*>(
+                                    reinterpret_cast<char*>(static_cast<void*>(token_a_)) +
+                                    kArTokenStrideBytes);
                             }
                         }
                         if (tokens) {
