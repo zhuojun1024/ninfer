@@ -1387,6 +1387,28 @@ bool session_trace_enabled() {
 
 } // namespace
 
+void TP2GenerationCore::abort_if_ar_stalled() {
+    if (!pair_.in_kernel_allreduce()) { return; }
+    // Healthy path: one mapped host load, no stream touched. The trip flag, not the counter skew, is
+    // the trigger: the decode paths drain only shard A before reading their sample, so the mirroring
+    // shard is legitimately a call or two behind at that point and its skew would false-positive.
+    if (!pair_.ar_stalled()) { return; }
+    const long long skew = pair_.ar_token_skew();
+    for (Shard* shard : {&shard_a_, &shard_b_}) {
+        shard->device.bind_to_current_thread();
+        CUDA_CHECK(cudaStreamSynchronize(shard->device.stream));
+    }
+    shard_a_.device.bind_to_current_thread();
+    pair_.clear_ar_stall();
+    invalidate_host_checkpoints();
+    session_invalidate_active();
+    cached_state_valid_ = false;
+    throw RequestError(
+        RequestErrorKind::Unavailable,
+        "TP-2 allreduce stalled (token skew " + std::to_string(skew) +
+            "): the request was failed and the reusable context was discarded");
+}
+
 void TP2GenerationCore::invalidate_host_checkpoints() {
     Shard* const shards[2] = {&shard_a_, &shard_b_};
     for (Shard* shard : shards) {
@@ -2761,6 +2783,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             CUDA_CHECK(cudaMemcpyAsync(&first, sampled_a.data, sizeof(std::int32_t),
                                        cudaMemcpyDeviceToHost, shard_a_.device.stream));
             CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+            abort_if_ar_stalled();
             request.generated.push_back(first);
             request.budget.commit(1);
             if (mtp_enabled_) {
@@ -3305,6 +3328,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 result.speculative.accepted_per_position[static_cast<std::size_t>(i)] += 1;
             }
         }
+        // Every round converges here before any token reaches the client, which is the last point at
+        // which a stalled transport can be caught without serving a partial sum as an answer.
+        abort_if_ar_stalled();
         // A speculative round can license more tokens than the request still has budget for; the
         // output policy only ever commits a prefix of what it is shown.
         const std::uint32_t remaining = request.budget.remaining();

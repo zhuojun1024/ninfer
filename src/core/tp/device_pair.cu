@@ -101,28 +101,56 @@ __device__ __forceinline__ uint4 add_bf16x8(uint4 a, uint4 b) {
 // staging, arrival-token and slice machinery; only phase 3 differs. The copy mode preserves every
 // 16-bit lane, so a payload whose lanes spell a signaling NaN - an I32 id, an FP32 score - travels
 // intact where the BF16 add would quiet it.
+// Wall-clock nanoseconds for the bounded spin: %globaltimer is a device-wide clock every SM agrees
+// on, unlike clock64(), whose per-SM counters drift apart under boost.
+__device__ __forceinline__ unsigned long long ar_now_ns() {
+    unsigned long long t = 0;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// True once the deadline taken at kernel entry has passed. A zero deadline disables the bound, so a
+// timeout of 0 keeps the transport's behavior exactly as it was before the bound existed.
+__device__ __forceinline__ bool ar_expired(unsigned long long deadline) {
+    return deadline != 0ULL && ar_now_ns() >= deadline;
+}
+
 template <bool kAdd>
 __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
                             char* host_mine_base, const char* host_other_base, int count,
                             int* arrival_mine, int* arrival_other, int* order_mine,
-                            int* token_ptr, int slot_bytes, int groups, int fuse_bump) {
+                            int* token_ptr, int slot_bytes, int groups, int fuse_bump,
+                            int* stall_mine, int* stall_peer, unsigned long long timeout_ns) {
     // The token lives in mapped host memory (either device may run this call), where a per-thread
     // load would be a system-scope read per thread. One read per block is enough: the value is fixed
     // for the whole call, so publish it through shared memory. The single-block decode-sized call
     // (fuse_bump) advances the counter from that same thread instead of running bump_ar_token first:
     // a second launch is pure latency at this payload, and only this device reads its own counter.
     __shared__ int shared_token;
+    // Cooperative give-up: thread 0 is the only spinner, so a timeout is published through shared
+    // memory and every thread leaves the block together. Returning from one thread alone would
+    // deadlock the block at its next __syncthreads.
+    __shared__ int stalled;
+    const unsigned long long deadline = timeout_ns == 0ULL ? 0ULL : ar_now_ns() + timeout_ns;
+    // A tripped pair is one call out of step, so every later rendezvous would wait out its whole
+    // deadline: without this entry check a desynchronized round pays one timeout per allreduce
+    // (about 128 of them) before the host can react. Both flags are read, because either side may
+    // have been the one that gave up.
     if (threadIdx.x == 0) {
-        if (fuse_bump != 0) {
-            const int next            = *(volatile int*)token_ptr + 1;
-            *(volatile int*)token_ptr = next;
-            __threadfence_system();
-            shared_token = next;
-        } else {
-            shared_token = *(const volatile int*)token_ptr;
+        stalled = (*stall_mine != 0 || *stall_peer != 0) ? 1 : 0;
+        if (stalled == 0) {
+            if (fuse_bump != 0) {
+                const int next            = *(volatile int*)token_ptr + 1;
+                *(volatile int*)token_ptr = next;
+                __threadfence_system();
+                shared_token = next;
+            } else {
+                shared_token = *(const volatile int*)token_ptr;
+            }
         }
     }
     __syncthreads();
+    if (stalled != 0) { return; }
     const int token  = shared_token;
     const int stride = blockDim.x;
     const int blocks = gridDim.x;
@@ -141,9 +169,19 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     const auto* other_groups  = reinterpret_cast<const uint4*>(host_other);
     auto* out_groups          = reinterpret_cast<uint4*>(out);
     if (blocks > 1 && blockIdx.x > 0 && threadIdx.x == 0) {
-        while (*(const volatile int*)(order_mine + blockIdx.x - 1) != token) { __nanosleep(100); }
+        while (*(const volatile int*)(order_mine + blockIdx.x - 1) != token) {
+            if (ar_expired(deadline)) {
+                stalled    = 1;
+                *(volatile int*)stall_mine = 1;
+                break;
+            }
+            __nanosleep(100);
+        }
     }
-    if (blocks > 1) { __syncthreads(); }
+    if (blocks > 1) {
+        __syncthreads();
+        if (stalled != 0) { return; }
+    }
     for (int i = begin + threadIdx.x; i < end; i += stride) { mine_groups[i] = local_groups[i]; }
     if (blockIdx.x == 0) {
         for (int i = tail + threadIdx.x; i < count; i += stride) { host_mine[i] = local[i]; }
@@ -154,9 +192,17 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
         *(volatile int*)(order_mine + blockIdx.x)  = token;
         *(volatile int*)(arrival_mine + blockIdx.x) = token;
         __threadfence_system();
-        while (*(const volatile int*)(arrival_other + blockIdx.x) != token) { __nanosleep(100); }
+        while (*(const volatile int*)(arrival_other + blockIdx.x) != token) {
+            if (ar_expired(deadline)) {
+                stalled    = 1;
+                *(volatile int*)stall_mine = 1;
+                break;
+            }
+            __nanosleep(100);
+        }
     }
     __syncthreads();
+    if (stalled != 0) { return; }
     __threadfence_system();
     int i = begin + threadIdx.x;
     for (; i + 3 * stride < end; i += 4 * stride) {
@@ -269,6 +315,45 @@ void DevicePair::note_ar_call(std::size_t count_bytes) {
     watch_->calls.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Fault injection: only the armed process counts collectives, so an unarmed process pays nothing.
+bool DevicePair::fault_skip_peer() {
+    if (ar_fault_skip_call_ == 0) { return false; }
+    ++ar_call_serial_;
+    return ar_call_serial_ == ar_fault_skip_call_;
+}
+
+bool DevicePair::ar_stalled() const noexcept {
+    if (stall_host_ == nullptr) { return false; }
+    const auto* flags = reinterpret_cast<const int*>(stall_host_);
+    return flags[0] != 0 || flags[kArTokenStrideBytes / sizeof(int)] != 0;
+}
+
+long long DevicePair::ar_token_skew() const noexcept {
+    if (token_host_ == nullptr) { return -1; }
+    const int a = token_host_[0];
+    const int b = *reinterpret_cast<const int*>(reinterpret_cast<const char*>(token_host_) +
+                                               kArTokenStrideBytes);
+    return static_cast<long long>(a) - static_cast<long long>(b);
+}
+
+void DevicePair::clear_ar_stall() noexcept {
+    if (stall_host_ != nullptr) {
+        std::memset(stall_host_, 0, 2 * kArTokenStrideBytes);
+    }
+    if (token_host_ == nullptr) { return; }
+    // A stalled pair is at most one call apart (the side that never launched did not bump), so
+    // lifting both counters to the higher value re-arms them on one call number.
+    int* const token_b = reinterpret_cast<int*>(reinterpret_cast<char*>(static_cast<void*>(token_host_)) +
+                                                kArTokenStrideBytes);
+    const int  common  = token_host_[0] > *token_b ? token_host_[0] : *token_b;
+    token_host_[0] = common;
+    *token_b       = common;
+    // Zeroed slots can never equal a later call number (which is always > common), so no stale
+    // arrival or write-order value can satisfy the next spin without the peer actually arriving.
+    if (arrival_host_a_ != nullptr) { std::memset(arrival_host_a_, 0, kArTokenBytes); }
+    if (arrival_host_b_ != nullptr) { std::memset(arrival_host_b_, 0, kArTokenBytes); }
+}
+
 void DevicePair::start_ar_watchdog() {
     if (!watch_ || std::getenv("NINFER_TP2_AR_WATCHDOG") == nullptr) { return; }
     ArWatchState* raw = watch_.get();
@@ -326,6 +411,16 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
     // NINFER_TP2_AR_STRATEGY=kernel pins every payload to the sliced transport, which is the A/B
     // reference for the size-keyed policy.
     ar_size_keyed_ = ar_strategy == nullptr || std::strcmp(ar_strategy, "kernel") != 0;
+    ar_timeout_ns_ = 2000ULL * 1000000ULL; // 2 s: ~700x the slowest measured collective (2.7 ms)
+    if (const char* timeout = std::getenv("NINFER_TP2_AR_TIMEOUT_MS")) {
+        ar_timeout_ns_ = static_cast<unsigned long long>(std::strtoull(timeout, nullptr, 10)) *
+                         1000000ULL;
+    }
+    // Fault injection for the bounded-spin acceptance run: skip the peer launch of one collective so
+    // the pair desynchronizes exactly as a divergent call sequence would. Diagnostics only.
+    if (const char* fault = std::getenv("NINFER_TP2_AR_FAULT_SKIP_PEER_CALL")) {
+        ar_fault_skip_call_ = std::strtoull(fault, nullptr, 10);
+    }
     int can_a_to_b = 0;
     int can_b_to_a = 0;
     const cudaError_t err_a = cudaDeviceCanAccessPeer(&can_a_to_b, device_a, device_b);
@@ -377,6 +472,25 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
                                 token_b_ = reinterpret_cast<int*>(
                                     reinterpret_cast<char*>(static_cast<void*>(token_a_)) +
                                     kArTokenStrideBytes);
+                                // One bounded-spin flag per side, spaced like the tokens.
+                                if (cudaHostAlloc(reinterpret_cast<void**>(&stall_host_),
+                                                  2 * kArTokenStrideBytes, cudaHostAllocPortable |
+                                                      cudaHostAllocMapped) == cudaSuccess) {
+                                    std::memset(stall_host_, 0, 2 * kArTokenStrideBytes);
+                                    if (cudaHostGetDevicePointer(
+                                            reinterpret_cast<void**>(&stall_a_), stall_host_,
+                                            0) == cudaSuccess) {
+                                        stall_b_ = reinterpret_cast<int*>(
+                                            reinterpret_cast<char*>(static_cast<void*>(stall_a_)) +
+                                            kArTokenStrideBytes);
+                                    } else {
+                                        stall_a_ = nullptr;
+                                        tokens   = false;
+                                    }
+                                } else {
+                                    stall_host_ = nullptr;
+                                    tokens      = false;
+                                }
                             }
                         }
                         if (tokens) {
@@ -416,6 +530,9 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
             if (token_host_) { cudaFreeHost(token_host_); token_host_ = nullptr; }
             token_a_ = nullptr;
             token_b_ = nullptr;
+            if (stall_host_) { cudaFreeHost(stall_host_); stall_host_ = nullptr; }
+            stall_a_ = nullptr;
+            stall_b_ = nullptr;
         }
     }
     if (in_kernel_available_) {
@@ -440,6 +557,7 @@ DevicePair::~DevicePair() {
     if (arrival_host_a_) { cudaFreeHost(arrival_host_a_); }
     if (arrival_host_b_) { cudaFreeHost(arrival_host_b_); }
     if (token_host_) { cudaFreeHost(token_host_); }
+    if (stall_host_) { cudaFreeHost(stall_host_); }
     if (small_host_a_) { cudaFreeHost(small_host_a_); }
     if (small_host_b_) { cudaFreeHost(small_host_b_); }
 }
@@ -451,7 +569,10 @@ DevicePair::DevicePair(DevicePair&& other) noexcept
       dev_a_(other.dev_a_), dev_b_(other.dev_b_), arrival_a_(other.arrival_a_),
       arrival_b_(other.arrival_b_), arrival_host_a_(other.arrival_host_a_),
       arrival_host_b_(other.arrival_host_b_), token_host_(other.token_host_),
-      token_a_(other.token_a_), token_b_(other.token_b_), ar_size_keyed_(other.ar_size_keyed_),
+      token_a_(other.token_a_), token_b_(other.token_b_), stall_host_(other.stall_host_),
+      stall_a_(other.stall_a_), stall_b_(other.stall_b_), ar_timeout_ns_(other.ar_timeout_ns_),
+      ar_call_serial_(other.ar_call_serial_), ar_fault_skip_call_(other.ar_fault_skip_call_),
+      ar_size_keyed_(other.ar_size_keyed_),
       small_available_(other.small_available_), small_host_a_(other.small_host_a_),
       small_host_b_(other.small_host_b_), small_dev_a_(other.small_dev_a_),
       small_dev_b_(other.small_dev_b_) {
@@ -469,6 +590,9 @@ DevicePair::DevicePair(DevicePair&& other) noexcept
     other.token_host_       = nullptr;
     other.token_a_          = nullptr;
     other.token_b_          = nullptr;
+    other.stall_host_       = nullptr;
+    other.stall_a_          = nullptr;
+    other.stall_b_          = nullptr;
 }
 
 DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
@@ -490,8 +614,13 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     token_host_          = other.token_host_;
     token_a_             = other.token_a_;
     token_b_             = other.token_b_;
+    stall_host_          = other.stall_host_;
+    stall_a_             = other.stall_a_;
+    stall_b_             = other.stall_b_;
+    ar_timeout_ns_       = other.ar_timeout_ns_;
+    ar_call_serial_      = other.ar_call_serial_;
+    ar_fault_skip_call_  = other.ar_fault_skip_call_;
     stop_ar_watchdog();
-    watch_               = std::move(other.watch_);
     watch_               = std::move(other.watch_);
     ar_size_keyed_       = other.ar_size_keyed_;
     small_available_     = other.small_available_;
@@ -508,6 +637,9 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     other.token_host_       = nullptr;
     other.token_a_          = nullptr;
     other.token_b_          = nullptr;
+    other.stall_host_       = nullptr;
+    other.stall_a_          = nullptr;
+    other.stall_b_          = nullptr;
     other.small_available_  = false;
     other.small_host_a_     = nullptr;
     other.small_host_b_     = nullptr;
@@ -552,38 +684,44 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
             // launch off every call, and 128 calls ride each decode round. The thread count stays at
             // kArThreads: a smaller block regressed, because the payload's cost is the mapped-host
             // round trip and the group loops want the parallelism.
+            const bool skip_peer = fault_skip_peer();
             a_.bind_to_current_thread();
             ar_exchange<true><<<1, kArThreads, 0, stream_a>>>(
                 reinterpret_cast<const __nv_bfloat16*>(data_a),
                 reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(small_dev_a_),
                 static_cast<const char*>(small_dev_b_), count, arrival_a_, arrival_b_, order_a,
-                token_a_, static_cast<int>(kArSmallBytes), groups, 1);
-            b_.bind_to_current_thread();
-            ar_exchange<true><<<1, kArThreads, 0, stream_b>>>(
-                reinterpret_cast<const __nv_bfloat16*>(data_b),
-                reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(small_dev_b_),
-                static_cast<const char*>(small_dev_a_), count, arrival_b_, arrival_a_, order_b,
-                token_b_, static_cast<int>(kArSmallBytes), groups, 1);
+                token_a_, static_cast<int>(kArSmallBytes), groups, 1, stall_a_, stall_b_, ar_timeout_ns_);
+            if (!skip_peer) {
+                b_.bind_to_current_thread();
+                ar_exchange<true><<<1, kArThreads, 0, stream_b>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(data_b),
+                    reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(small_dev_b_),
+                    static_cast<const char*>(small_dev_a_), count, arrival_b_, arrival_a_, order_b,
+                    token_b_, static_cast<int>(kArSmallBytes), groups, 1, stall_b_, stall_a_, ar_timeout_ns_);
+            }
             return;
         }
         const int slices     = ar_slices(count_bytes);
         const int slot_bytes = static_cast<int>(kInKernelArBytes);
         // Each device advances its own token before running the kernel, and the kernel derives its
         // double-buffer parity from that value, so a captured sequence needs no host-side counter.
+        const bool skip_peer = fault_skip_peer();
         a_.bind_to_current_thread();
         bump_ar_token<<<1, 1, 0, stream_a>>>(token_a_);
         ar_exchange<true><<<slices, kArThreads, 0, stream_a>>>(
             reinterpret_cast<const __nv_bfloat16*>(data_a),
             reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(dev_a_),
             static_cast<const char*>(dev_b_), count, arrival_a_, arrival_b_, order_a, token_a_,
-            slot_bytes, groups, 0);
-        b_.bind_to_current_thread();
-        bump_ar_token<<<1, 1, 0, stream_b>>>(token_b_);
-        ar_exchange<true><<<slices, kArThreads, 0, stream_b>>>(
-            reinterpret_cast<const __nv_bfloat16*>(data_b),
-            reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(dev_b_),
-            static_cast<const char*>(dev_a_), count, arrival_b_, arrival_a_, order_b, token_b_,
-            slot_bytes, groups, 0);
+            slot_bytes, groups, 0, stall_a_, stall_b_, ar_timeout_ns_);
+        if (!skip_peer) {
+            b_.bind_to_current_thread();
+            bump_ar_token<<<1, 1, 0, stream_b>>>(token_b_);
+            ar_exchange<true><<<slices, kArThreads, 0, stream_b>>>(
+                reinterpret_cast<const __nv_bfloat16*>(data_b),
+                reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(dev_b_),
+                static_cast<const char*>(dev_a_), count, arrival_b_, arrival_a_, order_b, token_b_,
+                slot_bytes, groups, 0, stall_b_, stall_a_, ar_timeout_ns_);
+        }
         return;
     }
     if (p2p_) {
@@ -668,32 +806,40 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
         int*      order_a = reinterpret_cast<int*>(reinterpret_cast<char*>(arrival_a_) + kArSlotBytes);
         int*      order_b = reinterpret_cast<int*>(reinterpret_cast<char*>(arrival_b_) + kArSlotBytes);
         if (ar_size_keyed_ && small_available_ && count_bytes <= kArSmallBytes) {
+            const bool skip_peer = fault_skip_peer();
             a_.bind_to_current_thread();
             ar_exchange<false><<<1, kArThreads, 0, stream_a>>>(
                 static_cast<const __nv_bfloat16*>(send_a), static_cast<__nv_bfloat16*>(recv_a),
                 static_cast<char*>(small_dev_a_), static_cast<const char*>(small_dev_b_), count,
-                arrival_a_, arrival_b_, order_a, token_a_, static_cast<int>(kArSmallBytes), groups, 1);
-            b_.bind_to_current_thread();
-            ar_exchange<false><<<1, kArThreads, 0, stream_b>>>(
-                static_cast<const __nv_bfloat16*>(send_b), static_cast<__nv_bfloat16*>(recv_b),
-                static_cast<char*>(small_dev_b_), static_cast<const char*>(small_dev_a_), count,
-                arrival_b_, arrival_a_, order_b, token_b_, static_cast<int>(kArSmallBytes), groups, 1);
+                arrival_a_, arrival_b_, order_a, token_a_, static_cast<int>(kArSmallBytes), groups, 1,
+                stall_a_, stall_b_, ar_timeout_ns_);
+            if (!skip_peer) {
+                b_.bind_to_current_thread();
+                ar_exchange<false><<<1, kArThreads, 0, stream_b>>>(
+                    static_cast<const __nv_bfloat16*>(send_b), static_cast<__nv_bfloat16*>(recv_b),
+                    static_cast<char*>(small_dev_b_), static_cast<const char*>(small_dev_a_), count,
+                    arrival_b_, arrival_a_, order_b, token_b_, static_cast<int>(kArSmallBytes), groups, 1,
+                    stall_b_, stall_a_, ar_timeout_ns_);
+            }
             return;
         }
         const int slices     = ar_slices(count_bytes);
         const int slot_bytes = static_cast<int>(kInKernelArBytes);
+        const bool skip_peer = fault_skip_peer();
         a_.bind_to_current_thread();
         bump_ar_token<<<1, 1, 0, stream_a>>>(token_a_);
         ar_exchange<false><<<slices, kArThreads, 0, stream_a>>>(
             static_cast<const __nv_bfloat16*>(send_a), static_cast<__nv_bfloat16*>(recv_a),
             static_cast<char*>(dev_a_), static_cast<const char*>(dev_b_), count, arrival_a_,
-            arrival_b_, order_a, token_a_, slot_bytes, groups, 0);
-        b_.bind_to_current_thread();
-        bump_ar_token<<<1, 1, 0, stream_b>>>(token_b_);
-        ar_exchange<false><<<slices, kArThreads, 0, stream_b>>>(
-            static_cast<const __nv_bfloat16*>(send_b), static_cast<__nv_bfloat16*>(recv_b),
-            static_cast<char*>(dev_b_), static_cast<const char*>(dev_a_), count, arrival_b_,
-            arrival_a_, order_b, token_b_, slot_bytes, groups, 0);
+            arrival_b_, order_a, token_a_, slot_bytes, groups, 0, stall_a_, stall_b_, ar_timeout_ns_);
+        if (!skip_peer) {
+            b_.bind_to_current_thread();
+            bump_ar_token<<<1, 1, 0, stream_b>>>(token_b_);
+            ar_exchange<false><<<slices, kArThreads, 0, stream_b>>>(
+                static_cast<const __nv_bfloat16*>(send_b), static_cast<__nv_bfloat16*>(recv_b),
+                static_cast<char*>(dev_b_), static_cast<const char*>(dev_a_), count, arrival_b_,
+                arrival_a_, order_b, token_b_, slot_bytes, groups, 0, stall_b_, stall_a_, ar_timeout_ns_);
+        }
         return;
     }
     if (p2p_) {

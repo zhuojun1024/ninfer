@@ -38,6 +38,29 @@ public:
     // host-staging fallbacks synchronize the caller's streams.
     bool in_kernel_allreduce() const noexcept { return in_kernel_available_; }
 
+    // Bounded-spin safety for the in-kernel transport. Every rendezvous spin carries a wall-clock
+    // deadline (NINFER_TP2_AR_TIMEOUT_MS, default 2000, 0 disables it): a spin that can never be
+    // satisfied would otherwise pin both devices at 100% forever and freeze the whole process. On
+    // expiry the side that gave up raises its mapped flag and the kernel returns, so the caller's
+    // streams drain and the request can fail instead of the service locking up. A stalled pair is
+    // one call out of step: the caller must synchronize both streams, call clear_ar_stall(), and
+    // discard any state the stalled round may have half-written.
+    [[nodiscard]] bool ar_stalled() const noexcept;
+    // Difference between the two sides' call counters, or a negative value when the in-kernel
+    // transport is not in use. Non-zero means the rendezvous is already broken.
+    [[nodiscard]] long long ar_token_skew() const noexcept;
+    // Re-arms the rendezvous after a stall: equalizes the two call counters and clears the arrival
+    // and write-order slots, so no stale value can satisfy a later spin. Both streams must be
+    // synchronized before this call.
+    void clear_ar_stall() noexcept;
+    // Fault injection for the bounded-spin test: skip the peer-side launch of the n-th in-kernel
+    // collective issued after arming (1-based; 0 disarms). It desynchronizes the two sides exactly
+    // like a divergent call sequence, which is the failure the bound exists for. Diagnostics only.
+    void set_ar_fault_skip_peer_call(std::uint64_t serial) noexcept {
+        ar_fault_skip_call_ = serial;
+        ar_call_serial_     = 0;
+    }
+
     // In-place all-reduce of count_bytes (multiple of 16): on return both
     // buffers contain a + b elementwise. stream_a/stream_b are the compute
     // streams that produced data_a/data_b. The P2P path runs peer copies plus
@@ -95,6 +118,14 @@ private:
     int* token_host_ = nullptr; // cudaFreeHost handle
     int* token_a_    = nullptr; // device pointer into token_host_
     int* token_b_    = nullptr; // device pointer into token_host_
+    // Bounded-spin state: one mapped flag per side, a cache line apart like the tokens, plus the
+    // deadline handed to every kernel launch (see ar_stalled).
+    int* stall_host_ = nullptr; // cudaFreeHost handle: 2 * kArTokenStrideBytes
+    int* stall_a_    = nullptr; // device pointer to side a's own flag
+    int* stall_b_    = nullptr; // device pointer to side b's own flag
+    unsigned long long ar_timeout_ns_ = 0; // 0 disables the deadline
+    std::uint64_t ar_call_serial_     = 0; // in-kernel collectives issued since the last arming
+    std::uint64_t ar_fault_skip_call_ = 0; // fault injection, see set_ar_fault_skip_peer_call
     // Size-keyed transport policy for the in-kernel route. A decode-sized payload is a latency
     // problem: one block, one launch, and its own compact staging so the two parity slots never
     // alias the prefill-sized ones. A prefill-sized payload is a bandwidth problem and keeps the
@@ -112,6 +143,8 @@ private:
     std::shared_ptr<ArWatchState> watch_;
     void note_ar_call(std::size_t count_bytes);
     void stop_ar_watchdog();
+    // True when the injected collective is the one whose peer launch must be skipped.
+    bool fault_skip_peer();
 };
 
 // Non-owning view of one shard of a tensor split along dim. The local tensor

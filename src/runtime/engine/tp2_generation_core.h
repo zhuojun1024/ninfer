@@ -435,6 +435,12 @@ private:
     // forwarded until the first decode round, so a finished response's frontier is one token short
     // of its history.
     void session_publish(const std::vector<TokenId>& history, std::uint32_t frontier);
+    // The in-kernel transport gives up on its deadline instead of waiting forever (see DevicePair),
+    // so a stalled rendezvous no longer freezes the process: it surfaces here as a round whose data
+    // is a local partial sum rather than an allreduce result. Fails the request with the retryable
+    // engine status and discards every reusable prefix, because the stalled round may have
+    // half-written KV and GDN state; the next request prefills from scratch.
+    void abort_if_ar_stalled();
     // Retires the prefix-reuse checkpoint ring. A checkpoint is only usable while every prompt that
     // followed the prefill that wrote it agreed on the tokens before its position; once the device
     // pools hold another session, that chain is broken even though the ring's positions may still
