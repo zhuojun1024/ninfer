@@ -341,18 +341,34 @@ req#35–#39（客户端约每 5 分钟重试）被接受但永不推进 ⇒ 6 �
 - [ ] 验收：故障注入（人为让一侧少一次合算／丢一次发布）必须表现为"该请求 5xx + 服务存活 + 下一请求正常"；
       真实 agent 流量连续 ≥1 h 无永久挂死；prefill/decode A/B 回退 ≤1%。
 
-**Phase 2 —— id 权威化（删掉整类 desync）**
-- [ ] `device_pair.{h,cu}`：删除 `token_host_/token_a_/token_b_`、`bump_ar_token`、`fuse_bump` 小通路与
-      `ar_size_keyed_` 策略开关；新增 `begin_capture()/end_capture(n_calls)/set_round_base(base)` 与每设备
-      pinned base cell + device 标量；`ar_exchange` 的 `token_ptr` 换成 `(base_dev, call_index)`。
-- [ ] `src/core/decode_graph.{h,cpp}`：不改语义，仅由调用方在 `capture_group` 前后调用 transport 的 capture
-      钩子（显式优先于用 `cudaStreamIsCapturing` 隐式判定）。
-- [ ] `src/runtime/engine/tp2_generation_core.cpp`：三个捕获点接钩子——`capture_verify_graph`（:949）、
-      `capture_decode_graph`（:1055）、`capture_mtp_chain_graph`（:1193）；三块 pinned window
-      （`tp2_generation_core.h:386-398`）各带一个 `base`；`launch_window_graph`（:941）前写 base。
-      9 个模型侧 `pair.allreduce/sendrecv` 调用点**不需要改**（id 由 transport 自持）。
-- [ ] 验收：`ninfer_tp2_device_pair_test`（含 `check_graph_queue`）+ 60 轮图压力零挂死；DFlash2 solo digest 与
-      append K=7/K=5 金值不变；r57 贪心探针接受率与吞吐不退化。
+**Phase 2 —— id 权威化（删掉整类 desync）** ✅ 已完成（2026-09-23）
+- [x] `device_pair.{h,cu}`：删除 `token_host_/token_a_/token_b_`、`bump_ar_token`、`fuse_bump` 与
+      `ar_size_keyed_`/`NINFER_TP2_AR_STRATEGY`。落地形态比原计划更严，三处偏离都是有意的：
+      - **每个捕获图一条 id 通道**（`create_ar_channel()`，通道 k 占 `[(k+1)<<32, …)`），而不是"每设备一格 pinned cell"：
+        每轮三个 window 各 launch 一次，共用一格会在上一个 launch 的 memcpy node 执行前就被下一次写掉而串值。
+        每通道 = 一格 pinned cell + 每设备一个 device 标量（图内 memcpy node 的源与目标）。
+      - **id 全程 64 位**（arrival/order 槽改 `unsigned long long`）：32 位截断会让不同通道的 id 段撞值，
+        那样陈旧槽又能满足未来的自旋——正是要根除的那一类。
+      - **eager 走 64 位 kernel 实参**（从 `1<<62` 起、独立区间），不用 mapped cell：eager 调用会背靠背入队，
+        共用一格同样会读到后一个 id。内核只做 `token = base_dev ? *base_dev + call_index : value`，
+      `call_index` 是捕获期常量，烘进实参是安全的（烘 id 不安全）。
+      - 钩子为 `begin_capture(channel)/end_capture()/arm_round(channel)`：`end_capture` 自记 `calls`（少一处真相）；
+        `ar_token_skew()` 删除（计数器概念消失）→ `ar_last_id()` 供错误消息与看门狗；
+        `clear_ar_stall()` 只清 trip 标志——**id 永不重复 ⇒ 陈旧槽不可能满足未来自旋 ⇒ 停滞那一轮原地可恢复**，
+        这是 Phase 2 相对 Phase 1 的实质收益。
+- [x] `src/core/decode_graph.{h,cpp}`：**未改**（钩子由调用方显式调，未使用 `cudaStreamIsCapturing` 隐式判定）。
+- [x] `src/runtime/engine/tp2_generation_core.{h,cpp}`：`WindowGraph` 增 `ar_channel`；三个捕获点接钩子
+      （`capture_verify_graph`/`capture_decode_graph`/`capture_mtp_chain_graph`）；`launch_window_graph` 先 `arm_round`。
+      9 个模型侧 `allreduce/sendrecv` 调用点确实**一行未改**。
+- [x] 验收（2026-09-23）：
+      `ninfer_tp_device_pair_test` PASS——含改造后的 `check_graph_queue`：**逐次重放换新操作数**（否则 id 复用根本测不出来，
+      旧操作数会让陈旧槽照样"通过"）+ 每轮 `arm_round`；
+      `tp2_dflash_solo`(solo digest)、`tp2_dflash_append`(K=7/K=5)、3× `linear_tp2_split` 全 PASS；
+      `tp2_sessions` 仍以**改动前逐字节相同**的序列失败（既有 ulp 非契约，未被扰动）；
+      服务级注入 3000：`HTTP 503 | TP-2 allreduce stalled at rendezvous id 4294968076`
+      （`= (1<<32) + 1548` ⇒ 正是通道 1 的段，证明 base 确实经图内 memcpy node 送达）⇒ 下一条请求 HTTP 200；
+      同轮 `decode 120.4 tok/s / dflash2 accepted 782/1,200 (65.2%)` 与 Phase 1 的 120.0/65.2% 完全一致（无性能回退）；
+      看门狗 dump 同时出现 `12884914887`(通道 3) 与 `4611686018427390359`(eager `1<<62`+) ⇒ 多通道与双区间并存互不干扰。
 
 **Phase 3 —— 大 payload 事件路径（A/B 决定，选做）**
 - [ ] 照上游形态实现 D2H/H2D 分块 + 专用 non-blocking copy stream + compute stream 上 add，跨流安全靠
@@ -387,6 +403,7 @@ req#35–#39（客户端约每 5 分钟重试）被接受但永不推进 ⇒ 6 �
       `ninfer_tp_device_pair_test`（含新注入用例）**PASS**；`ninfer_qwen3_5_tp2_dflash_solo_test`（solo digest）**PASS**；`ninfer_qwen3_5_tp2_dflash_append_test`（K=7/K=5 哈希）**PASS**；3× `ninfer_linear_tp2_split_*` **PASS**；
       `tp2_sessions_test`(plain recall 序列分叉)、`dflash2_real_test`(1.7 s cudaMalloc OOM)、`dflash_real_test`(0xc0000409 快败) 三项**在改动前 HEAD 上逐字节/同码复现** ⇒ 既有问题与本次无关
       （sessions 即 worklog 记的"热引擎从零重放不保证与冷 oracle 逐 token 相同"的 ulp 非契约；另两项为 artifact/环境类，docs 未收录这两个用例名）。
+- [x] **Phase 2（2026-09-23）**：见上方 Phase 2 清单（id 权威化完成，验收证据同处；改动未提交，待用户确认）。
       **部署注意**：`build-win/apps/ninfer-serve.exe` **不会**自动同步到 `C:\ninfer\`，需手动复制；PE 时间戳使每次链接的 hash 都不同，比对以"部署件与 build-win 产出 `Get-FileHash` 相等"为准（本轮已同步，`108AD767…`）。
 - [x] 停掉卡死进程并留档日志（2026-09-23；显存立即清零；残留自旋内核约 2 分钟后自行回落）
 - [x] 测量前置确认：两卡空闲占用已归零（2026-09-23 21:49，无需重启）
