@@ -57,6 +57,23 @@ int q5_a16_conformance() {
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
                           {7168, 5120, 163U, Comparison::Sampled, false, kN7168K5120});
 
+    constexpr std::array kN5120K4096{
+        a16(1),
+        a16(2),
+        a16(3),
+        a16(4),
+        a16(5),
+        a16(6),
+        Invocation{4, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true},
+        Invocation{6, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true},
+        a16(7),
+        a16(24),
+        a16(25),
+        a16(128),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {5120, 4096, 175U, Comparison::Sampled, false, kN5120K4096});
+
     constexpr std::array kN5120K6144{
         a16(1),
         a16(2),
