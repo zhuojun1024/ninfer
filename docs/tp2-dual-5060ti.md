@@ -406,6 +406,16 @@ Observable behaviour:
 - A returning conversation reports `reused_prompt_tokens == frontier` (its whole stored history) and
   the prefill only walks the new suffix. The frontier is one token short of the history, because the
   last sampled token is not forwarded until the next round.
+- A conversation that continues in place - the agent loop, where no other conversation runs in
+  between - has no reuse checkpoint past its own previous prompt: decode publishes none, so the only
+  grid-aligned candidate is the rewind snapshot at that prompt's chunk start, with the whole generated
+  answer behind it. The scan takes the committed frontier itself instead, off the prefill grid, so the
+  tail of the last answer is not prefilled a second time.
+- Every generated token is published, including the one the prefill itself samples, so a client that
+  sends an answer back the way it received it re-tokenizes to the stored tokens and reaches the frontier above
+  rather than stopping at the previous prompt. The first token is committed through the output policy like every
+  later one; a token that bypassed it would be missing from the answer and would leave the pools and the session
+  catalog describing a history one token longer than any client could send back.
 - A recall restores byte-identical KV, so a returning conversation reproduces a from-scratch prefill
   of the same prompt up to the prefill's own chunk-boundary rounding. That residue is small but not
   zero: an exact logit tie can still flip a sampled token, so the session tests assert the recalled
@@ -425,7 +435,14 @@ Constraints and limits:
 - Shard 0's arena also carries the MTP layer's own KV (~2 KiB/token), so a symmetric split spends a
   little of shard 0's budget on it.
 - A client that re-renders its history so it no longer starts with the stored token sequence cannot
-  be recalled; that request falls back to a full prefill, exactly as before.
+  reach the frontier; it restarts at the deepest boundary it still shares, which is the state frozen at
+  the previous prompt's end when the divergence sits at the first generated token.
+- On the masked-draft route an off-grid boundary is only taken when the prefill it skips beats sixteen
+  tokens per token the request may still generate: the restored draft ring belongs to a differently
+  chunked walk, so such a request runs target-only while it generates. A request with a large output
+  budget therefore re-prefills its own tail on purpose instead of paying a slower decode for it.
+- `--chat-template FILE` reaches this route: the core builds the serving frontend with the option, so a
+  maintained template can replace the artifact's embedded one.
 - Session switching happens at request boundaries only. A request that arrives while another is
   generating waits for it, because TP-2 runs one request at a time.
 

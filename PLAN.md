@@ -686,3 +686,81 @@ ncu 对 `causal_attention_prompt_k8v4_kernel`（W=1024、65,536 深度、k8v4、
 
 **顺带修复**：`bench/context_cost/model_context_fixture.cpp` 的 `__int128` 改为等价的 uint64 溢出检查（两个累加项各自不溢出，只需检查其和），
 `-DNINFER_BUILD_BENCHMARKS=ON` 现在在 Windows 可正常构建（已用默认目标 `cmake --build build-win` 验证通过）。
+
+---
+
+## 4. DSH/agent-loop 前缀复用修复（2026-09-24，进行中）
+
+**问题**：DSH 接入 ninfer 的 agent loop 里，某轮生成大 tool call（写大文件，24k token）后，
+下一轮必须把这 24k token 重新 prefill（实测 req#3：prompt 34,050 / cache 9,216 / prefill 24,834 tok / TTFT 17.0s）。
+
+**已确证（NINFER_TP2_REUSE_TRACE=1 / NINFER_TP2_SESSION_TRACE=1 实测）**：
+1. 引擎保存了上一轮完整历史（`cached` = prompt+generated），但 `shared` 等于上一轮 **prompt** 长度
+   （332/331/315 三例），即**第一个生成 token 就不匹配** → 只能从上一轮 prompt 末尾重启。
+2. 用 `/v1/chat/completions` 原样回放 `reasoning_content` 复现同样结果 → 不是 DSH 特有。
+3. artifact 内嵌模板对 `reasoning_content` 做 `|trim`，把模型生成的首个空格吃掉（实测
+   `"ABCD"` 与 `"  ABCD  "` 渲染出的 prompt 长度完全相同）；而模型 reasoning 首个 token 带前导空格，
+   因此任何文本回放都无法逐 token 复现。
+4. TP-2 路线自建 frontend 时**漏传 `chat_template_path`**（`tp2_generation_core.cpp:472-480`），
+   所以 `--chat-template` 在该路线被静默忽略（实测 developer 角色仍报 `artifact:chat_template.jinja`）。
+5. 复用扫描里"对齐边界优先"会遮蔽更深的未对齐 live frontier，只有在 `reuse == 0` 时才走兜底；
+   而 DFlash2 的兜底带代价门控（放弃 draft ≈ 3× 解码变慢 vs 省下的 prefill）。
+
+**结果（2026-09-24）**：
+- [x] A `tp2_generation_core.cpp`：TP-2 frontend 透传 `chat_template_path`。实测：部署新件并带
+      `--chat-template` 重启后，`developer` 角色由 400 变 200（覆盖真正生效）。
+- [x] C `tp2_generation_core.cpp`：兜底边界扫描改为无条件第二轮，门控改用"边际节省"
+      （`position - reuse`），对齐边界仍是最低优先级。`dflash2`/`mtp` 两路 `ninfer_qwen3_5_tp2_sessions_test` PASS。
+- [x] D `tests/models/qwen3_5/test_tp2_sessions.cpp`：新增常驻会话连续两轮用例（1000 token prompt；
+      二轮期望 plain/mtp = 1007、dflash2 = 768）。没有 C 时 plain/mtp 会停在 768，用例能抓住该改动。
+- [x] E 构建（`nm`/ninja，测试目标 + `ninfer-serve` 并同步 `C:\ninfer\ninfer-serve.exe`）+ 测试 +
+      在线复测；证据：`profiles/sessions-{dflash2,mtp,plain-trace,all}.log`、`profiles/reuse-trace*.log`。
+- [x] F 文档：`docs/tp2-dual-5060ti.md` 增补常驻连续两轮、门控与 `--chat-template` 说明。
+- [~] B 模板 `|trim` → `rstrip('\n')`：**已回退（实测否定）**。覆盖为维护模板后原样回放
+      `reasoning_content` 仍得 `shared == 上一轮 prompt 长度`，与 artifact 模板结果一致。
+
+**残留根因（新发现，未修）**：文本协议回放无法逐 token 复现。`max_tokens=1` 时实测
+`completion_tokens=1 / reasoning_tokens=0 / reasoning_content 为空`；k=2 得 `" need"`、k=3 得
+`" need answer"`，而回放一律停在 `shared=72`（上一轮 prompt 长度）。即**第一个生成 token 不在已发布的
+reasoning 文本里**（或回放重分词与采样边界不同），因此 DFlash2 上"复用上一轮回答尾部"对任何文本客户端
+都不可达。再叠加门控（放弃 draft ≈ 3× 解码 vs 省下 prefill），32k 输出预算下重算 24.8k token（17 s）
+是代价模型下的**理性选择**。
+
+**可选杠杆**：客户端输出预算（`remaining` 需 < 节省量/16 ≈ 1.5k token 才触发复用）；让 DFlash2 在
+未对齐复用下保持 draft（需要先解决 `extent=0` 钳位轮的可复现性）；或走携带 token id 的续写协议。
+
+**既有失败（与本次改动无关）**：`NINFER_TEST_ROUTE=plain` 在 `shared_a_first` 处 `reuse=0/src=none`
+的从零 walk 与冷 oracle 首 token 不同（`[2752 13 198 …]` vs `[365 2798 349 …]`）。trace 证明该场景及
+其之前所有复用决策（0/71/512）与测试期望一致，新扫描路径在 `shared_prefix=0` 时不可能取任何边界。
+
+## 5. TP-2 首个生成 token 不发布（2026-09-24，已修）
+
+**现象**：`max_tokens=1` 时 `completion_tokens=1 / reasoning_tokens=0 / 无文本`；`max_tokens=k` 只发布 k−1 个 token
+的文本；逐字节回放上一轮回答（chat-completions 原样回传 `reasoning_content`+`content`，带/不带 tools、换模板都一样）时
+`shared` 永远等于上一轮 prompt 长度（实测 67 / 306 / 72）。于是 TP-2 上"复用上一轮回答尾部"对任何文本客户端都不可达，
+`cache` 在服务日志里恒为 `floor(上一轮 prompt/1024)×1024`。
+
+**根因**：`src/runtime/engine/tp2_generation_core.cpp` 的 prefill 末尾用 `request.generated.push_back(first)` 直接落账，
+**没有经过输出会话**（`preview_model`/`commit_preview`）。单卡路线会把 prefill 采样的首 token 经
+`commit_pending`→`preview_model` 提交（`src/runtime/engine/engine_core.h`），TP-2 是唯一漏掉的路线；因此
+`generated`（KV/状态/会话目录索引的序列）比"已发布文本"多一个 token。
+
+**修复**：prefill 采样后 `preview_model({first}, budget.remaining(), limit_reason())` → `budget.commit` →
+`publish_preview(false)`；若该决策已终止请求（stop token 或预算用尽）则记入 `first_token_finish` 并跳过 decode 循环。
+这也顺带修掉"首 token 是 stop token 时引擎仍继续生成"和首 token 未受语法约束（前者已修，后者记录为独立遗留项）。
+
+**验证**（证据：`C:\ninfer\serve-win.log` 的 `[tp2-reuse]` trace、`profiles/fixtok-*.log`）：
+- `max_tokens=1` → `reasoning_tokens=1`、`R="We"`（修复前 0 / 空）。
+- 回放 40 token 回答：`shared=107`（= 67 prompt + 40 生成；修复前 67）。
+- 回放 1400 token 回答：`reuse=1470 src=live` = 整个上一轮回答（DFlash2 按门控对该 1-token 请求弃稿，代价可忽略）。
+- `ninfer_qwen3_5_tp2_sessions_test`：dflash2 / mtp 均 PASS（既有断言无回归）。
+- 新增用例 `check_first_token_published`：thinking 开、输出预算 1 token 时 `reasoning_tokens` 必须为 1。
+
+**残留（未修）**：门控仍按 `max(reuse_grid, 16 × 剩余预算)` 决定是否取未对齐边界，所以 DSH 的 32,768 预算下长回答仍会整段重算
+（代价模型下的理性选择）；prefill 的首个 sample 仍未应用工具语法掩码（TP-2 prefill 与 decode 路径的不对称，独立遗留项）。
+
+**附带观察（未修，独立）**：在服务实例上以 `temperature: 0` 连发同一请求 3 次，前 4 个 token 出现两种结果
+（`"The user wants me"` / `"We need to respond"`）。`src/serve/translate.cpp:38-88` 会把请求里的 temperature 覆盖到服务默认值上，
+所以温度确实被应用；DFlash2 的稀疏接受（`speculative_accept_sparse_drafts`）配合每次请求随机 seed（`translate.cpp:51-57`）
+使解码在温度 0 下也不保证逐位 argmax——这正是 `--greedy`（"force temperature 0 (exact argmax)"）存在的原因。
+需要可复现 A/B 时应加 `--greedy`；这条独立于本次修复，未改动。

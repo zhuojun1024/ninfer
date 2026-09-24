@@ -41,6 +41,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -122,6 +124,17 @@ bool draft_rounds_down(Route route, std::uint32_t boundary) {
 bool draft_declined(Route route, std::uint32_t boundary) {
     return route == Route::DFlash2 && boundary != 0 && boundary % kPrefillChunk != 0 &&
            !draft_rounds_down(route, boundary);
+}
+// The exit-path scan prices an unaligned boundary against the masked draft: the restored ring is the
+// one a differently chunked walk froze, so taking the boundary runs the request target-only for as
+// long as it generates. A boundary only wins when the prefill it skips beats sixteen tokens per token
+// the request may still generate (tp2_generation_core.cpp). A resident continuation's frontier is
+// unaligned and its clip is the distance back to the previous prompt's own chunk start, so the
+// scenario below has to pin which of the two boundaries each route lands on.
+bool resident_tail_rounds_down(Route route, std::uint32_t frontier, std::uint32_t aligned,
+                               std::uint32_t remaining) {
+    return route == Route::DFlash2 && frontier != aligned &&
+           frontier - aligned <= std::max(kPrefillChunk, 16U * remaining);
 }
 
 ninfer::EngineOptions engine_options(const char* artifact, int device_a, int device_b,
@@ -258,6 +271,42 @@ int compare_recall(const std::string& label, const char* what, Route route, std:
 }
 
 // One full A/B/A/LRU scenario. Returns 0 on success, 1 on a failed assertion.
+// The first token the prefill samples is a generated token like every later one, so it has to reach
+// the output policy. The policy owns the published text, the reasoning/content split and the
+// stop-token decision, and a token that bypasses it is never published at all. The pools, the
+// session catalog and the published answer then describe histories one token apart, so a client that
+// replays an answer never reaches the tail of it - no cache setting can repair that, which is why
+// the usage counter is the observable to pin: with the thinking phase open, a request whose whole
+// budget is one token has to report that one token as reasoning.
+int check_first_token_published(const char* artifact, int device_a, int device_b, Route route) {
+    const std::string label = std::string("first token (") + route_name(route) + ")";
+    ninfer::Engine engine(engine_options(artifact, device_a, device_b, false, route));
+    ninfer::PromptInput input;
+    input.options.enable_thinking = true;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    ninfer::MessagePart question;
+    question.kind = ninfer::MessagePartKind::Text;
+    question.text = "How many trailing zeros does 100! have?";
+    user.parts.push_back(std::move(question));
+    input.messages.push_back(std::move(user));
+
+    ninfer::RequestOptions request            = greedy_request();
+    request.execution.requested_output_tokens = 1;
+    const ninfer::GenerationResult result =
+        engine.generate(engine.prepare(std::move(input)), request);
+    if (result.generated_token_ids.size() != 1) {
+        return fail(label, "a one-token budget produced " +
+                               std::to_string(result.generated_token_ids.size()) + " tokens");
+    }
+    if (result.reasoning_tokens != 1) {
+        return fail(label, "the first generated token was not published: " +
+                               std::to_string(result.reasoning_tokens) +
+                               " reasoning tokens for 1 generated token");
+    }
+    return 0;
+}
+
 int run_scenario(const char* artifact, int device_a, int device_b, Route route) {
     const std::string label = route_name(route);
     // Every route keeps cross-session retention here; the oracle beside it runs retention-off.
@@ -298,6 +347,14 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     append(rerendered, make_prompt(50000, 8));
     append(rerendered, follow_up);
 
+    // A conversation that continues in place: the client sends the previous prompt, the sampled
+    // tokens it was handed, and its next turn, with no other conversation in between, so the
+    // resident lineage - not a host slab - has to serve it. Its previous prompt ends inside a
+    // prefill chunk, so the committed frontier sits off the reuse grid and the aligned scan can only
+    // offer the rewind snapshot at that prompt's own chunk start, with the whole generated answer
+    // behind it. The tail is reachable only through the exit-path scan, which is what this pins.
+    const std::vector<TokenId> resident_base = make_prompt(61000, 1000);
+
     // The oracle prefills the continued prompt from zero with retention disabled. A recalled
     // walk reuses the byte-identical KV prefix, so the greedy answers have to agree exactly.
     std::vector<TokenId> opening_answer;
@@ -308,6 +365,8 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     std::vector<TokenId> shared_b_answer;
     std::vector<TokenId> shared_c_answer;
     std::vector<TokenId> interrupted_answer;
+    std::vector<TokenId> resident_base_answer;
+    std::vector<TokenId> resident_answer;
     {
         ninfer::Engine oracle(engine_options(artifact, device_a, device_b, false, route));
         opening_answer = run(oracle, opening).generated_token_ids;
@@ -333,6 +392,12 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
         shared_c_answer      = run(oracle, shared_c).generated_token_ids;
         (void)run(oracle, aside_flush);
         interrupted_answer = run(oracle, interrupted).generated_token_ids;
+
+        resident_base_answer = run(oracle, resident_base).generated_token_ids;
+        std::vector<TokenId> resident_continued = resident_base;
+        append(resident_continued, resident_base_answer);
+        append(resident_continued, follow_up);
+        resident_answer = run(oracle, std::move(resident_continued)).generated_token_ids;
     }
     if (opening_answer.empty() || continued_answer.empty()) {
         return fail(label, "the oracle produced no tokens");
@@ -516,6 +581,44 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
         return status;
     }
 
+    // The resident conversation: no other conversation ran in between, so the device pools still hold
+    // exactly this lineage and the continuation has to start at the committed frontier rather than at
+    // the chunk start behind the previous prompt. The masked draft rounds the frontier down to that
+    // chunk start while the clip stays inside its budget, so the two routes pin two boundaries.
+    const ninfer::GenerationResult resident_first = run(engine, resident_base);
+    if (resident_first.reused_prompt_tokens != 0) {
+        return fail(label, "a resident conversation started from a stale lineage");
+    }
+    if (resident_first.generated_token_ids != resident_base_answer) {
+        return fail(label, "a fresh resident conversation diverged from the oracle: got " +
+                               tokens_text(resident_first.generated_token_ids) + " expected " +
+                               tokens_text(resident_base_answer));
+    }
+    std::vector<TokenId> resident_continued = resident_base;
+    append(resident_continued, resident_first.generated_token_ids);
+    append(resident_continued, follow_up);
+    const std::uint32_t resident_frontier = static_cast<std::uint32_t>(
+                                                resident_base.size() +
+                                                resident_first.generated_token_ids.size()) -
+                                            1U;
+    const std::uint32_t resident_aligned =
+        static_cast<std::uint32_t>(resident_base.size()) / kPrefillChunk * kPrefillChunk;
+    const std::uint32_t resident_reuse =
+        resident_tail_rounds_down(route, resident_frontier, resident_aligned, kOutputTokens)
+            ? resident_aligned
+            : resident_frontier;
+    const ninfer::GenerationResult resident_second = run(engine, resident_continued);
+    if (resident_second.reused_prompt_tokens != resident_reuse) {
+        return fail(label, "a resident conversation's next turn reused " +
+                               std::to_string(resident_second.reused_prompt_tokens) +
+                               " prompt tokens, expected " + std::to_string(resident_reuse));
+    }
+    if (const int status = compare_recall(label, "a resident conversation's next turn", route,
+                                          resident_reuse, resident_second, resident_answer);
+        status != 0) {
+        return status;
+    }
+
     // A client that gives up mid-prefill and sends the same prompt again. The cancelled walk wrote
     // KV for the whole chunks it finished and left the GDN state at the end of the last one, so the
     // catalog can name that prefix; the retry has to continue from it rather than prefill the whole
@@ -598,6 +701,11 @@ int main() {
 
     try {
         for (const Route route : routes) {
+            if (const int status = check_first_token_published(artifact, devices.first,
+                                                               devices.second, route);
+                status != 0) {
+                return status;
+            }
             if (const int status = run_scenario(artifact, devices.first, devices.second, route);
                 status != 0) {
                 return status;

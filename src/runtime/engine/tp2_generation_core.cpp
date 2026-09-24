@@ -471,7 +471,8 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
 
     frontend_ = std::make_unique<qwen::Frontend>(
         qwen::make_frontend(shard_a_.model->resources(),
-                            {.architecture           = shard_a_.model->config().text.architecture,
+                            {.chat_template_path     = options.chat_template_path,
+                             .architecture           = shard_a_.model->config().text.architecture,
                              .vision_enabled         = options.enable_vision,
                              .max_context            = options.max_context,
                              .media_cache_bytes      = options.media_cache_bytes,
@@ -2198,40 +2199,42 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             reuse_slot    = index;
             reuse_source_ = ReuseSource::HostCheckpoint;
         }
-        // A lineage whose every boundary sits inside its first prefill chunk (a conversation far
-        // shorter than one chunk) has no grid-aligned candidate at all, and the aligned scan above
-        // would drop all the way to a full prefill. Keeping the deepest boundary is better: the
-        // recalled state and KV are still this prompt's own, and only the suffix chunking differs
-        // from a from-scratch walk. Rescan the same boundaries without the grid restriction. The
-        // suffix chunking is what the DFlash2 route cannot accept (the declined-draft flag below),
-        // so the masked draft rounds such a boundary down to the aligned scan's result instead of
-        // trading its ring for the clip: the clip replay costs prefill work at ~1.6K tok/s while the
-        // draft saves ~19 ms of decode per generated token, so replaying up to sixteen clip tokens
-        // per budget token - and never less than one chunk - stays a clear win. Only a deeper
-        // mid-chunk lineage takes this branch, and it declines the draft below.
-        if (reuse == 0) {
-            auto take = [&](std::uint32_t position, std::size_t slot, ReuseSource source) {
-                if (position != 0 && position <= shared_prefix && position < prompt_tokens &&
-                    position > reuse) {
-                    if (dflash2_enabled_ &&
-                        position <= std::max(reuse_grid, 16U * request.budget.remaining())) {
-                        return;
-                    }
-                    reuse         = position;
-                    reuse_slot    = slot;
-                    reuse_source_ = source;
-                }
-            };
-            if (live_state_valid_ && active_session_ != kNoSession) {
-                take(sessions_[active_session_].frontier, 0, ReuseSource::LiveState);
+        // Every boundary the lineage can offer, deepest wins. The aligned scan above only accepts a
+        // position on the prefill grid, because a walk anchored mid-chunk chunks its suffix
+        // differently from a from-scratch walk. That rounding is nearly free when the grid holds a
+        // checkpoint close to the shared prefix, but a conversation that continues in place has no
+        // grid boundary past its own previous prompt: decode publishes no checkpoint at all, so the
+        // deepest aligned candidate is the rewind snapshot at that prompt's chunk start, with the
+        // whole generated answer behind it. Rescan the same boundaries without the grid restriction:
+        // the recalled state and KV are still this prompt's own, and only the suffix chunking
+        // differs. The masked-draft route cannot accept that, because its ring is the one a
+        // differently chunked walk froze, so the request would run target-only for as long as it
+        // generates. That clip replay costs prefill work at ~1.6K tok/s while the draft saves ~19 ms
+        // of decode per generated token, so only a boundary that saves more prefill than sixteen
+        // tokens per remaining budget token - and never less than one chunk - is worth declining the
+        // draft. A survivor of this gate is an unaligned boundary, reported as a declined draft.
+        auto take = [&](std::uint32_t position, std::size_t slot, ReuseSource source) {
+            if (position == 0 || position > shared_prefix || position >= prompt_tokens ||
+                position <= reuse) {
+                return;
             }
-            for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
-                take(cached_boundaries_[slot], slot, ReuseSource::DeviceSnapshot);
+            if (dflash2_enabled_ &&
+                position - reuse <= std::max(reuse_grid, 16U * request.budget.remaining())) {
+                return;
             }
-            for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
-                const auto& checkpoint = shard_a_.host_checkpoints[index];
-                if (checkpoint.valid) { take(checkpoint.position, index, ReuseSource::HostCheckpoint); }
-            }
+            reuse         = position;
+            reuse_slot    = slot;
+            reuse_source_ = source;
+        };
+        if (live_state_valid_ && active_session_ != kNoSession) {
+            take(sessions_[active_session_].frontier, 0, ReuseSource::LiveState);
+        }
+        for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
+            take(cached_boundaries_[slot], slot, ReuseSource::DeviceSnapshot);
+        }
+        for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
+            const auto& checkpoint = shard_a_.host_checkpoints[index];
+            if (checkpoint.valid) { take(checkpoint.position, index, ReuseSource::HostCheckpoint); }
         }
     }
     // The target state at the reused boundary is this prompt's own prefix, but the draft ring beside
@@ -2660,6 +2663,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // boundary the target state is at too, so this captures the two halves together.
         session_capture_shared_state(host_stored_session_, reuse, true, nullptr, nullptr);
     }
+    // Set when the prefill's own sample already ended the request: the first token can be a stop
+    // token, or it can spend the whole output budget. Decode then has nothing left to do.
+    FinishReason first_token_finish = FinishReason::None;
     for (std::uint32_t t0 = reuse; t0 < prompt_tokens;) {
         if (cancellation.requested()) {
             // Chunks that finished wrote KV for tokens the prompt really has and left the GDN state
@@ -2803,8 +2809,27 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                                        cudaMemcpyDeviceToHost, shard_a_.device.stream));
             CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
             abort_if_ar_stalled();
-            request.generated.push_back(first);
+            // The first token is a generated token like any later one, so it has to reach the
+            // output policy before it reaches the client. The policy owns the published text, the
+            // reasoning/content split and the stop-token decision; a token that bypasses it is never
+            // published, and the pools, the session catalog and the published answer then describe
+            // histories one token apart - which is exactly what makes a later turn unable to reuse
+            // the tail of this one, however exactly the client replays it.
+            const TokenId first_token        = static_cast<TokenId>(first);
+            const std::uint32_t first_budget = request.budget.remaining();
+            if (first_budget == 0) {
+                throw std::logic_error("prefill sampled a token with no output budget left");
+            }
+            const OutputDecision first_decision = request.output.preview_model(
+                std::span<const TokenId>(&first_token, 1), first_budget,
+                request.budget.limit_reason());
+            if (first_decision.accepted_tokens != 1) {
+                throw std::logic_error("output policy rejected the prefill's first token");
+            }
+            request.generated.push_back(first_token);
             request.budget.commit(1);
+            publish_preview(false);
+            if (first_decision.finished()) { first_token_finish = first_decision.finish_reason; }
             if (mtp_enabled_) {
                 // The final MTP column embeds the token just sampled, so the MTP layer's own K/V for
                 // the prompt is appended only after the first token exists.
@@ -2951,7 +2976,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
     };
-    bool finished = false;
+    bool finished = first_token_finish != FinishReason::None;
+    if (finished) { result.finish_reason = first_token_finish; }
     while (!finished) {
         if (cancellation.requested()) {
             (void)request.output.preview_terminal(FinishReason::Cancelled);
