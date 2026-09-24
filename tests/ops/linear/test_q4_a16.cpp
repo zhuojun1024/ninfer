@@ -108,6 +108,43 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
                           {131072, 2048, 131U, Comparison::Sampled, false, kN131072K2048});
 
+    // The DFlash2 draft dynamic-convolution kernel projection [1280,5120]: every selector
+    // branch, with the full-output arm pinning each masked-capacity and K-split boundary.
+    constexpr std::array kN1280K5120Full{
+        convenience(1), graph(2), graph(3), graph(4), graph(5),
+        graph(6),       graph(7), graph(8), graph(24), graph(25),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {1280, 5120, 197U, Comparison::Full, true, kN1280K5120Full});
+
+    constexpr std::array kN1280K5120{
+        a16(1),   a16(2),   a16(3),   a16(4),   a16(5),   a16(6),   a16(7),   a16(8),
+        a16(9),   a16(15),  a16(16),  a16(17),  a16(23),  a16(24),  a16(25),  a16(26),
+        a16(32),  a16(33),  a16(63),  a16(64),  a16(65),  a16(127), a16(128), a16(129),
+        graph(16), graph(64), graph(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {1280, 5120, 197U, Comparison::Sampled, false, kN1280K5120});
+
+    // The DFlash2 draft feature projection [5120,25600]. The full-output arm pins every
+    // masked-capacity and K-split selector boundary; the sampled arm reaches the wider
+    // SIMT/MMA tiles and the draft prefill width.
+    constexpr std::array kN5120K25600Full{
+        convenience(1), graph(2), graph(3), graph(4), graph(5),
+        graph(6),       graph(7), graph(24), graph(25),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {5120, 25600, 191U, Comparison::Full, true, kN5120K25600Full});
+
+    constexpr std::array kN5120K25600{
+        a16(1),   a16(2),   a16(3),   a16(4),   a16(5),   a16(6),   a16(7),   a16(8),
+        a16(9),   a16(15),  a16(16),  a16(17),  a16(23),  a16(24),  a16(25),  a16(26),
+        a16(32),  a16(33),  a16(63),  a16(64),  a16(65),  a16(127), a16(128), a16(129),
+        graph(8), graph(16), graph(64), graph(128), graph(2048),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {5120, 25600, 191U, Comparison::Sampled, false, kN5120K25600});
+
     constexpr std::array kN3456K1152{
         a16(4),   a16(20),  a16(36),  a16(40),   a16(44),     a16(128),
         a16(320), a16(324), a16(328), a16(1024), a16(131072),
