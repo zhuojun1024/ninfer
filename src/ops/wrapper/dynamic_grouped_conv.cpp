@@ -2,9 +2,12 @@
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
+#include "ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_prepare_plan.h"
+#include "ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add_plan.h"
 #include "ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -36,16 +39,36 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t d0, std::int
     }
 }
 
+// Total stored bytes of the dynamic-convolution kernel projection under one codec.
+std::uint64_t kernel_projection_payload_bytes(QType qtype) {
+    const std::uint64_t groups = kHidden / 64;
+    switch (qtype) {
+    case QType::BF16:
+        return static_cast<std::uint64_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
+    case QType::Q4_G64_FP16:
+        // 4-bit codes (32 B per group of 64) plus one FP16 group scale.
+        return static_cast<std::uint64_t>(kCoefficientRows) * groups * (32U + 2U);
+    default:
+        throw std::invalid_argument(
+            "dynamic grouped conv prepare: invalid kernel_projection_weight");
+    }
+}
+
 void require_kernel_projection_weight(const Weight& weight) {
-    constexpr std::uint64_t kPayloadBytes =
-        static_cast<std::uint64_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
-    if (weight.qtype != QType::BF16 || weight.layout != QuantLayout::Contiguous ||
-        weight.payload_bytes < kPayloadBytes || weight.high_plane_bytes != 0 || weight.ndim != 2 ||
-        weight.n != kCoefficientRows || weight.k != kHidden ||
-        weight.shape[0] != kCoefficientRows || weight.shape[1] != kHidden ||
-        weight.padded_shape[0] != kCoefficientRows || weight.padded_shape[1] != kHidden ||
-        weight.qhigh != nullptr || weight.scales != nullptr || weight.group_size != 0 ||
-        weight.group != 0 || !aligned_to(weight.qdata, 16)) {
+    const std::uint64_t payload_bytes = kernel_projection_payload_bytes(weight.qtype);
+    const bool layout_compatible =
+        (weight.qtype == QType::BF16 && weight.layout == QuantLayout::Contiguous &&
+         weight.qhigh == nullptr && weight.scales == nullptr && weight.group_size == 0 &&
+         weight.group == 0) ||
+        (weight.qtype == QType::Q4_G64_FP16 && weight.layout == QuantLayout::RowSplit &&
+         weight.scale_dtype == DType::FP16 && weight.group_size == 64 && weight.group == 64 &&
+         weight.qhigh == nullptr && weight.high_plane_bytes == 0 &&
+         aligned_to(weight.scales, 16));
+    if (!layout_compatible || weight.payload_bytes < payload_bytes ||
+        weight.high_plane_bytes != 0 || weight.ndim != 2 || weight.n != kCoefficientRows ||
+        weight.k != kHidden || weight.shape[0] != kCoefficientRows ||
+        weight.shape[1] != kHidden || weight.padded_shape[0] != kCoefficientRows ||
+        weight.padded_shape[1] != kHidden || !aligned_to(weight.qdata, 16)) {
         throw std::invalid_argument(
             "dynamic grouped conv prepare: invalid kernel_projection_weight");
     }
@@ -69,6 +92,10 @@ ProjectionPlanes projection_planes(QType qtype, std::int32_t input_rows) {
         const std::uint64_t groups = columns / 64U;
         return {rows * groups * 32U, rows * groups * 8U, rows * groups * sizeof(std::uint16_t)};
     }
+    case QType::Q4_G64_FP16: {
+        const std::uint64_t groups = columns / 64U;
+        return {rows * groups * 32U, 0, rows * groups * sizeof(std::uint16_t)};
+    }
     default:
         throw std::invalid_argument("linear dynamic grouped conv add: invalid projection_weight");
     }
@@ -81,7 +108,9 @@ void require_finish_projection_weight(const Weight& weight, std::int32_t input_r
          weight.qhigh == nullptr && weight.high_plane_bytes == 0) ||
         (weight.qtype == QType::Q5_G64_FP16 && weight.group_size == 64 && weight.group == 64 &&
          weight.qhigh != nullptr && weight.high_plane_bytes >= planes.high_bytes &&
-         aligned_to(weight.qhigh, 16));
+         aligned_to(weight.qhigh, 16)) ||
+        (weight.qtype == QType::Q4_G64_FP16 && weight.group_size == 64 && weight.group == 64 &&
+         weight.qhigh == nullptr && weight.high_plane_bytes == 0);
     const std::uint64_t payload_bytes = planes.code_bytes + planes.high_bytes + planes.scale_bytes;
     if (!codec_compatible || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.ndim != 2 || weight.n != kHidden ||
@@ -141,13 +170,13 @@ void require_nonoverlap(const Tensor& residual, const Tensor& norm_weight,
                         const Tensor& base_kernel, const Weight& kernel_projection_weight,
                         const Tensor& prepared, const Tensor& finish_delta,
                         const WorkspaceArena& workspace) {
-    constexpr std::size_t kWeightBytes =
-        static_cast<std::size_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
+    const std::size_t weight_bytes = static_cast<std::size_t>(
+        kernel_projection_payload_bytes(kernel_projection_weight.qtype));
     const std::array<Range, 7> ranges{{
         {residual.data, residual.bytes(), "residual"},
         {norm_weight.data, norm_weight.bytes(), "norm_weight"},
         {base_kernel.data, base_kernel.bytes(), "base_kernel"},
-        {kernel_projection_weight.qdata, kWeightBytes, "kernel_projection_weight"},
+        {kernel_projection_weight.qdata, weight_bytes, "kernel_projection_weight"},
         {prepared.data, prepared.bytes(), "prepared"},
         {finish_delta.data, finish_delta.bytes(), "finish_delta"},
         {workspace.base(), workspace.capacity(), "workspace"},
@@ -168,8 +197,13 @@ void require_nonoverlap(const Tensor& residual, const Tensor& norm_weight,
 std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
     std::int32_t min_width, std::int32_t max_width, std::int32_t min_batch_size,
     std::int32_t max_batch_size) {
-    return detail::bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-        min_width, max_width, min_batch_size, max_batch_size);
+    // One query serves both codecs: the returned size must cover the largest route either of
+    // them can select. The BF16 split-K partials dominate the materialized Q4 coefficients.
+    return std::max(
+        detail::bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+            min_width, max_width, min_batch_size, max_batch_size),
+        detail::q4_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+            min_width, max_width, min_batch_size, max_batch_size));
 }
 
 void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& norm_weight,
@@ -199,9 +233,21 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
     require_nonoverlap(residual, norm_weight, base_kernel, kernel_projection_weight, prepared,
                        finish_delta, workspace);
 
-    detail::bf16_dynamic_grouped_conv_prepare_dispatch(residual, norm_weight, eps, base_kernel,
-                                                       kernel_projection_weight, prepared,
-                                                       finish_delta, workspace, stream);
+    switch (kernel_projection_weight.qtype) {
+    case QType::BF16:
+        detail::bf16_dynamic_grouped_conv_prepare_dispatch(
+            residual, norm_weight, eps, base_kernel, kernel_projection_weight, prepared,
+            finish_delta, workspace, stream);
+        return;
+    case QType::Q4_G64_FP16:
+        detail::q4_dynamic_grouped_conv_prepare_dispatch(residual, norm_weight, eps, base_kernel,
+                                                         kernel_projection_weight, prepared,
+                                                         finish_delta, workspace, stream);
+        return;
+    default:
+        throw std::invalid_argument(
+            "dynamic grouped conv prepare: invalid kernel_projection_weight");
+    }
 }
 
 std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(QType qtype,
@@ -216,6 +262,9 @@ std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(QType qtype
             input_rows, min_width, max_width, min_batch_size, max_batch_size);
     case QType::Q5_G64_FP16:
         return detail::q5_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+            input_rows, min_width, max_width, min_batch_size, max_batch_size);
+    case QType::Q4_G64_FP16:
+        return detail::q4_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
             input_rows, min_width, max_width, min_batch_size, max_batch_size);
     default:
         break;
@@ -255,6 +304,11 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
         return;
     case QType::Q5_G64_FP16:
         detail::q5_linear_dynamic_grouped_conv_add_dispatch(x, projection_weight, base_kernel,
+                                                            finish_delta, residual, workspace,
+                                                            stream);
+        return;
+    case QType::Q4_G64_FP16:
+        detail::q4_linear_dynamic_grouped_conv_add_dispatch(x, projection_weight, base_kernel,
                                                             finish_delta, residual, workspace,
                                                             stream);
         return;

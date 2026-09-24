@@ -3,6 +3,7 @@
 #include "core/decode_graph.h"
 
 #include "ops/direct_bf16_weight.h"
+#include "ops/input_projection_test_common.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -37,6 +38,22 @@ constexpr ReductionCriterion kFinishDeltaCriterion{/*relative_l2=*/3.2e-3,
 constexpr ReductionCriterion kPreparedCriterion{/*relative_l2=*/3.6e-3,
                                                 /*gross_absolute=*/5.0e-3,
                                                 /*gross_relative=*/6.0e-3};
+
+struct Criteria {
+    ReductionCriterion prepared;
+    ReductionCriterion finish;
+};
+
+constexpr Criteria kBf16Criteria{kPreparedCriterion, kFinishDeltaCriterion};
+// The Q4 route materializes the private coefficient matrix in BF16 (the plain q4 GEMM epilogue)
+// where the BF16 route keeps FP32 split-K partials. That intermediate is not an observable
+// boundary, but it costs roughly half a BF16 ulp of extra relative error on the largest
+// coefficients, so the prepared budget is 1.5x the BF16 criterion. Measured worst ratios over
+// the whole W/B domain are 0.62x (rel_l2) and 0.68x (gross) under this budget; finish_delta
+// keeps the shared budget and measures 0.74x (rel_l2) and 0.68x (gross) of it.
+constexpr Criteria kQ4Criteria{{/*relative_l2=*/5.4e-3, /*gross_absolute=*/7.5e-3,
+                                /*gross_relative=*/9.0e-3},
+                               kFinishDeltaCriterion};
 
 std::uint32_t mix32(std::uint32_t value) {
     value ^= value >> 16;
@@ -119,10 +136,13 @@ struct Reference {
     std::vector<double> finish_delta;
 };
 
+// One naive FP64 oracle for every codec: the caller supplies the exact represented coefficient
+// of a stored projection, so a Q4 arm is measured against its own decoded weights.
+template <class WeightAt>
 Reference compute_reference(const std::vector<std::uint16_t>& residual,
                             const std::vector<std::uint16_t>& norm_weight,
                             const std::vector<std::uint16_t>& base_kernel,
-                            const direct_bf16_weight::HostWeight& projection_weight) {
+                            const WeightAt& weight_at) {
     std::vector<double> normalized(static_cast<std::size_t>(kHidden) * kMaximumTokens);
     for (std::int32_t token = 0; token < kMaximumTokens; ++token) {
         const std::size_t token_begin = static_cast<std::size_t>(token) * kHidden;
@@ -153,15 +173,12 @@ Reference compute_reference(const std::vector<std::uint16_t>& residual,
             static_cast<std::int64_t>(kCoefficientRows) * (thread + 1) / thread_count);
         workers.emplace_back([&, row_begin, row_end] {
             for (std::int32_t row = row_begin; row < row_end; ++row) {
-                const std::uint16_t* weight_row =
-                    projection_weight.bits.data() + static_cast<std::size_t>(row) * kHidden;
                 for (std::int32_t token = 0; token < kMaximumTokens; ++token) {
                     const double* normalized_row =
                         normalized.data() + static_cast<std::size_t>(token) * kHidden;
                     double sum = 0.0;
                     for (std::int32_t hidden = 0; hidden < kHidden; ++hidden) {
-                        sum += static_cast<double>(bf16_to_f32(weight_row[hidden])) *
-                               normalized_row[hidden];
+                        sum += static_cast<double>(weight_at(row, hidden)) * normalized_row[hidden];
                     }
                     coefficients[static_cast<std::size_t>(token) * kCoefficientRows + row] = sum;
                 }
@@ -228,12 +245,49 @@ void set_reference_width(Reference& reference, const std::vector<std::uint16_t>&
     }
 }
 
-int run() {
+// The BF16 arm stores its coefficients directly; the Q4 arm decodes the stored q4 codes with
+// their FP16 group scales. Both present the same "exact represented coefficient" to the oracle.
+struct DirectProjection {
+    direct_bf16_weight::HostWeight host = make_projection_weight();
+    direct_bf16_weight::DeviceWeight device{host};
+    Weight weight = device.view();
+
+    [[nodiscard]] const Weight& view() const { return weight; }
+    [[nodiscard]] double at(std::int32_t row, std::int32_t column) const {
+        return bf16_to_f32(host.bits[static_cast<std::size_t>(row) * kHidden + column]);
+    }
+    int verify_preserved(std::string_view label) const { return device.verify_preserved(label); }
+};
+
+inline quantized_weight::PackedWeight make_q4_projection() {
+    // Tiny group scales and hashed codes keep the decoded coefficients in the same magnitude
+    // band as the BF16 fixture, so both arms are compared under the same output criterion.
+    quantized_weight::PatternedWeightOptions options;
+    options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
+    options.row_split_codes = quantized_weight::RowSplitCodePattern::Hashed;
+    return quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, kCoefficientRows, kHidden,
+                                                   419U, options);
+}
+
+struct Q4Projection {
+    quantized_weight::PackedWeight packed = make_q4_projection();
+    input_projection::DevicePackedWeight device{packed};
+    Weight weight = device.view();
+
+    [[nodiscard]] const Weight& view() const { return weight; }
+    [[nodiscard]] double at(std::int32_t row, std::int32_t column) const {
+        return quantized_weight::logical_weight_fp64(packed, row, column);
+    }
+    int verify_preserved(std::string_view label) const { return device.verify_preserved(label); }
+};
+
+template <class Projection>
+int run_profiles(std::string_view codec, const Projection& projection, const Criteria& criteria) {
     const auto residual_host = make_residual(), norm_host = make_norm_weight(),
                base_host = make_base_kernel();
-    direct_bf16_weight::DeviceWeight projection_weight(make_projection_weight());
-    Reference reference =
-        compute_reference(residual_host, norm_host, base_host, projection_weight.host);
+    Reference reference = compute_reference(
+        residual_host, norm_host, base_host,
+        [&projection](std::int32_t row, std::int32_t column) { return projection.at(row, column); });
     DeviceBuffer residual_device = to_device(residual_host), norm_device = to_device(norm_host),
                  base_device = to_device(base_host);
     const auto capacity =
@@ -243,7 +297,7 @@ int run() {
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
     Tensor norm(norm_device.p, DType::BF16, {kHidden});
     Tensor base(base_device.p, DType::BF16, {kHidden, kTaps, kSides});
-    const Weight weight = projection_weight.view();
+    const Weight& weight = projection.view();
     int failures        = 0;
     for (int width = 2; width <= 16; ++width) {
         set_reference_width(reference, base_host, width);
@@ -278,16 +332,17 @@ int run() {
                 } else
                     launch();
                 cuda_synchronize();
-                const std::string label = "dynamic conv prepare W=" + std::to_string(width) +
+                const std::string label = std::string(codec) + " dynamic conv prepare W=" +
+                                          std::to_string(width) +
                                           " B=" + std::to_string(batch) +
                                           " graph=" + std::to_string(replay);
                 failures += verify_reduction(label + " prepared", from_device_bf16(pd.data(), pe),
                                              std::span<const double>(reference.prepared.data(), pe),
-                                             kPreparedCriterion);
+                                             criteria.prepared);
                 failures +=
                     verify_reduction(label + " finish", from_device_bf16(fd.data(), fe),
                                      std::span<const double>(reference.finish_delta.data(), fe),
-                                     kFinishDeltaCriterion);
+                                     criteria.finish);
                 failures += pd.verify_guards(label);
                 failures += fd.verify_guards(label);
                 const auto exact =
@@ -304,7 +359,7 @@ int run() {
     failures += verify_preserved("residual", residual_device, residual_host);
     failures += verify_preserved("norm", norm_device, norm_host);
     failures += verify_preserved("base", base_device, base_host);
-    failures += projection_weight.verify_preserved("projection");
+    failures += projection.verify_preserved("projection");
     return failures;
 }
 
@@ -316,7 +371,8 @@ int main() {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
-        const int failures = run();
+        const int failures = run_profiles("bf16", DirectProjection(), kBf16Criteria) +
+                             run_profiles("q4", Q4Projection(), kQ4Criteria);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " rmsnorm_dynamic_grouped_conv_prepare\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

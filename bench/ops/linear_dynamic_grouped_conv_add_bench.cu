@@ -2,6 +2,7 @@
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
 #include "ninfer_bench_common.h"
+#include "ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add_plan.h"
 #include "ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
 #include "quantized_weight.cuh"
@@ -62,8 +63,10 @@ Options parse_args(int argc, char** argv) {
                 options.qtype = QType::Q8_G32_FP16;
             } else if (!std::strcmp(qtype, "q5")) {
                 options.qtype = QType::Q5_G64_FP16;
+            } else if (!std::strcmp(qtype, "q4")) {
+                options.qtype = QType::Q4_G64_FP16;
             } else {
-                throw std::invalid_argument("qtype must be q8 or q5");
+                throw std::invalid_argument("qtype must be q8, q5 or q4");
             }
         } else if (!std::strcmp(argv[index], "--batch")) {
             options.batch_size = std::atoi(next("batch"));
@@ -72,7 +75,7 @@ Options parse_args(int argc, char** argv) {
             if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
             options.flush_bytes = static_cast<std::size_t>(mib) << 20;
         } else if (!std::strcmp(argv[index], "--help") || !std::strcmp(argv[index], "-h")) {
-            std::printf("usage: %s [--width 2..16] [--k 4096|17408] [--qtype q8|q5] "
+            std::printf("usage: %s [--width 2..16] [--k 4096|17408] [--qtype q8|q5|q4] "
                         "[--batch 1..8] [--warmup N] "
                         "[--repeat N] "
                         "[--flush-mib N]\n",
@@ -135,7 +138,10 @@ void run_profile(std::int32_t input_rows, const Options& options, DeviceBuffer& 
                             batch_size, cols, route, timing.median_us, timing.min_us, timing.p95_us,
                             tflops, bandwidth, graph.nodes(), workspace.peak_used());
             };
-            const char* route = options.qtype == QType::Q5_G64_FP16
+            const char* route = options.qtype == QType::Q4_G64_FP16
+                                    ? ops::detail::q4_linear_dynamic_grouped_conv_add_route_name(
+                                          input_rows, width, batch_size)
+                                : options.qtype == QType::Q5_G64_FP16
                                     ? ops::detail::q5_linear_dynamic_grouped_conv_add_route_name(
                                           input_rows, width, batch_size)
                                     : ops::detail::q8_linear_dynamic_grouped_conv_add_route_name(
