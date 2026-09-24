@@ -254,15 +254,6 @@ private:
         // evicted at. Zero means no other conversation has diverged from this one yet.
         std::uint32_t host_shared_end = 0;
         std::uint64_t lru_clock       = 0;
-        // Tokens the completed turns of this conversation generated, and how many turns that is.
-        // The reuse gate prices an unaligned boundary against the decode it costs, and the request's
-        // budget is a ceiling the protocol layer sets - for an agent client, its model's capable
-        // maximum - not a prediction of what the request will spend. Charging that ceiling makes the
-        // gate unreachable for any context that cannot hold sixteen budgets' worth of tokens, so the
-        // gate prices against what this conversation's own turns actually generate instead. Only
-        // turns that committed at least one token are counted, so the mean is never zero.
-        std::uint64_t generated_tokens_total = 0;
-        std::uint32_t generated_turns        = 0;
     };
     static constexpr std::size_t kNoSession = static_cast<std::size_t>(-1);
 
@@ -535,11 +526,6 @@ private:
     // previous round's verify window (append_pending). It never exceeds the target execution
     // frontier and lags it by at most one verify window.
     std::uint32_t dflash_context_frontier_ = 0;
-    // Set when this request reused a target prefix whose boundary is not on the prefill grid, so the
-    // recalled draft ring belongs to a differently chunked walk and cannot drive the verify window a
-    // from-scratch walk would produce. The request then runs target-only: the target prefix reuse
-    // stays, the masked draft does not. See GenerationResult::draft_context_declined.
-    bool dflash_draft_declined_ = false;
     // The first draft of the previous decode step, and whether there is one to compare. A draft
     // proposed at position p predicts the token at p+2, so the target's argmax at the next step is
     // exactly the acceptance oracle for it.

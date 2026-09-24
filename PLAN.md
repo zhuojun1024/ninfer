@@ -787,3 +787,36 @@ reasoning 文本里**（或回放重分词与采样边界不同），因此 DFla
 **已知边界（故意保留）**：定价用的均值包含突发轮，所以"突发之后紧接的短轮"能否复用取决于该会话的均值——
 均值 > 节省量/16 时仍然跳过（风险中性结论，不是 bug）。当前 DSH 会话均值约 1,735，其 24.8k 尾部仍会被跳过；
 要翻转只能把比率 16 做成可配选项，或走第 3 步（未对齐复用下保住 masked draft）。
+
+## 7. 未对齐复用不再弃稿：masked draft 全程在线（2026-09-24，已改）
+
+**前提被实测推翻**：第 2 步的门控建立在"未对齐复用必须弃掉 masked draft"之上。实测这个前提不成立——
+保留 draft 后 ring 只有 ulp 级差异，接受率几乎不变。
+
+**实测（同一 artifact、serve 配方 + trace；20 短轮均值 2 + 一个 2000-token 长轮，续轮 budget=32768）**：
+- 复用结果相同：`reuse=2442 src=live`、`cache 2,442 (99.3%)`、TTFT 58 ms、prefill 仅 17 token；
+- 弃稿（旧行为）：`decode 22.5 tok/s`，输出 37 token；
+- 保留 draft（新行为）：`decode 87.1 tok/s`、`dflash2 accepted 28/63 (44.4%)`。
+弃稿保护的从来不是正确性（target verify 始终为每个 token 发牌），只是"逐位复现 from-scratch walk"这一契约。
+
+**改动**：
+- `extent` 不再因边界未对齐而归零；删除 `dflash_draft_declined_`、`GenerationResult::draft_context_declined`、
+  stderr 提示与 solo 测试里的打印。
+- 复用扫描合并为单趟：网格过滤与门控删除，**最深边界获胜**；`reuse_grid` 随之删除。
+- 第 2 步的 `SessionEntry::generated_tokens_*` 与会话均值定价一并删除（前提消失，门控失去意义）。
+
+**契约（严格版实验定界）**：边界在网格上 ⇒ 与 oracle 逐 token 一致；边界在 chunk 内 ⇒ 只保证 boundary crossing。
+把 `compare_recall` 临时改成"处处要求逐 token 相等"实跑，失败于 `a conversation behind a re-rendered answer`：
+`got [2752 11 220 16 24 24 15 82]` vs `expected [2752 11 198 220 220 16 15 15]` —— 前两个 token 相同、第三个分叉，
+与旧注释预测的"第三 token 必然分叉"一致，说明分叉来自未对齐的 prefill 分块（窗口切分不同），不是 draft 模式。
+保留 draft 反而把分叉来源从两个（模式 + 分块）减到一个（分块）。
+
+**验证**：
+- `ninfer_qwen3_5_tp2_sessions_test`：dflash2 / mtp EXIT 0；plain 在本机失败于既有场景 "a conversation behind a
+  shared system prompt"（`got [2752 13 198 ...]` / `expected [365 2798 349 ...]`），与上一会话记录的同一失败逐位一致。
+  本次提交对 plain/mtp 是**行为等价重构**（旧门控只在 `dflash2_enabled_` 时生效，两者早已取最深边界），故与该失败无关。
+- `ninfer_qwen3_5_tp2_dflash_solo_test`（重建后）：两个独立进程 digest 均为 `0x4bcc3994a5efba7d`、PASS，与文档记录值一致
+  ⇒ 网格对齐路径未被扰动（solo 场景本身不含未对齐复用）。
+- served 路由（step-3 二进制）：`reuse=2442 src=live`、`cache 99.4%`、TTFT 51 ms、prefill 14 token、无弃稿提示；
+  `decode 53.9 tok/s / accepted 31/147 (21.1%)`（对照实验那次 87.1 tok/s / 44.4%；弃稿基线 22.5 tok/s）。接受率随
+  每请求随机 seed 波动，但两次都远高于弃稿基线。

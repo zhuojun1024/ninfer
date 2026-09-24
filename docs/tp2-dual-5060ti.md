@@ -245,9 +245,10 @@ against the target's own greedy tokens, and a GDN record/replay fold. The draft 
 layers + selector) is materialized whole on shard 0 next to the 40 MiB context ring; the verify window
 and fold run on both shards exactly like the MTP window.
 
-The route is bit-reproducible: a recall of a conversation - from host slabs, a device snapshot or a
-prefix-reuse checkpoint - reproduces a from-scratch prefill of the same prompt token for token when
-it keeps the draft pattern (a boundary on the prefill grid). That
+The route is bit-reproducible across a recall while the walk keeps the oracle's execution shape. A
+recall that lands on the prefill grid does: it re-walks the same chunks a from-scratch prefill of the
+same prompt walks, so every verify window verifies the same columns and the KV rows they write are
+the same bytes. That
 property needed one fix worth naming: a budget-clamped window (the tail of a request, where only a
 prefix of the proposal can be licensed) pins its trailing columns on the last licensed column's
 absolute position, and those duplicate columns used to append KV like every other column - several
@@ -257,24 +258,18 @@ clamped columns neither append KV nor publish logits. `ninfer_qwen3_5_tp2_dflash
 acceptance: independent processes must print one identical digest over a nine-walk sequence, and
 its recalled walk must match the evicted (from-scratch) walk of the same prompt token for token.
 
-A recall whose boundary is not a multiple of the prefill chunk (256 by default) cannot license the
-masked draft directly: the ring beside the restored state belongs to a differently chunked walk, so
-its proposals would not be licensed against a from-scratch walk's windows. The masked draft rounds
-such a boundary down to the aligned scan's result and replays the clip through the from-scratch chunk
-plan, which keeps the ring canonical and the draft live. That clip is at most one chunk, or sixteen
-tokens per token the conversation is expected to generate, so the prefill it costs (~1.6K tok/s)
-stays well below the decode it saves (~19 ms per generated token). The expectation is the mean of
-that conversation's completed turns, because a request's budget is the ceiling its client set rather
-than a prediction of what it will spend; a conversation with no completed turn yet keeps the budget,
-which is the worst case this gate was written for. Only a deeper mid-chunk lineage - one whose
-clip exceeds that bound - keeps the mid-chunk restore and declines the draft
-(`GenerationResult::draft_context_declined`, reported on stderr), running target-only rounds. Those
-are deterministic and their
-boundary crossing matches the oracle's, but target-only rounds are a different draft pattern from
-the oracle's full windows, and a changed draft pattern shifts which way near ties resolve (the same
-property the MTP section records for a changed draft cache dtype). What the decline costs is
-acceptance rate; what it protects is licensing - the output never depends on draft state that does
-not belong to the restored walk.
+A recall whose boundary is not a multiple of the prefill chunk (256 by default) walks its suffix from
+wherever the boundary sits, so its chunks are not the oracle's and it does not owe the oracle the
+whole trajectory - only the boundary crossing. The state and KV beside the boundary are still the
+conversation's own prefix (the scan proved the tokens before it agree), so the first sample is the
+same logits, and the tolerance covers the exact ties that can resolve differently later. The masked
+draft stays live on such a boundary rather than being declined: the ring beside the restored state
+belongs to the walk that froze it, so it proposes the block that walk would have proposed, the draft
+only proposes, and the target verify licenses every emitted token regardless - the guarantee every
+speculative round already gives. Keeping it live is what the route wants: measured on the served
+recipe, a conversation that reused its whole previous answer (2,442 cached tokens, TTFT 51-58 ms)
+decoded at 54-87 tok/s with 21-44% of its drafts accepted across two samples, against 22.5 tok/s for
+the same request with the draft declined.
 
 ### Verify CUDA graph
 
@@ -419,10 +414,11 @@ Observable behaviour:
   rather than stopping at the previous prompt. The first token is committed through the output policy like every
   later one; a token that bypassed it would be missing from the answer and would leave the pools and the session
   catalog describing a history one token longer than any client could send back.
-- A recall restores byte-identical KV, so a returning conversation reproduces a from-scratch prefill
-  of the same prompt up to the prefill's own chunk-boundary rounding. That residue is small but not
-  zero: an exact logit tie can still flip a sampled token, so the session tests assert the recalled
-  conversation's first sample rather than its whole generated tail.
+- A recall restores byte-identical KV and GDN state, so a returning conversation reproduces a
+  from-scratch prefill of the same prompt token for token while its boundary sits on the prefill grid.
+  A boundary inside a chunk re-walks the suffix from there: its first sample is the same logits, but an
+  exact tie later can resolve differently, so the session tests assert that crossing rather than the
+  whole generated tail.
 - A conversation the LRU budget evicted reports `reused_prompt_tokens == 0` and is prefilled from
   zero again.
 - `NINFER_TP2_SESSION_TRACE=1` prints every recall and eviction with its frontier.
@@ -440,13 +436,11 @@ Constraints and limits:
 - A client that re-renders its history so it no longer starts with the stored token sequence cannot
   reach the frontier; it restarts at the deepest boundary it still shares, which is the state frozen at
   the previous prompt's end when the divergence sits at the first generated token.
-- On the masked-draft route an off-grid boundary is only taken when the prefill it skips beats sixteen
-  tokens per token the conversation is expected to generate: the restored draft ring belongs to a
-  differently chunked walk, so such a request runs target-only while it generates. The expectation is
-  the mean of that conversation's completed turns; a request's budget is its client's ceiling, and
-  pricing it would put the boundary out of reach for any client that asks for 16K or more. A
-  conversation with no completed turn yet - a first request, or a server without retention - keeps
-  the budget as its worst case.
+- The reuse scan takes the deepest boundary the lineage offers, on or off the prefill grid, and the
+  request's output budget never enters into it: a client that asks for its model's whole context still
+  keeps the tail it already generated. An off-grid boundary leaves the suffix chunked from a different
+  start, so such a walk guarantees its boundary crossing rather than its whole trajectory, and it
+  keeps the masked draft live (see the masked-draft section).
 - `--chat-template FILE` reaches this route: the core builds the serving frontend with the option, so a
   maintained template can replace the artifact's embedded one.
 - Session switching happens at request boundaries only. A request that arrives while another is
@@ -526,7 +520,7 @@ The context cache is disabled on this route -- the core owns the prefix-reuse sn
 | DFlash2 walk determinism | `ninfer_qwen3_5_tp2_dflash_solo_test` (independent processes) | one digest (`0x4bcc3994a5efba7d`) over 10 captured-graph runs with identical walk bodies, byte-identical again under `NINFER_TP2_VERIFY_GRAPH=0`; the recalled walk matches the from-scratch walk of the same prompt on its first sample in every run |
 | DFlash2 verify CUDA graph | solo A/B graph vs `NINFER_TP2_VERIFY_GRAPH=0`, `bench_serve.ps1` served route | walk digests byte-identical across routes (before the capture-forwarding fix 2 of 6 graph runs flipped the tail near tie); equal-output 128-token decode -10.2% wall (-4.9 ms/round), prefill flat, MTP K=2 control in its band |
 | MTP draft-chain CUDA graph | r52 greedy goldens in all three launch modes + git-stash pre-change A/B, `ninfer_qwen3_5_tp2_sessions_test`, `NINFER_TP2_TIMING=1` trajectory A/B | 5/5 byte-identical across graph/eager(bucket)/eager(exact) and the pre-change build; sessions pass on all three routes (after teaching the replay advances to accept a zero workspace delta); identical 94-round walks measure the chain step 3.7 -> 3.5 ms and the round 34.2 -> 34.0 ms |
-| Cross-session KV retention | `ninfer_qwen3_5_tp2_sessions_test` (`NINFER_TEST_ARTIFACT`; all three routes) | every route: a returning conversation recalled 71 prompt tokens and matched the oracle token for token where the draft pattern survives (the switch scenario on the prefill grid and the cancellation retry included); the LRU-evicted one reported `reused_prompt_tokens == 0`. DFlash2 with a declined draft pins the boundary crossing (first sample), whose target-only tail is a different draft pattern's walk. The MTP round's shard-0 arena reports `2 layouts` against shard 1's `1`, so its own KV slab travels with the session |
+| Cross-session KV retention | `ninfer_qwen3_5_tp2_sessions_test` (`NINFER_TEST_ARTIFACT`; all three routes) | every route: a returning conversation recalled 71 prompt tokens and matched the oracle token for token where the draft pattern survives (the switch scenario on the prefill grid and the cancellation retry included); the LRU-evicted one reported `reused_prompt_tokens == 0`. A recall anchored inside a chunk pins the boundary crossing (first sample) instead of the whole trajectory. The MTP round's shard-0 arena reports `2 layouts` against shard 1's `1`, so its own KV slab travels with the session |
 
 "Exact" is bit for bit: the split Op output equals the same Op run with the full weight on the same
 device, which is the property the merge relies on. `temperature 0, top_k 1` is what makes the greedy

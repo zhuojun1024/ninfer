@@ -100,49 +100,26 @@ const char* route_name(Route route) {
     return "unknown";
 }
 
-// The scenario that pins what the reuse gate charges for an unaligned boundary: one long turn that
-// is deliberately longer than the conversation's average turn, continued with a budget far larger
-// than anything the conversation has generated. The gate has to price the conversation's own turns,
-// or the budget its client asked for puts the boundary out of reach for good.
+// The scenario that pins a conversation continued with a budget far larger than anything it has
+// generated: the scan still takes the deepest boundary the lineage holds, so a client asking for its
+// model's whole context keeps the tail it already produced instead of re-prefilling it.
 constexpr std::uint32_t kBurstBudget    = 60;
 constexpr std::uint32_t kContinueBudget = 1024;
 
-// The prefill chunk the scenario pins; `normalize_engine_options` keeps it and the core's recall
-// grid is the same width, so a boundary that is not a multiple of it sits inside a chunk.
+// The prefill chunk the scenarios pin; `normalize_engine_options` keeps it, and the chunk plan walks a
+// reused suffix in this width from wherever the boundary sits.
 constexpr std::uint32_t kPrefillChunk = 256;
 
-// A DFlash2 recall whose boundary is not on the prefill grid cannot license the masked draft
-// directly: the ring beside the restored state belongs to a differently chunked walk, so its
-// proposals would not be licensed against a from-scratch walk's windows. The masked draft rounds
-// such a boundary down to the aligned scan's result instead whenever the clip stays within its
-// budget - one chunk, or sixteen tokens per token the request may still generate
-// (tp2_generation_core.cpp, the reuse fallback's gate). The recall then re-prefills that clip through
-// the from-scratch chunk plan, which keeps the ring canonical and the draft licensed, so the answer
-// has to reproduce the oracle's in full (see compare_recall). Only a deeper mid-chunk lineage keeps
-// the mid-chunk restore and declines the draft: the request runs target-only rounds, deterministic in
-// themselves, and their boundary crossing matches the oracle, but the tail is a different draft
-// pattern's walk.
-constexpr std::uint32_t kDraftDeclineClip =
-    kPrefillChunk > 16U * kOutputTokens ? kPrefillChunk : 16U * kOutputTokens;
-bool draft_rounds_down(Route route, std::uint32_t boundary) {
-    return route == Route::DFlash2 && boundary != 0 && boundary % kPrefillChunk != 0 &&
-           boundary <= kDraftDeclineClip;
-}
-bool draft_declined(Route route, std::uint32_t boundary) {
-    return route == Route::DFlash2 && boundary != 0 && boundary % kPrefillChunk != 0 &&
-           !draft_rounds_down(route, boundary);
-}
-// The exit-path scan prices an unaligned boundary against the masked draft: the restored ring is the
-// one a differently chunked walk froze, so taking the boundary runs the request target-only for as
-// long as it generates. A boundary only wins when the prefill it skips beats sixteen tokens per token
-// the request will still generate, and what it will generate is the conversation's own average turn
-// rather than the budget its client asked for (tp2_generation_core.cpp). A resident continuation's
-// frontier is unaligned and its clip is the distance back to the previous prompt's own chunk start,
-// so the scenarios have to pin which of the two boundaries each route lands on.
-bool resident_tail_rounds_down(Route route, std::uint32_t frontier, std::uint32_t aligned,
-                               std::uint32_t expected_turn) {
-    return route == Route::DFlash2 && frontier != aligned &&
-           frontier - aligned <= std::max(kPrefillChunk, 16U * expected_turn);
+// A recall whose boundary is not a multiple of the prefill chunk walks its suffix from there, so the
+// chunks that produce its logits are not the ones a from-scratch walk of the same prompt would use.
+// The state and KV beside the boundary are still this prompt's own prefix - the scan proved the tokens
+// before it agree - so its first sample is the same logits either way, but an exact tie later can
+// resolve differently. That is the tolerance a bounded recall has always had and the reason its answer
+// is pinned at the boundary crossing (see compare_recall). The masked draft stays live on such a
+// boundary: its ring belongs to the walk that froze it, and the target verify licenses every emitted
+// token either way.
+bool boundary_on_grid(std::uint32_t boundary) {
+    return boundary != 0 && boundary % kPrefillChunk == 0;
 }
 
 ninfer::EngineOptions engine_options(const char* artifact, int device_a, int device_b,
@@ -203,8 +180,8 @@ ninfer::GenerationResult run(ninfer::Engine& engine, std::vector<TokenId> tokens
     return engine.generate(engine.prepare_tokens(std::move(tokens)), greedy_request());
 }
 
-// The same walk with a chosen output budget: the gate reads the request's budget, so a scenario that
-// pins how the gate prices a boundary has to control it.
+// The same walk with a chosen output budget: a scenario that pins what a request's budget does to the
+// reuse scan has to control it.
 ninfer::GenerationResult run_budget(ninfer::Engine& engine, std::vector<TokenId> tokens,
                                     std::uint32_t budget) {
     ninfer::RequestOptions options            = greedy_request();
@@ -243,34 +220,17 @@ std::string tokens_text(const std::vector<TokenId>& tokens) {
     return text + "]";
 }
 
-// Pins a recall's answer against the from-scratch oracle. Every recall the masked draft keeps -
-// every route, and DFlash2 whenever it stays on the prefill grid or rounds a shallow clip back down
-// to it - has to match token for token: the walk keeps the oracle's draft pattern, so its verify
-// windows are the same execution shape and the KV rows they write are the same bytes. A declined
-// DFlash2 recall (see draft_declined) runs target-only rounds instead - a
-// different draft pattern and therefore a different execution shape, the same property that makes
-// MTP windows and plain decodes differ (docs/tp2-dual-5060ti.md) - and a changed draft pattern
-// shifts which way near ties resolve. The re-rendered-answer scenario demonstrates it
-// deterministically: its third token forks, identically in every run. A rounded-down recall (see
-// draft_rounds_down) is licensed but re-prefills from zero in a warm engine, which is the ulp-level
-// shape difference the golden probe warns about; it pins its boundary crossing the same way. A recall
-// in either class still owes the oracle the boundary crossing - its first sample is the logits of the
-// prefix it starts from - so that is what is pinned for it.
-int compare_recall(const std::string& label, const char* what, Route route, std::uint32_t boundary,
+// Pins a recall's answer against the from-scratch oracle. A recall whose boundary is on the prefill
+// grid re-walks exactly the chunks a from-scratch walk of the same prompt would, so its verify windows
+// are the same execution shape, the KV rows they write are the same bytes, and it has to match the
+// oracle token for token. A recall anchored inside a chunk re-walks the suffix from there: the state
+// and KV beside it are still this prompt's own prefix, so its first sample is the same logits, but the
+// walk is a different execution shape and a near tie can resolve the other way - the same property
+// that makes MTP windows and plain decodes differ (docs/tp2-dual-5060ti.md). The boundary crossing is
+// therefore what it owes the oracle.
+int compare_recall(const std::string& label, const char* what, std::uint32_t boundary,
                    const ninfer::GenerationResult& got, const std::vector<TokenId>& expected) {
-    const bool declined = draft_declined(route, boundary);
-    const bool replayed = draft_rounds_down(route, boundary);
-    if (got.draft_context_declined != declined) {
-        return fail(label, std::string(what) +
-                               (declined ? " did not decline its draft"
-                                         : " declined its draft on an aligned boundary"));
-    }
-    // A rounded-down recall re-prefills its clip from zero in a warm engine. That is a licensed walk -
-    // the draft stays live, which the flag above pins - but its KV rows carry this prefill's reduction
-    // shape, and the project only guarantees a trajectory reproduces across engine warmth on a server
-    // that has served the same shapes (tools/win_port/r52_ab.ps1 records the property). The boundary
-    // crossing is what it still owes the oracle.
-    if (declined || replayed) {
+    if (!boundary_on_grid(boundary)) {
         if (got.generated_token_ids.empty() || expected.empty() ||
             got.generated_token_ids.front() != expected.front()) {
             return fail(label, std::string(what) + " diverged from the oracle on its first sample: got " +
@@ -450,22 +410,13 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     // A returns: the whole prefix comes back from the host slabs, so only the frontier token is
     // forwarded again.
     const ninfer::GenerationResult a_second = run(engine, a_continued);
-    const std::uint32_t a_second_reuse = recalled_frontier;
-    if (draft_rounds_down(route, recalled_frontier)) {
-        // The masked draft trades this shallow mid-chunk reuse for its ring, so the recall re-prefills
-        // from the aligned scan's result (nothing else is cached here, so that is zero) and has to
-        // reproduce the oracle's answer in full below.
-        if (a_second.reused_prompt_tokens != 0) {
-            return fail(label, "a rounded-down recall reused " +
-                                   std::to_string(a_second.reused_prompt_tokens) +
-                                   " prompt tokens, expected 0");
-        }
-    } else if (a_second.reused_prompt_tokens != a_second_reuse) {
+    if (a_second.reused_prompt_tokens != recalled_frontier) {
         return fail(label, "a recalled conversation reused " +
                                std::to_string(a_second.reused_prompt_tokens) +
-                               " prompt tokens, expected " + std::to_string(a_second_reuse));
+                               " prompt tokens, expected " +
+                               std::to_string(recalled_frontier));
     }
-    if (const int status = compare_recall(label, "a recalled conversation", route,
+    if (const int status = compare_recall(label, "a recalled conversation",
                                           recalled_frontier, a_second, continued_answer);
         status != 0) {
         return status;
@@ -532,7 +483,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
                                std::to_string(shared_a_second_reuse));
     }
     if (const int status = compare_recall(label, "a conversation behind a shared system prompt",
-                                          route, shared_frontier, shared_a_second,
+                                          shared_frontier, shared_a_second,
                                           shared_continued_answer);
         status != 0) {
         return status;
@@ -561,7 +512,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     // prefill grid, so its masked draft stays licensed and its verify windows have to reproduce a
     // from-scratch walk exactly.
     if (const int status = compare_recall(
-            label, "a conversation opening with a stored system prompt", route, shared_c_first_reuse,
+            label, "a conversation opening with a stored system prompt", shared_c_first_reuse,
             shared_c_first, shared_c_answer);
         status != 0) {
         return status;
@@ -577,22 +528,14 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     (void)run(engine, aside);
     const ninfer::GenerationResult rerendered_first = run(engine, rerendered);
     const std::uint32_t rerender_prompt_end = static_cast<std::uint32_t>(rerender_base.size());
-    const std::uint32_t rerendered_first_reuse = rerender_prompt_end;
-    if (draft_rounds_down(route, rerender_prompt_end)) {
-        // Same trade as the shallow recall above, and the oracle walks the same from-scratch plan.
-        if (rerendered_first.reused_prompt_tokens != 0) {
-            return fail(label, "a rounded-down return reused " +
-                                   std::to_string(rerendered_first.reused_prompt_tokens) +
-                                   " prompt tokens, expected 0");
-        }
-    } else if (rerendered_first.reused_prompt_tokens != rerendered_first_reuse) {
+    if (rerendered_first.reused_prompt_tokens != rerender_prompt_end) {
         return fail(label, "a conversation behind a re-rendered answer reused " +
                                std::to_string(rerendered_first.reused_prompt_tokens) +
                                " prompt tokens, expected " +
-                               std::to_string(rerendered_first_reuse));
+                               std::to_string(rerender_prompt_end));
     }
     if (const int status = compare_recall(label, "a conversation behind a re-rendered answer",
-                                          route, rerender_prompt_end, rerendered_first,
+                                          rerender_prompt_end, rerendered_first,
                                           rerendered_answer);
         status != 0) {
         return status;
@@ -618,69 +561,38 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
                                                 resident_base.size() +
                                                 resident_first.generated_token_ids.size()) -
                                             1U;
-    const std::uint32_t resident_aligned =
-        static_cast<std::uint32_t>(resident_base.size()) / kPrefillChunk * kPrefillChunk;
-    // The conversation has completed exactly one turn, of kOutputTokens tokens, so its average turn
-    // is the same number the request's budget is.
-    const std::uint32_t resident_reuse =
-        resident_tail_rounds_down(route, resident_frontier, resident_aligned, kOutputTokens)
-            ? resident_aligned
-            : resident_frontier;
+    // The previous turn's own answer is in the device state, so the scan takes the frontier and only
+    // the last token is forwarded again - whatever the request's budget asks for.
     const ninfer::GenerationResult resident_second = run(engine, resident_continued);
-    if (resident_second.reused_prompt_tokens != resident_reuse) {
+    if (resident_second.reused_prompt_tokens != resident_frontier) {
         return fail(label, "a resident conversation's next turn reused " +
                                std::to_string(resident_second.reused_prompt_tokens) +
-                               " prompt tokens, expected " + std::to_string(resident_reuse));
+                               " prompt tokens, expected its frontier " +
+                               std::to_string(resident_frontier));
     }
-    if (const int status = compare_recall(label, "a resident conversation's next turn", route,
-                                          resident_reuse, resident_second, resident_answer);
+    if (const int status = compare_recall(label, "a resident conversation's next turn",
+                                          resident_frontier, resident_second, resident_answer);
         status != 0) {
         return status;
     }
-    // A conversation whose client asks for far more than it spends. The gate used to charge the
-    // request's whole budget for every token it might still generate, so a client asking for its
-    // model's maximum put an unaligned boundary out of reach for good. Five short turns and one long
-    // one give the conversation an average to price against, and the long turn's own saving is what
-    // the continuation is offered. Only the conversation's average keeps that boundary reachable:
-    // priced against the budget the continuation asks for, it is not.
+    // A conversation continued with a budget far larger than anything it has generated. Its previous
+    // answer is the deepest boundary the lineage holds, and the scan takes it - a client asking for its
+    // model's whole context does not give up the tail it already produced.
     std::vector<TokenId> burst_history = make_prompt(63000, 386);
-    std::uint64_t burst_generated      = 0;
-    std::uint32_t burst_turns          = 0;
-    const auto charge                  = [&](const ninfer::GenerationResult& shaped) {
-        if (!shaped.generated_token_ids.empty()) {
-            burst_generated += shaped.generated_token_ids.size();
-            ++burst_turns;
-        }
-    };
     for (int turn = 0; turn < 5; ++turn) {
         const ninfer::GenerationResult short_turn = run(engine, burst_history);
-        charge(short_turn);
         append(burst_history, short_turn.generated_token_ids);
         append(burst_history, follow_up);
     }
     const std::uint32_t burst_prompt_end = static_cast<std::uint32_t>(burst_history.size());
     const ninfer::GenerationResult burst = run_budget(engine, burst_history, kBurstBudget);
-    charge(burst);
     append(burst_history, burst.generated_token_ids);
     append(burst_history, follow_up);
-    if (burst_turns == 0) { return fail(label, "the scenario's conversation generated nothing"); }
+    if (burst.generated_token_ids.empty()) {
+        return fail(label, "the scenario's long turn generated nothing to reuse");
+    }
     const std::uint32_t burst_frontier =
         burst_prompt_end + static_cast<std::uint32_t>(burst.generated_token_ids.size()) - 1U;
-    const std::uint32_t burst_aligned  = burst_prompt_end / kPrefillChunk * kPrefillChunk;
-    const std::uint32_t burst_saving   = burst_frontier - burst_aligned;
-    const std::uint32_t burst_expected = static_cast<std::uint32_t>(burst_generated / burst_turns);
-    // The budget-priced rule this scenario is here to distinguish would have taken the boundary
-    // already if the saving were this deep, so the scenario only means something while it is not.
-    if (burst_saving > std::max(kPrefillChunk, 16U * kContinueBudget)) {
-        return fail(label, "the scenario no longer tells the budget from the average: saving " +
-                               std::to_string(burst_saving) + " already beats budget " +
-                               std::to_string(kContinueBudget));
-    }
-    if (burst_saving <= std::max(kPrefillChunk, 16U * burst_expected)) {
-        return fail(label, "the scenario's long turn no longer pays for its own boundary: saving " +
-                               std::to_string(burst_saving) + " against average " +
-                               std::to_string(burst_expected));
-    }
     const ninfer::GenerationResult burst_continued =
         run_budget(engine, burst_history, kContinueBudget);
     if (burst_continued.reused_prompt_tokens != burst_frontier) {
@@ -688,10 +600,6 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
                                std::to_string(burst_continued.reused_prompt_tokens) +
                                " prompt tokens, expected its frontier " +
                                std::to_string(burst_frontier));
-    }
-    if (burst_continued.draft_context_declined != (route == Route::DFlash2)) {
-        return fail(label, "an off-grid continuation did not price its own draft: declined=" +
-                               std::to_string(burst_continued.draft_context_declined));
     }
 
     // A client that gives up mid-prefill and sends the same prompt again. The cancelled walk wrote

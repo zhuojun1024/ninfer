@@ -6,9 +6,9 @@
 // does) and prints every walk's generated tokens plus a digest of them all. Independent processes
 // must print one identical digest and identical walk bodies. Inside a run, the recalled walk's
 // first sample has to match the evicted (from-scratch) walk of the same prompt - the boundary
-// crossing is the property the retention carries. The tails are only compared across runs: the
-// recalled walk runs target-only rounds after a draft decline, a different draft pattern whose near
-// ties resolve its own way against a full-window walk (docs/tp2-dual-5060ti.md).
+// crossing is the property the retention carries. The tails are only compared across runs: a recall
+// anchored inside a prefill chunk re-walks its suffix from there, a different execution shape whose
+// near ties resolve their own way against a full-window walk (docs/tp2-dual-5060ti.md).
 
 #include "ninfer/engine.h"
 
@@ -129,7 +129,6 @@ int main(int argc, char** argv) {
             const ninfer::GenerationResult result =
                 engine.generate(engine.prepare_tokens(std::move(prompt)), greedy_request());
             std::cout << "[solo] " << name << " reused=" << result.reused_prompt_tokens
-                      << " declined=" << (result.draft_context_declined ? 1 : 0)
                       << " tokens=" << tokens_text(result.generated_token_ids) << '\n';
             digest_walk(result);
             return result;

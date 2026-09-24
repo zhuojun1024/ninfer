@@ -2137,42 +2137,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     std::size_t reuse_slot    = 0;
     std::size_t shared_prefix = 0;
     reuse_source_             = ReuseSource::None;
-    // A recalled walk has to chunk its suffix exactly like a from-scratch walk of the same prompt,
-    // and those chunks end on multiples of `prefill_chunk` (see the chunk plan below). A boundary
-    // inside a chunk - the per-token checkpoints a decode leaves behind, or a shared prefix cut
-    // mid-chunk - would make the two walks round differently and produce different logits, so only
-    // grid-aligned boundaries qualify. Rounding down costs at most one chunk of re-prefill, and the
-    // shared system-prompt boundary a cascade relies on is grid-aligned already.
-    const std::uint32_t reuse_grid =
-        std::min<std::uint32_t>(std::max<std::uint32_t>(options_.prefill_chunk, 64),
-                                kPrefillChunkMaximum);
     if (cached_state_valid_ && !cached_prompt_tokens_.empty()) {
         const std::size_t common = std::min(cached_prompt_tokens_.size(), token_ids.size());
         while (shared_prefix < common &&
                cached_prompt_tokens_[shared_prefix] == token_ids[shared_prefix]) {
             ++shared_prefix;
-        }
-        // The live GDN state is the deepest boundary a continued conversation can offer: it sits
-        // exactly at the resident entry's frontier, and the device KV holds the whole history
-        // before it. Reusing it copies nothing at all - but only a prompt that extends it has a
-        // column to forward, and the final prompt token must still be forwarded to produce the
-        // logits that drive the first sample.
-        if (live_state_valid_ && active_session_ != kNoSession) {
-            const std::uint32_t frontier = sessions_[active_session_].frontier;
-            if (frontier != 0 && frontier % reuse_grid == 0 && frontier <= shared_prefix &&
-                frontier < prompt_tokens && frontier > reuse) {
-                reuse        = frontier;
-                reuse_source_ = ReuseSource::LiveState;
-            }
-        }
-        for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
-            const std::uint32_t boundary = cached_boundaries_[slot];
-            if (boundary % reuse_grid == 0 && boundary <= shared_prefix && boundary < prompt_tokens &&
-                boundary > reuse) {
-                reuse        = boundary;
-                reuse_slot   = slot;
-                reuse_source_ = ReuseSource::DeviceSnapshot;
-            }
         }
         // A host checkpoint is a state plus the KV before it, and both are only this prompt's while
         // the lineage agrees on the tokens before it: the state was taken over the tokens of the
@@ -2188,59 +2157,33 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 if (checkpoint.position > shared_prefix) { checkpoint.valid = false; }
             }
         }
-        for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
-            const auto& checkpoint = shard_a_.host_checkpoints[index];
-            if (!checkpoint.valid || checkpoint.position % reuse_grid != 0 ||
-                checkpoint.position <= reuse ||
-                checkpoint.position > shared_prefix || checkpoint.position >= prompt_tokens) {
-                continue;
-            }
-            reuse         = checkpoint.position;
-            reuse_slot    = index;
-            reuse_source_ = ReuseSource::HostCheckpoint;
-        }
-        // Every boundary the lineage can offer, deepest wins. The aligned scan above only accepts a
-        // position on the prefill grid, because a walk anchored mid-chunk chunks its suffix
-        // differently from a from-scratch walk. That rounding is nearly free when the grid holds a
-        // checkpoint close to the shared prefix, but a conversation that continues in place has no
-        // grid boundary past its own previous prompt: decode publishes no checkpoint at all, so the
-        // deepest aligned candidate is the rewind snapshot at that prompt's chunk start, with the
-        // whole generated answer behind it. Rescan the same boundaries without the grid restriction:
-        // the recalled state and KV are still this prompt's own, and only the suffix chunking
-        // differs. The masked-draft route cannot accept that, because its ring is the one a
-        // differently chunked walk froze, so the request would run target-only for as long as it
-        // generates. That clip replay costs prefill work at ~1.6K tok/s while the draft saves ~19 ms
-        // of decode per generated token, so only a boundary that saves more prefill than sixteen
-        // tokens per token the request will still generate - and never less than one chunk - is worth
-        // declining the draft. A survivor of this gate is an unaligned boundary, reported as a
-        // declined draft.
+        // Every boundary the lineage can offer, deepest wins. Any of them is usable while the state
+        // and KV beside it are this prompt's own prefix - which the shared prefix above proves - and a
+        // boundary inside a prefill chunk is no exception: the suffix this walk chunks from it rounds
+        // differently from a from-scratch walk, so the two can part at an exact logit tie. That is the
+        // tolerance a bounded recall has always had, and why a recall owes a from-scratch walk its
+        // boundary crossing rather than its whole trajectory. Rounding down to the prefill grid
+        // instead would re-prefill up to a whole chunk on every turn of a conversation that continues
+        // in place - the common agent case - because decode publishes no grid boundary past its own
+        // prompt, so the deepest aligned candidate sits behind the entire generated answer.
         //
-        // What the request will generate is not its budget: the protocol layer sets that to its
-        // client's capable maximum, so pricing sixteen budgets per token puts the boundary out of
-        // reach for every context that cannot hold that many tokens, which is all of them once a
-        // client asks for 16K or more. Price this conversation's own turns instead. A conversation
-        // with no completed turn yet - a first request, or retention off - keeps the budget, which is
-        // the worst case this gate was written for.
-        const std::uint32_t budget = request.budget.remaining();
-        std::uint32_t expected_turn = budget;
-        if (active_session_ != kNoSession && sessions_[active_session_].generated_turns != 0) {
-            const SessionEntry& active = sessions_[active_session_];
-            expected_turn              = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                budget, active.generated_tokens_total / active.generated_turns));
-        }
-        auto take = [&](std::uint32_t position, std::size_t slot, ReuseSource source) {
+        // The masked draft stays live on such a boundary as well. Its ring belongs to the walk that
+        // froze it, so it proposes the block that walk would have proposed; the draft only proposes,
+        // and the target verify licenses every emitted token either way.
+        const auto take = [&](std::uint32_t position, std::size_t slot, ReuseSource source) {
             if (position == 0 || position > shared_prefix || position >= prompt_tokens ||
                 position <= reuse) {
-                return;
-            }
-            if (dflash2_enabled_ &&
-                position - reuse <= std::max(reuse_grid, 16U * expected_turn)) {
                 return;
             }
             reuse         = position;
             reuse_slot    = slot;
             reuse_source_ = source;
         };
+        // The live GDN state is the deepest boundary a continued conversation can offer: it sits
+        // exactly at the resident entry's frontier, and the device KV holds the whole history before
+        // it. Reusing it copies nothing at all - but only a prompt that extends it has a column to
+        // forward, and the final prompt token must still be forwarded to produce the logits that
+        // drive the first sample.
         if (live_state_valid_ && active_session_ != kNoSession) {
             take(sessions_[active_session_].frontier, 0, ReuseSource::LiveState);
         }
@@ -2251,23 +2194,6 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             const auto& checkpoint = shard_a_.host_checkpoints[index];
             if (checkpoint.valid) { take(checkpoint.position, index, ReuseSource::HostCheckpoint); }
         }
-    }
-    // The target state at the reused boundary is this prompt's own prefix, but the draft ring beside
-    // it is not necessarily the one a from-scratch walk would hold there: the fallback above may pick
-    // a boundary inside a prefill chunk, where the walk that froze the ring chunked its suffix
-    // differently. That ring still proposes against the same tokens, so the target verify keeps every
-    // emitted token sound, but the accepted counts (and with them the verify windows the emitted
-    // logits come from) would not match a from-scratch walk. Decline the masked draft for this
-    // request; the target KV/GDN reuse stays. See GenerationResult::draft_context_declined.
-    dflash_draft_declined_ =
-        dflash2_enabled_ && reuse != 0 && reuse % reuse_grid != 0;
-    if (dflash_draft_declined_) {
-        // Surface the trade loudly: this request runs target-only rounds for its whole generation,
-        // which is ~2x slower than the same request with a live masked draft.
-        std::fprintf(stderr,
-                     "[tp2-draft] masked draft declined: reuse boundary %u is not grid aligned "
-                     "(mid-chunk walk); this request runs target-only rounds\n",
-                     reuse);
     }
     if (prefill_trace) { scan_done = Clock::now(); }
     if (reuse_trace) {
@@ -2433,7 +2359,6 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         sink->start(GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
     }
     result.reused_prompt_tokens   = reuse;
-    result.draft_context_declined = dflash_draft_declined_;
 
     // Sampling config, device-resident, for ops::sample.
     ops::SamplingConfig sampling_config = make_sampling_config(request.sampling);
@@ -3031,13 +2956,12 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 budget_remaining > 1 ? budget_remaining - 1U : 0U;
             const std::uint32_t capacity_left =
                 position + 1U < options_.max_context ? options_.max_context - position - 1U : 0U;
-            // A declined draft runs every round target-only: the window still forwards the anchor
-            // and the verify still taps its residual into the pending staging, but no proposal is
-            // licensed, so each round commits the target's own single token.
+            // The draft is never declined, whatever boundary the scan took: the ring beside an
+            // unaligned boundary belongs to the walk that froze it, so the block it proposes is that
+            // walk's, and the target verify licenses every emitted token either way. The proposal
+            // budget is what the request has left to spend and what the context has left to hold.
             const std::uint32_t extent =
-                dflash_draft_declined_
-                    ? 0U
-                    : std::min({dflash_drafts_, max_by_budget, capacity_left});
+                std::min({dflash_drafts_, max_by_budget, capacity_left});
             const std::int32_t width = static_cast<std::int32_t>(dflash_drafts_) + 1;
             // extent == 0 is a real round here, exactly as it is on the single-device route
             // (decode.cpp:732 counts it as a fallback step but still runs the round): the window
@@ -3520,14 +3444,6 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // remainder first. A finished round already did this itself.
         flush_dflash_context(frontier);
         session_publish(history, frontier);
-        // Charge the request to its conversation. session_publish may have created the entry or
-        // evicted another one, so read the active index after it, and price only turns that actually
-        // generated something: the gate divides by the count.
-        if (active_session_ != kNoSession && !request.generated.empty()) {
-            SessionEntry& active = sessions_[active_session_];
-            active.generated_tokens_total += request.generated.size();
-            active.generated_turns += 1;
-        }
     }
     result.generated_token_ids = std::move(request.generated);
     result.tool_calls          = request.output.take_tool_calls();

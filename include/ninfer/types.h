@@ -845,13 +845,6 @@ struct GenerationResult {
     std::optional<std::string> matched_stop_string;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
-    // Only the TP-2 DFlash2 route sets this. The request reused the target KV/GDN prefix but the
-    // masked draft was declined, because the recall boundary is not one a from-scratch walk would
-    // reach and the recalled draft ring belongs to a differently chunked walk, so the verify-window
-    // sequence the emitted tokens depend on would not match a from-scratch walk's. The request runs
-    // target-only; the draft only proposes and the target verify still licenses every token, so this
-    // costs acceptance rate, not correctness.
-    bool draft_context_declined = false;
     MaterializationDiagnostics materialization;
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
