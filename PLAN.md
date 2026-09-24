@@ -817,6 +817,13 @@ reasoning 文本里**（或回放重分词与采样边界不同），因此 DFla
   本次提交对 plain/mtp 是**行为等价重构**（旧门控只在 `dflash2_enabled_` 时生效，两者早已取最深边界），故与该失败无关。
 - `ninfer_qwen3_5_tp2_dflash_solo_test`（重建后）：两个独立进程 digest 均为 `0x4bcc3994a5efba7d`、PASS，与文档记录值一致
   ⇒ 网格对齐路径未被扰动（solo 场景本身不含未对齐复用）。
-- served 路由（step-3 二进制）：`reuse=2442 src=live`、`cache 99.4%`、TTFT 51 ms、prefill 14 token、无弃稿提示；
-  `decode 53.9 tok/s / accepted 31/147 (21.1%)`（对照实验那次 87.1 tok/s / 44.4%；弃稿基线 22.5 tok/s）。接受率随
-  每请求随机 seed 波动，但两次都远高于弃稿基线。
+- served 路由（step-3 二进制）：`reuse=2442 src=live`、`cache 99.4%`、TTFT 51-57 ms、prefill 14 token、无弃稿提示。
+  同一二进制独立重启两次结果逐位相同（`output 52`、`accepted 31/147 (21.1%)`、`decode 53.9 tok/s`）⇒ 该二进制确定性，
+  21% 不是 run 间抖动（早先"temperature 0 非确定"的结论只适用于当时那个场景）。
+- **接受率是文本属性，不是本次改动的属性**：同一复用边界、同一二进制，只改续写内容 —— prose 53.9 tok/s / 21.1%，
+  数字列表 175.8 tok/s / 99.6%（446/448）。因此 `44.4%`（实验那次，数字型、output 37）与 `21.1%`（终结版，prose、output 52）
+  是两段不同文本的度量，不能当 A/B；真正同 walk 的 A/B 是"弃稿 22.5 tok/s vs 保留 87.1 tok/s / 44.4%"（同一 conversation、
+  同一 scan，只切换 extent）。
+- 两次构建为何会造出不同文本：门控删除也改变了**早期短轮**的复用边界（旧门控要求 `saving > max(1024, 16×expected)`，
+  短轮 prompt 的 off-grid 节省量远小于 1024，旧代码退到对齐边界；新代码取 frontier）⇒ 前缀不同 ⇒ 2-token 短答案在 tie 处可能不同
+  ⇒ 内容级联分叉（观测：旧 2,459/37 vs 新 2,456/52）。两者都是合法 walk。

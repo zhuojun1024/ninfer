@@ -266,10 +266,11 @@ same logits, and the tolerance covers the exact ties that can resolve differentl
 draft stays live on such a boundary rather than being declined: the ring beside the restored state
 belongs to the walk that froze it, so it proposes the block that walk would have proposed, the draft
 only proposes, and the target verify licenses every emitted token regardless - the guarantee every
-speculative round already gives. Keeping it live is what the route wants: measured on the served
-recipe, a conversation that reused its whole previous answer (2,442 cached tokens, TTFT 51-58 ms)
-decoded at 54-87 tok/s with 21-44% of its drafts accepted across two samples, against 22.5 tok/s for
-the same request with the draft declined.
+speculative round already gives. Keeping it live is what the route wants. On the walk the decline used to run target-only - the same
+conversation and the same reuse boundary, only the draft toggled - keeping it decoded at 87 tok/s
+with 28 of 63 drafts accepted, against 22.5 tok/s declined. What it accepts follows the text it is
+predicting, not the route: the same served recipe and the same 2,442-token reuse decode a prose
+answer at 54 tok/s (31 of 147 accepted) and a number list at 176 tok/s (446 of 448).
 
 ### Verify CUDA graph
 
