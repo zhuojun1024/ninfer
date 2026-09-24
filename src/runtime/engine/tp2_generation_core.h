@@ -254,6 +254,15 @@ private:
         // evicted at. Zero means no other conversation has diverged from this one yet.
         std::uint32_t host_shared_end = 0;
         std::uint64_t lru_clock       = 0;
+        // Tokens the completed turns of this conversation generated, and how many turns that is.
+        // The reuse gate prices an unaligned boundary against the decode it costs, and the request's
+        // budget is a ceiling the protocol layer sets - for an agent client, its model's capable
+        // maximum - not a prediction of what the request will spend. Charging that ceiling makes the
+        // gate unreachable for any context that cannot hold sixteen budgets' worth of tokens, so the
+        // gate prices against what this conversation's own turns actually generate instead. Only
+        // turns that committed at least one token are counted, so the mean is never zero.
+        std::uint64_t generated_tokens_total = 0;
+        std::uint32_t generated_turns        = 0;
     };
     static constexpr std::size_t kNoSession = static_cast<std::size_t>(-1);
 

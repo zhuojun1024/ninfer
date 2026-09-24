@@ -764,3 +764,26 @@ reasoning 文本里**（或回放重分词与采样边界不同），因此 DFla
 所以温度确实被应用；DFlash2 的稀疏接受（`speculative_accept_sparse_drafts`）配合每次请求随机 seed（`translate.cpp:51-57`）
 使解码在温度 0 下也不保证逐位 argmax——这正是 `--greedy`（"force temperature 0 (exact argmax)"）存在的原因。
 需要可复现 A/B 时应加 `--greedy`；这条独立于本次修复，未改动。
+
+## 6. 复用门控改按"会话自身轮次"定价（2026-09-24，已改）
+
+**问题**：门控 `position - reuse <= max(reuse_grid, 16 × request.budget.remaining())` 里的 budget 是客户端设的上限
+（DSH 固定 32,768）。预算 ≥ 16K 时 `16 × budget >= max_context`，未对齐回退分支**在数学上不可达**——而它是尾部复用
+的唯一入口（网格上没有任何 decode 检查点），也就是说该机器生产配置下永远不会触发，即使节省量是整个上下文。
+
+**改动**：
+- `SessionEntry` 增 `generated_tokens_total` / `generated_turns`；每轮结束后按 `request.generated.size()` 累加
+  （只统计生成 >=1 token 的轮次，保证均值非零）。
+- 门控改用 `expected = min(budget, total/turns)`；没有已完成轮次（首轮请求、或关闭 retention）退回 budget（原最坏情况）。
+- 语义上只放宽（`min(budget, mean) <= budget`），任何原先接受的边界仍被接受。
+
+**验证**：
+- 测试 `ninfer_qwen3_5_tp2_sessions_test`：dflash2 / mtp EXIT 0。新增场景 = 5 短轮 + 1 长轮（60 token）+ 1024 预算
+  续轮，期望复用直达 frontier；另加两条场景自检，若某天不再落在 take 分支会带数字明确失败。证据 `profiles/gate-{dflash2,mtp}.log`。
+- 在线（serve + trace）：20 短轮（均值 2）+ 1 个 2000-token 长轮 → 续轮 **budget 32,768** 下 `reuse=2442 src=live`、
+  `cache 2,442 (99.3%)`、**TTFT 57.9 ms**（prefill 仅 17 token）；旧规则阈值 16 x 32,768 = 524,288 必然跳过。
+  同一请求按门控弃稿，decode 22.5 tok/s、输出 37 token ⇒ 代价约 1.2 s < 省下约 1.6 s，本注是净赚。
+
+**已知边界（故意保留）**：定价用的均值包含突发轮，所以"突发之后紧接的短轮"能否复用取决于该会话的均值——
+均值 > 节省量/16 时仍然跳过（风险中性结论，不是 bug）。当前 DSH 会话均值约 1,735，其 24.8k 尾部仍会被跳过；
+要翻转只能把比率 16 做成可配选项，或走第 3 步（未对齐复用下保住 masked draft）。

@@ -2211,15 +2211,30 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // differently chunked walk froze, so the request would run target-only for as long as it
         // generates. That clip replay costs prefill work at ~1.6K tok/s while the draft saves ~19 ms
         // of decode per generated token, so only a boundary that saves more prefill than sixteen
-        // tokens per remaining budget token - and never less than one chunk - is worth declining the
-        // draft. A survivor of this gate is an unaligned boundary, reported as a declined draft.
+        // tokens per token the request will still generate - and never less than one chunk - is worth
+        // declining the draft. A survivor of this gate is an unaligned boundary, reported as a
+        // declined draft.
+        //
+        // What the request will generate is not its budget: the protocol layer sets that to its
+        // client's capable maximum, so pricing sixteen budgets per token puts the boundary out of
+        // reach for every context that cannot hold that many tokens, which is all of them once a
+        // client asks for 16K or more. Price this conversation's own turns instead. A conversation
+        // with no completed turn yet - a first request, or retention off - keeps the budget, which is
+        // the worst case this gate was written for.
+        const std::uint32_t budget = request.budget.remaining();
+        std::uint32_t expected_turn = budget;
+        if (active_session_ != kNoSession && sessions_[active_session_].generated_turns != 0) {
+            const SessionEntry& active = sessions_[active_session_];
+            expected_turn              = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                budget, active.generated_tokens_total / active.generated_turns));
+        }
         auto take = [&](std::uint32_t position, std::size_t slot, ReuseSource source) {
             if (position == 0 || position > shared_prefix || position >= prompt_tokens ||
                 position <= reuse) {
                 return;
             }
             if (dflash2_enabled_ &&
-                position - reuse <= std::max(reuse_grid, 16U * request.budget.remaining())) {
+                position - reuse <= std::max(reuse_grid, 16U * expected_turn)) {
                 return;
             }
             reuse         = position;
@@ -3505,6 +3520,14 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // remainder first. A finished round already did this itself.
         flush_dflash_context(frontier);
         session_publish(history, frontier);
+        // Charge the request to its conversation. session_publish may have created the entry or
+        // evicted another one, so read the active index after it, and price only turns that actually
+        // generated something: the gate divides by the count.
+        if (active_session_ != kNoSession && !request.generated.empty()) {
+            SessionEntry& active = sessions_[active_session_];
+            active.generated_tokens_total += request.generated.size();
+            active.generated_turns += 1;
+        }
     }
     result.generated_token_ids = std::move(request.generated);
     result.tool_calls          = request.output.take_tool_calls();

@@ -100,6 +100,13 @@ const char* route_name(Route route) {
     return "unknown";
 }
 
+// The scenario that pins what the reuse gate charges for an unaligned boundary: one long turn that
+// is deliberately longer than the conversation's average turn, continued with a budget far larger
+// than anything the conversation has generated. The gate has to price the conversation's own turns,
+// or the budget its client asked for puts the boundary out of reach for good.
+constexpr std::uint32_t kBurstBudget    = 60;
+constexpr std::uint32_t kContinueBudget = 1024;
+
 // The prefill chunk the scenario pins; `normalize_engine_options` keeps it and the core's recall
 // grid is the same width, so a boundary that is not a multiple of it sits inside a chunk.
 constexpr std::uint32_t kPrefillChunk = 256;
@@ -128,13 +135,14 @@ bool draft_declined(Route route, std::uint32_t boundary) {
 // The exit-path scan prices an unaligned boundary against the masked draft: the restored ring is the
 // one a differently chunked walk froze, so taking the boundary runs the request target-only for as
 // long as it generates. A boundary only wins when the prefill it skips beats sixteen tokens per token
-// the request may still generate (tp2_generation_core.cpp). A resident continuation's frontier is
-// unaligned and its clip is the distance back to the previous prompt's own chunk start, so the
-// scenario below has to pin which of the two boundaries each route lands on.
+// the request will still generate, and what it will generate is the conversation's own average turn
+// rather than the budget its client asked for (tp2_generation_core.cpp). A resident continuation's
+// frontier is unaligned and its clip is the distance back to the previous prompt's own chunk start,
+// so the scenarios have to pin which of the two boundaries each route lands on.
 bool resident_tail_rounds_down(Route route, std::uint32_t frontier, std::uint32_t aligned,
-                               std::uint32_t remaining) {
+                               std::uint32_t expected_turn) {
     return route == Route::DFlash2 && frontier != aligned &&
-           frontier - aligned <= std::max(kPrefillChunk, 16U * remaining);
+           frontier - aligned <= std::max(kPrefillChunk, 16U * expected_turn);
 }
 
 ninfer::EngineOptions engine_options(const char* artifact, int device_a, int device_b,
@@ -193,6 +201,15 @@ std::vector<TokenId> make_prompt(std::int32_t first, std::size_t length) {
 
 ninfer::GenerationResult run(ninfer::Engine& engine, std::vector<TokenId> tokens) {
     return engine.generate(engine.prepare_tokens(std::move(tokens)), greedy_request());
+}
+
+// The same walk with a chosen output budget: the gate reads the request's budget, so a scenario that
+// pins how the gate prices a boundary has to control it.
+ninfer::GenerationResult run_budget(ninfer::Engine& engine, std::vector<TokenId> tokens,
+                                    std::uint32_t budget) {
+    ninfer::RequestOptions options            = greedy_request();
+    options.execution.requested_output_tokens = budget;
+    return engine.generate(engine.prepare_tokens(std::move(tokens)), options);
 }
 
 // Cancels after 'cancel_after' prefill iterations, so the walk is interrupted between chunks and
@@ -603,6 +620,8 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
                                             1U;
     const std::uint32_t resident_aligned =
         static_cast<std::uint32_t>(resident_base.size()) / kPrefillChunk * kPrefillChunk;
+    // The conversation has completed exactly one turn, of kOutputTokens tokens, so its average turn
+    // is the same number the request's budget is.
     const std::uint32_t resident_reuse =
         resident_tail_rounds_down(route, resident_frontier, resident_aligned, kOutputTokens)
             ? resident_aligned
@@ -617,6 +636,62 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
                                           resident_reuse, resident_second, resident_answer);
         status != 0) {
         return status;
+    }
+    // A conversation whose client asks for far more than it spends. The gate used to charge the
+    // request's whole budget for every token it might still generate, so a client asking for its
+    // model's maximum put an unaligned boundary out of reach for good. Five short turns and one long
+    // one give the conversation an average to price against, and the long turn's own saving is what
+    // the continuation is offered. Only the conversation's average keeps that boundary reachable:
+    // priced against the budget the continuation asks for, it is not.
+    std::vector<TokenId> burst_history = make_prompt(63000, 386);
+    std::uint64_t burst_generated      = 0;
+    std::uint32_t burst_turns          = 0;
+    const auto charge                  = [&](const ninfer::GenerationResult& shaped) {
+        if (!shaped.generated_token_ids.empty()) {
+            burst_generated += shaped.generated_token_ids.size();
+            ++burst_turns;
+        }
+    };
+    for (int turn = 0; turn < 5; ++turn) {
+        const ninfer::GenerationResult short_turn = run(engine, burst_history);
+        charge(short_turn);
+        append(burst_history, short_turn.generated_token_ids);
+        append(burst_history, follow_up);
+    }
+    const std::uint32_t burst_prompt_end = static_cast<std::uint32_t>(burst_history.size());
+    const ninfer::GenerationResult burst = run_budget(engine, burst_history, kBurstBudget);
+    charge(burst);
+    append(burst_history, burst.generated_token_ids);
+    append(burst_history, follow_up);
+    if (burst_turns == 0) { return fail(label, "the scenario's conversation generated nothing"); }
+    const std::uint32_t burst_frontier =
+        burst_prompt_end + static_cast<std::uint32_t>(burst.generated_token_ids.size()) - 1U;
+    const std::uint32_t burst_aligned  = burst_prompt_end / kPrefillChunk * kPrefillChunk;
+    const std::uint32_t burst_saving   = burst_frontier - burst_aligned;
+    const std::uint32_t burst_expected = static_cast<std::uint32_t>(burst_generated / burst_turns);
+    // The budget-priced rule this scenario is here to distinguish would have taken the boundary
+    // already if the saving were this deep, so the scenario only means something while it is not.
+    if (burst_saving > std::max(kPrefillChunk, 16U * kContinueBudget)) {
+        return fail(label, "the scenario no longer tells the budget from the average: saving " +
+                               std::to_string(burst_saving) + " already beats budget " +
+                               std::to_string(kContinueBudget));
+    }
+    if (burst_saving <= std::max(kPrefillChunk, 16U * burst_expected)) {
+        return fail(label, "the scenario's long turn no longer pays for its own boundary: saving " +
+                               std::to_string(burst_saving) + " against average " +
+                               std::to_string(burst_expected));
+    }
+    const ninfer::GenerationResult burst_continued =
+        run_budget(engine, burst_history, kContinueBudget);
+    if (burst_continued.reused_prompt_tokens != burst_frontier) {
+        return fail(label, "a conversation continued past its long turn reused " +
+                               std::to_string(burst_continued.reused_prompt_tokens) +
+                               " prompt tokens, expected its frontier " +
+                               std::to_string(burst_frontier));
+    }
+    if (burst_continued.draft_context_declined != (route == Route::DFlash2)) {
+        return fail(label, "an off-grid continuation did not price its own draft: declined=" +
+                               std::to_string(burst_continued.draft_context_declined));
     }
 
     // A client that gives up mid-prefill and sends the same prompt again. The cancelled walk wrote

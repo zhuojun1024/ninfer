@@ -262,8 +262,11 @@ masked draft directly: the ring beside the restored state belongs to a different
 its proposals would not be licensed against a from-scratch walk's windows. The masked draft rounds
 such a boundary down to the aligned scan's result and replays the clip through the from-scratch chunk
 plan, which keeps the ring canonical and the draft live. That clip is at most one chunk, or sixteen
-tokens per token the request may still generate, so the prefill it costs (~1.6K tok/s) stays well
-below the decode it saves (~19 ms per generated token). Only a deeper mid-chunk lineage - one whose
+tokens per token the conversation is expected to generate, so the prefill it costs (~1.6K tok/s)
+stays well below the decode it saves (~19 ms per generated token). The expectation is the mean of
+that conversation's completed turns, because a request's budget is the ceiling its client set rather
+than a prediction of what it will spend; a conversation with no completed turn yet keeps the budget,
+which is the worst case this gate was written for. Only a deeper mid-chunk lineage - one whose
 clip exceeds that bound - keeps the mid-chunk restore and declines the draft
 (`GenerationResult::draft_context_declined`, reported on stderr), running target-only rounds. Those
 are deterministic and their
@@ -438,9 +441,12 @@ Constraints and limits:
   reach the frontier; it restarts at the deepest boundary it still shares, which is the state frozen at
   the previous prompt's end when the divergence sits at the first generated token.
 - On the masked-draft route an off-grid boundary is only taken when the prefill it skips beats sixteen
-  tokens per token the request may still generate: the restored draft ring belongs to a differently
-  chunked walk, so such a request runs target-only while it generates. A request with a large output
-  budget therefore re-prefills its own tail on purpose instead of paying a slower decode for it.
+  tokens per token the conversation is expected to generate: the restored draft ring belongs to a
+  differently chunked walk, so such a request runs target-only while it generates. The expectation is
+  the mean of that conversation's completed turns; a request's budget is its client's ceiling, and
+  pricing it would put the boundary out of reach for any client that asks for 16K or more. A
+  conversation with no completed turn yet - a first request, or a server without retention - keeps
+  the budget as its worst case.
 - `--chat-template FILE` reaches this route: the core builds the serving frontend with the option, so a
   maintained template can replace the artifact's embedded one.
 - Session switching happens at request boundaries only. A request that arrives while another is
