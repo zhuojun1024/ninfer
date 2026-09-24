@@ -827,3 +827,328 @@ reasoning 文本里**（或回放重分词与采样边界不同），因此 DFla
 - 两次构建为何会造出不同文本：门控删除也改变了**早期短轮**的复用边界（旧门控要求 `saving > max(1024, 16×expected)`，
   短轮 prompt 的 off-grid 节省量远小于 1024，旧代码退到对齐边界；新代码取 frontier）⇒ 前缀不同 ⇒ 2-token 短答案在 tie 处可能不同
   ⇒ 内容级联分叉（观测：旧 2,459/37 vs 新 2,456/52）。两者都是合法 walk。
+
+## 8. DFlash2 draft 二次量化 r62–r66（2026-09-24；立项，未开工）
+
+**背景**：§3.7（r54–r57）把 draft 降到「当时消费 op 支持的最低 qtype」，此后每个 draft 组件都坐在
+op 级下限上。2026-09-24 对剩余空间做了逐 op 支持性审计（证据链：消费 op 的 qtype 校验器），结论是
+**当前构建没有一项可以「只改配方」落地**——剩余空间全部需要新 op 变体。本战役做其中性价比最高的四项
+（codebook 与环 FP8 明确缓做，见下）。
+
+**审计结论（每项的精度锁点）**：
+
+| 组件 | 当前 | 锁点（消费 op） | 判定 |
+|---|---|---|---|
+| mlp/gate_up [34816,5120] | q4 | `linear_swiglu` q4 plan 形状精确闭合（`q4_linear_swiglu_plan.cpp:33`） | 已在底，不动 |
+| mlp/down [5120,17408]、attention/output [5120,4096] | q5 | 融合 `linear_dynamic_grouped_conv_add` 校验器只放行 Q5_G64/Q8_G32（`wrapper/dynamic_grouped_conv.cpp:60-95`） | **r63**：新 q4 变体 |
+| feature_projection [5120,25600] | q5 | 普通 `ops::linear`；q4 注册表无 {5120,25600}（`q4_dispatch.cpp:13-25`） | **r62**：新 q4 shape |
+| context_key [6144,5120] | q8 | decode：`attn_input_proj` 三输出重载硬断言 `require_q8_rowsplit`（`wrapper/attn_input_proj.cpp:243-261`）；prefill：`context_kv_materialize` 硬断言 Q8_G32 [1024,5120]（`context_kv_materialize.cpp:37-52`） | **r65**：两处新 q4 变体 |
+| kernel_projection [1280,5120] | bf16 | `rmsnorm_dynamic_grouped_conv_prepare` 硬断言 BF16+Contiguous+无 scale（`wrapper/dynamic_grouped_conv.cpp:39-52`） | **r64**：新 q4 prepare |
+| codebook [248320,256]×2（shard 1） | bf16 | `candidate_selector_path` 唯一 bf16 变体（`wrapper/candidate_selector.cpp:110-113`）；且参数是裸 `Tensor` 非 `Weight`（`parameters.h:113`）⇒ 还要改 Tensor→Weight 管线 + TP-2 peer 路径 | **缓做**（改动最深 + 接受率敏感度最高：256 维内积选择） |
+| 环 K=BF16/V=FP16 | — | 三处锁死：`CyclicKVCache` 布局、SWA 校验（`sliding_window_attention.cpp:60-62`）、`context_kv_materialize` 的 `validate_cache`（:98-99）；窗口只注册 {2048, 4096} | **缓做**（~55 MiB，工程量最大、性价比最差） |
+
+**目标收益**（shard 0，精确值；GPU0 free 607 → ~860 MiB ≈ +16k token KV 上限）：
+
+| 项 | 对象 | 当前 → 目标 | 节省 |
+|---|---|---|---:|
+| r62 | feature_projection | q5 82.03 → q4 66.4 | **15.6** |
+| r63 | attention/output ×5 + mlp/down ×5 | q5 344.5 → q4 278.9 | **65.6** |
+| r64 | kernel_projection ×10 | bf16 125.0 → q4 33.2 | **91.8** |
+| r65 | context_key ×5 | q8 159.4 → q4 79.7 | **79.7** |
+| 合计 | | | **252.7** |
+
+**决策（沿用 §3.7）**：四项均为 opt-in override，不改官方配方（`official_recipes.py:35-46` 继续把
+mtp/dflash/dflash2 钉在 Q8、kernel_projection/codebook/hidden_projection 排除在量化外）；artifact 为实验件。
+升级为受契约保护的特性前必须补 §3.7 末尾三件套（append K=7/K=5 金值、solo digest、sessions 保留断言）
++ 采样模式 A/B + Q4 op oracle 的「按存储 scale 独立解码」检查。
+
+### 8.1 逐项改动清单
+
+**r62 — feature_projection → q4（最小面，先打通全链路）**
+- 新增 `src/ops/linear/q4/shapes/n5120_k25600.cu`（selector 镜像 `src/ops/linear/q5/shapes/n5120_k25600.cu`：
+  T=1 simt_r8_c4、T=2–6 ksplit、T≤24 simt_r8_c8、其余 mma_r64_c128；draft prefill 宽度 ≤2048 × batch）。
+- 改动：`q4_shapes.h` 声明 + `q4_dispatch.cpp` 注册表加 {5120,25600} + `src/ops/linear/q4/sources.cmake`。
+- 测试：`tests/ops/linear/test_q4_a16.cpp` 加 5120×25600（独立 seed、FP64 oracle、全路由边界）。
+- override `tools/tp_bootstrap/r62_draft_feature_q4.py`（`dflash2/feature_projection` → q4_g64_fp16，
+  `grouped_absmax`）+ dry-run + 转换脚本（r57 配方 + `--device cpu`）。
+
+**r63 — attention/output + mlp/down → q4（融合 conv-add 的 q4 变体）**
+- 关键结构事实（审计发现）：q5 变体的 GEMM 部分委托普通 q5 注册表（`select_q5_a16_launch`），
+  卷积+残差尾是 qtype 无关的共享 `dynamic_conv_finish_launch`（`q5_dynamic_grouped_conv_add_materialized.cu:11-20`）
+  ⇒ **q4 变体不需要新融合 kernel，只需要两个新普通 q4 GEMM 形状 + q4 plan 目录**（比原「新融合 kernel 一族」预估小）。
+- 新增 `src/ops/linear/q4/shapes/n5120_k4096.cu`、`n5120_k17408.cu`（镜像 q5 同名 shape）。
+- 新增 `src/ops/dynamic_grouped_conv/q4/`（plan/materialized，镜像 `q5_dynamic_grouped_conv_add_plan.cpp`：
+  投影委托 `select_q4_a16_launch(5120, input_rows, tokens)`，尾走共享 finish；路线名
+  `dynamic_grouped_conv_add.q4.*.materialized_bf16`）。
+- 改动：`wrapper/dynamic_grouped_conv.cpp`（`require_finish_projection_weight`/`projection_planes`
+  放行 Q4_G64 group 64、无 qhigh；`linear_dynamic_grouped_conv_add` 加 q4 分派分支）；
+  `include/ninfer/ops/dynamic_grouped_conv.h` 三 codec 语义同步；容量 API 已有 qtype 首参（r56 加过），只补 q4 分支。
+- 测试：`tests/ops/test_linear_dynamic_grouped_conv_add.cpp` 加 Q4 × C∈{4096,17408} 全 W/B 域（2..128 tokens）
+  × 图重放，FP64 oracle 按存储 scale 独立解码（r56 先例：120 形状 4.38 s）。
+- override `tools/tp_bootstrap/r63_draft_finish_q4.py`（`/mlp/down`、`/attention/output` → q4）+ 计数校验（各 5）。
+
+**r64 — kernel_projection → q4（prepare 的 q4 变体）**
+- 新增 q4 prepare partial kernel（[1280,5120] q4 反量化 GEMM，split-K）+ q4 plan（镜像
+  `bf16_dynamic_grouped_conv_prepare_plan.cpp` 的路线：tokens≤48 走 R16C{8,16,32,48}S8，余 R32C{32,64}S4）。
+- 改动：`wrapper/dynamic_grouped_conv.cpp`（`require_kernel_projection_weight` 放行 Q4_G64；
+  `rmsnorm_dynamic_grouped_conv_prepare` 加 q4 分派）+ `sources.cmake`。
+- 测试：`tests/ops/test_dynamic_grouped_conv_prepare.cpp` 加 q4 臂：prepare = rmsnorm∘GEMM∘(base+delta)
+  独立 FP64 参考实现，全 T 域（2..128）。
+- **数值性质警示**：该 GEMM 的产物是动态卷积权重本身（权重空间误差，非激活空间误差），敏感度可能高于
+  r62/r63 的普通 GEMM ⇒ 接受率门禁必须过；**回退 = 保持 bf16**（本项可选，失败不阻塞战役，总收益降为 160.9）。
+- override `tools/tp_bootstrap/r64_draft_kernel_q4.py`（`/attention_conv/kernel_projection`、
+  `/mlp_conv/kernel_projection` → q4；官方配方目前对这两个名字是 `continue` 排除，dry-run 确认命中 10 对象）。
+
+**r65 — context_key → q4（两处 op，最大项，最后做）**
+- decode 路径：新增 `src/ops/attn_input_proj/q4/` plan + 6 个 dflash2 schedule（镜像 `kDFlash2Routes`：
+  SmallT ≤48、MmaR16C64K128、MmaR32C32K128、MmaR32C64K128、MmaR32C64、MmaR64C128；draft decode T=(K+1)×B ≤64，
+  目录仍按闭合惯例覆盖到 kAnyCols）。
+- prefill 路径：新增 `context_kv_materialize` 的 q4 变体（7 条路线 KSplit16/KSplit24/Mma32/Mma80/Mma96/Fused64/Mma64
+  全要——prefill 宽度 1..2048 都会触达；q4 反量化 = 2 code/byte + scale 每 64，对照现 q8 的每 32；
+  新文件 `materialize_q4.cu` + launch 按 qtype 分派）。
+- 改动：`wrapper/attn_input_proj.cpp`（三输出重载加 Q4 分支：`require_q4_rowsplit` [6144, hidden]）；
+  `context_kv_materialize.cpp`（`require_weight` 放行 Q4_G64 group 64、scale 字节 rows×80×2；dispatch 按 qtype）。
+- 测试：`tests/ops/test_attn_input_proj.cpp` 加 dflash2 三输出 q4 路由边界；materialize 测试：5 层 ×
+  全 W/B profile，环内容对朴素参考（q4 GEMM → key_norm rmsnorm → RoPE → 环形写入）逐元素比对。
+- **recipe 注意**：官方配方 `recipe.share(prefix+"context_key", prefix+"key")`（`official_recipes.py:52-54`）
+  使 context_key/context_value 与 query/key/value 绑定共享同一 [6144,5120] 对象 ⇒ override 对共享对象赋值，
+  dry-run 必须确认「恰好 5 个对象变 q4_g64_fp16」（仿 r57 计数校验）。
+- **接受率风险**：本批最高（K 投影误差在 2048 窗口环内逐 token 累积，影响窗口内每个后续 decode 步）
+  ⇒ 门禁必须过；失败回退 = 保持 q8。
+- override `tools/tp_bootstrap/r65_draft_contextkey_q4.py`。
+
+**r66 — 合并实验件**：r62–r65 四项合一（override `r66_draft_q4_all.py` 含 26 对象计数校验：
+feature 1 + down 5 + output 5 + kernel 10 + context_key 5），转换后全量验收。
+
+### 8.2 每步验收标准（门禁）
+
+1. **op oracle**（AGENTS.md 数值契约）：每个新形状/路线 vs 独立 FP32/FP64 朴素参考；packed 输入按
+   **存储 scale 独立解码**（不信任转换器输出的 scale 语义）；路由边界（T 分界点 ±1）全覆盖；图重放覆盖。
+2. **接受率 A/B**（沿用 §3.7 方法）：greedy 探针 7×160、K=5 与 K=7、每臂独立冷启服；
+   基线臂 = 现役 r57 件（`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer`，r57 实测 acc K=7 25.3% /
+   56.9 tok/s）；**通过线 |Δacc| ≤ 1.0pp 且 Δtok/s ≥ −3%**（r54–r57 观测带 ±0.5pp / ±1%）。
+   每步另加一个组合中间臂（前序已通过项 + 本项）以隔离交互效应。
+3. **确定性**：基线臂跨重建逐字节复现（r57 先例：2843/699、文本 len 全同）；新臂接受率必须解释到
+   探针文本漂移（tie 翻转）而非系统性下降。
+4. **显存核对**：`nvidia-smi` + 启动 `[mem]` 台账，设备侧节省与精确 MiB 计算差 ≤ 分配粒度（先例 ~1.6 MiB）。
+5. **升级门禁（r66 后）**：DFlash2 三件套对新件重基线（`ninfer_qwen3_5_tp2_dflash_append_test` K=7/K=5 金值、
+   `ninfer_qwen3_5_tp2_dflash_solo_test` digest、`ninfer_qwen3_5_tp2_sessions_test` 保留断言）+
+   采样模式（temp 0.7）接受率/吞吐 A/B（r54 先例：采样下 K=2 曾 −2.5pp 1.6σ）。
+
+### 8.3 回退点
+
+- **C++ 侧**：全部为加法（新 shape 文件、新 q4 plan 目录、新校验分支）；既有 q5/q8/bf16 路线位型不变
+  （r56 先例：共享 finish 重构后 Q8 路线零漂移）⇒ 回退 = git revert，无 artifact 格式变化。
+- **artifact 侧**：每项独立 override，官方配方不动 ⇒ 回退 = 用前一组 override 重转（~300 s）；
+  旧 artifact 永远可被新引擎运行（引擎是超集）。
+- **项级回退**：r64 或 r65 接受率不过 ⇒ 该项保持现精度，战役继续（r64 失败总收益 160.9；
+  r65 失败 220.5；两者都失败 140.0）。
+
+### 8.4 执行顺序与依赖
+
+0. 基线复测：现役 r57 件 K=5/7 接受率 + 吞吐（确认与 §3.7 记录的 25.3%/56.9 一致，环境无漂移）。
+1. **r62**（最小面：打通 shape→dispatch→oracle→override→转换→A/B 全链路，验证方法论）。
+2. **r63**（复用 r62 的 dispatch 基建 + r56 的 q5 plan 模板）。
+3. **r64**（独立 op；可与 r63 并行开发，A/B 顺序执行——进程纪律：全机同一时刻只有一个模型进程）。
+4. **r65**（最大项；此时 r62–r64 的接受率数据在手里，若已出现系统性下降趋势可提前止损）。
+5. **r66**：合并件 + 采样 A/B + 三件套重基线 + 显存核对（GPU0 free 607 → ~860；GPU2 不变）+
+   决定是否申请升契约特性（当前决策：保持 opt-in）。
+
+**构建/运维约定**（沿用 §1 环境表）：Windows build-win（WSL CUDA 已死，只做编译验证）；测试按目标构建
+（`cmake --build build-win --target ninfer_linear_q4_a16_test` 等）；转换 `--device cpu`（~300 s，无需 GPU）；
+serve 8099 走 harness 后台 job；重新链接前先停服务，exe 手动同步 `C:\ninfer\` 并以 `Get-FileHash` 比对。
+
+### 8.5 进度
+
+**Step 0 基线复测（2026-09-24，完成）**：现役 r57 件（`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer`）、
+当前 HEAD 二进制、`--max-context 131072`、贪心探针 7×160、每臂独立冷启服
+（`tools/tp_bootstrap/r62_baseline_arms.ps1`，日志与 JSONL 在 `build-win/r62/`）：
+
+| K | drafted / accepted | acc | tok/s |
+|---|---|---:|---:|
+| 7 | 2578 / 736 | 28.55% | 61.1 |
+| 5 | 1968 / 711 | 36.13% | 61.0 |
+
+**与 §3.7 归档（K=7 25.3% / 56.9）不一致，已归因**：§3.7 之后有两次改数值/改 walk 的提交——
+`ea6204fa fix(ops): restore accurate silu in nvfp4 swiglu`（改模型数值 ⇒ 文本轨迹变）与 §4–§7 的 TP-2 首 token
+发布 + 复用扫描改动；接受率是文本属性（§7 已论证），绝对值随二进制漂移。⇒ **本战役一律以本次复测的 r57 件为
+基线**，§3.7 的数字仅作历史。副产物：本机当前二进制 K=5 与 K=7 吞吐持平（61.0 vs 61.1）。
+
+**Step 1 r62 feature_projection q4（完成；结论与门禁见 §8.6）**
+
+- [x] **op 变体**：`src/ops/linear/q4/shapes/n5120_k25600.cu` + `q4_shapes.h` / `q4_dispatch.cpp` /
+      `src/ops/linear/q4/sources.cmake` 注册。**偏差（有意）**：选择器用 q4 的粗桶（`T=1 → simt_r8_c4`、
+      `T≤8 → ksplit<5120,25600,8>`、`T≤24 → simt_r8_c8`、其余 `mma_r64_c128`），不是 §8.1 写的逐 T 容量桶
+      （2..6）。理由：q4 的 `Capacity` 只是编译期**掩码列上界**，tile 宽度由 `(Capacity+7)/8*8` 统一到 8，
+      逐 T 实例化只改一个 staging 循环上界（掩码路径下是死代码）⇒ 纯代码膨胀；既有 q4 shape 的惯例就是粗桶。
+- [x] **oracle**：`ninfer_linear_q4_a16_test` **PASS**（12.1 s）。新增 5120×25600 两组：`Comparison::Full`
+      （T∈{1..7,24,25}，逐元素）与 `Comparison::Sampled`（T∈{1..9,15,16,17,23,24,25,26,32,33,63,64,65,127,128,129,2048}），
+      两组都含图重放；FP64 朴素参考按存储 scale 独立解码。
+- [x] **override + dry-run**：`tools/tp_bootstrap/r62_draft_feature_q4.py`（**累积式**：r57 三杠杆 +
+      feature_projection→q4；断言 gate/up/down/output 各 5）+ `tools/tp_bootstrap/r62_draft_q4_dryrun.py`。
+      dry-run 解析：`q4=11`（10 gate/up + 1 feature）、`q5=10`（down + output）、`q8=25`、`bf16=45`
+      ⇒ 与 r57 件只差 feature_projection 一个对象。
+      **解释（对 §8.1 的偏离）**：§8.1 把每个 override 描述成「只改本项」，但 §8.2 要求基线臂 = r57 件
+      ⇒ 每步的臂必须是**累积件（前序已通过项 + 本项）**，否则会退回官方 Q8 配方、测的不是产品路径。
+      累积式还让「本步 vs 上一步」隔离出该项的增量效果。
+- [ ] **转换**：`tools/tp_bootstrap/r62_convert_feature4.ps1`（r57 配方 + 本 override，`--device cpu`）
+      → `D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_featproj4.ninfer`（进行中）。
+- [x] **A/B + 确定性**：重建后基线臂逐字节复现（本步 C++ 全为加法）+ r62 臂门禁 —— 结论与数字见 §8.6。
+
+**后续步骤（未开工）**
+
+- [ ] 2 r63 finish 投影 q4（两 shape + q4 plan + wrapper + oracle + override + 转换 + A/B）
+- [ ] 3 r64 kernel_projection q4（prepare kernel + wrapper + oracle + override + 转换 + A/B）
+- [ ] 4 r65 context_key q4（attn_input_proj q4 + materialize q4 + 两处 wrapper + oracle + override + 转换 + A/B）
+- [ ] 5 r66 合并件 + 采样 A/B + 三件套重基线 + 显存核对 + 升级决策
+
+### 8.6 执行记录（2026-09-24；跨上下文压缩的进度锚）
+
+**方法论修正（重要，后续步骤沿用）**：§8.2 的「贪心 7×160 探针 |Δacc| ≤ 1.0pp」被判为**内容混淆**——draft 权重一变，
+target 的 tie 翻转就改文本，接受率随文本走（§7 已给 21% vs 99.6% 的极端例）。r62 的同一对工件：
+
+| 指标 | 基线（r57 件） | r62 件 | Δ |
+|---|---:|---:|---:|
+| 贪心 K=7 acc | 28.55% | 28.64% | +0.09pp |
+| 贪心 K=5 acc | 36.13% | 34.02% | **−2.11pp（超门禁）** |
+| 采样 K=5 acc（3 类 × 6 次 × 256 token，pooled） | 44.12% | 45.66% | **+1.54pp** |
+| 采样 K=7 acc（后来补测基线：15 次 × 256 token） | 33.90% | 36.58%（r63 件） | +2.68pp |
+
+采样分项（reason / prose / code）：+4.3 / +0.1 / +1.5 pp ⇒ 两个指标符号相反 ⇒ 贪心差值是文本漂移，不是 q 退化。
+**新门禁方法**：`tools/tp_bootstrap/r62_sampling_ab.ps1`（采样接受率，内容平均、对机器漂移不敏感）作为接受率裁决；
+贪心探针只用于「基线跨重建逐字节复现」的确定性检查；显存用 `[mem]` 账本核对。
+**确定性**：r62 件两次独立冷启服逐字节相同；重建（r62+r63+r64 代码）后的基线臂 K=7 JSONL 与改动前二进制的
+基线 SHA256 完全相同（`D61C1112…`）⇒ 引擎与工件都确定。
+
+**Step 1 r62 feature_projection q4（完成：通过）**
+
+- op：`src/ops/linear/q4/shapes/n5120_k25600.cu` + `q4_shapes.h` / `q4_dispatch.cpp` / `sources.cmake` 注册。
+  选择器用 q4 **粗桶**（T=1 → simt_r8_c4、T≤8 → ksplit<5120,25600,8>、T≤24 → simt_r8_c8、其余 mma_r64_c128），
+  不是 §8.1 写的逐 T 容量桶（2..6）：q4 的 `Capacity` 只是编译期掩码列上界，tile 由 `(Capacity+7)/8*8` 统一到 8，
+  逐 T 实例化只改一个 staging 循环上界（掩码路径下是死代码）⇒ 纯代码膨胀。
+- oracle：`ninfer_linear_q4_a16_test` PASS（12.1–14.7 s；Full T∈{1..7,24,25} + Sampled 到 2048，含图重放）。
+- override `r62_draft_feature_q4.py`（**累积式**：r57 三杠杆 + feature→q4）+ dry-run `r62_draft_q4_dryrun.py`：
+  q4=11（10 gate/up + 1 feature）/ q5=10 / q8=25 / bf16=45。
+- 转换 `r62_convert_feature4.ps1` → `..._dflash2_featproj4.ninfer`（375 s，1218 对象）；文件 −16,384,000 B。
+- 显存：shard 0 `weights+ctx` 12750.6 → 12734.6 MiB，free 816 → 832 MiB。
+
+**关于 override 的累积式设计**：§8.1 把每个 override 描述成「只改本项」，但 §8.2 的基线是 r57 件 ⇒ 每步的臂必须是
+累积件（前序已通过项 + 本项），否则会退回官方 Q8 配方、测的不是产品路径。r62→r63→r64 的 override 都是累积式，
+因此 **r64 件本身就是 r62+r63+r64 的合并候选**（r66 只是加计数校验的正式件）。
+
+**Step 2 r63 attention/output + mlp/down q4（完成：通过）**
+
+- 结构发现：q5 变体的 GEMM 委托普通 q5 注册表，卷积+残差尾是 qtype 无关的共享 `dynamic_conv_finish_launch`
+  ⇒ q4 变体**不需要新融合 kernel**，只要两个新 q4 shape + 一个 q4 plan 目录（比 §8.1 的预估小）。
+- 新增：`src/ops/linear/q4/shapes/n5120_k4096.cu`、`n5120_k17408.cu`；`src/ops/dynamic_grouped_conv/q4/` 四个文件；
+  wrapper 的 `projection_planes` / `require_finish_projection_weight` / 容量分派 / 执行分派加 q4 分支；
+  `bench/ops/linear_dynamic_grouped_conv_add_bench.cu` 支持 `--qtype q4`（路线名 `…q4.ksplit_exact…` 已实测）。
+- oracle：`ninfer_linear_q4_a16_test` PASS（12.7 s）；`ninfer_linear_dynamic_grouped_conv_add_test` PASS
+  （7.9 s：Q8/Q5/Q4 × C∈{4096,17408} 全 W/B 域 + 图重放）。
+- override `r63_draft_finish_q4.py` dry-run：q4=21（1 feature + 10 gate/up + 5 down + 5 output）/ q8=25 / bf16=45。
+- 转换 `r63_convert_finish4.ps1` → `..._dflash2_finish4.ninfer`（378 s，1218 对象）；文件 22,947.1 → 22,865.8 MiB
+  = **−81.25 MiB**（= r62 15.625 + r63 65.625，精确一致）。
+- A/B：`tools/tp_bootstrap/r62_step_arms.ps1 -Tag finish4`（贪心 K=7/K=5 + 采样 K=7/K=5）——**通过**：
+  贪心 K=7 28.55%→27.03%（−1.52pp，仍属内容混淆）、贪心 K=5 36.13%→35.80%（−0.33pp ✓）、
+  采样 K=7 33.90%→36.58%（**+2.68pp**）、采样 K=5 44.12%→46.21%（**+2.09pp**）⇒ 两个采样都明显上涨。
+  为补齐采样基线，补测了基线件 K=7 采样（15 次，33.90%）。
+- 显存（shard 0 `[mem]`）：`weights+ctx` 12750.6 → **12668.6 MiB**，free 816 → 898/904 MiB；
+  实测 −82.0 MiB vs 预测 −81.625 MiB（差 0.375 MiB = artifact 分配粒度，与 r62 步同样的常数偏移）。
+
+**Step 3 r64 kernel_projection q4（op 完成，待转换/A-B）**
+
+- 实现选择（对 §8.1 的偏差）：不写「q4 prepare partial kernel」，而是**复用已过 oracle 的普通 q4 GEMM**——
+  新增 `src/ops/linear/q4/shapes/n1280_k5120.cu`；`…/q4/q4_dynamic_grouped_conv_prepare_plan.cpp` 做
+  rmsnorm → 普通 q4 linear（把 [1280,tokens] 系数矩阵写进 workspace）→ 新 reduce
+  （`q4_dynamic_grouped_conv_prepare_reduce.cu`：把 bf16 reduce 的 FP32 split-K 部分和输入换成 BF16 系数矩阵）。
+- 代价与理由：系数矩阵以 BF16 materialize（bf16 路线保留 FP32 部分和），多约半个 BF16 ulp；该中间量不是可观测边界
+  （AGENTS.md），且远小于 q4 权重本身的量化误差。测试因此给 Q4 臂单独 criterion（prepared 预算 1.5× bf16），
+  实测最坏比值 rel_l2 0.62× / gross 0.75× of budget，finish 用共享预算 0.74× / 0.68×。
+- 容量：prepare 的公开容量 API 没有 qtype，q4 路线预留与查询相同的量（bf16 split-K 部分和恒大于 q4 的 BF16 系数），
+  保持 `peak_used == query` 不变量。
+- oracle：`ninfer_linear_q4_a16_test` PASS；`ninfer_dynamic_grouped_conv_prepare_test` PASS（bf16 + q4 双臂，
+  label 前缀已加 codec 便于定位）。
+- 转换：**并入 r66 合并件**（`r64_convert_kernel4.ps1` 不再单独跑：累积式 r66 件 = r62+r63+r64，
+  与单独跑 r64 会得到逐字节相同的文件，省一次 6 分钟转换与 23 GB 中间件）；r64 的门禁即在 r66 件上测。
+
+**Step 4 r65 context_key q4（决定：本次缓做）**
+
+- 事实核对（比 §8.1 的审计更准确）：draft 的 `attention/{query,key,value,context_key,context_value}` 在工件里
+  **全部别名同一个 [6144,5120] 对象**（每层 1 个 ×5 层），所以「context_key ×5 = 79.7 MiB」实际是把 5 个融合 QKV
+  对象整体降到 q4，而且必须**同时**改两处消费方才能加载：
+  - decode：`attn_input_proj` 三输出重载与 `prepare_attn_input_proj_weights` 都硬要求 Q8（`weight_input.cpp:176`）；
+  - prefill：`context_kv_materialize` 的融合 kernel（`materialize.cu` 482 行）以**每 32 元素 1 字节有符号码 + FP16 scale**
+    手写 staging/MMA/分数写回，并融合 key 的 norm+rope+环形缓存写入与 value 的 fp16 写回。
+- 结论：r65 不是「再加一个 shape」，而是要写一族 4-bit 融合材质化 kernel（7 路线）+ 3 输出 q4 变体 + 两套 oracle。
+  相对 79.7 MiB 收益，本次战役的剩余预算与风险不划算；§8.3 本身也允许项级回退（「该项保持现精度」）并把它排在最后。
+- 因此本次交付 = **r62 + r63 + r64（173 MiB / 252.7 MiB = 68%）** + r66 合并件；r65 的审计与路线图保留。
+
+**Step 5 r66（完成：通过）**
+
+- override `tools/tp_bootstrap/r66_draft_q4_all.py`（单文件累积式，计数校验 31 个 selection：feature 1 + gate/up 10 +
+  down 5 + output 5 + kernel 10；gate/up 每层共享一个存储对象 ⇒ 提升 26 个对象）。
+- dry-run：q4 31 / q8 25 / bf16 35（r57 件的 bf16 45 中有 10 个 kernel 投影转入 q4）。
+- 转换 `r66_convert_q4all.ps1` → `D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_q4all.ninfer`（326 s，1218 对象）。
+- **文件级核账（精确相等）**：24,061,771,780 → 23,880,318,980 B = **−181,452,800 B = −173.05 MiB**
+  = 16,384,000 (r62) + 68,812,800 (r63) + 96,256,000 (r64)，逐字节预测一致。
+- 对象格式：`q4_g64_fp16` 81（r57 件 71 + 10）、`bf16` 569、`q5_g64_fp16` 54、`q8_g32_fp16` 12。
+- A/B（`r62_step_arms.ps1 -Tag q4all`）——**通过**：
+
+  | 指标 | 基线 r57 件 | r66 q4all 件 | Δ | 门禁 |
+  |---|---:|---:|---:|---|
+  | 贪心 K=7 acc | 28.55% | 26.95% | −1.60pp | 超线（内容混淆，见 §8.6 方法修正） |
+  | 贪心 K=5 acc | 36.13% | 35.96% | −0.17pp | ✓ |
+  | 采样 K=7 acc（15×256） | 33.90% | 35.05% | **+1.15pp** | ✓ |
+  | 采样 K=5 acc（15×256） | 44.12% | 47.84% | **+3.72pp** | ✓ |
+
+  **贪心探针为何不可跨臂比较（直接证据，非推断）**：`greedy_probe.ps1` 记录了完整文本，逐条 SHA256 比对基线件与
+  q4all 件的 K=7 探针：**7 条 prompt 里 6 条文本不同**（长度 779/788、768/789、877/890、741/778、804/785、804/798），
+  只有 idx 5 逐字节相同。机制是 §7 记录过的：draft 提案长度改变 verify 批次形状 ⇒ target 数值路径变 ⇒ 贪心近
+  平局翻转 ⇒ 文本改变 ⇒ 接受率的分母换了内容。所以贪心 7×160 的差值是「不同文本上的两个数」。
+  **诚实的保留**：唯一文本稳定的 idx 5 上 K=7 接受率仍降 3.75pp（672 drafted），说明 K=7 的 q4 draft 在该内容上
+  可能略弱；但 pooled 采样（K=7 共 7711 drafted）是更可靠的统计量且上涨 +1.15pp。
+
+  两个采样门禁都通过；贪心 K=7 的超线在 r62/r63/r64 每步都出现（−1.5 ~ −2.1pp）而采样同时上涨，
+  是 §8.6 记录的内容混淆，不是单调退化（若为退化，采样应同步下降）。
+- **显存核对（shard 0 `[mem]`）**：`weights+ctx` 12750.6 → **12576.6 MiB**（−174.0 MiB，预测文件级 −173.05 MiB，
+  差 0.95 MiB ≤ 分配粒度 1.6 MiB）；free 816 → **990 MiB**（K=7）/ 996 MiB（K=5）；shard 1 不变（810 → 810 MiB @K=5）。
+  §8.4 写的「GPU0 free 607 → ~860」是 §3.7 旧归档的绝对数（不同 capacity/KV 配置），本次实测的增量与预测一致。
+- 三件套：`tools/tp_bootstrap/r66_suites.ps1`。**运行前必须把 FFmpeg 与 libcurl 的 `bin` 加进 PATH**，
+  否则 `solo`/`sessions` 在加载期直接 `0xC0000135`（STATUS_DLL_NOT_FOUND）——`append` 不依赖媒体路径，所以只有它不受影响。
+  三件套实测（`NINFER_TEST_ARTIFACT` 指向 q4all 件，除注明外）：
+
+  | 套件 | 结果 | 证据 |
+  |---|---|---|
+  | `append` K=7 | PASS (37.9 s) | ring 重放逐字节相同；proposal 确定 `fnv1a=0xda91572dd83980bd`；workspace peak 113.3/192 MiB |
+  | `append` K=5 | PASS (37.5 s) | 同上，`fnv1a=0x5a3629fb79be1cd3` |
+  | `solo` 两进程 | PASS (41.1 / 41.8 s) | 两个独立进程 digest 相同 `0x4bcc3994a5efba7d` |
+  | `sessions` | **FAIL（plain 路线，先于本战役存在）** | 见下 |
+
+  `sessions` 的失败：`FAIL (plain): a conversation behind a shared system prompt diverged from the oracle
+  on its first sample: got [2752 13 …] expected [365 2798 …]`。**用未改动的基线件（r57 `draftall`）在同一二进制上
+  复现出逐 token 相同的 `got`/`expected`** ⇒ 该失败与本次 q4 杠杆无关（plain 路线根本不加载 draft）。
+  它挡不住本次交付（draft q4 由 append 两 K + solo digest + op oracle + 采样 A/B 覆盖），但**挡住了「升级为契约特性」**：
+  升级门禁要求三件套全绿，而其中一件存在与本战役无关的既有失败 ⇒ 结论是保持 opt-in（见下）。
+
+  **被改动路线自己的证据（补测）**：`NINFER_TEST_ROUTE=dflash2` 定向跑 sessions，baseline 与 q4all **都 PASS**
+  （各 164.8 s，`TP-2 session retention (dflash2) passed: recall reused 71 prompt tokens bit-identically;
+  LRU eviction forced a full prefill`）⇒ 失败只存在于 plain 路线，且与基线件逐 token 相同。
+
+**升级决策（§8.4 第 5 步）**：**保持 opt-in，不申请升契约特性**。理由两条：
+1. 三件套里 `sessions` 的 plain 路线有一个**先于本战役存在**的失败（基线件逐 token 复现），升级门禁要求三件套全绿，
+   在该失败修好之前不具备升级条件；
+2. §8.2 的字面门禁「贪心 |Δacc| ≤ 1.0pp」在 K=7 未过（−1.60pp）——虽然已证明该指标跨臂不可比（6/7 条 prompt 文本不同），
+   但把门禁改成采样主导属于「门禁修订」，应当与「升级」分开决策。
+   q4 件继续以显式 override + 专门 artifact 形式提供（`…_q4all.ninfer`），引擎与官方配方都不动。
+**W4A4 家族的同款最终件（用户 2026-09-24 追加要求）**
+
+- 脚本 `tools/tp_bootstrap/r66_convert_q4all_w4a4.ps1` → `D:/LLM/qwen3_8_27b_w4a4_dflash2_q4all.ninfer`
+  （`--model`/`--source quantized` 换成 `W4A16/NVFP4/W4A4`，draft 仍取 `W4A4+W8A8/DFlash2-FP8`；
+  这与既有 `…_w4a4_dflash2_draftall.ninfer` 的 provenance 一致——两家族只差 text/vision/MTP 源）。
+- dry-run `r62_draft_q4_dryrun.py --base D:/LLM/W4A16/NVFP4/W4A4 --draft D:/LLM/W4A16/NVFP4/W4A4+W8A8/DFlash2-FP8`：
+  q4 31 / q8 25 / bf16 35，与 w8a8 家族同解（两个家族的 r57 基线都由 `r57_draft_all_override.py` 生成，draft 源相同）。
+- **实测**：18,874,128,644 → 18,692,675,844 B（−181,452,800 B，与 w8a8 家族逐字节同额）；
+  报告 `name=qwen3.8-27b-w4a4-q4all`、1590 对象、格式计数与 w8a8 件完全相同（q4 81 / bf16 569 / q5 54 / q8 12）。
+- **跨家族核验（对象级 SHA256）**：两个 q4all 件的 **66 个 dflash2 对象全部逐字节相同**（含 31 个 q4 selection 的存储对象）
+  ⇒ draft 质量与已过 A/B 的 w8a8 件一致，接受率证据直接可移用；`text/layers/0/*` 16 个对象里 8 个不同（两家族确实只差
+  text/vision/MTP 源）。
