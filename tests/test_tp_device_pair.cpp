@@ -252,6 +252,59 @@ int check_sendrecv(ninfer::tp::DevicePair& pair, std::size_t count_bytes, int it
     return failures;
 }
 
+// The MTP stem's id broadcast: one shard owns the token ids and the peer needs them, and each side
+// passes its single buffer as both its send and its receive. The payload is I32 token ids, so it
+// must travel byte exact - the BF16 all-reduce this route used to take quieted a signaling-NaN lane
+// and handed the peer a different token. The ids below are the real trigger set for that failure:
+// a low 16-bit lane of +Inf, of a signaling NaN (0x7F81..0x7FBF), and of -0.0, next to ordinary
+// vocabulary ids. The aliasing is the property the route relies on and no other case here covers
+// it: a transport that read its receive buffer before staging its own send, or that added instead
+// of copied, passes every distinct-buffer case above and fails this one.
+int check_id_broadcast(ninfer::tp::DevicePair& pair, std::size_t count_bytes, int iterations) {
+    const std::size_t words = count_bytes / 4;
+    constexpr std::uint32_t kIds[] = {0x00000000u, 0x00000001u, 0x00007F80u, 0x00007F81u,
+                                      0x00007FA0u, 0x00007FBFu, 0x00008000u, 0x0000FFFFu,
+                                      0x00010000u, 0x00018000u, 0x0001FBF0u, 0x00024E00u};
+    constexpr std::size_t kIdCount = sizeof(kIds) / sizeof(kIds[0]);
+    int failures = 0;
+    std::vector<std::uint32_t> host_a(words), got_b(words);
+
+    pair.a().bind_to_current_thread();
+    ninfer::DeviceBuffer buf_a(count_bytes);
+    cudaStream_t stream_a = nullptr;
+    cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
+    pair.b().bind_to_current_thread();
+    ninfer::DeviceBuffer buf_b(count_bytes);
+    cudaStream_t stream_b = nullptr;
+    cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
+
+    for (int iteration = 0; iteration < iterations && failures == 0; ++iteration) {
+        for (std::size_t i = 0; i < words; ++i) {
+            host_a[i] = kIds[(i + static_cast<std::size_t>(iteration)) % kIdCount];
+        }
+        pair.a().bind_to_current_thread();
+        cudaMemcpyAsync(buf_a.p, host_a.data(), count_bytes, cudaMemcpyHostToDevice, stream_a);
+        pair.b().bind_to_current_thread();
+        cudaMemsetAsync(buf_b.p, 0x5A, count_bytes, stream_b);
+        pair.sendrecv(buf_a.p, buf_a.p, buf_b.p, buf_b.p, count_bytes, stream_a, stream_b);
+        pair.b().bind_to_current_thread();
+        cudaMemcpyAsync(got_b.data(), buf_b.p, count_bytes, cudaMemcpyDeviceToHost, stream_b);
+        cudaStreamSynchronize(stream_b);
+        if (std::memcmp(got_b.data(), host_a.data(), count_bytes) != 0) {
+            std::size_t first = 0;
+            while (first < words && got_b[first] == host_a[first]) { ++first; }
+            std::cerr << "id broadcast[" << count_bytes << "] iteration " << iteration << ": id "
+                      << first << " arrived as 0x" << std::hex << got_b[first] << " not 0x"
+                      << host_a[first] << std::dec << '\n';
+            ++failures;
+            break;
+        }
+    }
+    cudaStreamDestroy(stream_a);
+    cudaStreamDestroy(stream_b);
+    return failures;
+}
+
 // One captured send-receive queue replayed many times, with an eager all-reduce queued between
 // replays (the production interleave of graphed verify windows and eager propose collectives).
 // The graph body's receives are byte exact and identical every replay, so the final readback is
@@ -620,6 +673,10 @@ int main() {
         failures += check_sendrecv(pair, 960, 64);
         failures += check_sendrecv(pair, 64, 64);
         failures += check_sendrecv(pair, 1 << 20, 16);
+        // The MTP stem's id broadcast: each side's one buffer used as both send and receive, at the
+        // padded sizes a draft window (K <= 15 ids) and a single id produce.
+        failures += check_id_broadcast(pair, 16, 64);
+        failures += check_id_broadcast(pair, 64, 64);
         // Captured queues replayed between eager calls: small fuse exchanges, sliced large
         // exchanges (write-order chain, separate token bump), and the two classes interleaved.
         failures += check_graph_queue(pair, 960, 20480, 32, 20);

@@ -457,10 +457,15 @@ void TextContext::embedding_tp2(TextContext& peer, tp::DevicePair& pair, const T
     Tensor ids_peer_view;
     if (ids_peer == nullptr) {
         // The peer needs the same token ids. The text path already binds them per shard; the MTP
-        // stem only owns them here, so mirror a private copy into a zeroed peer buffer and sum the
-        // pair - a broadcast that needs no host round trip.
-        // The pair's all-reduce works in 16-byte units, so the broadcast buffer is padded up and
-        // the tail zeroed on both sides; only the leading ids are read.
+        // stem only owns them here, so a private copy is mirrored into the peer's buffer.
+        // The pair's collectives work in 16-byte units, so the buffer is padded up and the tail
+        // zeroed; only the leading ids are read. A byte-exact exchange carries them, never the BF16
+        // all-reduce: an integer id whose 16-bit lane spells a signaling NaN is quieted by the add
+        // and a -0.0 lane is normalised to +0.0, so the sum would hand the peer a different id (the
+        // DFlash2 route already exchanges its ids and scores the same way).
+        // Each side passes one buffer as both its send and its receive. A's bytes are consumed by
+        // the peer before they are overwritten, and the peer's bytes are discarded, so a broadcast
+        // still needs no host round trip.
         const std::size_t id_bytes = static_cast<std::size_t>(ids.ne[0]) * sizeof(std::int32_t);
         const std::size_t broadcast_bytes = ((id_bytes + 15u) / 16u) * 16u;
         const std::int32_t words = static_cast<std::int32_t>(broadcast_bytes / sizeof(std::int32_t));
@@ -473,8 +478,8 @@ void TextContext::embedding_tp2(TextContext& peer, tp::DevicePair& pair, const T
         ids_peer_storage = peer.work_.alloc(DType::I32, {words});
         CUDA_CHECK(cudaMemsetAsync(ids_peer_storage.data, 0, broadcast_bytes, peer.ctx_.stream));
         ctx_.bind_to_current_thread();
-        pair.allreduce(ids_staging.data, ids_peer_storage.data, broadcast_bytes, ctx_.stream,
-                       peer.ctx_.stream);
+        pair.sendrecv(ids_staging.data, ids_staging.data, ids_peer_storage.data,
+                      ids_peer_storage.data, broadcast_bytes, ctx_.stream, peer.ctx_.stream);
         // The gather validates ids against the output's token extent, so the peer reads only the
         // leading ids from the padded staging buffer.
         ids_peer_view = ids_peer_storage.slice(0, 0, ids.ne[0]);
