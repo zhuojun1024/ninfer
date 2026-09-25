@@ -1,9 +1,10 @@
 # NInfer TP-2 计划（2× RTX 5060 Ti · Qwen3.8-27B NVFP4）
 
-> **唯一的活动计划**，也是跨上下文压缩的持久记忆。整理：2026-09-22（上游 cherry-pick 与 DFlash2 各轮完成后
-> 重写为交付前收尾版）。
-> - 完整历史记录：`docs/tp2-dual-5060ti-worklog.md` —— 含两份 PLAN.md 全文逐字归档（2026-09-21 上游
->   cherry-pick 重规划版；2026-09-22 本版整理前的全文）。
+> **唯一的活动计划**，也是跨上下文压缩的持久记忆。整理：2026-09-24（归档整理前全文入 worklog，本文件只保留
+> 关键信息与未完成事项）。
+> - 完整历史：`docs/tp2-dual-5060ti-worklog.md` —— 含三份 PLAN.md 全文逐字归档（2026-09-21 上游
+>   cherry-pick 重规划版；2026-09-22 交付收尾版；2026-09-24 本次整理前全文，含 §3.5–§3.14 与 §4–§8
+>   全部轮次记录）。
 > - 交付说明、推荐配置与实测数据：`docs/tp2-dual-5060ti.md`；Windows 原生移植：`docs/windows.md`。
 
 ---
@@ -14,13 +15,15 @@
   cherry-pick 完成（前端 jinja 链 + NVFP4 性能三项），端到端 A/B 无退化。
 - **硬件**：2× RTX 5060 Ti 16G（SYS 拓扑、无 P2P、448 GB/s/卡）。WSL2 构建树 `/home/zhuojun/ninfer`；
   Windows 工作树 `D:\Documents\workbench\ninfer`（构建树 `build-win`）。
-- **主负载**：Qwen3.8-27B NVFP4，TP-2（权重按 shard 切半，本地自建半几何 shape）。草稿后端：`--spec mtp`
-  （K=2、`--lm-head-draft`）或 `--spec dflash2`（K=7）；`--spec dflash`（v1）在构造期拒绝。
+- **主负载**：Qwen3.8-27B NVFP4，TP-2（权重按 shard 切半，本地自建半几何 shape）。草稿后端：`--spec dflash2`
+  （K=5/7，K=7 为二进制默认）或 `--spec mtp`（K=2、`--lm-head-draft`）；`--spec dflash`（v1）在构造期拒绝。
 - **现状**：交付目标 ①–⑤ 全部完成；vision、Windows 移植、多会话 KV 池、decode graph + AR 策略均已落地实测；
-  DFlash2 已在 TP-2 放行（B1–B6、verify CUDA Graph、MTP draft 链图化、弃稿守卫修复）。
+  DFlash2 已在 TP-2 放行（未对齐复用不再弃稿）；TP-2 会合协议重构完成（host 权威 id + 有界自旋 +
+  超时失败语义）。
 - **关键数字**（262,144 配置，WSL）：prefill 1,588 tok/s；decode 59.0 tok/s（MTP K=2）；Windows 131,072 配置
-  decode 56.9 tok/s（与 Linux 持平）。DFlash2 K=7 在 4096 上下文贪心档约 71 tok/s（与 MTP K=2 持平）；
-  roofline 修正上限 ≈108 tok/s（原归档 90–180 的 180 不可达）。
+  decode 56.9 tok/s（与 Linux 持平）。DFlash2 K=7 在 4096 上下文贪心档约 71 tok/s；245,760/k8v4（draftall 件）
+  扫描 K=5 96.4 / K=7 96.1 tok/s（交错复核 93.3 / 96.9）；roofline 修正上限 ≈108 tok/s（原归档 90–180 的
+  180 不可达）。
 
 **推荐运行配置**（WSL 8088 / Windows 8099 同配方，Windows 侧 `--max-context 131072`）：
 
@@ -32,7 +35,8 @@
 ```
 
 `--reasoning-effort low|medium|xhigh` 是进程级默认思考强度（请求体优先）；`--chat-template` 随第一梯队摘取
-可用（模板由内嵌 Jinja 执行）。
+可用（模板由内嵌 Jinja 执行）。2026-09-23 实测：DFlash2（K=5/7）decode 领先 MTP ~20%、prefill 代价 1% 内
+⇒ 追求吞吐用 `--spec dflash2 --draft-tokens 7`（扫描配方为 245,760/k8v4，依据见归档 §3.9–§3.11）。
 
 ### 环境与运维要点
 
@@ -41,15 +45,15 @@
 | 构建（WSL） | `bash tools/tp_bootstrap/r55_build.sh`（rsync + `cmake --build build_dyn -j 8`，成功标记 `BUILD_EXIT=0`，约 2–3 分钟；WSL 构建树现为 `build_dyn`（Ninja），`build_r35.sh` 仍指向已删除的 `build/`，不可用） |
 | 构建（Windows） | `tools/win_port/configure.bat` + `build.bat`（VS2022 + CUDA 13.3，`-DCMAKE_CUDA_ARCHITECTURES=120a`） |
 | 服务 | WSL 8088（`serve_supervise.sh`）；Windows 8099（`tools/win_port/serve.ps1`，默认前台；自测服务必须用 harness 后台 job，`Start-Process` 起的进程会随工具调用结束被杀） |
-| 运行 PATH（Windows） | FFmpeg（`D:\ffmpeg-dev\…\bin`）与 libcurl（`D:\curl-dev\…\bin`）必须在 PATH，否则 `STATUS_DLL_NOT_FOUND` |
-| artifact | `D:\LLM\qwen3_8_27b_nvfp4.ninfer`（23.7 GB，旧 artifact，模板 `c3cf9e34…`）；新官方 artifact（模板 `a497db9e…`）随第一梯队可用 |
-| 进程纪律 | 全机同一时刻只有一个模型进程（WSL 8088 与 Windows 8099 互斥）；Windows 重新链接 exe 前先停服务（LNK1104） |
+| 运行 PATH（Windows） | FFmpeg（`D:\ffmpeg-dev\…\bin`）与 libcurl（`D:\curl-dev\…\bin`）必须在 PATH，否则 `STATUS_DLL_NOT_FOUND`（三件套 solo/sessions 无它们会在加载期 `0xC0000135`） |
+| artifact | `D:\LLM\qwen3_8_27b_nvfp4.ninfer`（23.7 GB，旧 artifact，模板 `c3cf9e34…`）；新官方 artifact（模板 `a497db9e…`）随第一梯队可用；实验量化件 `…_dflash2_draftall.ninfer`（r57，−715.6 MiB）与 `…_dflash2_q4all.ninfer`（r66，−173.05 MiB，w8a8 + w4a4 家族各一件） |
+| 进程纪律 | 全机同一时刻只有一个模型进程（WSL 8088 与 Windows 8099 互斥）；Windows 重新链接 exe 前先停服务（LNK1104）；`build-win/apps/ninfer-serve.exe` 不会自动同步 `C:\ninfer\`，需手动复制并以 `Get-FileHash` 比对 |
 | 工具链 | 嵌套 `pwsh` → `wsl -e bash -lc` 吞 `$var` 与重定向 ⇒ 命令写成脚本文件放 `tools/tp_bootstrap/` 再执行；单次阻塞调用上限 600 s ⇒ 长任务用后台作业 |
-| GPU/WSL 状态（2026-09-23 起） | 机器可见 3 卡：nvidia-smi 序 0/2＝5060 Ti、1＝Tesla T10；`--devices 0,1` 账本两 shard 均 16310.6 MiB ⇒ CUDA 序数取到两张 5060 Ti（与 T10 的 nvidia-smi 序错位），TP-2 配对不受影响。WSL 侧 CUDA 当日全线段错误（cast/q4/q6/q8/q5 未改动测试全挂，疑似 T10 可见后 CUDA init 崩）⇒ 测试改走 Windows `tools/win_port/test.ps1`，WSL build_dyn 只作编译验证 |
+| GPU/WSL 状态（2026-09-23 起） | 机器可见 3 卡：nvidia-smi 序 0/2＝5060 Ti、1＝Tesla T10；`--devices 0,1` ⇒ CUDA 序数取到两张 5060 Ti（与 nvidia-smi 序错位），TP-2 配对不受影响。WSL 侧 CUDA 全线段错误 ⇒ 测试改走 Windows `tools/win_port/test.ps1`，WSL build_dyn 只作编译验证 |
 
 ---
 
-## 2. 已完成摘要（细节见归档）
+## 2. 已完成摘要（每条一行，细节见归档）
 
 - ① MTP 一致性：根因＝分片未写 replay 记录（fold 消费空日志），已修复；判据为「无退化 + 质量同档 + 有加速」。
 - ② 基准：prefill 615→1,588 tok/s；decode plain 31.4 / MTP K=2 50.5–54.0 → 59.0 tok/s。
@@ -65,10 +69,44 @@
 - 多会话 KV 池：host KV 换入换出 + 5 会话 LRU + 共享前缀镜像；召回 KV 与 device 逐字节一致。
 - 上游 cherry-pick：第一梯队 5 项（jinja 前端链 + `--chat-template`）、第二梯队 3 项（NVFP4 TMA 路由、
   SwiGLU epilogue、非 256 整除 token）全部落地；e2e A/B 无退化（decode +1.3%~+5.8%）。
-- 官方 NVFP4 工件接受率调查：合成工件（官方 mtp/dflash2/vision + 自转 text）与自转件一致、官方件最低
-  ⇒ 差异来自 text 权重，与组件无关。
+- 官方 NVFP4 工件接受率调查：合成工件与自转件一致、官方件最低 ⇒ 差异来自 text 权重，与组件无关。
 - TP-2 显存不平衡：方案 A（reduced proposal head 按词表切分，−170 MiB/卡）与方案 B（selector 移至 shard 1，
-  −246/+246 MiB）均已落地，输出逐字节一致。
+  −246/+246 MiB）均已落地，输出逐字节一致；新增 `DevicePair::sendrecv` 做逐字节跨卡交换，修掉 BF16-add
+  allreduce 搬 I32/FP32 的 sNaN 位型风险。
+- TP-2 会合协议重构（2026-09-23，事故驱动）：设备侧自旋事故第二次复现（两卡 SM 100%、6 条请求被静默吞掉；
+  杀进程后两卡仍自旋约 2 分钟）⇒ Phase 1 有界自旋（env `NINFER_TP2_AR_TIMEOUT_MS`，默认 2000）+ 超时失败
+  语义（HTTP 503 + 会话毒化重新 prefill，服务存活、下一请求正常）；Phase 2 host 权威 64 位 id（每捕获图一条
+  id 通道，id 经图内 memcpy node 送达——不可按值当 kernel 实参，陈旧槽永不满足未来自旋），已提交
+  `de74d966`/`b9c5d11c`/`634df875`；Phase 3 大 payload 事件路径**实测否决**（copy engine 地板 3.32 ms vs 现
+  sliced 2.70 ms，未计 event 栅栏已慢 23%）；Phase 4 partial 合并审计**定案形态不存在**（9 个调用点逐点
+  分类）。回归矩阵零回归（3 项既有失败在改动前 HEAD 逐字节复现）。
+- K 扫描与 prefill 成本归因（2026-09-23）：DFlash2 K=5≈K=7（交错配对 K=7 略优；**不要用 K=6**——三轮恒
+  25.7 rounds/s、被两侧同时支配的可复现每轮成本凹陷）；纯 MTP K=3/4 平局（79.4/79.7）且同 K 落后
+  DFlash2 ~20% ⇒ **生产继续 `--spec dflash2`**；开投机几乎不付 prefill 代价（1% 内），DFlash2 prefill 稳定
+  慢 3–4%（确切来源未归因）；prefill 1,905→569 tok/s（0→245k）＝深度无关固定项（0.525 ms/token，其中
+  AR ≈65% 已贴 Gen4 x4 链路地板、软件无空间）+ 深度项（245k 处 attention 占每 token 成本 70%）；GQA 6×
+  请求冗余被测量门**否证**（KV 字节跨 3.5× 耗时只差 13%；ncu：DRAM 1%、张量管线 63.5% 最忙、占用被寄存器
+  文件 + ~100 KB smem 锁在 33%）⇒ L1（GQA 感知 prompt 内核）取消，内核代码未动。
+- DFlash2 draft 量化 r54–r57（2026-09-23，opt-in）：draft gate/up→Q4（shard 0 −450 MiB）、融合 finish 投影
+  mlp/down + attention/output→Q5（共享 finish kernel + 新 q5 shape，−213.3 MiB）、feature_projection→Q5
+  （−50.8 MiB）；合并实验件 `…_dflash2_draftall.ninfer` −715.6 MiB，K=7 接受率 24.59%→25.3%（无下降）、
+  吞吐持平 ⇒ **决策：保持 opt-in**，不改官方 recipe。
+- DSH/agent-loop 前缀复用（2026-09-24）：TP-2 路线 `--chat-template` 被静默忽略已修（frontend
+  `chat_template_path` 透传，developer 角色 400→200）；模板 `|trim` 假设**实测否定**（维护模板覆盖后
+  原样回放仍停在上一轮 prompt 长度）；新增常驻两轮用例与文档。
+- 首个生成 token 不发布（2026-09-24）：TP-2 prefill 首 token 曾直接 `push_back` 落账、未经输出会话（唯一
+  漏掉的路线）⇒ 现 `preview_model → commit → publish`，`max_tokens=1` 正常发布（reasoning_tokens=1）；
+  回放 40/1400 token 回答直达 `src=live`（此前恒停在 prompt 长度）；新测试用例 `check_first_token_published`。
+- 复用门控与弃稿（2026-09-24）：「未对齐复用必须弃 masked draft」的前提**被实测推翻**（同轮：弃稿 22.5 vs
+  保留 87.1 tok/s，接受率几乎不变）⇒ 删除门控、`draft_context_declined`、`reuse_grid` 与会话均值定价，
+  单趟扫描最深边界获胜；契约：网格对齐与 oracle 逐 token 一致、chunk 内只保证 boundary crossing。
+- DFlash2 draft 二次量化 r62–r66（2026-09-24，opt-in）：feature_projection（r62）、finish 投影
+  mlp/down + attention/output（r63，q4 复用普通 GEMM + 共享 finish，无需新融合 kernel）、kernel_projection
+  （r64，复用普通 q4 GEMM + 新 reduce）→ q4；r66 合并件 `…_dflash2_q4all.ninfer` −173.05 MiB（字节级
+  核账精确相等），采样接受率 K=5 +3.72pp / K=7 +1.15pp（双双通过）；贪心 K=7 −1.60pp 已证明为跨臂文本
+  漂移混淆（7 条探针 6 条文本不同）；r65（context_key）实测后缓做；w8a8 + w4a4 家族件均已产出、跨家族
+  66 个 dflash2 对象逐字节相同。**决策：保持 opt-in**——升级被 plain sessions 既有失败（§3.3）与门禁修订
+  决策（§3.7）阻挡。
 
 ---
 
@@ -78,8 +116,8 @@
 
 - [ ] 用推荐配置复测并发 C=1/2/4 与流式/stop 冒烟（Round 31/34 的结论基于 bf16 配置）。
 - [ ] 交付时按 AGENTS.md 移除本文件（PLAN.md）；决定 `tools/tp_bootstrap/` 下约 300 个一次性诊断脚本的
-      保留/清理范围（`build_r35.sh`、`serve_*`、`r37+r38+r39+r4x` 系列与 `docs/tp2-dual-5060ti.md` 引用为
-      可复现流程）。
+  保留/清理范围（`build_r35.sh`、`serve_*`、`r37+r38+r39+r4x` 系列与 `docs/tp2-dual-5060ti.md` 引用为
+  可复现流程）。
 
 ### 3.2 Windows 单卡 CLI tiny artifact 子任务（用户决定；前置已就绪）
 
@@ -99,6 +137,11 @@
 - MTP3 ≥ 70 tok/s 门槛未达（纯 decode 上限 K=2 50.5–54.0）。
 - TP-2 路线未跑 perplexity 评测（质量证据为同提示多采样 A/B）。
 - per-shard arena 的 `memory_summary()` 仍报 `pages 0/0`（仅显示口径问题）。
+- 温度 0 不保证逐位 argmax：DFlash2 稀疏接受 + 每请求随机 seed（`translate.cpp:51-57`）使解码在温度 0 下
+  也不确定 ⇒ 需要可复现 A/B 时加 `--greedy`（既有行为，未改动）。
+- `ninfer_qwen3_5_tp2_sessions_test` plain 路线 "a conversation behind a shared system prompt" 首采样分叉：
+  既有失败（r57 基线件与 r66 q4all 件逐 token 复现，`got [2752 13 198 …]` vs `expected [365 2798 349 …]`；
+  dflash2/mtp 路线通过）⇒ 阻挡「draft q4 升契约特性」（三件套须全绿）。
 
 ### 3.4 暂缓 / 可选（未排期）
 
@@ -110,1045 +153,244 @@
   （让出 shard 1 可重拿更大 envelope）；视觉编码期 shard 0 空闲（可接受）。
 - 归档 §6：KV dtype 扫描补全（nvfp4/k8v4 只验证了可启动与吞吐，无质量数据）。
 - 若要从源权重真正复刻官方工件的 DFlash2 draft，需先获取其 BF16 源检查点（本机只有 FP8/EXL3/GGUF）。
+- r65 context_key → q4（−79.7 MiB）：draft 的 5 个 attention QKV 融合对象全部别名同一 [6144,5120] 对象，
+  decode（`attn_input_proj` 三输出）与 prefill（`context_kv_materialize` 7 路线融合 kernel）两处消费方均
+  硬要求 Q8 ⇒ 需一族 4-bit 融合材质化 kernel + 三输出 q4 变体 + 两套 oracle；接受率风险本批最高
+  （K 投影误差在 2048 窗口环内逐 token 累积）；失败回退＝保持 q8。
+- L2：AR 与 MMA 重叠（环形 staging + 事件同步 + 子块流水）：浅层上限 ~1.5×（1,905 → ~4,760 tok/s 上限）；
+  大重构，跨卡 rendezvous 死锁风险（worklog Round 35c 已评估）。
+- 若仍攻 attention：只剩计算路径效率（FP8 PV + 压缩非张量 FP32 遍数），且需先解锁 profiler 权限
+  （ncu 2025.4.1 已装，`ERR_NVGPUCTRPERM` 被拒；管理员 PowerShell 或 NVIDIA Developer Settings 允许
+  GPU performance counters）。预期 attention 项 ~1.2–1.4×（245k 端到端 ~1.1–1.3×）。
+- 硬件杠杆：卡 1 从芯片组 Gen4 x4 槽（~7 GB/s）移到 CPU 直连 Gen5 x8 槽（~20 GB/s）：零代码，
+  浅/中上下文 1.78×、245k 1.15×；需主板有空槽。
+- DFlash2 K=6 每轮成本凹陷（三轮恒 25.7 rounds/s，低于更窄窗口的 K=5（27.9）也更宽窗口的 K=7（26.6））：
+  疑似按窗口宽度分桶/对齐的核函数边界效应；`NINFER_TP2_TIMING=1` 取逐相位每轮耗时排查。
+- DFlash2 prefill 稳定慢 3–4% 的确切来源（未做逐相位归因；`NINFER_TP2_TIMING=1` 拆 prefill 每相位）。
 
 ### 3.5 环境受阻的未做项（已用替代路径覆盖）
 
 - [ ] WSL 侧 op 测试 + 字节一致 + 前端夹具测试：**WSL2 CUDA 驱动崩溃**（`cudaGetDeviceCount()` 内 PTX JIT
-      segfault，GPU 被 Windows 服务占用）；jinja 测试通过证明二进制无误，op 测试改在 Windows 侧跑。
-      Windows 侧已过（NVFP4 A4/A16、frontend、jinja；`NINFER_OP_REPORT_STATS=1` 错误指标在容差内）。
+  segfault，GPU 被 Windows 服务占用）；jinja 测试通过证明二进制无误，op 测试改在 Windows 侧跑。
+  Windows 侧已过（NVFP4 A4/A16、frontend、jinja；`NINFER_OP_REPORT_STATS=1` 错误指标在容差内）。
 
-### 3.6 DFlash2 上 TP-2（主体已完成；余项待排期）
+### 3.6 DFlash2 上 TP-2：剩余验收与设计约束
 
-**状态**：`--spec dflash2` 已在 TP-2 放行（`--spec dflash` v1 仍构造期拒绝）。已完成：加载/分片（B1）、
-feature sink 上下文物化（B2a/B2b）、masked 提议前向（B3）、组装轮次 `program/dflash_round`（B4）、整轮接通
-（B5）、draft ring 随会话/检查点搬运（B6）、verify 窗口 CUDA Graph（C 轮）、MTP draft 链图化（E 轮）、
-reduced proposal head 按词表切分（方案 A）、selector 移至 shard 1（方案 B）。新增 `DevicePair::sendrecv`
-做逐字节跨卡交换，修掉方案 A 用 BF16-add allreduce 搬 I32/FP32 的 sNaN 位型风险。金值：append K=7
-`0xbad27a494a9bc853` / K=5 `0xbee487264ca8ffb8`；ring `0x1a53fd824cd4e360`；solo digest
-`0x4bcc3994a5efba7d`。
-
-**根因定案（A 轮，2026-09-22）**：`forward_tp2_window` 从未绑定 `active_valid_columns_` /
-`active_sequence_batch_` ⇒ 窗口每列都写 KV；而 DFlash2 的预算钳位窗口把尾列钉在同一绝对位置 ⇒ 同一次前向
-多 warp 并发写同一 paged-KV 槽，内容运行间不确定 ⇒ 近似并列处 argmax 翻转（此前的 S1「彻底同步」只是压低
-概率）。修复：窗口接受 `valid_columns`（钳位列禁写 KV、其 logits 置零），仅 DFlash2 传入，MTP/plain 路由
-逐位不变。修复后召回逐 token 复现 from-scratch，保留属性已实证并开放（见归档 A/B/C 轮证据）。
-
-**召回契约**：网格对齐边界（`reuse % reuse_grid == 0`）做全 token 对比；非对齐回退（declined 边界）只钉
-边界首采样，尾部可复现性由 solo digest 跨进程保证；弃稿状态经 `GenerationResult::draft_context_declined`
-暴露。
-
-**弃稿守卫修复**：非网格回退（模板前缀 ~37–57 token 恒命中）曾让 `dflash_draft_declined_` 每轮置位 ⇒
-`extent=0` ⇒ 每轮只提交 1 token（~22 tok/s）。现对 DFlash2 加门：`position <= max(reuse_grid, 16×remaining)`
-时不取非对齐边界、改用对齐扫描重放 clip ⇒ 草稿全程在线；实测每轮 3.17 committed、约 71 tok/s。归档里
-20–25 tok/s 的合成负载数字早于该修复。
-
-**余项**：
-
-- [ ] B7 性能验收：双卡吞吐对目标（roofline 修正 ≈108 tok/s，90 这端相符、180 不可达）+ 与 MTP 对比 +
-      plain/mtp 无回归，并记录 `--spec dflash2` 的推荐 K。
+- [ ] B7 性能验收：双卡吞吐对目标（roofline 修正 ≈108 tok/s）+ 与 MTP 对比 + plain/mtp 无回归，并记录
+  `--spec dflash2` 的推荐 K。
 - [ ] 待实测未知量：Windows 原生构建的真实 free（台账 `free` 取自 `cudaMemGetInfo`，WSL2 少报约 1 GiB）；
-      草稿按 head/row 切分的数值等价性；K=15 的 workspace 峰值；目标 5 层残差跨 shard 汇聚的每步开销；
-      草稿每层 allreduce 的延迟；稀疏拒绝采样在 TP-2 分片 logits 下的等价性。
+  草稿按 head/row 切分的数值等价性；K=15 的 workspace 峰值；目标 5 层残差跨 shard 汇聚的每步开销；
+  草稿每层 allreduce 的延迟；稀疏拒绝采样在 TP-2 分片 logits 下的等价性。
 
 **设计约束（勿重复调研）**：整份复制 draft 不可行——满上下文（262144 / fp8 / MTP K=2）下 free 仅
 697/1217 MiB，而草稿 2.07 GiB/卡；切分后每卡约 1.04 GiB。提议条件是目标 5 个 block 的 residual 拼接投影，
-TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，只捕 shard 0 即可）。候选 selector 直读全词表
-codebook（pred/succ 各 248320×256 BF16，约 254 MiB），必须整份。DFlash2 与 MTP 互斥：选 DFlash2 可释放
-shard 0 的 MTP 权重 430 MiB + KV 516 MiB。每轮成本构成、D1–D4 决策与各轮否定结论见归档。
+TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，只捕 shard 0 即可）。候选 selector 直读
+全词表 codebook（pred/succ 各 248320×256 BF16，约 254 MiB），必须整份。DFlash2 与 MTP 互斥：选 DFlash2
+可释放 shard 0 的 MTP 权重 430 MiB + KV 516 MiB。每轮成本构成、D1–D4 决策与各轮否定结论见归档。
 
-### 3.7 DFlash2 draft 量化实验（2026-09-23；已决定：保持 opt-in）
+### 3.7 draft 量化：升级门禁（保持 opt-in 直到满足）
 
-**目标**：验证「只改转换 recipe、不动算子」能把 TP-2 DFlash2 draft 变小多少、接受率掉多少。
+- [ ] 修 plain 路线 `sessions` 既有失败（§3.3）——三件套全绿才可升级。r66 q4all 件已测：`append`
+  K=7/K=5 PASS（金值重基线）、`solo` 双进程 digest 同 `0x4bcc3994a5efba7d`、`sessions` 仅 plain 失败；
+  dflash2 路线定向跑 PASS（164.8 s，recall 71 token 逐字节）。
+- [ ] 门禁修订决策：接受率裁决改以采样主导——字面门禁「贪心 |Δacc| ≤ 1.0pp」K=7 未过（−1.60pp），
+  已证明为跨臂文本漂移混淆（7 条探针 6 条文本不同；唯一文本稳定的 idx 5 上 −3.75pp，属小样本保留）；
+  pooled 采样 K=5/K=7 双涨（+3.72pp / +1.15pp）。门禁修订与升级分开决策。
+- （Q4 op oracle：新 shape 5120×25600 / 5120×4096 / 5120×17408 / 1280×5120 已由
+  `ninfer_linear_q4_a16_test` / `ninfer_linear_dynamic_grouped_conv_add_test` 按存储 scale 独立解码覆盖，
+  含图重放。）
 
-**结论**：能，但只能动一块——draft 的 fused gate/up SwiGLU 可在 Q4 下运行，**shard 0 省 450 MiB**，K=7 接受率
-不变（24.77% vs 24.59%），K=2 约 −2.5pp（1.6σ，样本不足以定论），探针吞吐持平。`mlp/down` 与
-`attention/output` 不能改：draft 的 fused dynamic grouped-conv finish 硬编码要求 Q8（见下）。
+剩余杠杆（未排期）：
+- selector codebook 量化（242.5 MiB BF16，非 GEMM）：需要新的 selector 路径（codebook codec + 保持
+  top-k 域）；且参数是裸 `Tensor` 非 `Weight`，还要动 Tensor→Weight 管线 + TP-2 peer 路径。
+- 全 draft NVFP4：**已做源码级可行性审计，判定不推进**（详见 `docs/tp2-dflash2-draft-nvfp4.md`）。
+  要点：相对现役 r66 `q4all` 件只再省 202.3 MiB，其中 174.3 来自 codebook（非 GEMM）；NVFP4 每元素
+  0.5625 B > Q4 的 0.53125 B，故已 Q4 化的 gate_up/output/down/kernel/feature 改 NVFP4 是增容；三个
+  硬阻塞＝转换器无 float→NVFP4 量化器且 draft 源（动态激活 FP8）无 A4 激活除数标定、NVFP4 native Weight
+  只收完整 parent（与融合 QKV 的 row-view 共享冲突）、各消费 op 的 NVFP4 几何/kernel 均为封闭集合
+  （`linear_pair` 只服务 dflash v1/MTP，不在 DFlash2 路径）。仅当动机转为「统一 W4A4 家族 / prefill
+  TMA」时重新立项。
 
-**决策（2026-09-23，用户确认）**：保持为 **opt-in override**，不改官方 recipe（`official_recipes.py:35-46`
-仍把 mtp/dflash/dflash2 钉在 Q8）；新 artifact 只作实验件，产品路线继续用 Q8 draft。
+### 3.9 DFlash2 draft q4 二次增量：②融合 QKV→q4 / ①codebook 量化（2026-09-24 开工）
 
-**分布一致性结论**：本引擎的投机解码是分布精确的——贪心分支发出的每个 token 都是 target 自己的 argmax
-（`src/ops/kernel/speculative_round.cuh:120-142`），采样分支是带掩码残差校正的拒绝采样（`:144-214`，算法说明
-`:216-228`），钳位列不写 KV（`docs/tp2-dual-5060ti.md:251-256`）⇒ **draft 权重（含其量化）只改变提议分布 q 与
-接受率，不改变模型输出分布**。但「输出轨迹逐位一致」被打破：窗口形状差异在近似并列处翻转（既有性质，先例
-`docs/tp2-dual-5060ti-worklog.md:1364-1366`），实测两个 K 的贪心文本长度均已变化。
+> 依据：`docs/tp2-dflash2-draft-nvfp4.md` 审计（全 draft NVFP4 已否决，只留这两条真显存杠杆）。
+> 决策：两项均保持 opt-in override + 专用 artifact，官方 recipe 与引擎默认路径不动。
 
-**脚本与产物**：
+**② 融合 QKV → q4（−79.7 MiB）——关键设计修正：不需要新融合 kernel**
 
-- override：`tools/tp_bootstrap/r54_draft_mlp_override.py`（`dflash2/layers/*/mlp/gate|up` → `q4_g64_fp16`，
-  `grouped_absmax`）；配方仍为 `D:/LLM/w4a4_family_recipe.py`，draft 源 `W4A16/NVFP4/W4A4+W8A8/DFlash2-FP8`。
-- 转换：`tools/tp_bootstrap/r54_convert_mlp4.ps1`（332 s，1218 objects，1 file）。
-- 新 artifact：`out/qwen3_8_27b_w4a4_w8a8_dflash2_gateup4.ninfer`（24,338,661,380 B，比基线 −451.6 MiB）。
-- A/B 臂：`tools/tp_bootstrap/r54_dflash2_arm.ps1`（起服 → greedy_probe 7 提示 × 160 token → 汇总 → 停服）；
-  检查工具 `tools/tp_bootstrap/r54_draft_quant_inspect.py`、dry-run `tools/tp_bootstrap/r54_draft_quant_dryrun.py`。
+审计发现 q4 GEMM 注册表**已经**含 `{4096,5120}`/`{1024,5120}`（`src/ops/linear/q4/q4_dispatch.cpp:14-15`），且 RowSplit q4 的
+row-region 由 `native_weight` 全链路支持（`src/core/weight_view.cpp:271-284`）⇒ 融合 [6144,5120] QKV 对象降到 q4 后，
+两个 Q8-only 消费方都能用既有算子绕开：
 
-**账本（`--max-context 131072`、DFlash2 K=7 + vision + host KV 32 GiB，同一二进制）**：
+- decode（`draft.cpp:326`）：Q8 走融合 `attn_input_proj` 三输出；q4 改走 **3 次 `ops::linear`**
+  （query/key/value 行视图，形状已在注册表）。
+- append/prefill（`draft.cpp:157`）：Q8 走融合 `context_kv_materialize`；q4 改走**既有逐层通用分支**
+  （2 次 `ops::linear` + `rmsnorm`/`rope`/`kv_cache_append_prefix`），并修正该分支对 dflash2 已裁剪 context 的复用
+  （原实现只对 dflash v1 正确；v1 已在构造期拒绝）。代价：每轮多 ~20 次 launch，预估 ≪1%，由 A/B 门禁验证。
 
-| arm | shard 0 `weights+ctx` | shard 0 `free` | shard 1 |
-|---|---:|---:|---:|
-| 基线（gate/up q8） | 13462.6 | 102.0 | 12112.6 |
-| gate/up q4 | **13012.6** | **552.0** | 12112.6 |
+改动清单：`parameters.h`/`parameters.cpp`（DraftBlockParameters 增加 query/key/value 行视图；`query_key_value` 改
+`std::optional`，仅 Q8 parent 构建）、`draft.cpp`（按 qtype 分支 + 通用分支修正）、override
+`tools/tp_bootstrap/r67_draft_qkv_q4.py`（**恰好 5 个对象**计数校验，官方 recipe 的 share 使
+query/key/value/context_key/context_value 同属一个对象）。
+门禁：stock Q8 路线逐位不变；现有 q4 op oracle 已覆盖所用 shape（无需新 kernel oracle）；显存核账 −79.7 MiB；
+贪心 K=5/7 + 采样接受率 A/B；DFlash2 三件套。
 
-⇒ shard 0 上限 +450 MiB ≈ **+28.5k token**（16.125 KiB/token/card）。
+**② 进度（2026-09-24）**：代码落地，`BUILD_EXIT=0`；stock Q8 件（`…_w8a8_dflash2_q4all.ninfer`）
+append 回归 **PASS**（ring/proposal digest 与基线逐位相同，Q8 路线零扰动）。r67 实验件已转换：
+`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_qkv4.ninfer`（1218 对象，379.5 s；payload **−79.69 MiB**，
+q4 81→86 / q8 12→7，恰 5 个 `[6144,5120]` q4 对象；dry-run 选择 q4 46 / q8 10 / bf16 35）。
+qkv4 件的 append 功能验证 **PASS**（`TEST_EXIT=0`：direct/split append 逐位一致、repeat 逐位一致、
+K=7 proposal 确定，ring K 与 Q8 基线逐值相同、V 差在 q4 量化量级 ≤1.5%）；proposal cost
+7.036 vs 6.854 ms/proposal（+2.7% 的 proposal 步，端到端约 +0.25%，待 A/B 实测）。
+顺带修正 append 测试的 draft-weight 台账：融合 QKV parent 与其 context 行视图是同一分配，
+改为按 parent 计一次（qkv4 臂 layers **843.9 MiB**；q4all 臂同口径 **923.6 MiB**，差 79.7 MiB
+与 artifact 字节差一致——旧口径把 parent 记了 3 次，gross 虚高 318.7 MiB）。
+待：贪心 K=5/7 / 采样接受率 A/B、solo digest 与 sessions 三件套，以及端到端吞吐 A/B。
 
-**接受率（greedy，每臂独立冷启服）**：
+**②-e 验收 A/B（2026-09-25，同一二进制；基线 = r66 `q4all` 件）**：
 
-| arm | K=7 drafted/accepted | K=7 acc | K=7 tok/s | K=2 drafted/accepted | K=2 acc | K=2 tok/s |
-|---|---|---:|---:|---|---:|---:|
-| 基线 | 2843 / 699 | 24.59% | 54.9 | 1012 / 603 | **59.58%** | 52.0 |
-| gate/up q4 | 2826 / 700 | **24.77%** | 57.2 | 1035 / 591 | 57.10% | 51.8 |
+| 指标 | q4all（Q8 QKV） | qkv4 | Δ |
+|---|---|---|---|
+| 贪心 K=7 | 26.95%（720/2672） | 27.07%（722/2667） | +0.12 pp |
+| 贪心 K=5 | 35.96%（712/1980） | 34.85%（703/2017） | −1.11 pp |
+| 采样 K=7（15 run 池化） | 33.87%（2678/7907） | 33.23%（2663/8014） | −0.64 pp |
+| 采样 K=5（15 run 池化） | 46.50%（2667/5735） | 44.34%（2626/5922） | −2.16 pp（差的标准误 ≈0.92 pp） |
+| 贪心吞吐 | 59.0 / 59.2 tok/s | 59.4 / 57.9 tok/s | 噪声内 |
 
-（tok/s 为 7×160 token 的探针用时折算，含 prefill，±5% 噪声。）
+采样 K=5 > K=7 符合预期（草稿越短接受率越高）。q4all 采样臂的**首次** K=7 运行在第 14 个请求崩溃：
+`tp2_generation_core.cpp:3119` 的 D2H `cudaMemcpyAsync` 报 `cudaErrorIllegalAddress`（sticky——故障在更早的
+DFlash2 verify/accept kernel，报错点只是首个 API 边界）；同一臂**重跑 15/15 全部通过**，且该 artifact 的 draft
+执行路径本次改动未触及（Q8 QKV 仍走融合 `attn_input_proj`/`context_kv_materialize`），故判定为
+**既有 TP-2 竞态 flake**（worklog 历史同类：Round 36d `tp2_generation_core.cpp:443` D2H 同症状），
+已记录待专项排查；本轮结论以重跑数据为准。
 
-**失败记录（重要）**：第一版把 `mlp/down` 一并降到 Q5，加载正常但 warmup 即报
-`FATAL warmup failed | linear dynamic grouped conv add: invalid projection_weight`。根因：
-`src/ops/wrapper/dynamic_grouped_conv.cpp:61-73` 的 `require_finish_projection_weight` 硬性要求
-`Q8_G32_FP16 / RowSplit / group 32`——该 finish 把 down/output 与动态卷积 delta 融合，draft 的
-`mlp/down`（5120×17408）与 `attention/output`（5120×4096）没有 Q5/Q4 变体。该中间 artifact 已删除。
+**三件套（qkv4）**：append-K7 / append-K5 / solo 全部 **exit=0**；solo 两次跨进程 digest 相同
+（`0x4bcc3994a5efba7d`），且与 q4all **逐位相同**——贪心接受规则下草稿只改变每轮产出 token 数、不改变 token 序列，
+所以这是预期；append 的 proposal digest 与 q4all 不同（`0xf9622ee5cd45709d` vs `0xda91572dd83980bd`）属预期。
+`sessions` 在**默认（三路线全跑）**下报 `FAIL (plain): a conversation behind a shared system prompt diverged …`，
+但该失败**与本次改动和草稿精度无关**：q4all 臂的输出 token **逐位相同**，且 `build-win/r66/` 里**改动前**的
+`sessions.log`（baseline 件）与 `sessions-baseline.log` 是同一串 token；把路线收窄为 `NINFER_TEST_ROUTE=dflash2`
+后 `sessions-dflash2-*.log` 一律 PASS。⇒ 本活动的 sessions 门禁一律按 dflash2 路线跑（r66 亦如此）。
 
-**后续杠杆（未排期；按性价比排序）**：
+**②-f 30-rep 高功效复测（2026-09-25，同一二进制，两臂相邻轮次）——推翻上面的 15-rep 结论**：
 
-- [x] **fused dynamic-conv finish 的 Q5 变体**（放开 `dynamic_grouped_conv.cpp` 的 Q8-only 校验）：
-      已落地（r56，2026-09-23）。`mlp/down` −172 MiB、`attention/output` −42 MiB（5 层 draft 合计）。
-      实现为「Q5 GEMM 物化 + 共享 finish kernel」路线：**复用已合规的 `select_q5_a16_launch` Q5 A16
-      GEMM，无新 GEMM kernel**（原"需要新 kernel"预估偏高）——新增 q5 形状 `n5120_k4096`
-      （`src/ops/linear/q5/shapes/n5120_k4096.cu`，selector 镜像 n5120_k17408）+ dispatch 注册；
-      新增 `src/ops/dynamic_grouped_conv/q5/`（plan/materialized，路线名
-      `dynamic_grouped_conv_add.q5.*.materialized_bf16`）；finish kernel 从 q8 materialized 抽出为共享
-      `src/ops/dynamic_grouped_conv/dynamic_conv_finish.cu`（q8/q5 共用，算术逐位不变）。wrapper
-      校验与非重叠检查按 qtype（Q8_G32_FP16 / Q5_G64_FP16 RowSplit，Q5 含 qhigh 高位面检查）分派；
-      容量 API `linear_dynamic_grouped_conv_add_workspace_capacity_bytes` 增加 qtype 首参（对齐
-      `linear_workspace_capacity_bytes` 惯例，`draft.cpp`/`dflash_round.cpp` 调用方跟进）；公共契约
-      （`include/ninfer/ops/dynamic_grouped_conv.h`）同步双 codec 语义；bench 增加 `--qtype q8|q5`。
-      **验证**：op oracle `ninfer_linear_dynamic_grouped_conv_add_test` 通过（4.38 s：Q8/Q5 ×
-      C∈{4096,17408} 全 W/B 域 120 形状 × 图重放，FP64 oracle 按存储 scale 独立解码）；
-      `ninfer_linear_q5_a16_test` 通过（3.11 s，新增 5120×4096 全路由边界 vs FP64 oracle）；
-      WSL build_dyn 与 Windows build-win 编译通过。
-      **实验件已转换**（2026-09-23，CONVERT_EXIT=0，285.8 s，1218 objects）：
-      `D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_finish5.ninfer`（23,449.4 MiB，**−213.3 MiB** vs 基线
-      23,662.7，与精确计算一致；恰 10 对象 `q5_g64_fp16`：`dflash2/layers/*/attention/output`
-      [5120,4096] ×5、`dflash2/layers/*/mlp/down` [5120,17408] ×5，其余 draft tensor 不变）。
-      override `tools/tp_bootstrap/r56_draft_finish_override.py`，转换脚本
-      `tools/tp_bootstrap/r56_convert_finish5.ps1`（r54 配方，`--device cpu`）。
-      **r56 实测**（2026-09-23，Windows 8099，K=7 贪心探针 7×160，2×5060 Ti，日志 `build-win/r56/`）：
-      账本 shard 0 free **102.0 → 314.0 MiB**（weights+ctx 13462.6 → 13250.6 = −212.0 MiB 设备侧，
-      工件 −213.3，1.3 为分配粒度吸收），shard 1 不变 810.0 ✓ 本地性成立；
-      接受率 base **24.59%**（699/2843）→ finish5 **25.13%**（703/2798），**+0.54pp**（p0/p2/p3 与
-      base 逐轮全同，p1/p4/p5/p6 文本轨迹漂移使分母变小；无下降迹象）；吞吐 56.4 → 56.2 tok/s（−0.4%）。
-      确定性：base 臂跨重建逐字节复现 r55 基线（2843/699、文本 len 全同）——共享 finish 重构后
-      Q8 路线零漂移。判定：**维持 opt-in**，升契约特性前仍欠 §3.7 末尾三件套验证。
-      **已知 flake（既有问题，用户确认偶发多次遇到）**：首次 finish5 臂在 req#2 流中途概率性挂死
-      （两卡 SM 100% 自旋等 handoff、/health 200、日志无报错；桌面进程已排除），重跑即过；
-      挂死机理待专项排查（用户指示暂缓，日志留存 `build-win/r56/serve-finish5-hang1.log`）；**该专项已由 §3.8 接手**（2026-09-23 第二次复现后定案为设备侧自旋，处置见 §3.8）。
-- [x] **`feature_projection` 新 profile**（5120×25600，132.8 MiB）：已落地（r55，2026-09-23）。
-      更正：该 tensor 走 plain `linear` op（`project` → `ops::linear`），不是 `linear_add`。
-      新增 `src/ops/linear/q5/shapes/n5120_k25600.cu`（selector 镜像 n5120_k17408：T=1 simt_r8_c4、
-      T=2–6 ksplit、T≤24 simt_r8_c8、其余 mma_r64_c128）+ dispatch 表注册 + 合规测试用例
-      （`tests/ops/linear/test_q5_a16.cpp` 5120×25600，seed 183U，FP64 oracle）。opt-in override
-      `tools/tp_bootstrap/r55_draft_feature_proj_override.py`（`dflash2/feature_projection` → Q5）。
-      收益精确值：该对象为 shard 0 本地全量（tp_split_spec 的 dflash2/* Replicated shards=0x1），
-      Q8 132.81 MiB → Q5 82.03 MiB（row_split_k128_v1：400 组/行 × 42 B + scale），**−50.8 MiB**
-      （原估 −63 偏高）。转换脚本 `tools/tp_bootstrap/r55_convert_featproj5.ps1`（r54 配方 +
-      r55 override，`--device cpu`，无需 GPU）。WSL build_dyn 编译通过（BUILD_EXIT=0）。
-      **实验件已转换**（2026-09-23，CONVERT_EXIT=0，299 s，1218 objects）：
-      `D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_featproj5.ninfer`（23,611.9 MiB，
-      实测 −50.8 MiB vs 基线，与精确计算一致；`dflash2/feature_projection` 已确认
-      `q5_g64_fp16:[5120,25600]`，其余 draft tensor 保持 Q8）。A/B 基线：
-      `D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2.ninfer`（23,662.7 MiB）。
-      **r55 实测**（2026-09-23，Windows 8099，K=7 贪心探针 7×160，2×5060 Ti，日志 `build-win/r55/`）：
-      op 合规 `ninfer_linear_q5_a16_test` 通过（5120×25600 全路由边界 vs FP64 oracle，2.9 s）；
-      账本 shard 0 free **102.0 → 152.0 MiB**（weights+ctx 13462.6 → 13412.6，设备侧 −50.0 MiB，
-      分配粒度吃掉 0.8），shard 1 不变 810.0 ✓ 本地性成立；接受率 base **24.59%**（699/2843）→
-      featproj5 **24.40%**（696/2853），**−0.19pp**（与 r54 gate/up Q4 的 ±0.2pp 同带宽 ⇒ 不变）；
-      吞吐 56.7 → 56.4 tok/s（−0.5%）。探针确定性：base 跨重建逐字节复现（2843/699、文本 len 全同）；
-      改 draft 必然微漂文本（FP 平局随轮切移动，r54 gateup4 同现象：834→837、795→784；
-      featproj5 漂 4/7 条），目标贪心流仍是验证 oracle。判定：**维持 opt-in**，
-      升契约特性前仍欠 §3.7 末尾三件套验证。
-- [ ] **selector codebook 量化**（242.5 MiB BF16，非 GEMM）：需要新的 selector 路径（codebook codec + 保持 top-k 域）。
-- [ ] **全 draft NVFP4**（约 −0.95 GiB）：先给转换器加 BF16/FP8→NVFP4 方法（现只有 `import_encoded` 能产 NVFP4），
-      再补上面三条的 NVFP4 profile；`linear_pair` 与 draft 版 `attn_input_proj` 仍是 Q8-only，全量化必须动它们。
-
-**组合实验件（r57，2026-09-23）**：三个已验证量化合并为最终实验件
-`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer`（22,947.1 MiB，**−715.6 MiB** vs 基线
-23,662.7，= 451.6+50.8+213.3 精确求和；21 对象：gate/up ×10 `q4_g64_fp16`、
-feature_projection/down/output ×11 `q5_g64_fp16`；`attention/{query,key,value,context_*}`
-[6144,5120]、draft 版 `attn_input_proj`/`linear_pair` 等仍 Q8——属杠杆#4 范围）。
-override `tools/tp_bootstrap/r57_draft_all_override.py`（含计数校验）+
-`tools/tp_bootstrap/r57_convert_draftall.ps1`（CONVERT_EXIT=0，290 s）。
-**r57 实测**（Windows 8099，K=7 贪心探针 7×160，日志 `build-win/r56/`）：账本 shard 0
-weights+ctx 13462.6 → **12748.6**（−714.0 MiB，粒度吸收 1.6；三杠杆单独测量之和 712.0 的 2 MiB
-差为各自粒度取整方式不同），free 102.0 → **816.0 MiB**（≈ +45k token 上限）；shard 1 不变 810.0 ✓；
-接受率 **25.3%**（706/2791）vs 基线 24.59%（无下降）；吞吐 56.9 tok/s（+0.9%）。
-命名 `qwen3.8-27b-w4a4-w8a8-draftall`。
-
-**升级为受契约保护的特性前必须补的验证（本次未做）**：
-
-- [ ] DFlash2 三件套针对新 artifact 重基线：`ninfer_qwen3_5_tp2_dflash_append_test`（K=7/K=5 金值）、
-      `ninfer_qwen3_5_tp2_dflash_solo_test`（digest）、`ninfer_qwen3_5_tp2_sessions_test`（保留断言）。
-- [ ] 采样模式（temperature>0）接受率/吞吐 A/B：分布精确性由算法保证，但 q 变化会影响采样下的接受率。
-- [ ] Q4 gate_up 在该形状上的 op oracle，以及「按存储 scale 独立解码」检查（AGENTS.md 的数值契约）。
-
----
-
-### 3.8 TP-2 会合协议重构（2026-09-23；事故驱动，进行中）
-
-**事故（第二次复现，且已定位到设备侧自旋）**：2026-09-23 21:02:56，Windows 3456，`qwen3.8-27b-w4a4-draftall`
-（245760 / k8v4 / DFlash2 K=5 / 4 会话 host KV）。req#34 在 prefill 2,189 tok + decode 158 tok 后冻结：
-两卡 SM 100%、显存 12,962/12,558 MiB 恒定、`/health` 200、host 恰好 1 个核连续跑满、日志零输出；
-req#35–#39（客户端约每 5 分钟重试）被接受但永不推进 ⇒ 6 条请求被静默吞掉（`--max-pending-requests 16`）。
-日志留档 `build-win/serve-hang-2026-09-23.log`（30,559 B），现场快照 `build-win/live-serve-snapshot.log`。
-**杀进程后两卡仍报 100% / 2805 MHz / 22–25 W / 0 MiB 且无 compute 进程** ⇒ 卡住的是设备侧自旋内核
-（`__nanosleep` 轮询的低功耗签名）。进程终止不会立刻回收：21:45 杀进程，21:47 两卡仍 100%/2805 MHz/~25 W，21:49 自行回落到 180 MHz/0%/4–7 W ⇒ 设备侧自旋的又一佐证；测量前先确认两卡回到 0%（本次已确认，无需重启）。
-
-**与下午修复的关系（结论：不是漏打补丁）**：部署件 `C:\ninfer\ninfer-serve.exe` = `build-win/apps/ninfer-serve.exe`
-（202,497,024 B，14:23:32），二进制内含 `NINFER_TP2_AR_WATCHDOG` 与 `graph queue[` 字面量 ⇒ 14:50–14:51
-那批提交（`12760cb8` 看门狗 → `f8d33f13` cache-line 修复 → `fe96c13d` 图重放测试）在链接时已在树内；
-14:24–14:30 的 r57e（图压力 60/60 PASS）与 r57f（serve 复检）跑的就是它。⇒ 本次是**同类现象的另一条路径**：
-`src/core/tp/device_pair.cu:191-197` 只堵掉「两计数器同 cache line 互相写回覆盖」这一条漏 bump。
-
-**三条设计缺陷（根因判断）**：
-
-- **D1 会合标识＝两卡各自 RMW 的自增计数器**（`device_pair.cu:208`、`:116-119`）：把"两卡永久锁步"当成
-  不可验证、不可恢复的分布式不变量。且本平台无法用原子修——`atomicAdd_system()` 需要
-  `hostNativeAtomicSupported`，PCIe 消费卡没有（llama.cpp `ggml/src/ggml-cuda/allreduce.cu:56-58`）。
-- **D2 等待严格相等且无上界**（`:153-158`）：唯一失败模式是活锁，且能带走整个服务。
-- **D3 会合落在最不可控的一致性域**（两块 GPU 写同一块 mapped host memory），每 token 约 128 次。
-
-**关键决策（对照 llama.cpp ar3-opt 与上游 `allreduce.cu`；细节见 `docs/tp2-dual-5060ti-llamacpp-notes.md`）**：
-
-1. **借"谁来发号"，不借架构**。采用 host 权威 id，但**不**采用 llama.cpp 的图级 meta 架构
-   （每 decode step 约 81 段 host lockstep）：同机 3 卡实测 44.5 tok/s vs 本引擎 2 卡约 100 tok/s，
-   且违反本仓库 "Models own finite execution composition" 的 ownership。
-2. **id 送达复用本引擎已有机制**：host 每轮写 pinned `base` → 图内 memcpy node 拷进 device 标量 →
-   内核算 `id = base + call_index`（`call_index` 为捕获参数，跨 replay 恒定）。与 `valid_columns` 同路
-   （`src/models/qwen3_5/execution/text.h:203-216`、`tp2_generation_core.cpp:998-1006`）。
-   **必须走 memcpy node，不能按值当 kernel 实参**——llama.cpp 的形态一旦入图会重放冻结值，自旋条件被
-   上一轮残留值满足 ⇒ 不等待直接读，静默算错（比挂死更难查）。
-3. **大 payload 事件路径只作 A/B 候选**，不预设替换：sliced 已在链路地板（2.70 vs 2.66 ms）；上游
-   copy-engine 固定开销约 80 µs 对 SM kernel stage A 约 30 µs，故其 1 MB 阈值。
-4. **补两边都没有的**：有界自旋 + 失败语义 + 退化路径。partial 合并（`ggml-backend-meta.cpp:2126-2180`，
-   已核实）BF16 下非结合、与逐位摘要契约冲突，本轮不做。
-
-**改动清单**：
-
-**Phase 1 —— 止血（不动协议，可独立上线）**
-- [ ] `device_pair.cu`：自旋加 `clock64()` 上界（env `NINFER_TP2_AR_TIMEOUT_MS`，默认 2000，0=关），超时后
-      `__threadfence_system()` + 置 mapped `stalled` 标志并让所有 block 退出；扩展现有 `ArWatchState`
-      （`:236-244`）承载该标志。
-- [ ] `allreduce`/`sendrecv` 返回状态；超时后 host 排空两条流、复位 arrival/order/parity，失败该请求并
-      **毒化该会话上下文**（要求重新 prefill，避免用半写 KV 继续），服务保持存活。
-- [ ] host 侧每轮不变式检查：`token_a_ == token_b_`（两个 mapped 计数器 host 可直读），不等即 dump 并失败。
-- [ ] 验收：故障注入（人为让一侧少一次合算／丢一次发布）必须表现为"该请求 5xx + 服务存活 + 下一请求正常"；
-      真实 agent 流量连续 ≥1 h 无永久挂死；prefill/decode A/B 回退 ≤1%。
-
-**Phase 2 —— id 权威化（删掉整类 desync）** ✅ 已完成（2026-09-23）
-- [x] `device_pair.{h,cu}`：删除 `token_host_/token_a_/token_b_`、`bump_ar_token`、`fuse_bump` 与
-      `ar_size_keyed_`/`NINFER_TP2_AR_STRATEGY`。落地形态比原计划更严，三处偏离都是有意的：
-      - **每个捕获图一条 id 通道**（`create_ar_channel()`，通道 k 占 `[(k+1)<<32, …)`），而不是"每设备一格 pinned cell"：
-        每轮三个 window 各 launch 一次，共用一格会在上一个 launch 的 memcpy node 执行前就被下一次写掉而串值。
-        每通道 = 一格 pinned cell + 每设备一个 device 标量（图内 memcpy node 的源与目标）。
-      - **id 全程 64 位**（arrival/order 槽改 `unsigned long long`）：32 位截断会让不同通道的 id 段撞值，
-        那样陈旧槽又能满足未来的自旋——正是要根除的那一类。
-      - **eager 走 64 位 kernel 实参**（从 `1<<62` 起、独立区间），不用 mapped cell：eager 调用会背靠背入队，
-        共用一格同样会读到后一个 id。内核只做 `token = base_dev ? *base_dev + call_index : value`，
-      `call_index` 是捕获期常量，烘进实参是安全的（烘 id 不安全）。
-      - 钩子为 `begin_capture(channel)/end_capture()/arm_round(channel)`：`end_capture` 自记 `calls`（少一处真相）；
-        `ar_token_skew()` 删除（计数器概念消失）→ `ar_last_id()` 供错误消息与看门狗；
-        `clear_ar_stall()` 只清 trip 标志——**id 永不重复 ⇒ 陈旧槽不可能满足未来自旋 ⇒ 停滞那一轮原地可恢复**，
-        这是 Phase 2 相对 Phase 1 的实质收益。
-- [x] `src/core/decode_graph.{h,cpp}`：**未改**（钩子由调用方显式调，未使用 `cudaStreamIsCapturing` 隐式判定）。
-- [x] `src/runtime/engine/tp2_generation_core.{h,cpp}`：`WindowGraph` 增 `ar_channel`；三个捕获点接钩子
-      （`capture_verify_graph`/`capture_decode_graph`/`capture_mtp_chain_graph`）；`launch_window_graph` 先 `arm_round`。
-      9 个模型侧 `allreduce/sendrecv` 调用点确实**一行未改**。
-- [x] 验收（2026-09-23）：
-      `ninfer_tp_device_pair_test` PASS——含改造后的 `check_graph_queue`：**逐次重放换新操作数**（否则 id 复用根本测不出来，
-      旧操作数会让陈旧槽照样"通过"）+ 每轮 `arm_round`；
-      `tp2_dflash_solo`(solo digest)、`tp2_dflash_append`(K=7/K=5)、3× `linear_tp2_split` 全 PASS；
-      `tp2_sessions` 仍以**改动前逐字节相同**的序列失败（既有 ulp 非契约，未被扰动）；
-      服务级注入 3000：`HTTP 503 | TP-2 allreduce stalled at rendezvous id 4294968076`
-      （`= (1<<32) + 1548` ⇒ 正是通道 1 的段，证明 base 确实经图内 memcpy node 送达）⇒ 下一条请求 HTTP 200；
-      同轮 `decode 120.4 tok/s / dflash2 accepted 782/1,200 (65.2%)` 与 Phase 1 的 120.0/65.2% 完全一致（无性能回退）；
-      看门狗 dump 同时出现 `12884914887`(通道 3) 与 `4611686018427390359`(eager `1<<62`+) ⇒ 多通道与双区间并存互不干扰。
-
-**Phase 3 —— 大 payload 事件路径（A/B 决定）** ❌ 已否决（2026-09-23，实测定案）
-- [x] 决定测量：**不写完整实现**，因为候选路径的**地板**已经超过现路径的**全部成本**。事件路径与 sliced 路径搬的是同样的字节
-      （每设备 D2H 本地 delta + H2D 对端 delta，都过同一条 PCIe），所以先量 copy engine 在该 payload 形态下的天花板即可判定。
-      探针：`NINFER_TP2_AR_COPY_BENCH=1 build-win/tests/ninfer_tp_device_pair_test.exe`
-      （`check_copy_engine_ceiling`：按计划的 `chunk = clamp(nbytes/4, 512 KiB, 2 MiB)` 分块，**每设备两条 copy stream 让双向同时在飞**；
-      串行单流版本实测 3.315 vs 双向 3.316 ms ⇒ copy engine 不会因双向并发变快，故该数字是可靠地板）。
-      实测：**10 MiB → 3.32 ms/次（两向合计 6.33 GB/s）；24 MiB → 8.86 ms（5.68 GB/s）**。
-      现 sliced 路径同一 10 MiB delta 实测 **2.70 ms**（≈7.4 GB/s，链路地板 2.66 ms 的 98.5%）。
-      ⇒ 候选路径尚未计入 event 栅栏（约 80 µs/次固定）与 add 输入所需的额外设备往返，就已慢约 23%：
-      "prefill 吞吐 ≥ 现 sliced 路径"不可能满足。第二个条件（删除 8-slice write-order 链）随之不成立——write-order 链正是现路径
-      吃到链路地板的原因，删掉它只会更慢。
-      范围说明：prefill 每层 payload 被 `--prefill-chunk 1024` 钉在 10 MiB，与提示长度无关，所以按 payload 形态做微观测量即可判定
-      （现路径已在链路地板 1.5% 以内 ⇒ 端到端不可能有 >1.5% 的收益，而候选在传输层就差 23%）。
-- [x] 结论：照计划 **"否则不做"**——不实现事件路径，不动 sliced 路径与 write-order 链。若日后换平台（PCIe 双向带宽更不对称、
-      或 SM 访问 mapped host 更慢的机型）可重跑该探针复核。
-
-**Phase 4 —— partial 合并可行性审计** ✅ 已审结（2026-09-23）：**形态不存在，门槛未触发，不做**
-- [x] 审计范围：9 个模型侧调用点（`text.cpp:409/475/822/893/950/952/2288`、`text.h:496/509`）。判据：是否存在
-      **两个独立 partial 各自归约后送进同一个 elementwise ADD**——只有这种形态才能压成"本地两 partial 先相加 → 一次 collective → 一次 add"。
-      逐点分类：
-      | 调用点 | 实际形态 | 可合并 |
-      |---|---|---|
-      | `text.h:496` mixer delta → residual_add | 行并行 partial → 一次 allreduce → `x += delta` | **否**：紧随的 MLP（`text.h:505`）读的是**就地更新后**的 `x`，两次 add 严格依赖 |
-      | `text.h:509` MLP delta → residual_add | 同上 | **否**：同上；下一层 mixer 又依赖本层结果 |
-      | `text.cpp:409 / 475 / 822 / 893 / 2288` | 一侧**零填充**、另一侧为本地数据拷贝 ⇒ 实为 replicate/gather（add-over-zeros） | **否**：不存在两个独立 partial；且 `__hadd(x,0)==x` 逐位成立，这里本就不是部分和归约点 |
-      | `text.cpp:950 / 952` | 背靠背两次 `sendrecv`（ids + scores） | **否**：结果是 top-k **选择式合并**，不是 elementwise ADD |
-- [x] 结论：**形态不存在** ⇒ 按门槛"存在才评估"不进入评估，**FP64 oracle 不触发**，无实现改动。附带记录（审计副产品，均判定不做）：
-      - replicate 类 5 处改为 `sendrecv` 逐位等价（对端全零），但成本由搬运字节主导、内核内 add 几乎免费 ⇒ 无可测收益。
-      - `950/952` 合并为一次需打包 I32/FP32 两种 dtype，省下的只是一次握手（每轮几十 µs / 37 ms 轮时 ⇒ ~0.1%）。
-      - 推论：每 decode round 约 128 次 collective 里，96 次是 48 层 × 2 次**真**部分和归约，且每个结果都有依赖它的消费者
-        ⇒ **在不改数学的前提下不可约减**；这也解释了为什么 transport 的优化空间只在每次 collective 的成本上（Phase 1–3 已封口）。
-
-**进度**
-
-- [x] **Phase 1a 传输层（2026-09-23）**：`device_pair.{h,cu}` 加 `%globaltimer` deadline（`NINFER_TP2_AR_TIMEOUT_MS`，默认 2000，0=关）、每侧 mapped `stall` 标志、
-      协作式退出（thread 0 经 shared 发布、全 block 一起 return，避免 `__syncthreads` 死锁）、`ar_stalled()/ar_token_skew()/clear_ar_stall()`
-      （复位=两计数器取大值 + 清零 arrival/order 槽）、以及测试用故障注入 `set_ar_fault_skip_peer_call()`。
-      新用例 `tests/test_tp_device_pair.cpp::check_ar_timeout`（跳过一次对端启动）实测：**gave up after 2000 ms, token skew 1 →
-      复位后逐位正确**，`ninfer_tp_device_pair_test` PASS（其余 allreduce/sendrecv/图重放/move 用例全过）。
-      ⚠️ **1a 不能单独上线**：超时内核在 phase 3 之前返回，调用方只拿到本地偏和 ⇒ 会把"响亮挂死"变成"静默算错"；已与 1b 同批完成。
-      另修一个 1a 自身的严重缺陷：内核入口先读**两侧** trip 标志，已 trip 立即退出——否则首次超时后 token 永久错位，同一轮后续 ~128 次合算会各烧 2 s（≈4 分钟/轮）才等到 host 检测。
-- [x] **Phase 1b 引擎层（2026-09-23）**：`TP2GenerationCore::abort_if_ar_stalled()`（`tp2_generation_core.cpp`，声明在 `tp2_generation_core.h`）在**每轮收敛点**
-      （`request.budget.remaining()`/output policy 之前、任何 token 送达客户端之前）与 prefill 首个 token 采样后检测；触发条件**只用 trip 标志**——
-      plain decode 路径只排空 shard A，镜像 shard 落后 1~2 次合算属正常，用 token 偏差判会误报 503，偏差只写进错误消息当取证；
-      触发后排空两卡 → `clear_ar_stall()` → `invalidate_host_checkpoints()` + `session_invalidate_active()` → `RequestError(Unavailable)` ⇒ **HTTP 503 + 下一请求重新 prefill**。
-      故障注入入口：`NINFER_TP2_AR_FAULT_SKIP_PEER_CALL=<n>`（env，构造期读；诊断用）。
-      **服务级验收**（新件已部署 `C:\ninfer\ninfer-serve.exe`，验收时 hash `001446D4…`；注入 3000）：`[ar-watch] calls=3114 … tok=[34054,34053]`（偏差 1）
-      → `WARN req#2 failed during generation | HTTP 503 | service unavailable` → 错误体 `TP-2 allreduce stalled (token skew 1)…`
-      → 复位后 dump `tok=[34054,34054]`、arrival/order 全 0 → **后续两条请求 1 s 内 HTTP 200**。Phase 1 完成。
-      记录教训：本次验收原文只留在本节与当次会话——`C:\ninfer\serve-win.log` 被随后的干净重启覆盖；后续验收先 `--request-log-jsonl` 或先复制日志。
-      **回归矩阵**（artifact `D:/LLM/qwen3_8_27b_w4a4_dflash2_draftall.ninfer`；每项都做了"改动后 / git-stash 改动前 HEAD"两次）：
-      `ninfer_tp_device_pair_test`（含新注入用例）**PASS**；`ninfer_qwen3_5_tp2_dflash_solo_test`（solo digest）**PASS**；`ninfer_qwen3_5_tp2_dflash_append_test`（K=7/K=5 哈希）**PASS**；3× `ninfer_linear_tp2_split_*` **PASS**；
-      `tp2_sessions_test`(plain recall 序列分叉)、`dflash2_real_test`(1.7 s cudaMalloc OOM)、`dflash_real_test`(0xc0000409 快败) 三项**在改动前 HEAD 上逐字节/同码复现** ⇒ 既有问题与本次无关
-      （sessions 即 worklog 记的"热引擎从零重放不保证与冷 oracle 逐 token 相同"的 ulp 非契约；另两项为 artifact/环境类，docs 未收录这两个用例名）。
-- [x] **Phase 2（2026-09-23）**：见上方 Phase 2 清单（id 权威化完成，已提交 `de74d966`/`b9c5d11c`/`634df875`）。
-- [x] **Phase 3（2026-09-23）**：见上方 Phase 3 清单——**实测否决，不做**（copy engine 地板 3.32 ms vs 现路径 2.70 ms）。
-- [x] **Phase 4（2026-09-23）**：见上方 Phase 4 清单——**形态不存在，门槛未触发，不做**（9 个调用点逐点分类，FP64 oracle 未触发）。
-      **部署注意**：`build-win/apps/ninfer-serve.exe` **不会**自动同步到 `C:\ninfer\`，需手动复制；PE 时间戳使每次链接的 hash 都不同，比对以"部署件与 build-win 产出 `Get-FileHash` 相等"为准（本轮已同步，`108AD767…`）。
-- [x] 停掉卡死进程并留档日志（2026-09-23；显存立即清零；残留自旋内核约 2 分钟后自行回落）
-- [x] 测量前置确认：两卡空闲占用已归零（2026-09-23 21:49，无需重启）
-### 3.9 DFlash2 DraftTokens（K）扫描（2026-09-23；结论：**维持 K=5**）
-
-**问题**：`qwen3_8_27b_w4a4_dflash2_draftall.ninfer` 在 MTP + DFlash2 路线下 `--draft-tokens` 取多少最优。
-**方法**：`tools/tp_bootstrap/r59_draft_tokens_sweep.ps1`——每个 K 用**完全相同的生产参数**启动 ninfer-serve
-（245760 / k8v4 / `--spec dflash2` / `--lm-head-draft` / temp 0.7 / top-k 20 / top-p 0.8 / vision / preserve-thinking），
-只改 `--draft-tokens`；每 K 先 warmup 一次，再对 3 类 prompt（reason 推理链 / prose 描述文 / code 代码）各 5 次、`max_tokens=256`。
-指标取自请求日志的 `decode X tok/s` 与 `dflash2 accepted a/b`；tokens/round = output ÷ (drafted/K)，rounds/s = decode ÷ tokens/round。
-
-| K | decode tok/s | 接受率 | tokens/round | rounds/s | reason | prose | code |
-|---|---|---|---|---|---|---|---|
-| 3 | 83.8 | 58.4% | 2.78 | 30.2 | 93.4 | 76.0 | 82.2 |
-| **5** | **96.4** | 48.5% | 3.45 | 27.9 | 113.9 | 81.6 | **93.6** |
-| 7 | 96.1 | 36.9% | 3.62 | 26.6 | **117.8** | **83.2** | 87.4 |
-| 9 | 89.1 | 30.1% | 3.74 | 23.8 | 113.1 | 72.9 | 81.3 |
-
-（粗扫 8 点的其余值：K=1 → 60.3、K=11 → 84.6、K=13 → 85.4、K=15 → 81.8 tok/s，均低于 K=3~7 的平台。）
-
-**K=6 补测 + 交错复核**（5/6/7 轮流启动 3 轮、每 K 共 18 样本；同一轮内比较可消掉机器状态漂移——K=5/7 都随机器转热从 c1 升到 c3）：
-
-| K | 池化 decode | 接受率 | tokens/round | rounds/s（三轮） | 推理链 | 描述文 | 代码 |
-|---|---|---|---|---|---|---|---|
-| 5 | 93.3 | 46.3% | 3.34 | **27.9 / 28.0 / 27.9** | 112.1 | 77.4 | **90.4** |
-| 6 | 89.7 | 40.9% | 3.48 | **25.7 / 25.7 / 25.7** | 111.8 | 75.7 | 81.6 |
-| 7 | **96.9** | 37.4% | 3.65 | 26.6 / 26.4 / 26.6 | **123.2** | **78.2** | 89.4 |
-
-同轮配对（c1/c2/c3）：K=5 88.1 / 93.8 / 98.0，K=6 87.6 / 94.0 / 87.5，K=7 94.4 / 96.8 / 99.6 ⇒ **K=7 三轮均不低于 K=5（+7% / +3% / +2%，差距随机器转热收窄）**，K=6 三轮均低于 K=7。
-
-**K=6 是一个可复现的每轮成本凹陷**：它的 rounds/s 三轮都是 25.7（±0.0），既低于窗口更窄的 K=5（27.9）也低于窗口更宽的 K=7（26.6）；接受率与 tokens/round 都正常插在两者之间 ⇒ 不是噪声，也不在启动台账里（`[mem]` 的 `record` 随 K 单调 5.1/6.0/6.8 MiB，`[tp2-graph]` 三个 K 相同）。疑似按窗口宽度分桶/对齐导致的核函数边界效应，**待查**（线索：`NINFER_TP2_TIMING=1` 取逐相位每轮耗时）。
-
-**机制**：K 增大提高 tokens/round（2.78 → 3.74），但接受率按位置快速衰减（58% → 30%），同时窗口变宽使每轮更贵
-（rounds/s 30.2 → 23.8）⇒ 净收益在 K=5~7 到顶。
-**结论**：**K=5 与 K=7 相差只在几个百分点内，K=7 略优**；**不要用 K=6**（被两侧同时支配）；K≤3 与 K≥9 明显更差。
-- 交错配对里 K=7 三轮均 ≥ K=5（+7% / +3% / +2%，热机后收窄到 ~+1.6%），驱动项是**推理链 +10%**（123.2 vs 112.1）；
-  code/tool-call 类反过来 K=5 略高（90.4 vs 89.4），描述文几乎相同。
-- 单轮粗测时两者是 96.4 vs 96.1 的平局 ⇒ 差异 ≤ 几个百分点，在样本波动内；要拍板需要更长的配对测量。
-- 倾向：客户流量以思考为主 ⇒ **建议把 `--draft-tokens` 从 5 调到 7**（也正是二进制对 dflash2 的默认值 7，与 `append K=7` 金值一致）；
-  工具调用占比若上升，5 与 7 的差距会进一步缩小。
-**边界**：单机单 artifact、3 类 prompt、temp 0.7、256-token 生成；接受率与内容强相关，换语料结论可能移动。
-显存不是区分项（K=3→9 每卡 free 仅差 ~10 MiB；K=15 在 245760 下也能正常启动）。
-### 3.10 纯 MTP 后端（`--spec mtp`）的 K 扫描（2026-09-23；结论：**K=3/4 平局，K=5 明显差；仍用 DFlash2**）
-
-**方法**：同 §3.9 的生产配方与交错方法（3 轮 × K=3/4/5 × 每 K 18 样本），只把 `--spec` 换成 `mtp`：
-
-| K | decode tok/s | 接受率 | tokens/round | rounds/s（三轮） | 推理链 | 描述文 | 代码 |
-|---|---|---|---|---|---|---|---|
-| 3 | 79.4 | 52.7% | 2.58 | **30.8 / 30.8 / 30.8** | 88.5 | **73.8** | **75.9** |
-| 4 | **79.7** | 45.0% | 2.80 | 28.5 / 28.5 / 28.5 | **92.4** | 71.0 | 75.7 |
-| 5 | 74.5 | 37.2% | 2.86 | 26.1 / 26.1 / 26.1 | 88.3 | 67.7 | 67.5 |
-
-**结论**：MTP 的最优落在 **K=3~4（79.4 vs 79.7，统计平局）**，K=5 低 6.5%；分类看 K=4 优于长推理链（92.4 vs 88.5），K=3 优于描述文（73.8 vs 71.0），代码打平。
-但**同 K 对比 DFlash2 全面落后**：K=5 时 74.5 vs 93.3（-20%），且 K 越大差距越大（MTP 的 tokens/round 2.58→2.86 只微增，DFlash2 是 3.34→3.65），
-加上 MTP 上限 K=5 无法再换收益 ⇒ **继续用 `--spec dflash2`**。
-**顺带澄清**：启动脚本第 60-61 行注释"TP-2 只支持 mtp（dflash/dflash2 会被拒绝）"**已过期**——本轮与 §3.9 都在 TP-2 上实测跑通了 dflash2。
-**方法论旁证**：两个后端的 rounds/s 在各自三轮里都只变 ±0.1（MTP 30.8 / 28.5 / 26.1；DFlash2 27.9 / 25.7 / 26.6），
-说明"每轮成本"是 K 的确定性函数，decode 的轮间波动来自接受率/内容，交错配对是这类比较的正确做法。
-
-### 3.11 prefill 对比：DFlash2 K=7 / MTP K=3 / 无投机（2026-09-23；结论：**投机几乎不付 prefill 代价，DFlash2 慢 ~3-4%**）
-
-**方法**：`tools/tp_bootstrap/r60_prefill_spec_compare.ps1`——三个配置用**同一套生产参数**，只差 spec 相关开关
-（`--spec dflash2 --draft-tokens 7 --lm-head-draft` / `--spec mtp --draft-tokens 3 --lm-head-draft` / 三者都去掉）；
-每个配置一个**新进程**（不跨配置复用），两个长度用**不同文本**，日志确认 `cache 0%`（6481 那 0.6% 是共用的 chat 模板前缀 ~39 tok）。
-为排除"同一轮里越晚跑越热"的顺序伪影，除 2 轮正序（dflash2→mtp→plain）外又跑 1 轮**反序**（plain→mtp→dflash2）。
-
-| prompt | DFlash2 K=7 | MTP K=3 | 无投机 | TTFT（dflash2 / mtp / plain） |
+| 指标 | q4all | qkv4 | Δ | se(Δ) |
 |---|---|---|---|---|
-| ~1,673 tok | 1,473 tok/s | **1,593** | 1,567 | 1.10 / 1.05 / 1.10 s |
-| ~6,481 tok | 1,743 tok/s | 1,807 | **1,817** | 3.70 / 3.60 / 3.55 s |
+| 采样 K=7 | 35.13%（16234/46207） | 34.99%（16208/46326） | **−0.14 pp** | ≈0.31 pp |
+| 采样 K=5 | 45.42%（15865/34927） | 45.25%（15852/35029） | **−0.17 pp** | ≈0.38 pp |
+| proposal cost（CUDA events） | 6.851 ms | **7.044 / 7.031 ms** | **+0.19 ms（+2.8%）** | 确定性 |
 
-（每组 3 次测量，配置内重复性 ±1%；反序轮里 dflash2 排在最后仍最低 ⇒ 顺序伪影已排除。prompt 变长速率上升 = 每请求固定开销被摊薄。）
+接受率代价**不可测**（两档都 <0.5σ）；15-rep 的 "−2.2 pp" 与基线自身 0.6–1.1 pp 的轮次漂移同量级。
+三件套在**当前二进制**下重跑仍全过（`SUITES_DONE failures=0`，5/5 exit=0；solo digest 与基线逐位相同；
+append proposal digest K=7 `0xf9622ee5cd45709d` / K=5 `0x96582e7289dd2702`）。② 的真实代价只剩确定性的
+proposal 步 +2.8%（+0.19 ms/轮；按 ~45 ms/轮折算 ≈ **+0.4% 端到端**）。
 
-**结论**：开投机**几乎不付 prefill 代价**（1% 内），MTP 与无投机基本打平；**DFlash2 稳定慢 3-4%**（扣掉 0.6% 的前缀命中差后仍 ~3%）。
-整请求上可忽略：decode 侧 DFlash2 领先 MTP ~20%（§3.10），远超这 3-4% ⇒ **生产继续 DFlash2（K=5 或 7）**。
-**未定位**：DFlash2 这 3-4% 的确切来源（未做逐相位归因；要查可用 `NINFER_TP2_TIMING=1` 拆 prefill 每相位耗时）。
+**② 结论（修正）**：② 是「**−79.69 MiB 换 ≈+0.4% 轮时、接受率无代价**」的中性偏正杠杆，而非上一轮判定的
+「赔 1.3–3.2% 吞吐」。与 ①（−178.09 MiB、零代价）相比 ① 严格更优；② 是否进默认取决于显存压力是否值得
+那 0.4% 轮时。（方法论：本活动的接受率判决必须用 30-rep；15-rep 的臂间噪声地板 ≈±2 pp。）
 
-### 3.12 DFlash2 K=7 的 prefill 深度曲线（0 → 239k；2026-09-23）
+**① selector codebook 量化（−174.3 MiB，非 GEMM）**
 
-**方法**：`tools/tp_bootstrap/r61_prefill_depth_curve.ps1`——单进程、单一逐步加长的文档（每次请求发送 1..i 段），
-靠前缀复用让每步**只 prefill 新增段**，于是日志里 `prefill X tok/s (N tok)` 的 N 就是"新增 token 数"（已验证 `N = prompt − cache`），
-即**该深度区间内的瞬时速率**。K=7 / dflash2 / 生产参数，共 17 步、每步 ~14.1k token，max_tokens=1 以隔离 prefill。
+现状：codebook 是裸 `Tensor`（`parameters.h:111-114`），唯一 bf16 路径（`src/ops/candidate_selector/bf16/`、
+`wrapper/candidate_selector.cpp:110-113`），248320×256×2 = 242.5 MiB；TP-2 置于 shard 1
+（`tp_split_spec.cpp:97-104`）并由 peer 代跑 selector（`text.cpp:973+`）。选择域是 256 维内积 top-16/248320。
+设计：新增 codebook codec（目标档待定：Q4_G64 每元素最小，NVFP4 每 16 权重一 scale、排序保真更好），
+保持 top-k 域；`SelectorParameters`（`parameters.h:116-119`）的 codebook 由裸 `Tensor` 升级为带 qtype 的表示，
+再由 `candidate_selector_path` 的量化重载按存储 scale 独立解码。已定位的两个 ABI 约束：
+① loader 目前用 `b.direct(..., BF16)` 精确钉住格式，`Binder::binding` 在 `exact_format` 不符时抛错
+（`src/artifact/binder.cpp:53`）⇒ codebook 参数必须改为「不钉格式」并按 artifact 实际几何选择表示；
+② TP-2 下 codebook 在 shard 1、由 peer 的 `dflash_propose_batch` 消费（`text.cpp:973+`），量化表示必须同样跨 peer。
+先做 op 级 oracle（top-16 集合/分数 vs bf16 基线），再端到端 A/B（接受率为硬门禁——量化误差直接改提案集合）。
 
-| 深度区间 | 速率 | 拟合 | 累计耗时 |
+**① 进度（2026-09-25）**：op 层实现完成。格式无关的 plan 从 `bf16/` 上移为
+`src/ops/candidate_selector/plan.{h,cpp}`（新增 `candidate_selector_path_q4_dispatch`，workspace 不重叠校验
+同时覆盖 codebook 两平面）；新增 `src/ops/candidate_selector/q4/candidate_selector_path_q4.cu`，按
+Q4_G64_FP16 RowSplit 独立解码——`code(r) = nibble (r&1) of byte (r>>1)`（nibble 语义 `(n^8)-8`），
+scale = `fp16(scales + token*8 + (r>>6)*2)`（`padded_columns=align(256,128)=256`、`code_bytes_per_row=128`、
+`scale_offset=align(n*128,256)=n*128` 已按 `weight_geometry` 核对）；公开头新增 `Weight` 重载，
+wrapper 校验 qtype/layout/group/n/k/scale_dtype 与 payload 不重叠。`ninfer_ops` 与
+`ninfer_candidate_selector_test` 均编译链接通过（exit 0）。测试新增 q4 oracle 臂：host 侧构造
+`value = code * fp16_scale` 并打包 nibble，FP64 oracle 按**存储 scale 独立回解**，覆盖 K=3（Direct）/
+K=7（Lattice）× B∈{1,3,8}。该测试已运行 **PASS**（`OK candidate_selector_path`，`TEST_EXIT=0`）——
+q4 解码与 FP64 oracle（按存储 fp16 group scale 独立回解）在两条路由上逐位一致。
+**①-b 进度（2026-09-25）**：loader / 参数 / peer 已打通。`load/dflash2.cpp` 的 codebook 由
+`b.direct(..., BF16)` 改为 `b.parameter(...)`（不钉格式；`bindings` 里 `direct` 本就是
+`parameter(..., {}, format)` 的特例，故只去掉格式钉死）；新增 `SelectorCodebook{dense, weight, quantized}`
+表示与 `Prepare::codebook()`（按 artifact 几何在 BF16→`tensor()` 与 Q4→`prepare_linear_weight().weight`
+之间选择，格式非法即抛错）；新增 `execution/selector.h::run_candidate_selector()` 作为**唯一派发点**，
+`draft.cpp`（持有 selector 的 shard）与 `text.cpp`（TP-2 peer）都改走它，量化表示随 `SelectorParameters`
+自然跨 peer。**stock BF16 codebook 回归**：q4all 件 append 测试 digest 与基线**逐位相同**
+（proposal `0xda91572dd83980bd`、ring `0x371f934bfbd6c7ec`），`TEST_EXIT=0`。
+r68 实验件 `D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_cb4.ninfer` 已转换（1218 对象，379.8 s；
+payload **−178.09 MiB**，q4 81→83 / bf16 569→567，恰 2 个 `[248320,256]` q4 codebook；dry-run
+q4 33 / bf16 33 / q8 25；不含 r67 的 QKV 改动）。加载期首个实现踩到 `Model::input(WeightId)` 要求
+「恰好一个 Use」（`model.cpp:23-28`）而 codebook 是裸 direct 参数——改为直接 `native_weight(bound.view)`
+从完整 parent 取 Weight（不需要 Use），仍是同一几何校验。**cb4 端到端验证**：append 测试
+`TEST_EXIT=0`（direct/split append、ring repeat、proposal determinism 全过），且
+`peer selector: on shard 1` 由 **245.0 MiB → 66.9 MiB**（−178.1 MiB，与 artifact 字节差一致），
+proposal cost **6.854 ms/proposal**（基线 6.851，噪声内）。
+
+**①-c 结果（2026-09-25，同一二进制；基线 = q4all）**：采样池化（15 run × 3 prompt 类）。
+
+| 指标 | q4all | cb4 | Δ |
 |---|---|---|---|
-| 0-14,116 | 1,810 | 1,785 | 7.8 s |
-| 13,312-28,180 | 1,610 | 1,590 | 17.0 s |
-| 27,648-42,244 | 1,440 | 1,428 | 27.1 s |
-| 41,984-56,308 | 1,310 | 1,297 | 38.1 s |
-| 55,296-70,372 | 1,200 | 1,191 | 50.7 s |
-| 69,632-84,436 | 1,090 | 1,098 | 64.3 s |
-| 83,968-98,500 | 1,000 | 1,018 | 78.8 s |
-| 98,304-112,564 | 931 | 949 | 94.1 s |
-| 111,616-126,628 | 908 | 891 | 110.6 s |
-| 125,952-140,693 | 822 | 838 | 128.5 s |
-| 140,288-154,758 | 797 | 791 | 146.7 s |
-| 154,624-168,823 | 738 | 749 | 166.0 s |
-| 167,936-182,888 | 700 | 712 | 187.4 s |
-| 182,272-196,953 | 684 | 678 | 208.9 s |
-| 196,608-211,018 | 653 | 647 | 231.0 s |
-| 210,944-225,083 | 622 | 618 | 253.7 s |
-| 224,256-239,148 | 597 | 593 | 278.7 s |
+| 采样 K=7 | 34.62%（2697/7790） | 34.37%（2691/7829） | −0.25 pp |
+| 采样 K=5 | 45.59%（2649/5810） | 43.40%（2609/6012） | −2.19 pp（se ≈0.91 pp） |
 
-**拟合**：每 token 成本 `1/rate = 5.25e-4 + 5.01e-9 · depth` 秒（17 点，全部误差 <3%）
-⇒ 深度 0 外推 **1,905 tok/s**、245,760 处 **569 tok/s**；**满上下文时 attention 已占每 token 成本的 70%**（浅层由固定开销主导）。
-**实用结论**：灌满 239k 上下文实际耗时 **278.7 s**（其中 248,072 token 被真正计算——比 239,148 多 3.7%，是 1024-chunk 检查点粒度导致的尾部重算），
-有效速率 890 tok/s（首段 1,810 → 末段 597，降 3.0×）。
-**复现与旁证**：独立重跑的前 16 点逐点吻合（±1%）；`cache` 数字显示前缀复用在 239k 深度仍然近乎完美（缓存边界 = 上一 prompt 减 ~1 个 chunk），
-即上下文缓存环在满深度可用。
+基线自身也在漂：同一 q4all 件在 r67 那轮是 K=7 33.87% / K=5 46.50%，本轮 34.62% / 45.59%
+⇒ 15-rep 池化的臂间漂移约 ±1 pp，K=5 的 −2.2 pp 只有 ~2.4σ，**不足以定论**。三件套 **全过**
+（append-K7/K5、solo×2、sessions-dflash2，`SUITES_DONE failures=0`）；solo digest 与基线逐位相同
+（贪心序列不随草稿变）；append 的 K=5 proposal digest 与 q4all **相同**（`0x5a3629fb79be1cd3`）、
+K=7 不同（`0x766be9d7643131e2`）⇒ codebook 量化对该 fixture 的候选选择影响很小。
+**①-c 高功效复测（30-rep，90 run/臂，同一二进制）——15-rep 的 −2.2 pp 是噪声**：
 
-### 3.13 深上下文 prefill 的成本归因与优化空间（2026-09-23；分析，未改代码）
-
-**问题**：§3.12 测到 prefill 速率 1,905 → 569 tok/s（3.3×），是否有优化空间。
-
-**架构事实**（`D:/LLM/W4A16/NVFP4/W4A4/config.json`）：Qwen3.5 是**混合注意力**——64 层里只有 **16 层 full attention**
-（24 Q / 4 KV / head_dim 256；TP-2 单卡 12 Q / 2 KV），另 **48 层 linear attention（GDN）成本与深度无关**。
-⇒ 整条斜率只来自 16/64 层；若 64 层全是 full attention，同一深度处 ≈185 tok/s（当前 569，混合结构已买到 3.1×）。
-
-**实测分解**（§3.12 拟合）：每 token 成本 = **0.525 ms（深度无关，1,905 tok/s 上限）+ 5.012e-9·d**；
-在 245,760 处两者分别占 **30% / 70%** ⇒ 这 70% 就是"任何 attention 侧优化"的**收益预算**：完美内核最多 3.3×，现实约 1.3–1.8×。
-
-**生产 prefill 走哪个内核**（已核实）：`causal_softmax_attention.cpp:382-385` 对 `(q_heads==12||16) && width<=16` 才给 ChunkedSmallT，
-宽度 1024 的 prefill 因而落到 **Prompt** 路线 ⇒ `causal_attention_prompt_k8v4_kernel`（flash 风格：Br=64 行、Bc=64 KV 列、16 warps、
-FP8 tensor core 做 QK^T、FP16 做 PV），但 **grid = (tokens/64, 12 Q 头)**：**每块只处理一个 Q 头**，而单卡只有 2 个 KV 头
-⇒ 6 个 Q 头共享 1 个 KV 头却各自独立遍历同一段 KV（请求级 6× 冗余；L2 可能吸收一部分，需 profile 判定）。
-
-**推算的交通量与效率**（以引擎自己的 `[mem]` 账本为锚：kv 3015 MiB/shard @245760 ⇒ 12.87 KB/token/shard，
-其中 full-attention 部分 16 层×2 KV 头×256 dim×1.5 B = 12,288 B ✓）：
-245,760 深度、1024-token chunk 下 KV 流量 ≈ 16 行 tile × 12 Q 头 × 384 B × 245,760 ≈ **290 GB/chunk/卡**；
-实测 attention 时间 ≈1.26 s/chunk ⇒ **~230 GB/s（峰值的 51%）**；attention 计算 ≈4.95e13 FLOP/chunk ⇒ **~39 TFLOP/s（FP8 roofline 的 ~40%）**。
-⇒ 两个 roofline 都未饱和，且存在 6× 的请求级冗余 ⇒ 确有空间。
-
-**优化清单（按收益排序；均为估算，需 profile 定夺）**：
-1. **GQA 感知的 prompt 内核**：让共享同一 KV 头的 Q 头共用一个 KV 数据流（如 6 头×16 行/块），流量 290 GB→48 GB/chunk；
-   若转为带宽受限（~400 GB/s）⇒ attention 0.12 ms/token，245k 处端到端可达 **~1,550 tok/s（2.7×）**；
-   若被 FP8 计算下限拦住（~60–70% roofline）⇒ 更现实 **~830–1,000 tok/s（1.5–1.8×）**。50k 处约 1.3×，10k 处约 1.05×。
-2. **提高 Prompt 内核已达到的带宽/占用**（KV tile 双缓冲、prefetch、occupancy）：对 attention 项最多 ~2×。
-3. **通用性说明**：收益集中在长上下文；**短 prompt 的瓶颈是 0.525 ms/token 的固定项**（48 层线性注意力 + MLP + W4A4 GEMM），那是另一条线。
-4. **不是杠杆**：更小的 KV dtype（已 1.5 B/元素，且有质量代价）、TP 切分、GQA 比例（已 4 KV 头）、chunk 上限（`kPrefillChunkMaximum=1024` 是 TP-2 既定设计）。
-
-**下一步（建议先做）**：`ncu` 抓 `causal_attention_prompt_k8v4_kernel`（深度 ≥100k 时）看 **DRAM 吞吐 / L2 命中率 / tensor pipe 利用率**
-——据此判定 6× 冗余是否真落到 DRAM（决定做"减流量"还是"提占用"）。注意 worklog 已修过同族的 12 头路由漏洞（仅覆盖 width≤16 的 verify 窗口），
-大 chunk 这条是遗留。
-
-**补：PCIe 拓扑（Gen5 x8 + Gen4 x4）已考虑，且是"深度无关项"的主因（2026-09-23 交叉验证）**
-
-worklog Round 35b/35c（`docs/tp2-dual-5060ti-worklog.md:636-691`）早已实测本机拓扑并定位：
-
-- 卡 0（`pci 01:00.0`）**Gen5 x8，实测 ~20 GB/s**；卡 1（CUDA device 1，`pci 08:00.0`）**芯片组 Gen4 x4，实测 ~7 GB/s**（`nvidia-smi --query-gpu=pcie.link.gen.max,pcie.link.width.max` 复现：device 0 = 5/x8，device 2 = 4/x4）。
-- nsys 归因：`ar_inplace_bf16` 占内核总时间 **48%**（1024 宽块内约 60%）；每层 2 次 allreduce、载荷 [hidden 5120, T] bf16、写+读往返 = 4·hidden·T 字节/层/卡
-  ⇒ **2.6 MB/token**，在 7 GB/s 上 = **0.368 ms/token ≈ 2.67k tok/s 的 AR 硬件上限**（实测边际斜率正好贴上、与块宽无关）。
-- 关键否证：这条 Gen4 x4（走芯片组）链路**双向合计只有 ~7.9 GB/s**（不是每方向）；21 MB 往返物理下限 2.66 ms，8 切片有序流水已达 **2.704 ms = 98.5%**。
-  （本机 Phase 3 独立复现同一数字：10 MiB 载荷 2.70 ms ✓）⇒ **AR 侧软件已无空间**；多 block AR 无差异、copy-engine 会合更慢且结果不一致，均已实测否决。
-
-**与本节拟合的交叉验证**：我测的深度无关项 `a = 0.525 ms/token`（1024 块 = 538 ms）与 worklog 在 ~1.3k 深度的 nsys 归因（AR ~350 + MMA ~188 + 其它 ~35 = 573 ms）**一致**
-⇒ 该固定项的构成是 **AR ~65% + MMA ~34% + 其它 ~6%**。注意 worklog 那次深度只有 ~1.3k，所以其归因自然只覆盖深度无关部分，与本节 attention 项不冲突。
-
-**由此修正 §3.13 的措辞**：固定项**不是**"另一条可优化的计算线"，而是**已经贴死链路地板的 PCIe 开销**。
-浅层上限 1,905 tok/s = 1/(0.34 + 0.18 + 0.03) ms，其中 0.34 ms/token 已无软件空间。两条杠杆：
-
-| 杠杆 | 作用域 | 收益 | 代价/风险 |
-|---|---|---|---|
-| 卡 1 移到 CPU 直连 Gen5 x8 槽 | 硬件 | 浅/中上下文 **1,905 → ~3,390 tok/s（1.78×）**；245k 处 569→655（1.15×）；14k 处 1,810→2,740（1.51×） | 零代码；需主板有空槽 |
-| AR 与 MMA 重叠（环形 staging + 事件同步 + 子块流水） | 软件 | 上限 ~1.5×（AR 隐藏后 ~4,760 tok/s 浅层上限） | 大重构，跨卡 rendezvous 死锁风险 |
-| GQA 感知 prompt 内核（见上） | 软件 | 深上下文 1.5–1.8× | 内核工程 |
-
-三者互补：硬件换浅层、内核换深层。P2P 不可用的根因也是这个槽位——`canAccessPeer=0`（worklog:200）、`nvidia-smi topo` 显示两卡为 **SYS**（不同 root complex），所以 peer 流量必须过主机桥，这也是 host-staging 设计的由来（`device_pair.h:114`）。
-
-### 3.14 待实施的两个软件杠杆（2026-09-23；L1 已开工）
-
-按 §3.13 的账，prefill 两个成本项各有杠杆，且**互补**（一个作用于 `b·d`，一个作用于 `a`）：
-
-| # | 杠杆 | 作用项 | 预估收益 | 前置/风险 |
+| 指标 | q4all | cb4 | Δ | se(Δ) |
 |---|---|---|---|---|
-| **L1** | **GQA 感知 prompt 内核**：让共享同一 KV 头的 6 个 Q 头共用一份 KV 数据流（现在 `grid=(tokens/64, QHeads=12)`，每块只处理 1 个 Q 头，单卡 2 个 KV 头被各读 6 遍） | `b·d`：深上下文 attention，245k 处占 **70%** | 深上下文 **1.5–1.8×**（245k: 569 → ~830–1,000 tok/s） | 先过测量门确认 6× 冗余是否真落到 DRAM；只改调度与数据复用，**不动物理累加顺序 ⇒ 可与现内核逐位一致**。**（2026-09-23 测量门否证 ⇒ 已取消，见下）** |
-| **L2** | **AR 与 MMA 重叠**（环形 staging + 事件同步 + 子块流水） | `a`：深度无关项，其中 AR ≈ 65% | 浅层上限 **~1.5×**（1,905 → ~4,760 tok/s 上限） | 跨卡 rendezvous 死锁风险，属大重构（worklog Round 35c 已评估） |
-
-> 硬件杠杆（卡 1 从芯片组 Gen4 x4 槽移到 CPU 直连 Gen5 x8）不在表内：零代码但需主板槽位，收益 1.78×（浅/中上下文），与 L1/L2 可叠加。
-
-**L1 执行顺序**：
-1. **测量门（先做，未过则不动代码）**：ncu 抓 `causal_attention_prompt_k8v4_kernel`（生产几何 12q/2kv/d256/k8v4，KV 深度 ≥100k），看
-   `dram__bytes_read.sum`、`lts__t_sector_hit_rate.pct`、tensor pipe 利用率、achieved occupancy。
-   - L2 命中率高且 DRAM 已近峰值 ⇒ 6× 冗余已被 L2 吸收 ⇒ 杠杆变小，改走"提占用/降延迟"；
-   - DRAM 流量 ≈ 6× 唯一 KV 字节且吞吐近峰值 ⇒ 冗余真实 ⇒ 进入第 2 步。
-2. **设计**：块的行维度由「1 头 × 64 行」改为「6 头 × R 行」（R 由 smem 预算反推，Q/K/V/P/stats 各项已在 `prompt_k8v4.cuh` 里算过），
-   KV tile 仍按 Bc=64 顺序流过；**每行看到的 KV tile 顺序与累加顺序不变** ⇒ 目标是与现内核逐位一致。
-3. **实现**：只改 `prompt_k8v4`（生产 dtype）；其余四种 dtype 的 prompt 内核暂保持现路径（同构，后续同步）。
-4. **验证**：OP 级 FP32/FP64 oracle（12/2/d256 深包络）+ 同步 `causal_attention_workspace_capacity_bytes` + 模型级金值（`tp2_dflash_solo`/`append` 摘要）+ 复跑 §3.12 深度曲线作性能对照。
-
-**L1 测量门结论（2026-09-23，已否证 ⇒ 不改内核）**：用现成的 op 级基准 `bench/ops/causal_softmax_attention_bench`（本次为它补上生产分片几何 `d256-h12-kv2`——op 与测试本就支持，bench 落后）在 W=1024（Prompt 路线）、h12-kv2 下实测，245,760 深度单层：
-
-| KV dtype | 耗时 | 达成 math | 唯一 KV 字节 |
-|---|---|---|---|
-| bf16 | 82,927 µs | 37.4 TFLOP/s | **482.0 MB** |
-| int8 | 83,207 µs | 37.2 | 248.5 MB |
-| fp8 | **73,782 µs** | 42.0 | 242.9 MB |
-| nvfp4 | 82,270 µs | 37.7 | 135.6 MB |
-| k8v4（生产） | 73,910 µs | 41.9 | 189.2 MB |
-
-**KV 字节跨 3.5×，耗时只差 13%**：fp8 比 k8v4 多 28% 字节却同耗时；nvfp4 少 28% 字节反而慢 11%；bf16 字节 2.55× 只慢 12%
-⇒ **内核不是 KV 带宽受限，而是计算/ALU 受限** ⇒ 去掉 6× 请求冗余不会有时间收益，**L1 按原设计取消**（内核代码未动，符合门禁约定）。
-
-**顺带确定的天花板**：同机 T=1024 下 `ninfer_fp8_linear_add_bench`（A8, K=17408）**85.9 TFLOP/s**、`ninfer_q4_linear_swiglu_bench`（W4A4）**44.1 TFLOP/s**；
-attention 的 QK^T 与 PV 各约 21 TFLOP/s（合计 41.9）。与纯 FP8 GEMM 比每个 attention GEMM 只到 24%，
-但 k8v4 与 fp8 同耗时说明**差距不只在 MMA dtype**，而在内核结构（k8v4 的 PV 走 FP16、Hadamard 旋转/行缩放、softmax、smem 流量）。
-⇒ 若仍要攻 attention，唯一形态是**计算路径效率**（FP8 PV + 减少 ALU 遍数），且**必须先有 profiler**：本机**未安装 Nsight Compute（ncu）**，黑盒计时已到极限。
-预期：attention 完全消除 ⇒ 245k 处 569 → ~1,900 tok/s（3.3× 上限）；现实减半 ⇒ ~1.4×。
-
-**基线留档**（W=1024、h12-kv2、k8v4、单层 median）：8,192 → 2,637 µs；32,768 → 9,924；65,536 → 19,630；131,072 → 39,602；245,760 → 73,880。
-线性度极好，且 ×16 层 = 1.18 s/chunk，与 §3.12 模型级 1.26 s/chunk 只差 6% ⇒ 两条独立测量互证。
-复跑：`ninfer_causal_softmax_attention_bench.exe --entry cached --geometry d256-h12-kv2 --kv-dtype k8v4 --tokens 1024 --context 8192,32768,65536,131072,245760 --execution eager --cache cold`。
-**构建注意**：`-DNINFER_BUILD_BENCHMARKS=ON` 在 Windows 上会让默认目标失败（`bench/context_cost/model_context_fixture.cpp:400` 用了 MSVC 不支持的 `__int128`），
-本次只按目标构建（`cmake --build build-win --target ninfer_causal_softmax_attention_bench`）；该缓存开关已复位为 OFF，不影响常规构建。
-
-**L1 后续（2026-09-23）：profiler 已就绪，但被驱动权限挡住**
-
-- 已安装 Nsight Compute 2025.4.1（winget `Nvidia.Nsight.Compute`），`ncu --version` 正常；但非管理员进程读性能计数器被拒：
-  `ERR_NVGPUCTRPERM`（target device 0）。解锁二选一：① 用**管理员** PowerShell 运行 ncu；
-  ② NVIDIA 控制面板 → Desktop → Enable Developer Settings → Developer → Manage GPU Performance Counters → 允许所有用户访问 → 应用（持久生效）。
-- 无计数器可得的归因（已完成）：
-  * **W 扫描**（深度 65,536、k8v4、h12-kv2）：W=256 → 31.7、512 → 41.8、1024 → 41.8、2048 → 45.4 TFLOP/s
-    ⇒ **W=1024 已在平台区**；把 prefill chunk 上限从 1024 提到 2048 只值 ~9%，不是杠杆。
-  * **同机 GEMM 天花板**（T=1024）：FP8 A8 **85.9**、W4A4 **44.1** TFLOP/s；attention 平台约 45（QK+PV 合计），
-    而 QK^T / PV 各约 21–23 ⇒ QK^T(FP8) ≈ 其 dtype 天花板的 25%，PV(FP16) ≈ 50%。
-  * 4-bit K 路径（nvfp4-K vs fp8-K）贵 +11%；bf16（完全无反量化）反而慢 12% ⇒ **MMA dtype 比反量化更主导**。
-- **候选改动（待 profile 确认后再动，遵守门禁）**：把 prompt 内核的 KV tile 宽度 `Bc` 从 64 提到 128
-  （QK^T 的 N 维翻倍、KV 循环次数减半；smem 由 ~99 KB 增至 ~165 KB，仍可单块容纳）。
-
-**L1 实验记录（2026-09-23）：两条低成本路径均被硬件墙挡死，内核已回退**
-
-ncu 对 `causal_attention_prompt_k8v4_kernel`（W=1024、65,536 深度、k8v4、h12-kv2）的实测：
-
-| 指标 | 值 | 含义 |
-|---|---|---|
-| Compute (SM) Throughput | **63.54%** | 计算为主 |
-| Tensor 管线 | **63.5%（最高）** | 张量管线是最忙资源 |
-| **DRAM Throughput** | **1.09%** | KV 流量基本全被 L2 吸收 |
-| L2 / L1 吞吐 | 10.10% / 40.43% | 都不是瓶颈 |
-| Issue Slots Busy / IPC | 30.89% / 1.39 | 不是发射受限 |
-| 最大 stall | 等数学管线 4.0/11.5 周期（34.4%） | 张量管线排队 |
-| Occupancy | 理论=实际 **33.33%**（16/48 warp） | 1 block/SM |
-| Block Limit | 寄存器 1 / smem 1 | 双重限制 |
-| 寄存器/线程 · 动态 smem | **100** · 85.12 KB（配置 102.40 KB） | — |
-
-⇒ **"减 6× KV 冗余"彻底证伪**（DRAM 1%）；真瓶颈是张量管线 + 33% 占用。
-
-两次实验（均先过 oracle 正确性）：
-1. **Warps 16→32**（同 smem 内翻倍 warp，寄存器上限随之压到 64）：正确性 **PASS**，性能 **−12%**（65k: 19.63→22.17 ms；245k: 73.88→82.43 ms）。
-   原因结构性：1024 线程的块被 64K 寄存器文件硬顶在 ≤64 寄存器/线程，而内核需 ~100 ⇒ spilling。**死路**。
-2. **Bc 64→128**（加宽 KV tile 改善 MMA 形状，smem 85,120→151,808 B）：**无法启动**，
-   `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` 返回 `cudaErrorInvalidValue` ⇒ 消费级 Blackwell **单块动态 smem 上限 ~100 KB**。**死路**。
-
-**结论**：该内核已贴住本机硬件边界（张量管线最忙、DRAM 空闲、占用被"寄存器文件 + 100 KB smem"同时锁死）。
-剩余可做的都更大且收益有限：Br=32/256 线程的 tile 重构争取 2–4 block/SM（受寄存器支配）、PV 改 FP8、压缩非张量 FP32 指令（占指令 11%，ncu 提示 ~3.6%）。
-上限：attention 项约 1.2–1.4× ⇒ 245k 端到端 ~1.1–1.3×、50k ~1.05–1.1×。
-⇒ **性价比排序更明确：硬件移槽（浅/中 1.78×，零代码）> L2（AR/MMA 重叠，浅层 ~1.5×）> attention 重构（深上下文，收益最小、风险最大）。**
-
-**顺带修复**：`bench/context_cost/model_context_fixture.cpp` 的 `__int128` 改为等价的 uint64 溢出检查（两个累加项各自不溢出，只需检查其和），
-`-DNINFER_BUILD_BENCHMARKS=ON` 现在在 Windows 可正常构建（已用默认目标 `cmake --build build-win` 验证通过）。
-
----
-
-## 4. DSH/agent-loop 前缀复用修复（2026-09-24，进行中）
-
-**问题**：DSH 接入 ninfer 的 agent loop 里，某轮生成大 tool call（写大文件，24k token）后，
-下一轮必须把这 24k token 重新 prefill（实测 req#3：prompt 34,050 / cache 9,216 / prefill 24,834 tok / TTFT 17.0s）。
-
-**已确证（NINFER_TP2_REUSE_TRACE=1 / NINFER_TP2_SESSION_TRACE=1 实测）**：
-1. 引擎保存了上一轮完整历史（`cached` = prompt+generated），但 `shared` 等于上一轮 **prompt** 长度
-   （332/331/315 三例），即**第一个生成 token 就不匹配** → 只能从上一轮 prompt 末尾重启。
-2. 用 `/v1/chat/completions` 原样回放 `reasoning_content` 复现同样结果 → 不是 DSH 特有。
-3. artifact 内嵌模板对 `reasoning_content` 做 `|trim`，把模型生成的首个空格吃掉（实测
-   `"ABCD"` 与 `"  ABCD  "` 渲染出的 prompt 长度完全相同）；而模型 reasoning 首个 token 带前导空格，
-   因此任何文本回放都无法逐 token 复现。
-4. TP-2 路线自建 frontend 时**漏传 `chat_template_path`**（`tp2_generation_core.cpp:472-480`），
-   所以 `--chat-template` 在该路线被静默忽略（实测 developer 角色仍报 `artifact:chat_template.jinja`）。
-5. 复用扫描里"对齐边界优先"会遮蔽更深的未对齐 live frontier，只有在 `reuse == 0` 时才走兜底；
-   而 DFlash2 的兜底带代价门控（放弃 draft ≈ 3× 解码变慢 vs 省下的 prefill）。
-
-**结果（2026-09-24）**：
-- [x] A `tp2_generation_core.cpp`：TP-2 frontend 透传 `chat_template_path`。实测：部署新件并带
-      `--chat-template` 重启后，`developer` 角色由 400 变 200（覆盖真正生效）。
-- [x] C `tp2_generation_core.cpp`：兜底边界扫描改为无条件第二轮，门控改用"边际节省"
-      （`position - reuse`），对齐边界仍是最低优先级。`dflash2`/`mtp` 两路 `ninfer_qwen3_5_tp2_sessions_test` PASS。
-- [x] D `tests/models/qwen3_5/test_tp2_sessions.cpp`：新增常驻会话连续两轮用例（1000 token prompt；
-      二轮期望 plain/mtp = 1007、dflash2 = 768）。没有 C 时 plain/mtp 会停在 768，用例能抓住该改动。
-- [x] E 构建（`nm`/ninja，测试目标 + `ninfer-serve` 并同步 `C:\ninfer\ninfer-serve.exe`）+ 测试 +
-      在线复测；证据：`profiles/sessions-{dflash2,mtp,plain-trace,all}.log`、`profiles/reuse-trace*.log`。
-- [x] F 文档：`docs/tp2-dual-5060ti.md` 增补常驻连续两轮、门控与 `--chat-template` 说明。
-- [~] B 模板 `|trim` → `rstrip('\n')`：**已回退（实测否定）**。覆盖为维护模板后原样回放
-      `reasoning_content` 仍得 `shared == 上一轮 prompt 长度`，与 artifact 模板结果一致。
-
-**残留根因（新发现，未修）**：文本协议回放无法逐 token 复现。`max_tokens=1` 时实测
-`completion_tokens=1 / reasoning_tokens=0 / reasoning_content 为空`；k=2 得 `" need"`、k=3 得
-`" need answer"`，而回放一律停在 `shared=72`（上一轮 prompt 长度）。即**第一个生成 token 不在已发布的
-reasoning 文本里**（或回放重分词与采样边界不同），因此 DFlash2 上"复用上一轮回答尾部"对任何文本客户端
-都不可达。再叠加门控（放弃 draft ≈ 3× 解码 vs 省下 prefill），32k 输出预算下重算 24.8k token（17 s）
-是代价模型下的**理性选择**。
-
-**可选杠杆**：客户端输出预算（`remaining` 需 < 节省量/16 ≈ 1.5k token 才触发复用）；让 DFlash2 在
-未对齐复用下保持 draft（需要先解决 `extent=0` 钳位轮的可复现性）；或走携带 token id 的续写协议。
-
-**既有失败（与本次改动无关）**：`NINFER_TEST_ROUTE=plain` 在 `shared_a_first` 处 `reuse=0/src=none`
-的从零 walk 与冷 oracle 首 token 不同（`[2752 13 198 …]` vs `[365 2798 349 …]`）。trace 证明该场景及
-其之前所有复用决策（0/71/512）与测试期望一致，新扫描路径在 `shared_prefix=0` 时不可能取任何边界。
-
-## 5. TP-2 首个生成 token 不发布（2026-09-24，已修）
-
-**现象**：`max_tokens=1` 时 `completion_tokens=1 / reasoning_tokens=0 / 无文本`；`max_tokens=k` 只发布 k−1 个 token
-的文本；逐字节回放上一轮回答（chat-completions 原样回传 `reasoning_content`+`content`，带/不带 tools、换模板都一样）时
-`shared` 永远等于上一轮 prompt 长度（实测 67 / 306 / 72）。于是 TP-2 上"复用上一轮回答尾部"对任何文本客户端都不可达，
-`cache` 在服务日志里恒为 `floor(上一轮 prompt/1024)×1024`。
-
-**根因**：`src/runtime/engine/tp2_generation_core.cpp` 的 prefill 末尾用 `request.generated.push_back(first)` 直接落账，
-**没有经过输出会话**（`preview_model`/`commit_preview`）。单卡路线会把 prefill 采样的首 token 经
-`commit_pending`→`preview_model` 提交（`src/runtime/engine/engine_core.h`），TP-2 是唯一漏掉的路线；因此
-`generated`（KV/状态/会话目录索引的序列）比"已发布文本"多一个 token。
-
-**修复**：prefill 采样后 `preview_model({first}, budget.remaining(), limit_reason())` → `budget.commit` →
-`publish_preview(false)`；若该决策已终止请求（stop token 或预算用尽）则记入 `first_token_finish` 并跳过 decode 循环。
-这也顺带修掉"首 token 是 stop token 时引擎仍继续生成"和首 token 未受语法约束（前者已修，后者记录为独立遗留项）。
-
-**验证**（证据：`C:\ninfer\serve-win.log` 的 `[tp2-reuse]` trace、`profiles/fixtok-*.log`）：
-- `max_tokens=1` → `reasoning_tokens=1`、`R="We"`（修复前 0 / 空）。
-- 回放 40 token 回答：`shared=107`（= 67 prompt + 40 生成；修复前 67）。
-- 回放 1400 token 回答：`reuse=1470 src=live` = 整个上一轮回答（DFlash2 按门控对该 1-token 请求弃稿，代价可忽略）。
-- `ninfer_qwen3_5_tp2_sessions_test`：dflash2 / mtp 均 PASS（既有断言无回归）。
-- 新增用例 `check_first_token_published`：thinking 开、输出预算 1 token 时 `reasoning_tokens` 必须为 1。
-
-**残留（未修）**：门控仍按 `max(reuse_grid, 16 × 剩余预算)` 决定是否取未对齐边界，所以 DSH 的 32,768 预算下长回答仍会整段重算
-（代价模型下的理性选择）；prefill 的首个 sample 仍未应用工具语法掩码（TP-2 prefill 与 decode 路径的不对称，独立遗留项）。
-
-**附带观察（未修，独立）**：在服务实例上以 `temperature: 0` 连发同一请求 3 次，前 4 个 token 出现两种结果
-（`"The user wants me"` / `"We need to respond"`）。`src/serve/translate.cpp:38-88` 会把请求里的 temperature 覆盖到服务默认值上，
-所以温度确实被应用；DFlash2 的稀疏接受（`speculative_accept_sparse_drafts`）配合每次请求随机 seed（`translate.cpp:51-57`）
-使解码在温度 0 下也不保证逐位 argmax——这正是 `--greedy`（"force temperature 0 (exact argmax)"）存在的原因。
-需要可复现 A/B 时应加 `--greedy`；这条独立于本次修复，未改动。
-
-## 6. 复用门控改按"会话自身轮次"定价（2026-09-24，已改）
-
-**问题**：门控 `position - reuse <= max(reuse_grid, 16 × request.budget.remaining())` 里的 budget 是客户端设的上限
-（DSH 固定 32,768）。预算 ≥ 16K 时 `16 × budget >= max_context`，未对齐回退分支**在数学上不可达**——而它是尾部复用
-的唯一入口（网格上没有任何 decode 检查点），也就是说该机器生产配置下永远不会触发，即使节省量是整个上下文。
-
-**改动**：
-- `SessionEntry` 增 `generated_tokens_total` / `generated_turns`；每轮结束后按 `request.generated.size()` 累加
-  （只统计生成 >=1 token 的轮次，保证均值非零）。
-- 门控改用 `expected = min(budget, total/turns)`；没有已完成轮次（首轮请求、或关闭 retention）退回 budget（原最坏情况）。
-- 语义上只放宽（`min(budget, mean) <= budget`），任何原先接受的边界仍被接受。
-
-**验证**：
-- 测试 `ninfer_qwen3_5_tp2_sessions_test`：dflash2 / mtp EXIT 0。新增场景 = 5 短轮 + 1 长轮（60 token）+ 1024 预算
-  续轮，期望复用直达 frontier；另加两条场景自检，若某天不再落在 take 分支会带数字明确失败。证据 `profiles/gate-{dflash2,mtp}.log`。
-- 在线（serve + trace）：20 短轮（均值 2）+ 1 个 2000-token 长轮 → 续轮 **budget 32,768** 下 `reuse=2442 src=live`、
-  `cache 2,442 (99.3%)`、**TTFT 57.9 ms**（prefill 仅 17 token）；旧规则阈值 16 x 32,768 = 524,288 必然跳过。
-  同一请求按门控弃稿，decode 22.5 tok/s、输出 37 token ⇒ 代价约 1.2 s < 省下约 1.6 s，本注是净赚。
-
-**已知边界（故意保留）**：定价用的均值包含突发轮，所以"突发之后紧接的短轮"能否复用取决于该会话的均值——
-均值 > 节省量/16 时仍然跳过（风险中性结论，不是 bug）。当前 DSH 会话均值约 1,735，其 24.8k 尾部仍会被跳过；
-要翻转只能把比率 16 做成可配选项，或走第 3 步（未对齐复用下保住 masked draft）。
-
-## 7. 未对齐复用不再弃稿：masked draft 全程在线（2026-09-24，已改）
-
-**前提被实测推翻**：第 2 步的门控建立在"未对齐复用必须弃掉 masked draft"之上。实测这个前提不成立——
-保留 draft 后 ring 只有 ulp 级差异，接受率几乎不变。
-
-**实测（同一 artifact、serve 配方 + trace；20 短轮均值 2 + 一个 2000-token 长轮，续轮 budget=32768）**：
-- 复用结果相同：`reuse=2442 src=live`、`cache 2,442 (99.3%)`、TTFT 58 ms、prefill 仅 17 token；
-- 弃稿（旧行为）：`decode 22.5 tok/s`，输出 37 token；
-- 保留 draft（新行为）：`decode 87.1 tok/s`、`dflash2 accepted 28/63 (44.4%)`。
-弃稿保护的从来不是正确性（target verify 始终为每个 token 发牌），只是"逐位复现 from-scratch walk"这一契约。
-
-**改动**：
-- `extent` 不再因边界未对齐而归零；删除 `dflash_draft_declined_`、`GenerationResult::draft_context_declined`、
-  stderr 提示与 solo 测试里的打印。
-- 复用扫描合并为单趟：网格过滤与门控删除，**最深边界获胜**；`reuse_grid` 随之删除。
-- 第 2 步的 `SessionEntry::generated_tokens_*` 与会话均值定价一并删除（前提消失，门控失去意义）。
-
-**契约（严格版实验定界）**：边界在网格上 ⇒ 与 oracle 逐 token 一致；边界在 chunk 内 ⇒ 只保证 boundary crossing。
-把 `compare_recall` 临时改成"处处要求逐 token 相等"实跑，失败于 `a conversation behind a re-rendered answer`：
-`got [2752 11 220 16 24 24 15 82]` vs `expected [2752 11 198 220 220 16 15 15]` —— 前两个 token 相同、第三个分叉，
-与旧注释预测的"第三 token 必然分叉"一致，说明分叉来自未对齐的 prefill 分块（窗口切分不同），不是 draft 模式。
-保留 draft 反而把分叉来源从两个（模式 + 分块）减到一个（分块）。
-
-**验证**：
-- `ninfer_qwen3_5_tp2_sessions_test`：dflash2 / mtp EXIT 0；plain 在本机失败于既有场景 "a conversation behind a
-  shared system prompt"（`got [2752 13 198 ...]` / `expected [365 2798 349 ...]`），与上一会话记录的同一失败逐位一致。
-  本次提交对 plain/mtp 是**行为等价重构**（旧门控只在 `dflash2_enabled_` 时生效，两者早已取最深边界），故与该失败无关。
-- `ninfer_qwen3_5_tp2_dflash_solo_test`（重建后）：两个独立进程 digest 均为 `0x4bcc3994a5efba7d`、PASS，与文档记录值一致
-  ⇒ 网格对齐路径未被扰动（solo 场景本身不含未对齐复用）。
-- served 路由（step-3 二进制）：`reuse=2442 src=live`、`cache 99.4%`、TTFT 51-57 ms、prefill 14 token、无弃稿提示。
-  同一二进制独立重启两次结果逐位相同（`output 52`、`accepted 31/147 (21.1%)`、`decode 53.9 tok/s`）⇒ 该二进制确定性，
-  21% 不是 run 间抖动（早先"temperature 0 非确定"的结论只适用于当时那个场景）。
-- **接受率是文本属性，不是本次改动的属性**：同一复用边界、同一二进制，只改续写内容 —— prose 53.9 tok/s / 21.1%，
-  数字列表 175.8 tok/s / 99.6%（446/448）。因此 `44.4%`（实验那次，数字型、output 37）与 `21.1%`（终结版，prose、output 52）
-  是两段不同文本的度量，不能当 A/B；真正同 walk 的 A/B 是"弃稿 22.5 tok/s vs 保留 87.1 tok/s / 44.4%"（同一 conversation、
-  同一 scan，只切换 extent）。
-- 两次构建为何会造出不同文本：门控删除也改变了**早期短轮**的复用边界（旧门控要求 `saving > max(1024, 16×expected)`，
-  短轮 prompt 的 off-grid 节省量远小于 1024，旧代码退到对齐边界；新代码取 frontier）⇒ 前缀不同 ⇒ 2-token 短答案在 tie 处可能不同
-  ⇒ 内容级联分叉（观测：旧 2,459/37 vs 新 2,456/52）。两者都是合法 walk。
-
-## 8. DFlash2 draft 二次量化 r62–r66（2026-09-24；立项，未开工）
-
-**背景**：§3.7（r54–r57）把 draft 降到「当时消费 op 支持的最低 qtype」，此后每个 draft 组件都坐在
-op 级下限上。2026-09-24 对剩余空间做了逐 op 支持性审计（证据链：消费 op 的 qtype 校验器），结论是
-**当前构建没有一项可以「只改配方」落地**——剩余空间全部需要新 op 变体。本战役做其中性价比最高的四项
-（codebook 与环 FP8 明确缓做，见下）。
-
-**审计结论（每项的精度锁点）**：
-
-| 组件 | 当前 | 锁点（消费 op） | 判定 |
-|---|---|---|---|
-| mlp/gate_up [34816,5120] | q4 | `linear_swiglu` q4 plan 形状精确闭合（`q4_linear_swiglu_plan.cpp:33`） | 已在底，不动 |
-| mlp/down [5120,17408]、attention/output [5120,4096] | q5 | 融合 `linear_dynamic_grouped_conv_add` 校验器只放行 Q5_G64/Q8_G32（`wrapper/dynamic_grouped_conv.cpp:60-95`） | **r63**：新 q4 变体 |
-| feature_projection [5120,25600] | q5 | 普通 `ops::linear`；q4 注册表无 {5120,25600}（`q4_dispatch.cpp:13-25`） | **r62**：新 q4 shape |
-| context_key [6144,5120] | q8 | decode：`attn_input_proj` 三输出重载硬断言 `require_q8_rowsplit`（`wrapper/attn_input_proj.cpp:243-261`）；prefill：`context_kv_materialize` 硬断言 Q8_G32 [1024,5120]（`context_kv_materialize.cpp:37-52`） | **r65**：两处新 q4 变体 |
-| kernel_projection [1280,5120] | bf16 | `rmsnorm_dynamic_grouped_conv_prepare` 硬断言 BF16+Contiguous+无 scale（`wrapper/dynamic_grouped_conv.cpp:39-52`） | **r64**：新 q4 prepare |
-| codebook [248320,256]×2（shard 1） | bf16 | `candidate_selector_path` 唯一 bf16 变体（`wrapper/candidate_selector.cpp:110-113`）；且参数是裸 `Tensor` 非 `Weight`（`parameters.h:113`）⇒ 还要改 Tensor→Weight 管线 + TP-2 peer 路径 | **缓做**（改动最深 + 接受率敏感度最高：256 维内积选择） |
-| 环 K=BF16/V=FP16 | — | 三处锁死：`CyclicKVCache` 布局、SWA 校验（`sliding_window_attention.cpp:60-62`）、`context_kv_materialize` 的 `validate_cache`（:98-99）；窗口只注册 {2048, 4096} | **缓做**（~55 MiB，工程量最大、性价比最差） |
-
-**目标收益**（shard 0，精确值；GPU0 free 607 → ~860 MiB ≈ +16k token KV 上限）：
-
-| 项 | 对象 | 当前 → 目标 | 节省 |
-|---|---|---|---:|
-| r62 | feature_projection | q5 82.03 → q4 66.4 | **15.6** |
-| r63 | attention/output ×5 + mlp/down ×5 | q5 344.5 → q4 278.9 | **65.6** |
-| r64 | kernel_projection ×10 | bf16 125.0 → q4 33.2 | **91.8** |
-| r65 | context_key ×5 | q8 159.4 → q4 79.7 | **79.7** |
-| 合计 | | | **252.7** |
-
-**决策（沿用 §3.7）**：四项均为 opt-in override，不改官方配方（`official_recipes.py:35-46` 继续把
-mtp/dflash/dflash2 钉在 Q8、kernel_projection/codebook/hidden_projection 排除在量化外）；artifact 为实验件。
-升级为受契约保护的特性前必须补 §3.7 末尾三件套（append K=7/K=5 金值、solo digest、sessions 保留断言）
-+ 采样模式 A/B + Q4 op oracle 的「按存储 scale 独立解码」检查。
-
-### 8.1 逐项改动清单
-
-**r62 — feature_projection → q4（最小面，先打通全链路）**
-- 新增 `src/ops/linear/q4/shapes/n5120_k25600.cu`（selector 镜像 `src/ops/linear/q5/shapes/n5120_k25600.cu`：
-  T=1 simt_r8_c4、T=2–6 ksplit、T≤24 simt_r8_c8、其余 mma_r64_c128；draft prefill 宽度 ≤2048 × batch）。
-- 改动：`q4_shapes.h` 声明 + `q4_dispatch.cpp` 注册表加 {5120,25600} + `src/ops/linear/q4/sources.cmake`。
-- 测试：`tests/ops/linear/test_q4_a16.cpp` 加 5120×25600（独立 seed、FP64 oracle、全路由边界）。
-- override `tools/tp_bootstrap/r62_draft_feature_q4.py`（`dflash2/feature_projection` → q4_g64_fp16，
-  `grouped_absmax`）+ dry-run + 转换脚本（r57 配方 + `--device cpu`）。
-
-**r63 — attention/output + mlp/down → q4（融合 conv-add 的 q4 变体）**
-- 关键结构事实（审计发现）：q5 变体的 GEMM 部分委托普通 q5 注册表（`select_q5_a16_launch`），
-  卷积+残差尾是 qtype 无关的共享 `dynamic_conv_finish_launch`（`q5_dynamic_grouped_conv_add_materialized.cu:11-20`）
-  ⇒ **q4 变体不需要新融合 kernel，只需要两个新普通 q4 GEMM 形状 + q4 plan 目录**（比原「新融合 kernel 一族」预估小）。
-- 新增 `src/ops/linear/q4/shapes/n5120_k4096.cu`、`n5120_k17408.cu`（镜像 q5 同名 shape）。
-- 新增 `src/ops/dynamic_grouped_conv/q4/`（plan/materialized，镜像 `q5_dynamic_grouped_conv_add_plan.cpp`：
-  投影委托 `select_q4_a16_launch(5120, input_rows, tokens)`，尾走共享 finish；路线名
-  `dynamic_grouped_conv_add.q4.*.materialized_bf16`）。
-- 改动：`wrapper/dynamic_grouped_conv.cpp`（`require_finish_projection_weight`/`projection_planes`
-  放行 Q4_G64 group 64、无 qhigh；`linear_dynamic_grouped_conv_add` 加 q4 分派分支）；
-  `include/ninfer/ops/dynamic_grouped_conv.h` 三 codec 语义同步；容量 API 已有 qtype 首参（r56 加过），只补 q4 分支。
-- 测试：`tests/ops/test_linear_dynamic_grouped_conv_add.cpp` 加 Q4 × C∈{4096,17408} 全 W/B 域（2..128 tokens）
-  × 图重放，FP64 oracle 按存储 scale 独立解码（r56 先例：120 形状 4.38 s）。
-- override `tools/tp_bootstrap/r63_draft_finish_q4.py`（`/mlp/down`、`/attention/output` → q4）+ 计数校验（各 5）。
-
-**r64 — kernel_projection → q4（prepare 的 q4 变体）**
-- 新增 q4 prepare partial kernel（[1280,5120] q4 反量化 GEMM，split-K）+ q4 plan（镜像
-  `bf16_dynamic_grouped_conv_prepare_plan.cpp` 的路线：tokens≤48 走 R16C{8,16,32,48}S8，余 R32C{32,64}S4）。
-- 改动：`wrapper/dynamic_grouped_conv.cpp`（`require_kernel_projection_weight` 放行 Q4_G64；
-  `rmsnorm_dynamic_grouped_conv_prepare` 加 q4 分派）+ `sources.cmake`。
-- 测试：`tests/ops/test_dynamic_grouped_conv_prepare.cpp` 加 q4 臂：prepare = rmsnorm∘GEMM∘(base+delta)
-  独立 FP64 参考实现，全 T 域（2..128）。
-- **数值性质警示**：该 GEMM 的产物是动态卷积权重本身（权重空间误差，非激活空间误差），敏感度可能高于
-  r62/r63 的普通 GEMM ⇒ 接受率门禁必须过；**回退 = 保持 bf16**（本项可选，失败不阻塞战役，总收益降为 160.9）。
-- override `tools/tp_bootstrap/r64_draft_kernel_q4.py`（`/attention_conv/kernel_projection`、
-  `/mlp_conv/kernel_projection` → q4；官方配方目前对这两个名字是 `continue` 排除，dry-run 确认命中 10 对象）。
-
-**r65 — context_key → q4（两处 op，最大项，最后做）**
-- decode 路径：新增 `src/ops/attn_input_proj/q4/` plan + 6 个 dflash2 schedule（镜像 `kDFlash2Routes`：
-  SmallT ≤48、MmaR16C64K128、MmaR32C32K128、MmaR32C64K128、MmaR32C64、MmaR64C128；draft decode T=(K+1)×B ≤64，
-  目录仍按闭合惯例覆盖到 kAnyCols）。
-- prefill 路径：新增 `context_kv_materialize` 的 q4 变体（7 条路线 KSplit16/KSplit24/Mma32/Mma80/Mma96/Fused64/Mma64
-  全要——prefill 宽度 1..2048 都会触达；q4 反量化 = 2 code/byte + scale 每 64，对照现 q8 的每 32；
-  新文件 `materialize_q4.cu` + launch 按 qtype 分派）。
-- 改动：`wrapper/attn_input_proj.cpp`（三输出重载加 Q4 分支：`require_q4_rowsplit` [6144, hidden]）；
-  `context_kv_materialize.cpp`（`require_weight` 放行 Q4_G64 group 64、scale 字节 rows×80×2；dispatch 按 qtype）。
-- 测试：`tests/ops/test_attn_input_proj.cpp` 加 dflash2 三输出 q4 路由边界；materialize 测试：5 层 ×
-  全 W/B profile，环内容对朴素参考（q4 GEMM → key_norm rmsnorm → RoPE → 环形写入）逐元素比对。
-- **recipe 注意**：官方配方 `recipe.share(prefix+"context_key", prefix+"key")`（`official_recipes.py:52-54`）
-  使 context_key/context_value 与 query/key/value 绑定共享同一 [6144,5120] 对象 ⇒ override 对共享对象赋值，
-  dry-run 必须确认「恰好 5 个对象变 q4_g64_fp16」（仿 r57 计数校验）。
-- **接受率风险**：本批最高（K 投影误差在 2048 窗口环内逐 token 累积，影响窗口内每个后续 decode 步）
-  ⇒ 门禁必须过；失败回退 = 保持 q8。
-- override `tools/tp_bootstrap/r65_draft_contextkey_q4.py`。
-
-**r66 — 合并实验件**：r62–r65 四项合一（override `r66_draft_q4_all.py` 含 26 对象计数校验：
-feature 1 + down 5 + output 5 + kernel 10 + context_key 5），转换后全量验收。
-
-### 8.2 每步验收标准（门禁）
-
-1. **op oracle**（AGENTS.md 数值契约）：每个新形状/路线 vs 独立 FP32/FP64 朴素参考；packed 输入按
-   **存储 scale 独立解码**（不信任转换器输出的 scale 语义）；路由边界（T 分界点 ±1）全覆盖；图重放覆盖。
-2. **接受率 A/B**（沿用 §3.7 方法）：greedy 探针 7×160、K=5 与 K=7、每臂独立冷启服；
-   基线臂 = 现役 r57 件（`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer`，r57 实测 acc K=7 25.3% /
-   56.9 tok/s）；**通过线 |Δacc| ≤ 1.0pp 且 Δtok/s ≥ −3%**（r54–r57 观测带 ±0.5pp / ±1%）。
-   每步另加一个组合中间臂（前序已通过项 + 本项）以隔离交互效应。
-3. **确定性**：基线臂跨重建逐字节复现（r57 先例：2843/699、文本 len 全同）；新臂接受率必须解释到
-   探针文本漂移（tie 翻转）而非系统性下降。
-4. **显存核对**：`nvidia-smi` + 启动 `[mem]` 台账，设备侧节省与精确 MiB 计算差 ≤ 分配粒度（先例 ~1.6 MiB）。
-5. **升级门禁（r66 后）**：DFlash2 三件套对新件重基线（`ninfer_qwen3_5_tp2_dflash_append_test` K=7/K=5 金值、
-   `ninfer_qwen3_5_tp2_dflash_solo_test` digest、`ninfer_qwen3_5_tp2_sessions_test` 保留断言）+
-   采样模式（temp 0.7）接受率/吞吐 A/B（r54 先例：采样下 K=2 曾 −2.5pp 1.6σ）。
-
-### 8.3 回退点
-
-- **C++ 侧**：全部为加法（新 shape 文件、新 q4 plan 目录、新校验分支）；既有 q5/q8/bf16 路线位型不变
-  （r56 先例：共享 finish 重构后 Q8 路线零漂移）⇒ 回退 = git revert，无 artifact 格式变化。
-- **artifact 侧**：每项独立 override，官方配方不动 ⇒ 回退 = 用前一组 override 重转（~300 s）；
-  旧 artifact 永远可被新引擎运行（引擎是超集）。
-- **项级回退**：r64 或 r65 接受率不过 ⇒ 该项保持现精度，战役继续（r64 失败总收益 160.9；
-  r65 失败 220.5；两者都失败 140.0）。
-
-### 8.4 执行顺序与依赖
-
-0. 基线复测：现役 r57 件 K=5/7 接受率 + 吞吐（确认与 §3.7 记录的 25.3%/56.9 一致，环境无漂移）。
-1. **r62**（最小面：打通 shape→dispatch→oracle→override→转换→A/B 全链路，验证方法论）。
-2. **r63**（复用 r62 的 dispatch 基建 + r56 的 q5 plan 模板）。
-3. **r64**（独立 op；可与 r63 并行开发，A/B 顺序执行——进程纪律：全机同一时刻只有一个模型进程）。
-4. **r65**（最大项；此时 r62–r64 的接受率数据在手里，若已出现系统性下降趋势可提前止损）。
-5. **r66**：合并件 + 采样 A/B + 三件套重基线 + 显存核对（GPU0 free 607 → ~860；GPU2 不变）+
-   决定是否申请升契约特性（当前决策：保持 opt-in）。
-
-**构建/运维约定**（沿用 §1 环境表）：Windows build-win（WSL CUDA 已死，只做编译验证）；测试按目标构建
-（`cmake --build build-win --target ninfer_linear_q4_a16_test` 等）；转换 `--device cpu`（~300 s，无需 GPU）；
-serve 8099 走 harness 后台 job；重新链接前先停服务，exe 手动同步 `C:\ninfer\` 并以 `Get-FileHash` 比对。
-
-### 8.5 进度
-
-**Step 0 基线复测（2026-09-24，完成）**：现役 r57 件（`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer`）、
-当前 HEAD 二进制、`--max-context 131072`、贪心探针 7×160、每臂独立冷启服
-（`tools/tp_bootstrap/r62_baseline_arms.ps1`，日志与 JSONL 在 `build-win/r62/`）：
-
-| K | drafted / accepted | acc | tok/s |
-|---|---|---:|---:|
-| 7 | 2578 / 736 | 28.55% | 61.1 |
-| 5 | 1968 / 711 | 36.13% | 61.0 |
-
-**与 §3.7 归档（K=7 25.3% / 56.9）不一致，已归因**：§3.7 之后有两次改数值/改 walk 的提交——
-`ea6204fa fix(ops): restore accurate silu in nvfp4 swiglu`（改模型数值 ⇒ 文本轨迹变）与 §4–§7 的 TP-2 首 token
-发布 + 复用扫描改动；接受率是文本属性（§7 已论证），绝对值随二进制漂移。⇒ **本战役一律以本次复测的 r57 件为
-基线**，§3.7 的数字仅作历史。副产物：本机当前二进制 K=5 与 K=7 吞吐持平（61.0 vs 61.1）。
-
-**Step 1 r62 feature_projection q4（完成；结论与门禁见 §8.6）**
-
-- [x] **op 变体**：`src/ops/linear/q4/shapes/n5120_k25600.cu` + `q4_shapes.h` / `q4_dispatch.cpp` /
-      `src/ops/linear/q4/sources.cmake` 注册。**偏差（有意）**：选择器用 q4 的粗桶（`T=1 → simt_r8_c4`、
-      `T≤8 → ksplit<5120,25600,8>`、`T≤24 → simt_r8_c8`、其余 `mma_r64_c128`），不是 §8.1 写的逐 T 容量桶
-      （2..6）。理由：q4 的 `Capacity` 只是编译期**掩码列上界**，tile 宽度由 `(Capacity+7)/8*8` 统一到 8，
-      逐 T 实例化只改一个 staging 循环上界（掩码路径下是死代码）⇒ 纯代码膨胀；既有 q4 shape 的惯例就是粗桶。
-- [x] **oracle**：`ninfer_linear_q4_a16_test` **PASS**（12.1 s）。新增 5120×25600 两组：`Comparison::Full`
-      （T∈{1..7,24,25}，逐元素）与 `Comparison::Sampled`（T∈{1..9,15,16,17,23,24,25,26,32,33,63,64,65,127,128,129,2048}），
-      两组都含图重放；FP64 朴素参考按存储 scale 独立解码。
-- [x] **override + dry-run**：`tools/tp_bootstrap/r62_draft_feature_q4.py`（**累积式**：r57 三杠杆 +
-      feature_projection→q4；断言 gate/up/down/output 各 5）+ `tools/tp_bootstrap/r62_draft_q4_dryrun.py`。
-      dry-run 解析：`q4=11`（10 gate/up + 1 feature）、`q5=10`（down + output）、`q8=25`、`bf16=45`
-      ⇒ 与 r57 件只差 feature_projection 一个对象。
-      **解释（对 §8.1 的偏离）**：§8.1 把每个 override 描述成「只改本项」，但 §8.2 要求基线臂 = r57 件
-      ⇒ 每步的臂必须是**累积件（前序已通过项 + 本项）**，否则会退回官方 Q8 配方、测的不是产品路径。
-      累积式还让「本步 vs 上一步」隔离出该项的增量效果。
-- [ ] **转换**：`tools/tp_bootstrap/r62_convert_feature4.ps1`（r57 配方 + 本 override，`--device cpu`）
-      → `D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_featproj4.ninfer`（进行中）。
-- [x] **A/B + 确定性**：重建后基线臂逐字节复现（本步 C++ 全为加法）+ r62 臂门禁 —— 结论与数字见 §8.6。
-
-**后续步骤（未开工）**
-
-- [ ] 2 r63 finish 投影 q4（两 shape + q4 plan + wrapper + oracle + override + 转换 + A/B）
-- [ ] 3 r64 kernel_projection q4（prepare kernel + wrapper + oracle + override + 转换 + A/B）
-- [ ] 4 r65 context_key q4（attn_input_proj q4 + materialize q4 + 两处 wrapper + oracle + override + 转换 + A/B）
-- [ ] 5 r66 合并件 + 采样 A/B + 三件套重基线 + 显存核对 + 升级决策
-
-### 8.6 执行记录（2026-09-24；跨上下文压缩的进度锚）
-
-**方法论修正（重要，后续步骤沿用）**：§8.2 的「贪心 7×160 探针 |Δacc| ≤ 1.0pp」被判为**内容混淆**——draft 权重一变，
-target 的 tie 翻转就改文本，接受率随文本走（§7 已给 21% vs 99.6% 的极端例）。r62 的同一对工件：
-
-| 指标 | 基线（r57 件） | r62 件 | Δ |
-|---|---:|---:|---:|
-| 贪心 K=7 acc | 28.55% | 28.64% | +0.09pp |
-| 贪心 K=5 acc | 36.13% | 34.02% | **−2.11pp（超门禁）** |
-| 采样 K=5 acc（3 类 × 6 次 × 256 token，pooled） | 44.12% | 45.66% | **+1.54pp** |
-| 采样 K=7 acc（后来补测基线：15 次 × 256 token） | 33.90% | 36.58%（r63 件） | +2.68pp |
-
-采样分项（reason / prose / code）：+4.3 / +0.1 / +1.5 pp ⇒ 两个指标符号相反 ⇒ 贪心差值是文本漂移，不是 q 退化。
-**新门禁方法**：`tools/tp_bootstrap/r62_sampling_ab.ps1`（采样接受率，内容平均、对机器漂移不敏感）作为接受率裁决；
-贪心探针只用于「基线跨重建逐字节复现」的确定性检查；显存用 `[mem]` 账本核对。
-**确定性**：r62 件两次独立冷启服逐字节相同；重建（r62+r63+r64 代码）后的基线臂 K=7 JSONL 与改动前二进制的
-基线 SHA256 完全相同（`D61C1112…`）⇒ 引擎与工件都确定。
-
-**Step 1 r62 feature_projection q4（完成：通过）**
-
-- op：`src/ops/linear/q4/shapes/n5120_k25600.cu` + `q4_shapes.h` / `q4_dispatch.cpp` / `sources.cmake` 注册。
-  选择器用 q4 **粗桶**（T=1 → simt_r8_c4、T≤8 → ksplit<5120,25600,8>、T≤24 → simt_r8_c8、其余 mma_r64_c128），
-  不是 §8.1 写的逐 T 容量桶（2..6）：q4 的 `Capacity` 只是编译期掩码列上界，tile 由 `(Capacity+7)/8*8` 统一到 8，
-  逐 T 实例化只改一个 staging 循环上界（掩码路径下是死代码）⇒ 纯代码膨胀。
-- oracle：`ninfer_linear_q4_a16_test` PASS（12.1–14.7 s；Full T∈{1..7,24,25} + Sampled 到 2048，含图重放）。
-- override `r62_draft_feature_q4.py`（**累积式**：r57 三杠杆 + feature→q4）+ dry-run `r62_draft_q4_dryrun.py`：
-  q4=11（10 gate/up + 1 feature）/ q5=10 / q8=25 / bf16=45。
-- 转换 `r62_convert_feature4.ps1` → `..._dflash2_featproj4.ninfer`（375 s，1218 对象）；文件 −16,384,000 B。
-- 显存：shard 0 `weights+ctx` 12750.6 → 12734.6 MiB，free 816 → 832 MiB。
-
-**关于 override 的累积式设计**：§8.1 把每个 override 描述成「只改本项」，但 §8.2 的基线是 r57 件 ⇒ 每步的臂必须是
-累积件（前序已通过项 + 本项），否则会退回官方 Q8 配方、测的不是产品路径。r62→r63→r64 的 override 都是累积式，
-因此 **r64 件本身就是 r62+r63+r64 的合并候选**（r66 只是加计数校验的正式件）。
-
-**Step 2 r63 attention/output + mlp/down q4（完成：通过）**
-
-- 结构发现：q5 变体的 GEMM 委托普通 q5 注册表，卷积+残差尾是 qtype 无关的共享 `dynamic_conv_finish_launch`
-  ⇒ q4 变体**不需要新融合 kernel**，只要两个新 q4 shape + 一个 q4 plan 目录（比 §8.1 的预估小）。
-- 新增：`src/ops/linear/q4/shapes/n5120_k4096.cu`、`n5120_k17408.cu`；`src/ops/dynamic_grouped_conv/q4/` 四个文件；
-  wrapper 的 `projection_planes` / `require_finish_projection_weight` / 容量分派 / 执行分派加 q4 分支；
-  `bench/ops/linear_dynamic_grouped_conv_add_bench.cu` 支持 `--qtype q4`（路线名 `…q4.ksplit_exact…` 已实测）。
-- oracle：`ninfer_linear_q4_a16_test` PASS（12.7 s）；`ninfer_linear_dynamic_grouped_conv_add_test` PASS
-  （7.9 s：Q8/Q5/Q4 × C∈{4096,17408} 全 W/B 域 + 图重放）。
-- override `r63_draft_finish_q4.py` dry-run：q4=21（1 feature + 10 gate/up + 5 down + 5 output）/ q8=25 / bf16=45。
-- 转换 `r63_convert_finish4.ps1` → `..._dflash2_finish4.ninfer`（378 s，1218 对象）；文件 22,947.1 → 22,865.8 MiB
-  = **−81.25 MiB**（= r62 15.625 + r63 65.625，精确一致）。
-- A/B：`tools/tp_bootstrap/r62_step_arms.ps1 -Tag finish4`（贪心 K=7/K=5 + 采样 K=7/K=5）——**通过**：
-  贪心 K=7 28.55%→27.03%（−1.52pp，仍属内容混淆）、贪心 K=5 36.13%→35.80%（−0.33pp ✓）、
-  采样 K=7 33.90%→36.58%（**+2.68pp**）、采样 K=5 44.12%→46.21%（**+2.09pp**）⇒ 两个采样都明显上涨。
-  为补齐采样基线，补测了基线件 K=7 采样（15 次，33.90%）。
-- 显存（shard 0 `[mem]`）：`weights+ctx` 12750.6 → **12668.6 MiB**，free 816 → 898/904 MiB；
-  实测 −82.0 MiB vs 预测 −81.625 MiB（差 0.375 MiB = artifact 分配粒度，与 r62 步同样的常数偏移）。
-
-**Step 3 r64 kernel_projection q4（op 完成，待转换/A-B）**
-
-- 实现选择（对 §8.1 的偏差）：不写「q4 prepare partial kernel」，而是**复用已过 oracle 的普通 q4 GEMM**——
-  新增 `src/ops/linear/q4/shapes/n1280_k5120.cu`；`…/q4/q4_dynamic_grouped_conv_prepare_plan.cpp` 做
-  rmsnorm → 普通 q4 linear（把 [1280,tokens] 系数矩阵写进 workspace）→ 新 reduce
-  （`q4_dynamic_grouped_conv_prepare_reduce.cu`：把 bf16 reduce 的 FP32 split-K 部分和输入换成 BF16 系数矩阵）。
-- 代价与理由：系数矩阵以 BF16 materialize（bf16 路线保留 FP32 部分和），多约半个 BF16 ulp；该中间量不是可观测边界
-  （AGENTS.md），且远小于 q4 权重本身的量化误差。测试因此给 Q4 臂单独 criterion（prepared 预算 1.5× bf16），
-  实测最坏比值 rel_l2 0.62× / gross 0.75× of budget，finish 用共享预算 0.74× / 0.68×。
-- 容量：prepare 的公开容量 API 没有 qtype，q4 路线预留与查询相同的量（bf16 split-K 部分和恒大于 q4 的 BF16 系数），
-  保持 `peak_used == query` 不变量。
-- oracle：`ninfer_linear_q4_a16_test` PASS；`ninfer_dynamic_grouped_conv_prepare_test` PASS（bf16 + q4 双臂，
-  label 前缀已加 codec 便于定位）。
-- 转换：**并入 r66 合并件**（`r64_convert_kernel4.ps1` 不再单独跑：累积式 r66 件 = r62+r63+r64，
-  与单独跑 r64 会得到逐字节相同的文件，省一次 6 分钟转换与 23 GB 中间件）；r64 的门禁即在 r66 件上测。
-
-**Step 4 r65 context_key q4（决定：本次缓做）**
-
-- 事实核对（比 §8.1 的审计更准确）：draft 的 `attention/{query,key,value,context_key,context_value}` 在工件里
-  **全部别名同一个 [6144,5120] 对象**（每层 1 个 ×5 层），所以「context_key ×5 = 79.7 MiB」实际是把 5 个融合 QKV
-  对象整体降到 q4，而且必须**同时**改两处消费方才能加载：
-  - decode：`attn_input_proj` 三输出重载与 `prepare_attn_input_proj_weights` 都硬要求 Q8（`weight_input.cpp:176`）；
-  - prefill：`context_kv_materialize` 的融合 kernel（`materialize.cu` 482 行）以**每 32 元素 1 字节有符号码 + FP16 scale**
-    手写 staging/MMA/分数写回，并融合 key 的 norm+rope+环形缓存写入与 value 的 fp16 写回。
-- 结论：r65 不是「再加一个 shape」，而是要写一族 4-bit 融合材质化 kernel（7 路线）+ 3 输出 q4 变体 + 两套 oracle。
-  相对 79.7 MiB 收益，本次战役的剩余预算与风险不划算；§8.3 本身也允许项级回退（「该项保持现精度」）并把它排在最后。
-- 因此本次交付 = **r62 + r63 + r64（173 MiB / 252.7 MiB = 68%）** + r66 合并件；r65 的审计与路线图保留。
-
-**Step 5 r66（完成：通过）**
-
-- override `tools/tp_bootstrap/r66_draft_q4_all.py`（单文件累积式，计数校验 31 个 selection：feature 1 + gate/up 10 +
-  down 5 + output 5 + kernel 10；gate/up 每层共享一个存储对象 ⇒ 提升 26 个对象）。
-- dry-run：q4 31 / q8 25 / bf16 35（r57 件的 bf16 45 中有 10 个 kernel 投影转入 q4）。
-- 转换 `r66_convert_q4all.ps1` → `D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_q4all.ninfer`（326 s，1218 对象）。
-- **文件级核账（精确相等）**：24,061,771,780 → 23,880,318,980 B = **−181,452,800 B = −173.05 MiB**
-  = 16,384,000 (r62) + 68,812,800 (r63) + 96,256,000 (r64)，逐字节预测一致。
-- 对象格式：`q4_g64_fp16` 81（r57 件 71 + 10）、`bf16` 569、`q5_g64_fp16` 54、`q8_g32_fp16` 12。
-- A/B（`r62_step_arms.ps1 -Tag q4all`）——**通过**：
-
-  | 指标 | 基线 r57 件 | r66 q4all 件 | Δ | 门禁 |
-  |---|---:|---:|---:|---|
-  | 贪心 K=7 acc | 28.55% | 26.95% | −1.60pp | 超线（内容混淆，见 §8.6 方法修正） |
-  | 贪心 K=5 acc | 36.13% | 35.96% | −0.17pp | ✓ |
-  | 采样 K=7 acc（15×256） | 33.90% | 35.05% | **+1.15pp** | ✓ |
-  | 采样 K=5 acc（15×256） | 44.12% | 47.84% | **+3.72pp** | ✓ |
-
-  **贪心探针为何不可跨臂比较（直接证据，非推断）**：`greedy_probe.ps1` 记录了完整文本，逐条 SHA256 比对基线件与
-  q4all 件的 K=7 探针：**7 条 prompt 里 6 条文本不同**（长度 779/788、768/789、877/890、741/778、804/785、804/798），
-  只有 idx 5 逐字节相同。机制是 §7 记录过的：draft 提案长度改变 verify 批次形状 ⇒ target 数值路径变 ⇒ 贪心近
-  平局翻转 ⇒ 文本改变 ⇒ 接受率的分母换了内容。所以贪心 7×160 的差值是「不同文本上的两个数」。
-  **诚实的保留**：唯一文本稳定的 idx 5 上 K=7 接受率仍降 3.75pp（672 drafted），说明 K=7 的 q4 draft 在该内容上
-  可能略弱；但 pooled 采样（K=7 共 7711 drafted）是更可靠的统计量且上涨 +1.15pp。
-
-  两个采样门禁都通过；贪心 K=7 的超线在 r62/r63/r64 每步都出现（−1.5 ~ −2.1pp）而采样同时上涨，
-  是 §8.6 记录的内容混淆，不是单调退化（若为退化，采样应同步下降）。
-- **显存核对（shard 0 `[mem]`）**：`weights+ctx` 12750.6 → **12576.6 MiB**（−174.0 MiB，预测文件级 −173.05 MiB，
-  差 0.95 MiB ≤ 分配粒度 1.6 MiB）；free 816 → **990 MiB**（K=7）/ 996 MiB（K=5）；shard 1 不变（810 → 810 MiB @K=5）。
-  §8.4 写的「GPU0 free 607 → ~860」是 §3.7 旧归档的绝对数（不同 capacity/KV 配置），本次实测的增量与预测一致。
-- 三件套：`tools/tp_bootstrap/r66_suites.ps1`。**运行前必须把 FFmpeg 与 libcurl 的 `bin` 加进 PATH**，
-  否则 `solo`/`sessions` 在加载期直接 `0xC0000135`（STATUS_DLL_NOT_FOUND）——`append` 不依赖媒体路径，所以只有它不受影响。
-  三件套实测（`NINFER_TEST_ARTIFACT` 指向 q4all 件，除注明外）：
-
-  | 套件 | 结果 | 证据 |
-  |---|---|---|
-  | `append` K=7 | PASS (37.9 s) | ring 重放逐字节相同；proposal 确定 `fnv1a=0xda91572dd83980bd`；workspace peak 113.3/192 MiB |
-  | `append` K=5 | PASS (37.5 s) | 同上，`fnv1a=0x5a3629fb79be1cd3` |
-  | `solo` 两进程 | PASS (41.1 / 41.8 s) | 两个独立进程 digest 相同 `0x4bcc3994a5efba7d` |
-  | `sessions` | **FAIL（plain 路线，先于本战役存在）** | 见下 |
-
-  `sessions` 的失败：`FAIL (plain): a conversation behind a shared system prompt diverged from the oracle
-  on its first sample: got [2752 13 …] expected [365 2798 …]`。**用未改动的基线件（r57 `draftall`）在同一二进制上
-  复现出逐 token 相同的 `got`/`expected`** ⇒ 该失败与本次 q4 杠杆无关（plain 路线根本不加载 draft）。
-  它挡不住本次交付（draft q4 由 append 两 K + solo digest + op oracle + 采样 A/B 覆盖），但**挡住了「升级为契约特性」**：
-  升级门禁要求三件套全绿，而其中一件存在与本战役无关的既有失败 ⇒ 结论是保持 opt-in（见下）。
-
-  **被改动路线自己的证据（补测）**：`NINFER_TEST_ROUTE=dflash2` 定向跑 sessions，baseline 与 q4all **都 PASS**
-  （各 164.8 s，`TP-2 session retention (dflash2) passed: recall reused 71 prompt tokens bit-identically;
-  LRU eviction forced a full prefill`）⇒ 失败只存在于 plain 路线，且与基线件逐 token 相同。
-
-**升级决策（§8.4 第 5 步）**：**保持 opt-in，不申请升契约特性**。理由两条：
-1. 三件套里 `sessions` 的 plain 路线有一个**先于本战役存在**的失败（基线件逐 token 复现），升级门禁要求三件套全绿，
-   在该失败修好之前不具备升级条件；
-2. §8.2 的字面门禁「贪心 |Δacc| ≤ 1.0pp」在 K=7 未过（−1.60pp）——虽然已证明该指标跨臂不可比（6/7 条 prompt 文本不同），
-   但把门禁改成采样主导属于「门禁修订」，应当与「升级」分开决策。
-   q4 件继续以显式 override + 专门 artifact 形式提供（`…_q4all.ninfer`），引擎与官方配方都不动。
-**W4A4 家族的同款最终件（用户 2026-09-24 追加要求）**
-
-- 脚本 `tools/tp_bootstrap/r66_convert_q4all_w4a4.ps1` → `D:/LLM/qwen3_8_27b_w4a4_dflash2_q4all.ninfer`
-  （`--model`/`--source quantized` 换成 `W4A16/NVFP4/W4A4`，draft 仍取 `W4A4+W8A8/DFlash2-FP8`；
-  这与既有 `…_w4a4_dflash2_draftall.ninfer` 的 provenance 一致——两家族只差 text/vision/MTP 源）。
-- dry-run `r62_draft_q4_dryrun.py --base D:/LLM/W4A16/NVFP4/W4A4 --draft D:/LLM/W4A16/NVFP4/W4A4+W8A8/DFlash2-FP8`：
-  q4 31 / q8 25 / bf16 35，与 w8a8 家族同解（两个家族的 r57 基线都由 `r57_draft_all_override.py` 生成，draft 源相同）。
-- **实测**：18,874,128,644 → 18,692,675,844 B（−181,452,800 B，与 w8a8 家族逐字节同额）；
-  报告 `name=qwen3.8-27b-w4a4-q4all`、1590 对象、格式计数与 w8a8 件完全相同（q4 81 / bf16 569 / q5 54 / q8 12）。
-- **跨家族核验（对象级 SHA256）**：两个 q4all 件的 **66 个 dflash2 对象全部逐字节相同**（含 31 个 q4 selection 的存储对象）
-  ⇒ draft 质量与已过 A/B 的 w8a8 件一致，接受率证据直接可移用；`text/layers/0/*` 16 个对象里 8 个不同（两家族确实只差
-  text/vision/MTP 源）。
+| 采样 K=7 | 35.77%（16329/45644） | 35.74%（16309/45629） | **−0.03 pp** | ≈0.32 pp |
+| 采样 K=5 | 44.36%（15754/35510） | 45.95%（15928/34666） | **+1.59 pp** | ≈0.38 pp |
+
+两臂各自的 15→30-rep 估计漂了 1.4–2.6 pp，说明 15-rep 池化的臂间噪声就有 ~±2 pp，此前 r67/r68 的
+"−2 pp 接受率代价" 都是这个量级的噪声，不能作为否决依据。30-rep 下 K=7 无差异、K=5 方向反而为正
+（+1.6 pp 更可能是残余臂效应而非真实提升，但至少**没有可测代价**）。
+
+**① 结论（建议采纳）**：178.09 MiB（artifact **−0.75%**，运行时 peer selector 245.0→66.9 MiB）
+换零可测接受率代价、零 proposal 开销；op oracle、三件套、stock BF16 逐位回归全过。**② 与 ① 的对比正是
+A/B 噪声地板（~±2 pp）造成的误判**——两者对接受率的真实影响都小于该活动 15-rep 方案的分辨率，因此
+"省显存赔吞吐" 的结论只对 ① 不成立（① 证伪），对 ② 则应重测后才可下结论（见下）。
+
+**r69 提升为官方配方 + 最终件（2026-09-25，用户确认）**：`tools/convert/official_recipes.py::_optional`
+现在承载完整 DFlash2 draft Q4 集合——r62-r66 的 MLP（gate/up/down）、attention output、两个动态卷积 kernel、
+`feature_projection`，加 **②** 的融合 QKV（`dflash2/layers/*/attention/{query,key,value}`，一个
+`[6144,5120]` 父对象/层，经行视图消费）与 **①** 的两个 selector codebook；全部限定在 `dflash2/`，
+dflash v1 与 MTP 仍 Q8（`DFLASH2_Q4_NAMES`/`DFLASH2_Q4_ROLES`/`DFLASH2_CODEBOOKS`）。
+
+最终件 `D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_final.ninfer`（**无 `--override`**，1218 对象，385.7 s，
+`CONVERT_EXIT=0`）：与基线 `q4all` 逐参数对比，**恰好 17 个参数**格式变化（15 个 QKV + 2 个 codebook，
+全部 → q4），其余 **1486 个参数的格式与形状完全一致** ⇒ 官方配方精确复现了 r66 件，最终件 = r66 + ① + ②。
+payload **−257.77 MiB**（q4 81→88 / q8 12→7 / bf16 569→567）。
+
+**r69 最终验收（30-rep，90 run/臂，两臂相邻轮次）**：
+
+| 指标 | q4all（r66 基线） | final（r66+①+②） | Δ | se(Δ) |
+|---|---|---|---|---|
+| 采样 K=7 | 35.09%（16223/46228） | 34.79%（16188/46530） | **−0.30 pp** | ≈0.31 pp |
+| 采样 K=5 | 44.99%（15828/35181） | 44.88%（15812/35233） | **−0.11 pp** | ≈0.37 pp |
+
+两档都 ≤1σ ⇒ **无可测接受率代价**。三件套 **全过**（`SUITES_DONE failures=0`：append-K7/K5、solo×2、
+sessions-dflash2）；solo digest 与基线逐位相同（`0x4bcc3994a5efba7d`）；运行时 **peer selector 66.9 MiB**
+（基线 245.0），proposal cost **7.029 ms**（基线 6.851，即 ② 的 +0.18 ms ≈ +0.4% 轮时）。
+⇒ **最终件可发布**：相对 r66 基线省 **257.77 MiB（−1.08%）**，接受率无代价，轮时代价 ~0.4%。
+
+**过程中两次低频失败（与本次改动无关，待专项排查）**：① r67 那轮 q4all 臂 K=7 的
+`cudaErrorIllegalAddress`（同臂重跑全过，判定既有 TP-2 竞态）；② 本轮 final 臂 K=5 首次运行第 14 个请求
+`HTTP 503 service unavailable` 且无 FATAL 日志（重跑 90/90 全过）。两者都只出现在连续 ~90 请求的采样臂里，
+约 15 个臂共 2 次。
+
+**执行顺序**：② 先行（改动集中、可用既有 oracle 验证），① 并行做设计/op oracle。
+
+### 3.8 前缀复用：残留（2026-09-24）
+
+- 文本协议回放无法保证逐 token 复现：首生成 token 问题已随「首个生成 token 不发布」修复（回放回答现直达
+  `src=live`），但客户端重分词与采样边界不同、或边界落在 chunk 内（契约只保证 boundary crossing）时
+  尾部复用仍会退化；保证逐 token 的唯一杠杆是携带 token id 的续写协议（未排期）。
+- TP-2 prefill 的首个 sample 未应用工具语法掩码（prefill 与 decode 路径不对称，独立遗留项）。
