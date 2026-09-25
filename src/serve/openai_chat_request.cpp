@@ -869,7 +869,13 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
         param = "max_tokens";
     }
     if (limit) {
-        if (*limit < 0) { bad_request(std::string(param) + " must be nonnegative", param); }
+        if (*limit == 0) {
+            bad_request(std::string(param) +
+                            "=0 requires a completed cache prewarm lifecycle that NInfer "
+                            "does not provide",
+                        param, "cache_prewarm_not_supported");
+        }
+        if (*limit < 0) { bad_request(std::string(param) + " must be positive", param); }
         output.generation.max_tokens  = *limit;
         output.output_tokens_explicit = true;
     } else {

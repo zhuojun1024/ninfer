@@ -135,8 +135,9 @@ The endpoint supports:
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
   `video_url` extension using HTTP(S) or data URIs; image detail is omitted or `auto`;
-- nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
-  processing without generation;
+- positive `max_completion_tokens` and the legacy `max_tokens` spelling; zero is the prompt
+  cache prewarm lifecycle, which NInfer does not provide, and is rejected with
+  `cache_prewarm_not_supported`;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;

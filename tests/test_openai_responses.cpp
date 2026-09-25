@@ -170,15 +170,23 @@ int test_budgets_and_nonsemantic_hints() {
     failures +=
         check(!omitted.requested_max_output_tokens && omitted.prompt.generation.max_tokens == 256,
               "omitted output budget uses the server default without changing its echo");
-    for (const int budget : {0, 1, 15}) {
+    for (const int budget : {1, 15}) {
         Json body                 = base;
         body["max_output_tokens"] = budget;
         const OpenAIResponsesCreateRequest parsed =
             parse_openai_responses_create_request(body, limits());
         failures += check(parsed.requested_max_output_tokens == budget &&
                               parsed.prompt.generation.max_tokens == budget,
-                          "non-negative output budget accepted");
+                          "positive output budget accepted");
     }
+    Json zero_budget                 = base;
+    zero_budget["max_output_tokens"] = 0;
+    const ApiError zero_error        = api_error(
+        [&] { (void)parse_openai_responses_create_request(zero_budget, limits()); });
+    failures += check(zero_error.status == 400 &&
+                          zero_error.param == "max_output_tokens" &&
+                          zero_error.code == "cache_prewarm_not_supported",
+                      "a zero output budget is rejected as an unsupported lifecycle");
 
     Json hints = base;
     hints.update({{"background", false},

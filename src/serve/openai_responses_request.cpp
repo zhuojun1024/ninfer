@@ -1263,8 +1263,13 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
         out.prompt.generation.sampling.top_p = *top_p;
     }
     if (const std::optional<int> max_output = optional_int(body, "max_output_tokens")) {
+        if (*max_output == 0) {
+            bad_request("max_output_tokens=0 requires a completed cache prewarm lifecycle that "
+                        "NInfer does not provide",
+                        "max_output_tokens", "cache_prewarm_not_supported");
+        }
         if (*max_output < 0) {
-            bad_request("max_output_tokens must be non-negative", "max_output_tokens");
+            bad_request("max_output_tokens must be positive", "max_output_tokens");
         }
         out.requested_max_output_tokens  = *max_output;
         out.prompt.generation.max_tokens = *max_output;

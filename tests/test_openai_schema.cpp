@@ -180,9 +180,11 @@ int test_standard_field_policy() {
 
     Json zero_limit                     = base_request();
     zero_limit["max_completion_tokens"] = 0;
-    const OpenAIChatRequest zero        = parse(zero_limit);
-    failures += check(zero.output_tokens_explicit && zero.generation.max_tokens == 0,
-                      "an explicit zero output limit reaches Engine's no-generation path");
+    const ApiError zero_error           = api_error([&] { (void)parse(zero_limit); });
+    failures += check(zero_error.status == 400 &&
+                          zero_error.param == "max_completion_tokens" &&
+                          zero_error.code == "cache_prewarm_not_supported",
+                      "an explicit zero output limit is rejected as an unsupported lifecycle");
     return failures;
 }
 

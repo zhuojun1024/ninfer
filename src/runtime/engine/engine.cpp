@@ -33,6 +33,15 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     if (options.execution.thinking.budget && *options.execution.thinking.budget == 0) {
         throw std::invalid_argument("thinking budget must be positive");
     }
+    // A zero output limit is the prompt cache prewarm lifecycle: prefill the prompt, generate
+    // nothing. No execution path implements it, and the prefill's first sample cannot be committed
+    // against a zero budget, so it is rejected here instead of reaching the scheduler. This covers
+    // every frontend, including the ones that do not validate the field themselves.
+    if (options.execution.requested_output_tokens == 0) {
+        throw std::invalid_argument(
+            "requested output tokens must be positive: a zero output limit is the prompt cache "
+            "prewarm lifecycle, which NInfer does not provide");
+    }
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
