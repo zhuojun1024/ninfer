@@ -508,7 +508,15 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
     if (device_a == device_b) {
         throw std::invalid_argument("tp DevicePair: devices must be distinct");
     }
-    ar_timeout_ns_ = 2000ULL * 1000000ULL; // 2 s: ~700x the slowest measured collective (2.7 ms)
+    // 10 s: about 3700x the slowest legitimate collective (~2.7 ms for a full-width prefill payload;
+    // decode collectives are 9-18 us). The bound exists only to break a *permanent* desync, which no
+    // value resolves, so it belongs far above anything a healthy round can produce: a multi-second
+    // stall is a host or driver event (WDDM scheduling, paging, driver contention), not a slow
+    // kernel. The two costs are not symmetric - a false trip spends a whole request plus its
+    // re-prefill, while the headroom only lengthens the wait on an incident that was going to fail
+    // anyway, and natural incidents run about three in 1500 requests. Still bounded, so a genuine
+    // desync cannot wedge the service indefinitely.
+    ar_timeout_ns_ = 10000ULL * 1000000ULL;
     if (const char* timeout = std::getenv("NINFER_TP2_AR_TIMEOUT_MS")) {
         ar_timeout_ns_ = static_cast<unsigned long long>(std::strtoull(timeout, nullptr, 10)) *
                          1000000ULL;

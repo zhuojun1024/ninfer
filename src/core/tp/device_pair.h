@@ -41,7 +41,7 @@ public:
     bool in_kernel_allreduce() const noexcept { return in_kernel_available_; }
 
     // Bounded-spin safety for the in-kernel transport. Every rendezvous spin carries a wall-clock
-    // deadline (NINFER_TP2_AR_TIMEOUT_MS, default 2000, 0 disables it): a spin that can never be
+    // deadline (NINFER_TP2_AR_TIMEOUT_MS, default 10000, 0 disables it): a spin that can never be
     // satisfied would otherwise pin both devices at 100% forever and freeze the whole process. On
     // expiry the side that gave up raises its mapped flag and the kernel returns, so the caller's
     // streams drain and the request can fail instead of the service locking up. The caller must
