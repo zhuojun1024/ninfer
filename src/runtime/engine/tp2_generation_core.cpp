@@ -2404,11 +2404,16 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         : mtp_enabled_  ? static_cast<std::int32_t>(mtp_drafts_) + 1
                         : 1;
     Tensor tool_mask_dev;
+    // The prefill's first token needs a buffer of its own: apply_token_mask requires the mask shape
+    // to equal the logits shape, a speculative run's tool_mask_dev is [vocab, drafts + 1], and the
+    // prefill samples a single [vocab, 1] column.
+    Tensor tool_mask_first;
     std::vector<std::uint8_t> tool_mask_one;
     std::vector<std::uint8_t> tool_mask_columns;
     std::size_t constraint_fed = 0;
     if (tool_constrained) {
-        tool_mask_dev = ws_a.alloc(DType::U8, {vocab, constraint_columns});
+        tool_mask_dev   = ws_a.alloc(DType::U8, {vocab, constraint_columns});
+        tool_mask_first = ws_a.alloc(DType::U8, {vocab, 1});
         tool_mask_columns.resize(static_cast<std::size_t>(vocab) *
                                  static_cast<std::size_t>(constraint_columns));
     }
@@ -2739,6 +2744,22 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             // First token: sample from the last chunk's last-column logits.
             ops::set_i32_scalar(logical_pos_a, static_cast<std::int32_t>(prompt_tokens),
                                 shard_a_.device.stream);
+            // The declared-name grammar binds the first generated token exactly as it binds every
+            // later one. That token is content, so an unmasked sample could leave the tool-call
+            // region before the grammar ever saw a token, and the decode loop would then carry a
+            // continuation the grammar never licensed. The decode path applies the same mask to its
+            // single [vocab, 1] column; the grammar is inspected against the empty prefix here
+            // because nothing has been committed yet.
+            if (constraint_live()) {
+                constraint_advance();
+                if (tool_constraint->build_mask(logits_domain, tool_mask_one)) {
+                    shard_a_.device.bind_to_current_thread();
+                    CUDA_CHECK(cudaMemcpyAsync(tool_mask_first.data, tool_mask_one.data(),
+                                               tool_mask_one.size(), cudaMemcpyHostToDevice,
+                                               shard_a_.device.stream));
+                    ops::apply_token_mask(logits_a, tool_mask_first, shard_a_.device.stream);
+                }
+            }
 
             Tensor sampled_a = ws_a.alloc(DType::I32, {1});
             ops::sample(logits_a, sampled_a, public_tokens, sampling_a, logical_pos_a,
