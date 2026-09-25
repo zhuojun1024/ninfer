@@ -20,6 +20,11 @@ namespace ninfer::tp {
 // shard consumes are placed on that shard alone instead of being duplicated: the MTP layer runs on
 // shard 0, the Vision tower on shard 1, and neither is read by the other shard.
 inline constexpr std::uint8_t kBothShards = 0x3;
+// Named single-shard placements. kLocalShard holds the components that run beside the target on the
+// shard that owns the round (MTP and the DFlash2 masked draft); kPeerShard holds the components only
+// the peer runs (the Vision tower and the DFlash2 selector).
+inline constexpr std::uint8_t kLocalShard = 0x1;
+inline constexpr std::uint8_t kPeerShard  = 0x2;
 
 struct TPObjectSplit {
     artifact::ObjectHandle object;

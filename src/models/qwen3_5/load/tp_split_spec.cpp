@@ -12,6 +12,8 @@ namespace {
 
 using artifact::ObjectHandle;
 using artifact::TensorObject;
+using tp::kLocalShard;
+using tp::kPeerShard;
 using tp::RowPart;
 using tp::TPObjectSplit;
 using tp::TPSplitSpec;
@@ -98,7 +100,7 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
             TPObjectSplit selector;
             selector.object.index = idx;
             selector.kind         = WeightSplitKind::Replicated;
-            selector.shards       = 0x2U;
+            selector.shards       = kPeerShard;
             spec.splits.push_back(std::move(selector));
             continue;
         }
@@ -106,7 +108,7 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
             TPObjectSplit local;
             local.object.index = idx;
             local.kind         = WeightSplitKind::Replicated;
-            local.shards       = has_prefix("vision/") ? 0x2U : 0x1U;
+            local.shards       = has_prefix("vision/") ? kPeerShard : kLocalShard;
             spec.splits.push_back(std::move(local));
             continue;
         }

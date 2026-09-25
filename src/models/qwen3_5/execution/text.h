@@ -214,11 +214,16 @@ public:
     // column appending, which is what a window of distinct positions (the MTP window) wants. Like
     // ids/positions it must stay address-stable, and a captured graph re-reads its value on every
     // replay (the clamp extent changes per round).
+    // The trailing three operands are required, not defaulted: each of them changes the window's
+    // semantics when absent (no hidden capture; no masked-draft feature sink, which silently drops
+    // pending-feature columns and only costs acceptance; no clamp extent, which silently leaves every
+    // column appending KV). Every caller states its intent so an omission cannot compile, and the
+    // capture and eager routes must pass the same operands.
     void forward_tp2_window(TextContext& peer, tp::DevicePair& pair, const std::int32_t* ids,
                             const std::int32_t* positions,
                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits_columns,
-                            Tensor* hidden_columns = nullptr, DFlashFeatureSink* sink = nullptr,
-                            const std::int32_t* valid_columns = nullptr);
+                            Tensor* hidden_columns, DFlashFeatureSink* sink,
+                            const std::int32_t* valid_columns);
 
     // Registers the peer shard's context and the device pair. The tensor-parallel driver sets this
     // on both shards once, so operations that only run on one shard (the MTP stem) can still drive
