@@ -20,6 +20,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+. (Join-Path $PSScriptRoot "ar_watch.ps1")
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $log = Join-Path $OutDir ("stress-" + $Tag + ".log")
 $jsonl = Join-Path $OutDir ("stress-" + $Tag + ".jsonl")
@@ -82,6 +83,8 @@ try {
             $detail = ($_.ErrorDetails.Message + ' ' + $_.Exception.Message)
             $detail = $detail.Substring(0, [Math]::Min(600, $detail.Length))
             Write-Host ("REQUEST " + $i + " FAILED: " + $detail)
+            # Keep the transport state of this failure under a name the next arm cannot overwrite.
+            Save-ArWatchEvidence -LogPath $log -Stem (Join-Path $OutDir ("stress-" + $Tag + "-req" + $i)) | Out-Null
         }
         $lines += (@{ n = $i; prompt = $prompt.name; status = $status; ms = [math]::Round($sw.Elapsed.TotalMilliseconds, 0); detail = $detail } | ConvertTo-Json -Compress)
         if ($i % 25 -eq 0) {

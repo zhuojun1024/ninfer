@@ -22,13 +22,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+. (Join-Path $PSScriptRoot "ar_watch.ps1")
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $log = Join-Path $OutDir ("sampling-" + $Tag + ".log")
 $jsonl = Join-Path $OutDir ("sampling-" + $Tag + "-k" + $DraftTokens + ".jsonl")
+$stem = Join-Path $OutDir ("sampling-" + $Tag)
 
 Get-Process -Name ninfer-serve -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 3
 
+# Acceptance arms run with the transport watchdog on: a failed arm must leave the arrival/order
+# slots of both devices behind, which is the only record that distinguishes a token divergence from
+# a peer that never published (PLAN.md section 3.10).
+$env:NINFER_TP2_AR_WATCHDOG = "1"
 $server = Start-Process -FilePath "pwsh" -PassThru -WindowStyle Hidden -ArgumentList @(
     "-NoProfile", "-File", (Join-Path $repo "tools/win_port/serve.ps1"),
     "-Model", $Model, "-Spec", "dflash2", "-DraftTokens", "$DraftTokens",
@@ -92,7 +98,13 @@ try {
     $rate = if ($drafted -gt 0) { 100.0 * $accepted / $drafted } else { 0.0 }
     Write-Host ("SUMMARY tag=" + $Tag + " k=" + $DraftTokens + " runs=" + $rows.Count + " drafted=" + $drafted +
         " accepted=" + $accepted + " acceptance=" + [math]::Round($rate, 2) + "% tokens=" + $tokens)
+} catch {
+    # A re-run of the same tag overwrites the arm log, which is how the section 3.9 evidence for the
+    # one observed 503 was lost; keep a copy that cannot be overwritten and interpret its dump.
+    Save-ArWatchEvidence -LogPath $log -Stem $stem | Out-Null
+    throw
 } finally {
+    Remove-Item Env:NINFER_TP2_AR_WATCHDOG -ErrorAction SilentlyContinue
     Get-Process -Name ninfer-serve -ErrorAction SilentlyContinue | Stop-Process -Force
     if ($server -and -not $server.HasExited) { $server | Stop-Process -Force }
     Start-Sleep -Seconds 3

@@ -20,6 +20,10 @@ $env:PATH = 'D:/ffmpeg-dev/expanded/ffmpeg-master-latest-win64-gpl-shared/bin;' 
 if (-not (Test-Path $Model)) { throw "artifact not found: $Model" }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $env:NINFER_TEST_ARTIFACT = $Model
+. (Join-Path $PSScriptRoot "ar_watch.ps1")
+# The suites drive the same in-kernel transport as the serving arms, so a transport give-up here must
+# leave the same arrival/order evidence (PLAN.md section 3.10).
+$env:NINFER_TP2_AR_WATCHDOG = "1"
 
 $results = @()
 function Invoke-Suite([string] $name, [string] $exe, [string[]] $extra) {
@@ -30,6 +34,7 @@ function Invoke-Suite([string] $name, [string] $exe, [string[]] $extra) {
     $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1)
     "SUITE $name exit=$code elapsed_s=$elapsed log=$log"
     Get-Content $log | Select-Object -Last 4 | ForEach-Object { "  | $_" }
+    if ($code -ne 0) { Save-ArWatchEvidence -LogPath $log -Stem (Join-Path $OutDir $name) | Out-Null }
     $script:results += [pscustomobject]@{ suite = $name; exit = $code; elapsed_s = $elapsed }
 }
 
@@ -45,6 +50,7 @@ foreach ($name in @("solo-a", "solo-b", "sessions", "append-k7", "append-k5")) {
     foreach ($line in $lines) { "{0}: {1}" -f $name, $line.Line.Trim() }
 }
 
+Remove-Item Env:NINFER_TP2_AR_WATCHDOG -ErrorAction SilentlyContinue
 $bad = @($results | Where-Object { $_.exit -ne 0 })
 "SUITES_DONE failures=$($bad.Count)"
 $results | Format-Table -AutoSize | Out-String
