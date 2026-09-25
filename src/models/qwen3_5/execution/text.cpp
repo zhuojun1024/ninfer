@@ -1028,8 +1028,12 @@ void TextContext::dflash_selector_tp2(const Tensor& hidden, const Tensor& candid
     // into one transfer: the payload is I32 ids and FP32 scores, which the BF16 all-reduce would
     // reinterpret. The selector's outputs need a second exchange (they exist only after this one).
     const auto align16 = [](std::size_t value) { return (value + 15U) & ~std::size_t{15U}; };
-    const std::size_t forward_bytes = align16(candidate_ids.bytes() + candidate_scores.bytes() +
-                                              anchors.bytes() + frontiers.bytes());
+    // The packed length is announced to the peer, and the peer unpacks in the declared order, so the
+    // packing offsets below are checked against this payload rather than trusted (see the handoff
+    // table in text.h).
+    const std::size_t forward_payload =
+        candidate_ids.bytes() + candidate_scores.bytes() + anchors.bytes() + frontiers.bytes();
+    const std::size_t forward_bytes = align16(forward_payload);
     const std::size_t back_bytes    = align16(drafts_peer.bytes() + q_peer.bytes());
     Tensor pack_forward = work_.alloc(DType::I32, {static_cast<std::int32_t>(forward_bytes / 4)});
     Tensor recv_forward = work_.alloc(DType::I32, {static_cast<std::int32_t>(forward_bytes / 4)});
@@ -1051,6 +1055,10 @@ void TextContext::dflash_selector_tp2(const Tensor& hidden, const Tensor& candid
     packed += anchors.bytes();
     CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(pack_forward.data) + packed, frontiers.data,
                                frontiers.bytes(), cudaMemcpyDeviceToDevice, ctx_.stream));
+    packed += frontiers.bytes();
+    if (packed != forward_payload) {
+        throw std::logic_error("dflash_selector_tp2: forward pack does not match its declared length");
+    }
     // This exchange's peer half carries nothing: the peer only has to send readable bytes, so it
     // sends from the buffer it receives into (an in-place exchange is safe).
     peer.ctx_.bind_to_current_thread();

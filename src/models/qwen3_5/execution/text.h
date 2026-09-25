@@ -230,6 +230,43 @@ public:
     // the peer's half of a column-split weight.
     void set_tp_peer(TextContext* peer, tp::DevicePair* pair);
 
+    // Every TP-2 handoff this context performs, in one place. The payload decides the transport:
+    // DevicePair::allreduce combines its two operands with BF16 addition, so it carries only payloads
+    // whose bits are BF16-safe, and only as a gather or broadcast where one operand is a zeroed or
+    // disjoint buffer; DevicePair::sendrecv moves bytes verbatim and is the only transport for token
+    // ids, FP32 scores, or anything that must arrive unchanged. C is drafts * batch.
+    //
+    //   merge_local_row_blocks      BF16 [rows, T]                 allreduce  disjoint halves: each
+    //                                                                         shard zeroes the full
+    //                                                                         buffer and writes only
+    //                                                                         its own row block
+    //   embedding_tp2               I32 ids, padded to 16B         allreduce  broadcast over a zeroed
+    //                                                                         peer. The one integer
+    //                                                                         payload on this path, so
+    //                                                                         a signaling-NaN bit
+    //                                                                         pattern is not preserved
+    //                                                                         (PLAN.md section 3.3)
+    //   proposal_argmax             BF16 [hidden, T]               allreduce  broadcast over a zeroed
+    //                                                                         peer
+    //   proposal_topk_tp2  hidden    BF16 [hidden, C]               allreduce  broadcast over a zeroed
+    //                                                                         peer
+    //   proposal_topk_tp2  merge     I32 [top_k, C] plus            sendrecv  byte-exact; the peer's
+    //                                FP32 [top_k, C]                          receive slot is scratch
+    //                                                                         it never reads
+    //   dflash_selector_tp2  draft   BF16 [hidden, C]               allreduce  broadcast over a zeroed
+    //                                                                         peer
+    //   dflash_selector_tp2  forward I32 ids, FP32 scores,          sendrecv  byte-exact, packed in
+    //                                I32 anchors, I32 frontiers                 that order, align16;
+    //                                                                          the peer unpacks in the
+    //                                                                          same order
+    //   dflash_selector_tp2  back    I32 drafts, FP32 q             sendrecv  byte-exact, packed in
+    //                                                                          that order, align16
+    //   forward_tp2_prefill  vision  BF16 [hidden, count]           allreduce  broadcast over a zeroed
+    //                                                                          local buffer
+    //
+    // The allreduce payloads are exact because the receiving operand is zero (broadcast) or holds a
+    // disjoint region (gather), never because a real sum is wanted.
+
     // Full-width token embedding for a component that runs on this shard alone but consumes the
     // complete hidden state. The masked draft's proposal block is that case on TP-2: its weights
     // are replicated whole on shard 0 while the shared text token embedding is column-split, so
