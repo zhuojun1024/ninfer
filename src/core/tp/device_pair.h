@@ -25,11 +25,14 @@ public:
     DevicePair(DevicePair&& other) noexcept;
     DevicePair& operator=(DevicePair&& other) noexcept;
 
-    // Spawns an env-gated (NINFER_TP2_AR_WATCHDOG=1) diagnostics thread that prints the mapped
-    // id/arrival/order state to stderr twice a second, so a stuck in-kernel transport can be
-    // classified after the fact: ids that stopped advancing with published arrivals mean a spin
-    // failed to observe the peer's write, and a stale order slot means the slice write-order chain
-    // broke. Ids are host-authored (see create_ar_channel), so the two sides can no longer diverge.
+    // Spawns the in-kernel transport's diagnostics thread, which runs unless
+    // NINFER_TP2_AR_WATCHDOG=0. It prints the mapped id/arrival/order state to stderr once per stall
+    // episode, so a stuck in-kernel transport can be classified after the fact: ids that stopped
+    // advancing with published arrivals mean a spin failed to observe the peer's write, and a stale
+    // order slot means the slice write-order chain broke. Ids are host-authored (see
+    // create_ar_channel), so the two sides can no longer diverge. The thread costs nothing
+    // measurable: it sleeps 25 ms per tick, reads one host counter plus, while idle, the two mapped
+    // stall flags, and touches the kernel-written arrival lines only after a device has tripped.
     void start_ar_watchdog();
 
     const DeviceContext& a() const noexcept { return a_; }

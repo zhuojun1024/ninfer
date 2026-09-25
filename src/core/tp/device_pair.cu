@@ -447,7 +447,14 @@ DevicePair::CollectiveId DevicePair::acquire_collective_id(cudaStream_t stream_a
 }
 
 void DevicePair::start_ar_watchdog() {
-    if (!watch_ || std::getenv("NINFER_TP2_AR_WATCHDOG") == nullptr) { return; }
+    if (!watch_) { return; }
+    // On by default. The per-collective counter this thread reads is incremented whether or not the
+    // thread runs (note_ar_call is gated only on watch_ being allocated, which the in-kernel
+    // transport always does), and the thread itself only reads host memory, so the diagnostics add
+    // nothing measurable to the hot path. Running them always is what turns a rare give-up into
+    // evidence: every natural occurrence so far left no dump because the thread was opt-in.
+    const char* env = std::getenv("NINFER_TP2_AR_WATCHDOG");
+    if (env != nullptr && env[0] == '0') { return; }
     watch_->stall      = reinterpret_cast<const int*>(stall_host_);
     ArWatchState* raw = watch_.get();
     watch_->thread    = std::thread([raw] {
@@ -475,10 +482,14 @@ void DevicePair::start_ar_watchdog() {
                     stalled = false;
                     continue;
                 }
-                if (!stalled) {
-                    stalled = true;
-                    std::fprintf(stderr, "[ar-watch] stalled at calls=%llu\n", calls);
+                if (stalled) {
+                    // One detailed dump per stall episode. The state that classifies the failure is
+                    // the state at detection, so repeating it every tick for the whole timeout only
+                    // added volume: at the current 10 s bound that was about 400 lines per incident.
+                    continue;
                 }
+                stalled = true;
+                std::fprintf(stderr, "[ar-watch] stalled at calls=%llu\n", calls);
             } else {
                 last_calls = calls;
                 stalled    = false;
