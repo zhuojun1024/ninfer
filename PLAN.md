@@ -592,7 +592,10 @@ rendezvous id（`2<<32+122460`）也在**captured 通道**内，与复现一致�
   同源）时才 dump——请求之间的空闲同样会让 host 计数停住，原来会被误当成 stall；轮询从 500 ms 收紧到
   **25 ms**，因为 trip 之后往往只有几毫秒就 fault 并退出，慢了就抓不到。
   **验证**：干净臂 0 条 ar-watch、无 FAILED 文件；注入臂（`FAULT_SKIP_PEER_CALL=700`）exit=1 并留下
-  `FAILED.log` + 判读 `OFF-BY-ONE: A=1<<62+439 B=1<<62+440`；三件套在看门狗开启下
+  `FAILED.log` + 判读 `OFF-BY-ONE: A=1<<62+439 B=1<<62+440`
+  （**唯一保留的原始 dump**：`build-win/ar-evidence/r73-watchdog-gate-injection.arwatch.txt` + 同名 `.log`；
+  其余 18 个历史 `*-FAILED.*` 已清理——r82 是我自己写错的打包断言造成的 5 组假警报，r76 是 §3.10 已定性的
+  旧 harness 抢端口假象，r75/r83 与 r73 重复或已在 §3.11 归纳）；三件套在看门狗开启下
   **5/5 exit=0**，proposal digest 与改动前逐位相同（K=7 `0x8103f572fb2d2f99` / K=5 `0x96582e7289dd2702`）；
   门控两点验证：空闲（3 请求 + 4 s 间隔）**0 条 dump**，注入 trip **2 条 dump 且判读正确**。
 
