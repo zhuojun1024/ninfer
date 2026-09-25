@@ -282,7 +282,7 @@ DFlash2 verify/accept kernel，报错点只是首个 API 边界）；同一臂**
 
 接受率代价**不可测**（两档都 <0.5σ）；15-rep 的 "−2.2 pp" 与基线自身 0.6–1.1 pp 的轮次漂移同量级。
 三件套在**当前二进制**下重跑仍全过（`SUITES_DONE failures=0`，5/5 exit=0；solo digest 与基线逐位相同；
-append proposal digest K=7 `0xf9622ee5cd45709d` / K=5 `0x96582e7289dd2702`）。② 的真实代价只剩确定性的
+append proposal digest K=7 `0x8103f572fb2d2f99` / K=5 `0x96582e7289dd2702`）。② 的真实代价只剩确定性的
 proposal 步 +2.8%（+0.19 ms/轮；按 ~45 ms/轮折算 ≈ **+0.4% 端到端**）。
 
 **② 结论（修正）**：② 是「**−79.69 MiB 换 ≈+0.4% 轮时、接受率无代价**」的中性偏正杠杆，而非上一轮判定的
@@ -484,8 +484,15 @@ rendezvous id（`2<<32+122460`）也在**captured 通道**内，与复现一致�
 或一次真实 desync（id 复用/错配）。已排除环境残留注入与默认超时被改。
 
 **处置建议（待决策）**
-- (a) **抓到触发源**：验收臂一律开 `NINFER_TP2_AR_WATCHDOG=1`，失败时把 dump 一起留档（`arrA vs arrB`
-  能区分「token 分歧」与「对端没写」）。
+- (a) **抓到触发源（已实施）**：采样 A/B（`r62_sampling_ab.ps1`）、三件套（`r66_suites.ps1`）、
+  长跑（`r71_ar_stress.ps1`）一律开 `NINFER_TP2_AR_WATCHDOG=1`；失败时 `tools/tp_bootstrap/ar_watch.ps1`
+  把日志**另存为不可被复跑覆盖**的 `*-FAILED.log`，并把解释后的 dump 写到 `*-FAILED.arwatch.txt`。
+  判读规则：两侧同槽 id 不同 ⇒ **TOKEN DIVERGENCE**（编号/时序缺陷）；一侧为 0 ⇒ 该侧**从未发布**
+  （对端迟到或丢写）。同时 `device_pair.cu` 的看门狗跳过首个 collective 之前的空槽 dump（模型加载期
+  原来每 500 ms 打一行 `calls=0`，~100 行噪声）。
+  **验证**：干净臂 0 条 ar-watch、无 FAILED 文件；注入臂（`FAULT_SKIP_PEER_CALL=700`）exit=1 并留下
+  `FAILED.log` + 判读 `slice 0: TOKEN DIVERGENCE A=1<<62+439 B=1<<62+440`；三件套在看门狗开启下
+  **5/5 exit=0**，proposal digest 与改动前逐位相同（K=7 `0x8103f572fb2d2f99` / K=5 `0x96582e7289dd2702`）。
 - (b) **让 give-up 安全**：host 侧检查已被证伪（来不及）；要么让传输在 give-up 后不再继续消费
   （毒化/中止语义），要么让窗口内做索引的算子对输入做范围约束——都是架构级改动，需要先知道确切算子。
 - (c) **止损**：默认超时 2000 ms 是相对**内核时间**（最慢 2.7 ms）的 700×，但对**host 侧停顿**并非安全余量；
