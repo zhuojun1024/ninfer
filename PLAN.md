@@ -415,6 +415,87 @@ Split 预分词器用 `\p{L}+`（无 `\p{M}`）且 `trim_offsets=true`，引擎�
   尾部复用仍会退化；保证逐 token 的唯一杠杆是携带 token id 的续写协议（未排期）。
 - TP-2 prefill 的首个 sample 未应用工具语法掩码（prefill 与 decode 路径不对称，独立遗留项）。
 
+### 3.11 TP-2 编排与握手：三项具体工作（2026-09-25 开工）
+
+> 缘起：用户问「以'所有组件都支持低耦合 TP-2'为目标做整体重写是否值得」。结论是**不做整体重写**，
+> 只做三件有明确收益的具体事。量化依据：分片计划已集中（`tp_split_spec.cpp` 175 行、shard mask 仅 2 处），
+> 巨型物 `execute_walk`（1412 行/12 lambda）的大头是会话与检查点状态机而非 TP；瓶颈在 target verify。
+
+**② 图谱接线：复核结论＝已完成，剩下的是 B7 验收**
+
+我依据的 worklog 4128-4131（2026-09-22「B7 前置侦察（已完成，未实施）」）**已过期**。现役代码四处全部接线：
+
+| 侦察所列 | 现役代码 |
+|---|---|
+| ① 总开关只对 MTP 生效 | `tp2_generation_core.cpp:374` = `(mtp_enabled_ || dflash2_enabled_) && in_kernel_allreduce()` ✓ |
+| ② verify 桶只在 MTP 分支建 | `:387-397` 两条路线都建 `verify_window_host_`；`:398-409` profiles 走
+`dflash_graph_profiles(DFlash2,…)` ✓ |
+| ③ `capture_verify_graph` 不收 sink | `:954-958` 形参已含 `DFlashFeatureSink* sink` + `valid_columns` ✓ |
+| ④ `:979-984` 的 throw | 已由捕获体 `:980-986` 的转发取代（注释即该结论）✓ |
+
+**实测确认**：本 session 的 DFlash2 服务日志 `build-win/r69/sampling-r69-final-k7.log` 打印
+`[tp2-graph] plain decode step: graph | verify step: graph | mtp chain: graph` ⇒ 生产已在图内运行。
+
+**剩余工作 = B7 验收**（worklog 4133 的判据）：`NINFER_TP2_VERIFY_GRAPH=0/1` 成对 A/B，verify ≈30.6 ms、
+比 eager 低 4~4.5 ms/轮、等输出吞吐 ≈+15%。gate：两臂吞吐 + proposal cost + 三件套。
+
+**① 收口隐式不变量：两个具体目标（明确不重写 `execute_walk`）**
+
+**1a 消灭「静默默认参数」这一类**——对应两个真实事故（worklog 4131 sink 漏接线、4135 `valid_columns`/
+`active_valid_columns_` 未绑定导致的 paged-KV 同槽撕裂）：
+`TextContext::forward_tp2_window`（`text.h:217-221`）末尾三个参数
+`hidden_columns=nullptr` / `sink=nullptr` / `valid_columns=nullptr` **每一个都改变语义**——
+头文件自己的注释（`:211-216`）就写着「nullptr leaves every column appending」，即漏传 = 静默退化成无掩码。
+做法：**删掉三个默认值**，两个调用点（`:984` 捕获、`:1031` eager）显式传参；并把两侧实参收进同一个只读
+struct，使「捕获与 eager 传不同参数」在类型上不可能（现在靠两处复制粘贴保持一致）。
+gate：`BUILD_EXIT=0` + 三件套 digest 逐位不变。
+
+**1b 让窗口内 give-up 可辨识**（§3.10(d)）：窗口内自旋 give-up 现在表现为语焉不详的 illegal address
+（注入 700 已逐字节复现）。目标是失败时能判定「give-up in window」而非「illegal address」。
+gate：注入 700 的报错可辨识，且干净臂零新增输出。
+
+**③ 命名与声明载荷**
+
+- shard mask 现在只剩 **2 处**（`tp_split_spec.cpp:101,109`），改为命名角色常量（如 `Shard::DraftHome`）。
+- 4–6 种握手协议（candidate ids/scores 并集、MTP `pack_forward`/`back`、draft state、AR）的载荷与契约集中声明。
+
+**顺序与 gate**：③ → 1a → ②B7 验收 → 1b。③/1a 只动结构与参数，不改数值 ⇒ 三件套 digest 必须逐位不变；
+② 用 `NINFER_TP2_VERIFY_GRAPH` 成对 A/B；1b 用注入点。
+
+**进度（2026-09-25，本批已实现并验证）**
+
+- **1a 完成**：`TextContext::forward_tp2_window` 末尾三个语义参数删掉默认值
+  （`hidden_columns`/`sink`/`valid_columns`），头文件写明「每个都改变语义、缺省即静默退化」；
+  两个调用点（捕获 `tp2_generation_core.cpp:984`、eager `:1031`）本来就显式传参 ⇒ 现在是编译期约束。
+  后续把两侧实参收进同一 struct 的动作未做（收益递减，见下）。
+- **③ 完成（命名部分）**：`src/core/tp/tp_materialize.h` 新增 `kLocalShard=0x1`/`kPeerShard=0x2`，
+  `tp_split_spec.cpp` 的两处裸 mask 改为命名角色 ⇒ 全仓 `0x1U/0x2U` 归零。**载荷声明部分未做**。
+- **1b 完成并验证**：`ar_exchange` 的 give-up 路径**不再把输出留成上一轮的陈旧值**——新增
+  `ar_abandon_output()`，三处 `stalled` 提前返回（入口检查/块序等待/arrival 等待）都先把本 block 的
+  `out` 切片清零。理由：该 staging 缓冲逐轮复用，重放的捕获图复用同一 arena 内存，留旧值会让下游把
+  陈旧数据当**索引**用 → 窗口内 illegal address，而 host 侧任何检查都来不及（§3.10 已证）。
+  零是合法的 token id/candidate/logit，于是该轮能跑完、由轮收敛点的 `abort_if_ar_stalled()` 变成设计好的 503。
+  **验证**：`r72_stall_injection.ps1 -Calls @(560,700)` ⇒ 两处都 `503,ok illegal=False`
+  （修复前 700 是**逐字节复现**的 `tp2_generation_core.cpp:3119 cudaErrorIllegalAddress` + 进程退出）；
+  健康路线零代价（填充只在超时路径执行）。
+- **①②③ 的数值零影响**：`r66_suites.ps1`（dflash2 路线，final 件）**5/5 exit=0**，
+  digest 与改动前**逐位相同**（K=7 `0x8103f572fb2d2f99`、K=5 `0x96582e7289dd2702`、
+  solo `0x4bcc3994a5efba7d`、ring `0xb1a1fe192b36817a`）。
+- **② B7 验收（`r81_verify_graph_ab.ps1`，final 件，K=7，6 reps × 3 prompt 类 = 18 请求/臂，4608 token/臂）**：
+
+  | 统计量 | graph | eager | Δ |
+  |---|---|---|---|
+  | 逐请求 decode 均值 | 76.22 tok/s | 71.90 tok/s | +4.33（+6.0%，se=4.39，**t=0.99 不显著**） |
+  | 逐请求 decode 中位数 | 72.2 | 70.5 | +1.7 |
+  | **聚合吞吐**（Σtoken / Σ请求 total） | **72.68 tok/s** | **69.09 tok/s** | **+3.60（+5.2%）** |
+
+  两臂 `[tp2-graph]` 行确证只差 verify 一项（`verify step: graph` vs `eager`，plain/mtp chain 相同）。
+  ⇒ **图谱确实在跑且带来约 +5% 端到端 decode**（方向与 worklog 的 +15% 预估一致但幅度更小）；
+  逐请求统计在本样本量下分辨不出，聚合口径可用但仍是单轮，若要定档需 ≥24 reps/臂。
+
+**未做（本批有意留下）**：1a 的"两侧实参收进同一 struct"（当前两个调用点已显式且一致，编译期已够）；
+③ 的握手载荷集中声明。
+
 ### 3.10 TP-2 传输低频失败专项排查（2026-09-25）
 
 **目标**：定性并（若可行）根因定位采样臂连续长跑下的两次低频 engine 失败。
