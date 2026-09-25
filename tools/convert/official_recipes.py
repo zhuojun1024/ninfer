@@ -16,7 +16,36 @@ def _assign(recipe, name, format, *, source=None):
     recipe.assign(name, format=format, method=method, source=source)
 
 
+# The masked DFlash2 draft runs entirely on Q4_G64_FP16 projections. Every entry below was
+# qualified by the section 8 / section 3.9 campaigns (r62-r68): the draft MLP, attention output and
+# dynamic-conv kernels, the fused QKV parent through its row views, and the selector codebooks. The
+# QKV parent is one [6144, 5120] object per layer shared with context_key/context_value; the native
+# Q8-only fused consumers are bypassed when it is quantized (see
+# src/models/qwen3_5/execution/draft.cpp). DFlash v1 and MTP keep Q8.
+DFLASH2_Q4_NAMES = ("dflash2/feature_projection",)
+DFLASH2_Q4_ROLES = (
+    "/attention/query",
+    "/attention/key",
+    "/attention/value",
+    "/attention/output",
+    "/mlp/gate",
+    "/mlp/up",
+    "/mlp/down",
+    "/attention_conv/kernel_projection",
+    "/mlp_conv/kernel_projection",
+)
+DFLASH2_CODEBOOKS = (
+    "dflash2/candidate_selector/predecessor_codebook",
+    "dflash2/candidate_selector/successor_codebook",
+)
+
+
 def _optional(model, recipe):
+    # The selector codebooks are direct [vocab, rank] parents rather than projections, so they are
+    # assigned before the projection filter below.
+    for name in DFLASH2_CODEBOOKS:
+        if name in model.parameters:
+            _assign(recipe, name, Q4)
     for name, parameter in model.parameters.items():
         if not parameter.projection:
             continue
@@ -34,16 +63,15 @@ def _optional(model, recipe):
             _assign(recipe, name, format)
         elif name.startswith(("mtp/", "dflash/", "dflash2/")):
             if name.endswith(
-                (
-                    "/moe/router",
-                    "/moe/shared_score",
-                    "/attention_conv/kernel_projection",
-                    "/mlp_conv/kernel_projection",
-                    "/candidate_selector/hidden_projection",
-                )
+                ("/moe/router", "/moe/shared_score", "/candidate_selector/hidden_projection")
             ):
                 continue
-            _assign(recipe, name, Q8)
+            if name in DFLASH2_Q4_NAMES or (
+                name.startswith("dflash2/") and name.endswith(DFLASH2_Q4_ROLES)
+            ):
+                _assign(recipe, name, Q4)
+            else:
+                _assign(recipe, name, Q8)
     for backend in ("dflash", "dflash2"):
         if backend not in model.components:
             continue
