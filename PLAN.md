@@ -487,8 +487,10 @@ rendezvous id（`2<<32+122460`）也在**captured 通道**内，与复现一致�
 - (a) **抓到触发源（已实施）**：采样 A/B（`r62_sampling_ab.ps1`）、三件套（`r66_suites.ps1`）、
   长跑（`r71_ar_stress.ps1`）一律开 `NINFER_TP2_AR_WATCHDOG=1`；失败时 `tools/tp_bootstrap/ar_watch.ps1`
   把日志**另存为不可被复跑覆盖**的 `*-FAILED.log`，并把解释后的 dump 写到 `*-FAILED.arwatch.txt`。
-  判读规则：两侧同槽 id 不同 ⇒ **TOKEN DIVERGENCE**（编号/时序缺陷）；一侧为 0 ⇒ 该侧**从未发布**
-  （对端迟到或丢写）。同时 `device_pair.cu` 的看门狗跳过首个 collective 之前的空槽 dump（模型加载期
+  判读规则按 **id 差值的量级**分类（数组保留的是各侧**最后写入**的值）：某侧整组为 0 ⇒ 该侧
+  **从未到达 arrival 写入**（内核没跑）；差值 1 ⇒ **OFF-BY-ONE**（两侧对同一次 collective 编号不同）；
+  差值达一个整块（数百）⇒ **BLOCK-LEVEL**（两侧跑在不同 id 块上，正是「captured 图读到了 host 已
+  重新 arm 的 cell」的形态）；其余为一般 SKEW。同时 `device_pair.cu` 的看门狗跳过首个 collective 之前的空槽 dump（模型加载期
   原来每 500 ms 打一行 `calls=0`，~100 行噪声）。
   **验证**：干净臂 0 条 ar-watch、无 FAILED 文件；注入臂（`FAULT_SKIP_PEER_CALL=700`）exit=1 并留下
   `FAILED.log` + 判读 `slice 0: TOKEN DIVERGENCE A=1<<62+439 B=1<<62+440`；三件套在看门狗开启下
