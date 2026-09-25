@@ -3,13 +3,17 @@
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -607,6 +611,210 @@ int run(bool ties = false, bool dependent = false) {
     return failures;
 }
 
+// --- Q4 codebook arm -------------------------------------------------------
+//
+// Every stored value is the exact product of a 4-bit code in [-8,7] and one fp16 group scale, so
+// the host packs the bytes the kernel must decode and the FP64 oracle decodes them back through
+// the stored scale instead of the analytic fixture. The predecessor and successor tables differ.
+constexpr std::int32_t kQ4CodeBytesPerRow  = kRank / 2;
+constexpr std::int32_t kQ4ScaleBytesPerRow = (kRank / 64) * 2;
+constexpr std::size_t kQ4CodeBytes = static_cast<std::size_t>(kCodebookRows) * kQ4CodeBytesPerRow;
+// weight_geometry places the scale plane at align(code_bytes + align(high_bytes, 256), 256); Q4 has
+// no high plane and kCodebookRows * kQ4CodeBytesPerRow is already 256-aligned.
+constexpr std::size_t kQ4ScaleOffset =
+    (kQ4CodeBytes + 255) / 256 * 256;
+constexpr std::size_t kQ4PayloadBytes =
+    kQ4ScaleOffset + static_cast<std::size_t>(kCodebookRows) * kQ4ScaleBytesPerRow;
+
+struct Q4Codebook {
+    std::vector<std::uint8_t> codes;
+    std::vector<std::uint16_t> scales;
+    std::map<std::int32_t, std::vector<double>> values;
+};
+
+std::uint16_t fp16_bits(float value) {
+    const __half rounded = __float2half_rn(value);
+    std::uint16_t bits   = 0;
+    std::memcpy(&bits, &rounded, sizeof(bits));
+    return bits;
+}
+
+Q4Codebook make_q4_codebook(const std::vector<std::int32_t>& tokens, std::uint32_t seed) {
+    Q4Codebook out;
+    out.codes.assign(static_cast<std::size_t>(kCodebookRows) * kQ4CodeBytesPerRow, 0);
+    out.scales.assign(static_cast<std::size_t>(kCodebookRows) * (kQ4ScaleBytesPerRow / 2), 0);
+    for (const std::int32_t token : tokens) {
+        std::vector<double> decoded(kRank);
+        for (std::int32_t group = 0; group < kRank / 64; ++group) {
+            const std::uint32_t mixed =
+                mix32(static_cast<std::uint32_t>(token) * 0x9e3779b9U ^
+                      static_cast<std::uint32_t>(group) * 0x85ebca6bU ^ seed);
+            const std::uint16_t scale_bits =
+                fp16_bits((static_cast<float>((mixed >> 8) & 0x3ffU) + 512.0F) / 16384.0F);
+            const float scale = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+            out.scales[static_cast<std::size_t>(token) * (kQ4ScaleBytesPerRow / 2) + group] =
+                scale_bits;
+            int codes[64];
+            for (std::int32_t rank = 0; rank < 64; ++rank) {
+                const std::uint32_t code_mix =
+                    mix32(mixed ^ (static_cast<std::uint32_t>(rank) * 0x27d4eb2dU));
+                codes[rank]                       = static_cast<int>(code_mix % 16U) - 8;
+                decoded[group * 64 + rank]        = static_cast<double>(
+                    static_cast<float>(codes[rank]) * scale);
+            }
+            for (std::int32_t byte = 0; byte < 32; ++byte) {
+                const std::uint8_t low  = static_cast<std::uint8_t>(codes[2 * byte] & 0x0f);
+                const std::uint8_t high = static_cast<std::uint8_t>((codes[2 * byte + 1] & 0x0f) << 4);
+                out.codes[static_cast<std::size_t>(token) * kQ4CodeBytesPerRow + group * 32 + byte] =
+                    static_cast<std::uint8_t>(low | high);
+            }
+        }
+        out.values.emplace(token, std::move(decoded));
+    }
+    return out;
+}
+
+DeviceBuffer to_q4_device(const Q4Codebook& codebook) {
+    DeviceBuffer buffer(kQ4PayloadBytes);
+    buffer.fill();
+    buffer.copy_from_host(codebook.codes.data(), codebook.codes.size(), 0);
+    buffer.copy_from_host(codebook.scales.data(),
+                          codebook.scales.size() * sizeof(std::uint16_t), kQ4ScaleOffset);
+    return buffer;
+}
+
+Weight q4_weight(const DeviceBuffer& buffer) {
+    Weight weight{};
+    weight.payload       = buffer.p;
+    weight.payload_bytes = kQ4PayloadBytes;
+    weight.qtype         = QType::Q4_G64_FP16;
+    weight.group_size    = 64;
+    weight.layout        = QuantLayout::RowSplit;
+    weight.qdata         = buffer.p;
+    weight.scales        = static_cast<std::uint8_t*>(buffer.p) + kQ4ScaleOffset;
+    weight.n             = kCodebookRows;
+    weight.k             = kRank;
+    weight.scale_dtype   = DType::FP16;
+    return weight;
+}
+
+std::vector<double> build_lattice_q4(const std::vector<std::int32_t>& candidate_ids,
+                                     const std::vector<float>& unary_scores,
+                                     const std::vector<std::uint16_t>& projected_hidden,
+                                     const std::vector<std::int32_t>& anchors,
+                                     const Q4Codebook& predecessor_codebook,
+                                     const Q4Codebook& successor_codebook) {
+    std::vector<double> lattice(static_cast<std::size_t>(kMaxBatch) * kSteps * kCandidates *
+                                kCandidates);
+    for (std::int32_t batch = 0; batch < kMaxBatch; ++batch) {
+        for (std::int32_t step = 0; step < kSteps; ++step) {
+            for (std::int32_t predecessor_rank = 0; predecessor_rank < kCandidates;
+                 ++predecessor_rank) {
+                const std::int32_t predecessor =
+                    step == 0 ? anchors[batch]
+                              : candidate_ids[candidate_offset(batch, step - 1, predecessor_rank)];
+                const std::vector<double>& predecessor_row =
+                    predecessor_codebook.values.at(predecessor);
+                for (std::int32_t candidate = 0; candidate < kCandidates; ++candidate) {
+                    const std::int32_t successor =
+                        candidate_ids[candidate_offset(batch, step, candidate)];
+                    const std::vector<double>& successor_row = successor_codebook.values.at(successor);
+                    double edge = unary_scores[candidate_offset(batch, step, candidate)];
+                    const std::size_t hidden_base =
+                        static_cast<std::size_t>(batch * kSteps + step) * kRank;
+                    for (std::int32_t rank = 0; rank < kRank; ++rank) {
+                        edge += predecessor_row[rank] *
+                                static_cast<double>(bf16_to_f32(projected_hidden[hidden_base + rank])) *
+                                successor_row[rank];
+                    }
+                    lattice[lattice_offset(batch, step, predecessor_rank, candidate)] = edge;
+                }
+            }
+        }
+    }
+    return lattice;
+}
+
+int run_q4() {
+    int failures = 0;
+    for (const int steps : {3, 7}) {
+        kSteps                                           = steps;
+        const std::vector<std::int32_t> candidate_ids    = make_candidate_ids();
+        const std::vector<float> unary_scores            = make_unary_scores();
+        const std::vector<std::uint16_t> projected_hidden = make_projected_hidden();
+        const std::vector<std::int32_t> anchors          = make_anchors();
+        const std::vector<std::int32_t> base_positions   = make_base_positions();
+        const std::vector<std::int32_t> tokens           = accessed_tokens(candidate_ids, anchors);
+        const Q4Codebook predecessor_codebook            = make_q4_codebook(tokens, 101U);
+        const Q4Codebook successor_codebook              = make_q4_codebook(tokens, 211U);
+        const std::vector<double> lattice =
+            build_lattice_q4(candidate_ids, unary_scores, projected_hidden, anchors,
+                             predecessor_codebook, successor_codebook);
+        std::vector<ops::SamplingConfig> configs(kMaxBatch);
+        for (int b = 0; b < kMaxBatch; ++b) {
+            configs[b].temperature = (b % 2 == 0) ? 0.75F : 0.0F;
+            configs[b].seed        = 1234 + b;
+        }
+        const WalkResult expected = walk_oracle(candidate_ids, lattice, configs, base_positions);
+
+        DeviceBuffer ids_device      = to_device(candidate_ids);
+        DeviceBuffer unary_device    = to_device(unary_scores);
+        DeviceBuffer hidden_device   = to_device(projected_hidden);
+        DeviceBuffer anchor_device   = to_device(anchors);
+        DeviceBuffer position_device = to_device(base_positions);
+        DeviceBuffer config_device   = to_device(configs);
+        const DeviceBuffer predecessor_device = to_q4_device(predecessor_codebook);
+        const DeviceBuffer successor_device   = to_q4_device(successor_codebook);
+        const Weight predecessor_weight       = q4_weight(predecessor_device);
+        const Weight successor_weight         = q4_weight(successor_device);
+
+        for (const int batch_size : {1, 3, kMaxBatch}) {
+            const std::size_t draft_count = static_cast<std::size_t>(batch_size) * kSteps;
+            const std::size_t q_count     = draft_count * kCandidates;
+            GuardedDeviceBuffer draft_device(draft_count * sizeof(std::int32_t));
+            GuardedDeviceBuffer q_device(q_count * sizeof(float));
+            draft_device.fill(0xff);
+            q_device.fill(0xff);
+            Tensor ids(ids_device.p, DType::I32, {kCandidates, kSteps, batch_size});
+            Tensor unary(unary_device.p, DType::FP32, {kCandidates, kSteps, batch_size});
+            Tensor hidden(hidden_device.p, DType::BF16, {kRank, kSteps, batch_size});
+            Tensor anchor(anchor_device.p, DType::I32, {batch_size});
+            Tensor positions(position_device.p, DType::I32, {batch_size});
+            Tensor drafts(draft_device.data(), DType::I32, {kSteps, batch_size});
+            Tensor q(q_device.data(), DType::FP32, {kCandidates, kSteps, batch_size});
+            const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
+                kSteps, kSteps, batch_size, batch_size);
+            GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
+            WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+            ops::candidate_selector_path(
+                ids, unary, hidden, anchor, predecessor_weight, successor_weight, positions,
+                static_cast<const ops::SamplingConfig*>(config_device.p), drafts, q, workspace,
+                nullptr);
+            cuda_synchronize();
+
+            const std::string label = "candidate_selector_path q4 K=" + std::to_string(kSteps) +
+                                      " B=" + std::to_string(batch_size);
+            failures += verify_exact((label + " drafts").c_str(),
+                                     from_device<std::int32_t>(draft_device.data(), draft_count),
+                                     std::vector<std::int32_t>(expected.drafts.begin(),
+                                                               expected.drafts.begin() + draft_count));
+            const std::vector<float> actual_q = from_device<float>(q_device.data(), q_count);
+            failures += verify_pointwise(
+                label + " proposal_q", std::vector<double>(actual_q.begin(), actual_q.end()),
+                std::span<const double>(expected.probabilities.data(), q_count),
+                kProbabilityCriterion);
+            failures += draft_device.verify_guards(label + " drafts");
+            failures += q_device.verify_guards(label + " proposal_q");
+            failures += scratch.verify_guards(label + " workspace");
+            if (workspace.used() != 0 || workspace.peak_used() != capacity) {
+                std::cerr << label << " workspace scope/peak\n";
+                ++failures;
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -617,6 +825,7 @@ int main() {
         }
         int failures = 0;
         for (kSteps = 1; kSteps <= 15; ++kSteps) failures += run();
+        failures += run_q4();
         {
             kSteps = 1;
             failures += run(true);

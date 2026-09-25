@@ -1,6 +1,6 @@
 #include "ninfer/ops/candidate_selector.h"
 
-#include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
+#include "ops/candidate_selector/plan.h"
 
 #include <array>
 #include <cstddef>
@@ -73,6 +73,46 @@ void require_nonoverlap(const Tensor& candidate_ids, const Tensor& unary_scores,
     }
 }
 
+void require_quantized_codebook(const Weight& codebook, const char* label) {
+    if (codebook.qtype != QType::Q4_G64_FP16 || codebook.layout != QuantLayout::RowSplit ||
+        codebook.group_size != 64 || codebook.n != kCodebookRows || codebook.k != kRank ||
+        codebook.scale_dtype != DType::FP16 || codebook.qdata == nullptr ||
+        codebook.scales == nullptr) {
+        throw std::invalid_argument(std::string("candidate_selector_path: invalid ") + label);
+    }
+}
+
+// The quantized overload replaces the two dense codebook tensors with two two-plane weights.
+void require_nonoverlap_codebook(const Tensor& candidate_ids, const Tensor& unary_scores,
+                                 const Tensor& projected_hidden, const Tensor& anchors,
+                                 const Weight& predecessor_codebook,
+                                 const Weight& successor_codebook,
+                                 const Tensor& base_positions, const SamplingConfig* configs,
+                                 const Tensor& drafts, const Tensor& proposal_q) {
+    const std::array<Range, 10> ranges{{
+        {candidate_ids.data, candidate_ids.bytes(), "candidate_ids"},
+        {unary_scores.data, unary_scores.bytes(), "unary_scores"},
+        {projected_hidden.data, projected_hidden.bytes(), "projected_hidden"},
+        {anchors.data, anchors.bytes(), "anchors"},
+        {predecessor_codebook.payload, predecessor_codebook.payload_bytes, "predecessor_codebook"},
+        {successor_codebook.payload, successor_codebook.payload_bytes, "successor_codebook"},
+        {base_positions.data, base_positions.bytes(), "base_positions"},
+        {configs, static_cast<std::size_t>(candidate_ids.ne[2]) * sizeof(SamplingConfig),
+         "configs"},
+        {drafts.data, drafts.bytes(), "drafts"},
+        {proposal_q.data, proposal_q.bytes(), "proposal_q"},
+    }};
+    for (std::size_t first = 0; first < ranges.size(); ++first) {
+        for (std::size_t second = first + 1; second < ranges.size(); ++second) {
+            if (overlaps(ranges[first], ranges[second])) {
+                throw std::invalid_argument(std::string("candidate_selector_path: ") +
+                                            ranges[first].label + " overlaps " +
+                                            ranges[second].label);
+            }
+        }
+    }
+}
+
 } // namespace
 
 std::size_t candidate_selector_path_workspace_capacity_bytes(int min_steps, int max_steps,
@@ -121,6 +161,40 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                        successor_codebook, base_positions, configs, drafts, proposal_q);
 
     detail::candidate_selector_path_dispatch(
+        candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
+        successor_codebook, base_positions, configs, drafts, proposal_q, workspace, stream);
+}
+
+void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
+                             const Tensor& projected_hidden, const Tensor& anchors,
+                             const Weight& predecessor_codebook, const Weight& successor_codebook,
+                             const Tensor& base_positions, const SamplingConfig* configs,
+                             Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
+                             cudaStream_t stream) {
+    const std::int32_t batch_size = candidate_ids.ne[2];
+    const std::int32_t kSteps     = candidate_ids.ne[1];
+    if (kSteps < 1 || kSteps > 15)
+        throw std::invalid_argument("candidate_selector_path: K must be in [1,15]");
+    if (batch_size < 1 || batch_size > 8) {
+        throw std::invalid_argument("candidate_selector_path: B must be in [1,8]");
+    }
+    require_tensor(candidate_ids, DType::I32, kCandidates, kSteps, batch_size, 1, "candidate_ids");
+    require_tensor(unary_scores, DType::FP32, kCandidates, kSteps, batch_size, 1, "unary_scores");
+    require_tensor(projected_hidden, DType::BF16, kRank, kSteps, batch_size, 1, "projected_hidden");
+    require_tensor(anchors, DType::I32, batch_size, 1, 1, 1, "anchors");
+    require_tensor(base_positions, DType::I32, batch_size, 1, 1, 1, "base_positions");
+    require_tensor(drafts, DType::I32, kSteps, batch_size, 1, 1, "drafts");
+    require_tensor(proposal_q, DType::FP32, kCandidates, kSteps, batch_size, 1, "proposal_q");
+    if (!aligned_to(configs, alignof(SamplingConfig))) {
+        throw std::invalid_argument("candidate_selector_path: invalid configs");
+    }
+    require_quantized_codebook(predecessor_codebook, "predecessor_codebook");
+    require_quantized_codebook(successor_codebook, "successor_codebook");
+    require_nonoverlap_codebook(candidate_ids, unary_scores, projected_hidden, anchors,
+                                predecessor_codebook, successor_codebook, base_positions, configs,
+                                drafts, proposal_q);
+
+    detail::candidate_selector_path_q4_dispatch(
         candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
         successor_codebook, base_positions, configs, drafts, proposal_q, workspace, stream);
 }

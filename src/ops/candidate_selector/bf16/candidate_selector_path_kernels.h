@@ -1,5 +1,5 @@
 #pragma once
-#include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
+#include "ops/candidate_selector/plan.h"
 
 namespace ninfer::ops::detail {
 void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate_ids,

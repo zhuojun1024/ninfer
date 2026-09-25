@@ -3,7 +3,7 @@
 #include "ninfer/ops/candidate_selector.h"
 
 #include "ninfer_bench_common.h"
-#include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
+#include "ops/candidate_selector/plan.h"
 
 #include <cuda_runtime.h>
 

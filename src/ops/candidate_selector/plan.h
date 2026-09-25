@@ -2,6 +2,7 @@
 #include "core/tensor.h"
 #include "core/layout.h"
 #include "core/arena.h"
+#include "core/weight.h"
 #include "ninfer/ops/sampling.h"
 #include <cuda_runtime.h>
 
@@ -25,6 +26,7 @@ SelectorWorkspace allocate_selector_workspace(Allocator& allocator, SelectorRout
     return out;
 }
 
+// Dense BF16 codebooks.
 void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor& unary_scores,
                                       const Tensor& projected_hidden, const Tensor& anchors,
                                       const Tensor& predecessor_codebook,
@@ -32,4 +34,13 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
                                       const Tensor& base_positions, const SamplingConfig* configs,
                                       Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
                                       cudaStream_t stream);
+
+// Q4_G64_FP16 RowSplit codebooks; each Weight stores one complete [vocab, rank] parent.
+void candidate_selector_path_q4_dispatch(const Tensor& candidate_ids, const Tensor& unary_scores,
+                                         const Tensor& projected_hidden, const Tensor& anchors,
+                                         const Weight& predecessor_codebook,
+                                         const Weight& successor_codebook,
+                                         const Tensor& base_positions, const SamplingConfig* configs,
+                                         Tensor& drafts, Tensor& proposal_q,
+                                         WorkspaceArena& workspace, cudaStream_t stream);
 } // namespace ninfer::ops::detail
