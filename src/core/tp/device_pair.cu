@@ -279,6 +279,9 @@ void require_bytes(std::size_t count_bytes) {
 // write them concurrently.
 struct DevicePair::ArWatchState {
     const std::atomic<unsigned long long>* id = nullptr;
+    // The two bounded-spin trip flags, read exactly as ar_stalled() reads them. They are what
+    // separates a give-up from the idle gap between requests, which also stops the call counter.
+    const int* stall = nullptr;
     const unsigned char* arrival_a = nullptr;
     const unsigned char* arrival_b = nullptr;
     std::atomic<unsigned long long> calls      = 0;
@@ -433,6 +436,7 @@ DevicePair::CollectiveId DevicePair::acquire_collective_id(cudaStream_t stream_a
 
 void DevicePair::start_ar_watchdog() {
     if (!watch_ || std::getenv("NINFER_TP2_AR_WATCHDOG") == nullptr) { return; }
+    watch_->stall      = reinterpret_cast<const int*>(stall_host_);
     ArWatchState* raw = watch_.get();
     watch_->thread    = std::thread([raw] {
         // The mapped arrays are read only while the transport is provably stalled (the host-side
@@ -441,14 +445,24 @@ void DevicePair::start_ar_watchdog() {
         unsigned long long last_calls = 0;
         bool stalled                  = false;
         while (!raw->stop.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            // A tripped device is usually followed by a fault and a process exit within a few
+            // milliseconds, so the watchdog has to poll far faster than a human-scale interval to
+            // catch the state that explains it. The thread is opt-in and only reads atomics.
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
             if (raw->stop.load(std::memory_order_relaxed)) { break; }
             const unsigned long long calls = raw->calls.load(std::memory_order_relaxed);
             if (calls == last_calls) {
-                // Before the first collective there is nothing to diagnose, and the model load makes
-                // that the common case: skipping it keeps a dump meaningful instead of ~100 lines of
-                // empty slots between the load and the first request.
-                if (calls == 0) { continue; }
+                // An idle gap between requests stops the call counter just like a give-up does, and
+                // the model load satisfies this branch for its whole duration, so only a device that
+                // actually tripped the bounded spin is worth a dump.
+                const int* flags = raw->stall;
+                const bool tripped =
+                    flags != nullptr &&
+                    (flags[0] != 0 || flags[kArTokenStrideBytes / sizeof(int)] != 0);
+                if (!tripped || calls == 0) {
+                    stalled = false;
+                    continue;
+                }
                 if (!stalled) {
                     stalled = true;
                     std::fprintf(stderr, "[ar-watch] stalled at calls=%llu\n", calls);
