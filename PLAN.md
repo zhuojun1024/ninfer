@@ -414,3 +414,80 @@ Split 预分词器用 `\p{L}+`（无 `\p{M}`）且 `trim_offsets=true`，引擎�
   `src=live`），但客户端重分词与采样边界不同、或边界落在 chunk 内（契约只保证 boundary crossing）时
   尾部复用仍会退化；保证逐 token 的唯一杠杆是携带 token id 的续写协议（未排期）。
 - TP-2 prefill 的首个 sample 未应用工具语法掩码（prefill 与 decode 路径不对称，独立遗留项）。
+
+### 3.10 TP-2 传输低频失败专项排查（2026-09-25）
+
+**目标**：定性并（若可行）根因定位采样臂连续长跑下的两次低频 engine 失败。
+
+**证据（两个实例，全战役仅此两次；扫描 `build-win/**` 全部 `.out`/`.log` 确认）**
+
+1. **IllegalAddress（2026-09-25 08:20:59，r67 q4all K=7 臂，req#14）**：
+   ```
+   tp2_generation_core.cpp:3119: CUDA_CHECK(cudaMemcpyAsync(licensed_host.data(),
+     frame.licensed_tokens.data, sizeof(TokenId)*width, D2H, shard_a_.device.stream))
+     failed: cudaErrorIllegalAddress
+   ```
+   这是**粘贴错误**：真正的越界 kernel 更早，报错点只是 round 末尾第一个 API 边界。日志无任何 503/停滞记录。
+   同臂重跑 15/15、90/90 全过；同 artifact 在改动前也是这个行为。
+2. **HTTP 503（2026-09-25 10:34:39，r69 final K=5 臂，req#14）**：请求体
+   `{"code":"service_unavailable","message":"TP-2 allreduce stalled at rendezvous id 8590057052: the request
+   was failed and the reusable context was discarded"}`。**不是崩溃**：这是有界自旋的设计行为
+   （`tp2_generation_core.cpp:1410 abort_if_ar_stalled()`）。id = `2<<32 + 122460` ⇒ 通道 index 1
+   （第 2 个创建的图），base 已累计 122460 次 collective，与「14 个请求 × K=5」的轮数×每轮 collective 数一致。
+
+**已排除**
+- 残留环境变量：HKCU/HKLM 与进程环境均**无** `NINFER_*`；故障注入
+  `NINFER_TP2_AR_FAULT_SKIP_PEER_CALL` 未开（`device_pair.cu:327-331` 在 0 时不计数、零开销），
+  超时为默认 **2000 ms**（`device_pair.cu:481`）。
+- 时钟：`ar_now_ns()` 用 `%globaltimer`（ns，设备内一致），deadline 语义正确（`device_pair.cu:113-123`）。
+- 边界：`ar_exchange` 的 group/tail 循环、parity 槽（`(token&1)*slot_bytes`）、stall 标志
+  （`stall_host_` 128 B = 2×64 B，`ar_stalled()` 读 flags[0]/flags[16]）与 store helper 的 `lane<=k`
+  逐项核对无越界；`count_bytes <= slot_bytes` 恒成立（小路径 64 KiB / 大路径 24 MiB 与各自守卫一致）。
+
+**机制判断**：一次失败的自旋会让**那一轮的本地偏和未被对端更新**（内核提前 return），
+而 host 只在**每轮收敛点**检查 trip 标志（`abort_if_ar_stalled()` 调用点 2751/3317）。
+若损坏数据在检测前被消费成**索引**（candidate/anchor/frontier/argmax），就会变成粘性
+illegal address ⇒ 两种表象可能是**同一事件在两个时刻被观察到**（干净 503 vs 先崩）。
+
+**验证结果（2026-09-25）**
+
+1. **长跑未复现**：`tools/tp_bootstrap/r71_ar_stress.ps1`（final/K=5、看门狗开启、600 请求、
+   首个失败后继续收集）**0 次失败** ⇒ 自然发生率低于 ~1/1350 请求，不能靠长跑排查。
+2. **注入可确定性复现，并证实「同一事件」**：`tools/tp_bootstrap/r72_stall_injection.ps1` 用既有注入点
+   `NINFER_TP2_AR_FAULT_SKIP_PEER_CALL=N` 在指定 collective 序号跳过一次对端启动：
+
+   | 注入序号 | 落点 | 结果 |
+   |---|---|---|
+   | 20 | warmup（eager） | `FATAL warmup failed … stalled at rendezvous id 1<<62+129`，引擎退出，无崩溃 |
+   | 280 / 300 / 330 / 360 / 400 / 440 / 480 | warmup 之后、prefill（eager） | **干净 503 + 下一请求 ok**（7/7） |
+   | 560 | captured 图内（`graph-ch2`） | 干净 503 |
+   | **700** | verify 窗口内 | **`tp2_generation_core.cpp:3119 cudaErrorIllegalAddress`**，与生产事故**逐字节同一条报错**，进程退出、连接被掐断 |
+
+   看门狗 dump 同时给出基线事实：warmup 结束于 `calls=268`（真实请求从 269 起），最后一个健康
+   collective 两侧 `arrA==arrB`（6 slices，大 payload 路径）。
+3. **二分定位：故障发生在窗口内部**。在失败分支的 `run_verify_window(...)`（`3100`）之后临时插入
+   `abort_if_ar_stalled()` 探针后重跑注入 700：探针**确实捕获了 trip**，而报错从 3119 变为
+   **`tp2_generation_core.cpp:1419`（`abort_if_ar_stalled` 内的 `cudaStreamSynchronize`）**
+   ⇒ 非法访问**已经在 verify 窗口（一个 captured 图）内部发生**，任何 host 侧检查都来不及。探针已回退。
+4. **工具边界（负面结论，重要）**：`CUDA_LAUNCH_BLOCKING=1` 与本传输**不兼容**——A 侧的 launch 变成阻塞，
+   而 B 侧内核要等它返回后才 launch ⇒ 第 1 次 collective 必然 give-up（自死锁）。`compute-sanitizer`
+   同理（串行化内核；把超时抬到 120 s 后 warmup 仍 give-up）⇒ **本传输无法用 launch 串行化工具做 kernel 级
+   归因**，只能靠源码级探针二分。
+
+**缺陷定性（已证）**：有界自旋 give-up 后，本轮各 collective 的偏和**只在本地**（对端贡献缺失），而 round
+会继续跑。phase 1b/2 的缓解只在**轮收敛点**（`abort_if_ar_stalled()`，调用点 2751/3317）检测，
+当 give-up 落在 **captured 窗口内部**时**来不及**：窗口自己的 kernel 把不一致的数据当**地址**用就会崩
+（已复现）。只有落在 eager prefill 的 give-up 才会走成干净 503 + 下一条请求恢复。
+
+**触发源（未决）**：自然 give-up 无法按需复现（600 请求 0 次；全战役 ~2700 请求 2 次）。生产那次 503 的
+rendezvous id（`2<<32+122460`）也在**captured 通道**内，与复现一致。需要 >2 s 的 host/device 延迟，
+或一次真实 desync（id 复用/错配）。已排除环境残留注入与默认超时被改。
+
+**处置建议（待决策）**
+- (a) **抓到触发源**：验收臂一律开 `NINFER_TP2_AR_WATCHDOG=1`，失败时把 dump 一起留档（`arrA vs arrB`
+  能区分「token 分歧」与「对端没写」）。
+- (b) **让 give-up 安全**：host 侧检查已被证伪（来不及）；要么让传输在 give-up 后不再继续消费
+  （毒化/中止语义），要么让窗口内做索引的算子对输入做范围约束——都是架构级改动，需要先知道确切算子。
+- (c) **止损**：默认超时 2000 ms 是相对**内核时间**（最慢 2.7 ms）的 700×，但对**host 侧停顿**并非安全余量；
+  抬高默认值可显著降低自然发生率，代价是真实 desync 的检测变慢（仍会失败，只是更晚）。
+- (d) **可诊断性**：窗口内 give-up 现在表现为一个语焉不详的 illegal address；即使不修安全性，也应让它可辨识。
