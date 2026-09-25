@@ -386,6 +386,26 @@ sessions-dflash2）；solo digest 与基线逐位相同（`0x4bcc3994a5efba7d`�
 `HTTP 503 service unavailable` 且无 FATAL 日志（重跑 90/90 全过）。两者都只出现在连续 ~90 请求的采样臂里，
 约 15 个臂共 2 次。
 
+**r69/r70 其余 Qwen3.8-27B 变体的最终件（2026-09-25）**：同一官方配方（无 override）+ 共用草稿源
+`D:/LLM/W4A16/NVFP4/W4A4+W8A8/DFlash2-FP8`，三个变体各产一件，均含 `text,vision,mtp,dflash2`：
+
+| 变体 | 源 | 最终件 | 大小 | 文本表示 | 转换 |
+|---|---|---|---|---|---|
+| W4A4 | `W4A16/NVFP4/W4A4` | `qwen3_8_27b_w4a4_dflash2_final.ninfer` | 18.42 GB | nvfp4 256 / fp8 2 | 336 s |
+| Swift-1.5 | `Swift-1.5-Qwen3.8-27b-NVFP4` | `qwen3_8_27b_swift15_dflash2_final.ninfer` | 21.58 GB | fp8 130 / nvfp4 128 | 413 s |
+| ThinkingCap | `ThinkingCap-Qwen3.8-27B-NVFP4A4-AWQ` | `qwen3_8_27b_thinkingcap_dflash2_final.ninfer` | 22.52 GB | fp8 146 / nvfp4 112 | 388 s |
+
+四件（含 w4a4+w8a8）的草稿剖面完全一致（q4 88 / q8 7 / bf16 567），append 冒烟测试**全部 PASS**：
+`peer selector on shard 1 = 66.9 MiB`、proposal cost 7.03–7.08 ms、K=7 proposal 确定性。
+
+**ThinkingCap 的 tokenizer 坑（已修）**：该导出由另一个 `tokenizers` 版本序列化——`tokenizer.json` 的
+Split 预分词器用 `\p{L}+`（无 `\p{M}`）且 `trim_offsets=true`，引擎的 Qwen tokenizer 拒绝
+（`pre_tokenizer.Split is not supported`）；且 `tokenizer_config.json` 缺引擎必需的
+`added_tokens_decoder`。该导出的 `vocab.json`/`merges.txt` 与规范导出**逐字节相同**，规范导出的 33 条
+`added_tokens_decoder` 与其 `tokenizer.json` 的 added_tokens **完全一致**，故用规范 `tokenizer.json`
+替换、并把缺失的 decoder 合并进该导出自己的 `tokenizer_config.json`（保留其模型专属字段）。
+见 `tools/tp_bootstrap/r70_convert_thinkingcap.ps1`。
+
 **执行顺序**：② 先行（改动集中、可用既有 oracle 验证），① 并行做设计/op oracle。
 
 ### 3.8 前缀复用：残留（2026-09-24）
