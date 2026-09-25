@@ -1,0 +1,41 @@
+2026-09-20 20:52:23.442  INFO  starting engine
+[mem] shard 0 capacity 204800 | weights+ctx 11414.6 | kv 3225.0 | state 293.6 | record 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 1184.0 of 16310.6 MiB
+[mem] shard 1 capacity 204800 | weights+ctx 11414.6 | kv 3225.0 | state 293.6 | record 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 1184.0 of 16310.6 MiB
+[tp2-graph] plain decode step: graph | verify step: eager
+2026-09-20 20:52:53.790  INFO  engine ready | qwen3.8-27b-w4a4-w8a8 | formats bf16,fp32,fp8_e4m3fn_row_bf16,nvfp4 | total 30.3s | weights 10.0 GiB
+2026-09-20 20:52:53.795  INFO  capacity | KV 204,800 tokens, fp8, explicit | pages 0/0 | runtime 0 B | free 0 B
+2026-09-20 20:52:53.799  INFO  context cache | root only
+[tp2-time] decode rounds=3 committed=3 avg_round=33.61ms mtp=0.00 verify=33.35 accept=0.04 copy=0.08 sync_wait=0.01 fold=0.00 prefill=949.2ms
+2026-09-20 20:52:54.849  INFO  warmup complete | 1.1s
+2026-09-20 20:52:54.849  INFO  listening on http://127.0.0.1:3457 | model qwen3.8-27b-w4a4-w8a8 | auth disabled
+2026-09-20 20:52:55.227  INFO  req#1 started | openai-chat non-stream | 2 messages | max output 1 | thinking xhigh
+2026-09-20 20:52:56.065  INFO  req#1 done | openai-chat | output limit | prompt 1,318 | output 1 | cache 0 (0.0%) | TTFT 835 ms | total 834 ms | prefill 1.58k tok/s (1,318 tok) | decode 0.0 tok/s
+2026-09-20 20:52:56.096  INFO  req#2 started | openai-chat non-stream | 2 messages | max output 1 | thinking xhigh
+2026-09-20 20:52:59.850  INFO  throughput | 5.0s | prefill 263.6 tok/s (1,318 tok) | running 0 | host 0.0% (0 us)
+2026-09-20 20:53:02.073  INFO  req#2 done | openai-chat | output limit | prompt 9,718 | output 1 | cache 0 (0.0%) | TTFT 6.0s | total 6.0s | prefill 1.63k tok/s (9,718 tok) | decode 0.0 tok/s
+2026-09-20 20:53:02.098  INFO  req#3 started | openai-chat non-stream | 2 messages | max output 32 | thinking xhigh
+[tp2-time] decode rounds=31 committed=31 avg_round=28.78ms mtp=0.00 verify=28.61 accept=0.04 copy=0.08 sync_wait=0.01 fold=0.00 prefill=331.1ms
+2026-09-20 20:53:03.322  INFO  req#3 done | openai-chat | output limit | prompt 518 | output 32 | cache 0 (0.0%) | TTFT 331 ms | total 1.2s | prefill 1.56k tok/s (518 tok) | decode 34.7 tok/s
+2026-09-20 20:53:03.360  INFO  req#4 started | openai-chat non-stream | 2 messages | max output 256 | thinking xhigh
+2026-09-20 20:53:04.851  INFO  throughput | 5.0s | prefill 2.05k tok/s (10,236 tok) | decode 6.2 tok/s (31 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-20 20:53:29.851  INFO  throughput | 5.0s | prefill 6.55k tok/s (32,768 tok) | decode 31.2 tok/s (156 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+[tp2-time] decode rounds=255 committed=255 avg_round=29.88ms mtp=0.00 verify=29.72 accept=0.04 copy=0.08 sync_wait=0.01 fold=0.00 prefill=21797.5ms
+2026-09-20 20:53:32.783  INFO  req#4 done | openai-chat | output limit | prompt 32,768 | output 256 | cache 0 (0.0%) | TTFT 21.8s | total 29.4s | prefill 1.50k tok/s (32,768 tok) | decode 33.5 tok/s
+2026-09-20 20:53:32.826  INFO  req#5 started | openai-chat non-stream | 2 messages | max output 256 | thinking xhigh
+2026-09-20 20:53:34.850  INFO  throughput | 5.0s | decode 19.8 tok/s (99 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-20 20:53:54.852  INFO  throughput | 5.0s | prefill 6.55k tok/s (32,768 tok) | decode 1.8 tok/s (9 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-20 20:53:59.850  INFO  throughput | 5.0s | decode 33.6 tok/s (168 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+[tp2-time] decode rounds=255 committed=255 avg_round=29.84ms mtp=0.00 verify=29.69 accept=0.04 copy=0.07 sync_wait=0.01 fold=0.00 prefill=21729.3ms
+2026-09-20 20:54:02.168  INFO  req#5 done | openai-chat | output limit | prompt 32,768 | output 256 | cache 0 (0.0%) | TTFT 21.7s | total 29.3s | prefill 1.51k tok/s (32,768 tok) | decode 33.5 tok/s
+2026-09-20 20:54:02.189  INFO  req#6 started | openai-chat non-stream | 2 messages | max output 256 | thinking xhigh
+2026-09-20 20:54:04.851  INFO  throughput | 5.0s | decode 15.6 tok/s (78 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-20 20:54:24.852  INFO  throughput | 5.0s | prefill 6.55k tok/s (32,768 tok) | decode 6.0 tok/s (30 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-20 20:54:29.852  INFO  throughput | 5.0s | decode 33.4 tok/s (167 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+[tp2-time] decode rounds=255 committed=255 avg_round=29.86ms mtp=0.00 verify=29.70 accept=0.04 copy=0.08 sync_wait=0.01 fold=0.00 prefill=21751.0ms
+2026-09-20 20:54:31.557  INFO  req#6 done | openai-chat | output limit | prompt 32,768 | output 256 | cache 0 (0.0%) | TTFT 21.8s | total 29.4s | prefill 1.51k tok/s (32,768 tok) | decode 33.5 tok/s
+2026-09-20 20:54:31.604  INFO  req#7 started | openai-chat non-stream | 2 messages | max output 256 | thinking xhigh
+2026-09-20 20:54:34.850  INFO  throughput | 5.0s | decode 11.6 tok/s (58 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-20 20:54:54.852  INFO  throughput | 5.0s | prefill 6.55k tok/s (32,768 tok) | decode 10.0 tok/s (50 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-20 20:54:59.853  INFO  throughput | 5.0s | decode 33.6 tok/s (168 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+[tp2-time] decode rounds=255 committed=255 avg_round=29.86ms mtp=0.00 verify=29.70 accept=0.04 copy=0.08 sync_wait=0.01 fold=0.00 prefill=21733.6ms
+2026-09-20 20:55:00.958  INFO  req#7 done | openai-chat | output limit | prompt 32,768 | output 256 | cache 0 (0.0%) | TTFT 21.7s | total 29.3s | prefill 1.51k tok/s (32,768 tok) | decode 33.5 tok/s

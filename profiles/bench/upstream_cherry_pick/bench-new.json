@@ -1,0 +1,79 @@
+{
+  "engine": "cherry-pick-new",
+  "base_url": "http://127.0.0.1:3456/v1",
+  "model": "qwen3.8-27b-w4a4-w8a8",
+  "started": "2026-09-21T14:04:11",
+  "finished": "2026-09-21T14:04:45",
+  "results": [
+    {
+      "tag": "prefill_2048",
+      "wall_s": 3.118,
+      "prompt_n": 1830,
+      "prompt_ms": 3112.6,
+      "prompt_per_second": 587.9,
+      "predicted_n": 1,
+      "predicted_ms": 0.0,
+      "predicted_per_second": 0.0,
+      "cache_n": 44,
+      "finish": "length",
+      "content_chars": 0,
+      "reasoning_chars": 0
+    },
+    {
+      "tag": "prefill_8192",
+      "wall_s": 4.608,
+      "prompt_n": 7154,
+      "prompt_ms": 4599.5,
+      "prompt_per_second": 1555.4,
+      "predicted_n": 1,
+      "predicted_ms": 0.0,
+      "predicted_per_second": 0.0,
+      "cache_n": 44,
+      "finish": "length",
+      "content_chars": 0,
+      "reasoning_chars": 0
+    },
+    {
+      "tag": "prefill_32768",
+      "wall_s": 19.228,
+      "prompt_n": 28571,
+      "prompt_ms": 19198.1,
+      "prompt_per_second": 1488.2,
+      "predicted_n": 1,
+      "predicted_ms": 0.0,
+      "predicted_per_second": 0.0,
+      "cache_n": 0,
+      "finish": "length",
+      "content_chars": 0,
+      "reasoning_chars": 0
+    },
+    {
+      "tag": "decode_short",
+      "wall_s": 1.413,
+      "prompt_n": 32,
+      "prompt_ms": 266.8,
+      "prompt_per_second": 119.9,
+      "predicted_n": 84,
+      "predicted_ms": 1144.5,
+      "predicted_per_second": 72.5,
+      "cache_n": 39,
+      "finish": "stop",
+      "content_chars": 95,
+      "reasoning_chars": 318
+    },
+    {
+      "tag": "decode_at_8192",
+      "wall_s": 5.695,
+      "prompt_n": 7160,
+      "prompt_ms": 4593.4,
+      "prompt_per_second": 1558.8,
+      "predicted_n": 83,
+      "predicted_ms": 1093.4,
+      "predicted_per_second": 75.0,
+      "cache_n": 39,
+      "finish": "stop",
+      "content_chars": 10,
+      "reasoning_chars": 292
+    }
+  ]
+}

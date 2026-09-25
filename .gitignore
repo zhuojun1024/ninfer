@@ -10,12 +10,6 @@ compile_commands.json
 CMakeUserPresets.json
 .cache/
 
-# CUDA / profiling artifacts
-*.nsys-rep
-*.ncu-rep
-*.qdrep
-*.sqlite
-
 # Python tooling
 __pycache__/
 *.pyc
@@ -24,15 +18,13 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Weight artifacts (large; produced by offline tooling)
+# Raw third-party weight checkpoints (large; produced by offline tooling).
+# Engine artifacts (*.ninfer) under out/ ARE tracked: this is a personal fork.
 *.qus
 *.bin
 *.safetensors
 *.gguf
-*.ninfer
-*.ninfer.conversion.json
 /models/
-out/
 
 # Local workspace and transient runtime output
 /.local/
@@ -43,6 +35,7 @@ out/
 /AGENTS.override.md
 /logs/
 *.log
+!profiles/**/*.log
 *.tmp
 /core
 /core.*
@@ -57,7 +50,6 @@ tools/freq_corpus/fixtures/*
 .idea/
 *.swp
 .DS_Store
-profiles/
 .chatgpt/
 
 # Claude Code personal/local settings (may contain API tokens)

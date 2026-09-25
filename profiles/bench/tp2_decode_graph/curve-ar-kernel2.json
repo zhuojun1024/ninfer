@@ -1,0 +1,96 @@
+{
+  "label": "ar-kernel2",
+  "base_url": "http://127.0.0.1:3457/v1",
+  "model": "qwen3.8-27b-w4a4-w8a8",
+  "started": "2026-09-20T20:52:55",
+  "finished": "2026-09-20T20:55:00",
+  "decode_tokens": 256,
+  "repetitions": 4,
+  "calibration": {
+    "tokens_per_sentence": 25.0,
+    "overhead_tokens": 118.0
+  },
+  "summary": [
+    {
+      "target": 32768,
+      "context": 32768.0,
+      "cache_n": 0.0,
+      "prefill_tps": 1506.4,
+      "prefill_sd": 2.2,
+      "decode_tps": 33.48,
+      "decode_sd": 0.02,
+      "decode_reps": 4,
+      "acceptance": 0.0
+    }
+  ],
+  "records": [
+    {
+      "target": 32768,
+      "tag": "size_32768_rep1",
+      "wall_s": 29.45,
+      "prompt_total": 32768,
+      "prompt_n": 32768,
+      "cache_n": 0,
+      "prompt_ms": 21797.533,
+      "prompt_per_second": 1503.29,
+      "predicted_n": 256,
+      "predicted_ms": 7621.548,
+      "predicted_per_second": 33.46,
+      "draft_n": 0,
+      "draft_n_accepted": 0,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "target": 32768,
+      "tag": "size_32768_rep2",
+      "wall_s": 29.358,
+      "prompt_total": 32768,
+      "prompt_n": 32768,
+      "cache_n": 0,
+      "prompt_ms": 21729.266,
+      "prompt_per_second": 1508.01,
+      "predicted_n": 256,
+      "predicted_ms": 7611.83,
+      "predicted_per_second": 33.5,
+      "draft_n": 0,
+      "draft_n_accepted": 0,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "target": 32768,
+      "tag": "size_32768_rep3",
+      "wall_s": 29.386,
+      "prompt_total": 32768,
+      "prompt_n": 32768,
+      "cache_n": 0,
+      "prompt_ms": 21750.957,
+      "prompt_per_second": 1506.51,
+      "predicted_n": 256,
+      "predicted_ms": 7616.89,
+      "predicted_per_second": 33.48,
+      "draft_n": 0,
+      "draft_n_accepted": 0,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "target": 32768,
+      "tag": "size_32768_rep4",
+      "wall_s": 29.371,
+      "prompt_total": 32768,
+      "prompt_n": 32768,
+      "cache_n": 0,
+      "prompt_ms": 21733.65,
+      "prompt_per_second": 1507.71,
+      "predicted_n": 256,
+      "predicted_ms": 7615.959,
+      "predicted_per_second": 33.48,
+      "draft_n": 0,
+      "draft_n_accepted": 0,
+      "finish_reason": "length",
+      "error": null
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+[mem] host sessions capacity 0 | host KV 0.0 MiB/shard | retention disabled
+[mem] shard 0 capacity 2048 | weights+ctx 11416.6 | kv 64.0 | state 293.6 | record 0.0 | draft-snap 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 4342.0 of 16310.6 MiB
+[mem] host-checkpoints shard 0 slots 9 (grid 4 + tail 4 + divergence 1) x 73.4 MiB | stride 8192 tok | pinned 660.7 MiB
+[mem] shard 1 capacity 2048 | weights+ctx 11416.6 | kv 64.0 | state 293.6 | record 0.0 | draft-snap 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 4342.0 of 16310.6 MiB
+[mem] host-checkpoints shard 1 slots 9 (grid 4 + tail 4 + divergence 1) x 73.4 MiB | stride 8192 tok | pinned 660.7 MiB
+[tp2-graph] plain decode step: graph | verify step: eager | mtp chain: graph
+[tp2-reuse] prompt=64 cached=0 shared=0 prefill_end=0 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-reuse] prompt=88 cached=64 shared=64 prefill_end=64 rewind=0 host=0/9 stride=8192 -> reuse=64 slot=0 src=device
+[tp2-reuse] prompt=640 cached=88 shared=0 prefill_end=88 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-reuse] prompt=664 cached=640 shared=640 prefill_end=640 rewind=512 host=2/9 stride=8192 -> reuse=640 slot=0 src=device
+[tp2-reuse] prompt=88 cached=664 shared=0 prefill_end=664 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-reuse] prompt=48 cached=88 shared=0 prefill_end=88 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-reuse] prompt=640 cached=48 shared=0 prefill_end=48 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-reuse] prompt=48 cached=640 shared=0 prefill_end=640 rewind=512 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-reuse] prompt=640 cached=48 shared=0 prefill_end=48 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-reuse] prompt=48 cached=640 shared=0 prefill_end=640 rewind=512 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-reuse] prompt=600 cached=48 shared=0 prefill_end=48 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-reuse] prompt=1000 cached=600 shared=0 prefill_end=600 rewind=512 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-reuse] prompt=1024 cached=1000 shared=1000 prefill_end=1000 rewind=768 host=3/9 stride=8192 -> reuse=1000 slot=0 src=device
+[mem] host sessions capacity 3 | host KV 64.0 MiB/shard | retention enabled
+[mem] shard 0 capacity 2048 | weights+ctx 11424.6 | kv 64.0 | state 293.6 | record 0.0 | draft-snap 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 4334.0 of 16310.6 MiB
+[mem] host-checkpoints shard 0 slots 9 (grid 4 + tail 4 + divergence 1) x 73.4 MiB | stride 8192 tok | pinned 660.7 MiB
+[mem] shard 1 capacity 2048 | weights+ctx 11424.6 | kv 64.0 | state 293.6 | record 0.0 | draft-snap 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 4334.0 of 16310.6 MiB
+[mem] host-checkpoints shard 1 slots 9 (grid 4 + tail 4 + divergence 1) x 73.4 MiB | stride 8192 tok | pinned 660.7 MiB
+[tp2-session] host budget 64.0 MiB/shard holds 1 of 2 full-context sessions (64.0 MiB each)
+[tp2-graph] plain decode step: graph | verify step: eager | mtp chain: graph
+[tp2-session] switch active_shared=0 resident_depth=0 stored=1 entries=0
+[tp2-reuse] prompt=64 cached=0 shared=0 prefill_end=0 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-session] host KV arena shard 0: 64.0 MiB pageable, 1 layouts
+[tp2-session] host KV arena shard 1: 64.0 MiB pageable, 1 layouts
+[tp2-session] switch active_shared=0 resident_depth=0 stored=1 entries=1
+[tp2-reuse] prompt=48 cached=72 shared=0 prefill_end=64 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-session]   entry 0 tokens=72 frontier=71 prompt_end=64 shared_end=0 shared=72 reach=71 via=frontier resident=0
+[tp2-session] recall frontier=71 resident_depth=0 tokens=72 entries=2
+[tp2-reuse] prompt=88 cached=72 shared=72 prefill_end=0 rewind=0 host=0/9 stride=8192 -> reuse=71 slot=0 src=live
+[tp2-session]   entry 1 tokens=56 frontier=55 prompt_end=48 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session] switch active_shared=0 resident_depth=0 stored=1 entries=2
+[tp2-reuse] prompt=48 cached=96 shared=0 prefill_end=88 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-session]   entry 0 tokens=96 frontier=95 prompt_end=88 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=56 frontier=55 prompt_end=48 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session] switch active_shared=0 resident_depth=0 stored=1 entries=3
+[tp2-reuse] prompt=48 cached=56 shared=0 prefill_end=48 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-session] evict frontier=55 tokens=56
+[tp2-session]   entry 0 tokens=96 frontier=95 prompt_end=88 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=56 frontier=55 prompt_end=48 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session] switch active_shared=0 resident_depth=0 stored=1 entries=3
+[tp2-reuse] prompt=48 cached=56 shared=0 prefill_end=48 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-session] evict frontier=95 tokens=96
+[tp2-session]   entry 0 tokens=56 frontier=55 prompt_end=48 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=56 frontier=55 prompt_end=48 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session] switch active_shared=0 resident_depth=0 stored=1 entries=3
+[tp2-reuse] prompt=88 cached=56 shared=0 prefill_end=48 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-session] evict frontier=55 tokens=56
+[tp2-session]   entry 0 tokens=56 frontier=55 prompt_end=48 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=56 frontier=55 prompt_end=48 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session] switch active_shared=0 resident_depth=0 stored=1 entries=3
+[tp2-reuse] prompt=640 cached=96 shared=0 prefill_end=88 rewind=0 host=0/9 stride=8192 -> reuse=0 slot=0 src=none
+[tp2-session] evict frontier=55 tokens=56
+[tp2-session]   entry 0 tokens=56 frontier=55 prompt_end=48 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=96 frontier=95 prompt_end=88 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session] switch active_shared=512 resident_depth=512 stored=1 entries=3
+[tp2-reuse] prompt=640 cached=648 shared=512 prefill_end=640 rewind=512 host=2/9 stride=8192 -> reuse=512 slot=1 src=device
+[tp2-session] evict frontier=55 tokens=56
+[tp2-session]   entry 0 tokens=96 frontier=95 prompt_end=88 shared_end=0 shared=0 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=648 frontier=647 prompt_end=640 shared_end=512 shared=648 reach=647 via=frontier resident=0
+[tp2-session] recall frontier=647 resident_depth=512 tokens=648 entries=3
+[tp2-reuse] prompt=664 cached=648 shared=648 prefill_end=0 rewind=0 host=0/9 stride=8192 -> reuse=647 slot=0 src=live
+FAIL (plain): a conversation behind a shared system prompt diverged from the oracle: got [2752 13 198 197 197 92 198 197] expected [365 2798 349 543 220 197 92 198]

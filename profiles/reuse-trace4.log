@@ -1,0 +1,123 @@
+2026-09-24 02:25:35.800  INFO  starting engine
+[mem] host sessions capacity 4 | host KV 12288.0 MiB/shard | retention enabled
+[mem] shard 0 DFlash2 round | targets 25600 x 1024 | ring 40.0 | context 90.4 | frame 4.4 | proposal 4.4 MiB
+[mem] shard 0 capacity 262144 | weights+ctx 12750.6 | kv 3216.0 | state 293.6 | record 6.8 | draft-snap 80.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 0.0 of 16310.6 MiB
+[mem] host-checkpoints shard 0 slots 33 (grid 24 + tail 8 + divergence 1) x 73.4 MiB | stride 11008 tok | pinned 3742.4 MiB
+[mem] vision shard 1 item ceiling 8192 | encode peak 413.3 | handoff 80.0 | arena 413.3 MiB
+[mem] shard 1 capacity 262144 | weights+ctx 12114.6 | kv 3216.0 | state 293.6 | record 6.8 | draft-snap 0.0 | round 0.0 | workspace 192.0 | vision 413.3 | free 70.0 of 16310.6 MiB
+[mem] host-checkpoints shard 1 slots 33 (grid 24 + tail 8 + divergence 1) x 73.4 MiB | stride 11008 tok | pinned 2422.4 MiB
+[tp2-session] host budget 12288.0 MiB/shard holds 3 of 3 full-context sessions (3216.0 MiB each)
+[tp2-graph] plain decode step: graph | verify step: graph | mtp chain: graph
+2026-09-24 02:26:24.794  INFO  engine ready | qwen3.8-27b-w4a4-w8a8-draftall | total 49.0s | weights 11.3 GiB
+2026-09-24 02:26:24.794  INFO  capacity | KV 262,144 tokens, k8v4, explicit | pages 0/0 | runtime 0 B | free 0 B
+2026-09-24 02:26:24.794  INFO  context cache | root only
+2026-09-24 02:26:24.794  INFO  media | 16 preprocess workers | cache 1.00 GiB | live 2.00 GiB
+[tp2-session] switch active_shared=0 resident_depth=0 stored=1 entries=0
+[tp2-reuse] prompt=53 cached=0 shared=0 prefill_end=0 rewind=0 host=0/33 stride=11008 -> reuse=0 slot=0 src=none
+2026-09-24 02:26:26.030  INFO  warmup complete | 1.2s
+2026-09-24 02:26:26.030  INFO  listening on http://0.0.0.0:3456 | model qwen3.8-27b-w4a4-w8a8-draftall | auth disabled
+2026-09-24 02:26:26.041  INFO  req#1 started | openai-chat non-stream | 2 messages | max output 4 | thinking template default | preserve thinking
+[tp2-session] host KV arena shard 0: 12288.0 MiB pageable, 1 layouts
+[tp2-session] host KV arena shard 1: 12288.0 MiB pageable, 1 layouts
+[tp2-session] switch active_shared=40 resident_depth=0 stored=1 entries=1
+[tp2-reuse] prompt=57 cached=57 shared=40 prefill_end=53 rewind=0 host=0/33 stride=11008 -> reuse=0 slot=0 src=none
+2026-09-24 02:26:26.389  INFO  req#1 done | openai-chat | output limit | prompt 57 | output 4 | cache 0 (0.0%) | TTFT 292 ms | total 348 ms | prefill 195.6 tok/s (57 tok) | decode 53.5 tok/s | dflash2 accepted 2/2 (100.0%)
+2026-09-24 02:26:26.395  INFO  req#2 started | openai-chat non-stream | 1 message | max output 3,000 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=57 frontier=56 prompt_end=53 shared_end=32 shared=45 reach=32 via=shared resident=0
+[tp2-session] switch active_shared=40 resident_depth=32 stored=1 entries=2
+[tp2-reuse] prompt=72 cached=61 shared=40 prefill_end=57 rewind=0 host=2/33 stride=11008 -> reuse=0 slot=0 src=none
+2026-09-24 02:26:31.032  INFO  throughput | 5.0s | prefill 25.8 tok/s (129 tok) | decode 82.6 tok/s (413 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-24 02:26:36.032  INFO  throughput | 5.0s | decode 151.8 tok/s (759 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-24 02:26:41.031  INFO  throughput | 5.0s | decode 180.8 tok/s (904 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-24 02:26:46.032  INFO  throughput | 5.0s | decode 179.2 tok/s (896 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-24 02:26:46.168  INFO  req#2 done | openai-chat | output limit | prompt 72 | output 3,000 | cache 0 (0.0%) | TTFT 217 ms | total 19.8s | prefill 333.2 tok/s (72 tok) | decode 153.3 tok/s | dflash2 accepted 2,555/3,106 (82.3%)
+2026-09-24 02:26:46.180  INFO  req#3 started | openai-chat non-stream | 3 messages | max output 1 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=57 frontier=56 prompt_end=53 shared_end=32 shared=45 reach=32 via=shared resident=0
+[tp2-session]   entry 1 tokens=61 frontier=60 prompt_end=57 shared_end=0 shared=40 reach=0 via=none resident=0
+[tp2-session] continue active_shared=72 resident_depth=72 frontier=3071 prompt_end=72 entries=3
+[tp2-reuse] prompt=3087 cached=3072 shared=72 prefill_end=72 rewind=0 host=2/33 stride=11008 -> reuse=0 slot=0 src=none
+2026-09-24 02:26:48.095  INFO  req#3 done | openai-chat | output limit | prompt 3,087 | output 1 | cache 0 (0.0%) | TTFT 1.9s | total 1.9s | prefill 1.61k tok/s (3,087 tok) | decode 0.0 tok/s
+2026-09-24 02:26:51.032  INFO  throughput | 5.0s | prefill 617.4 tok/s (3,087 tok) | decode 6.0 tok/s (30 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-24 02:27:16.052  INFO  req#4 started | openai-chat non-stream | 1 message | max output 1 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=57 frontier=56 prompt_end=53 shared_end=32 shared=45 reach=32 via=shared resident=0
+[tp2-session]   entry 1 tokens=61 frontier=60 prompt_end=57 shared_end=0 shared=40 reach=0 via=none resident=0
+[tp2-session] switch active_shared=72 resident_depth=64 stored=1 entries=3
+[tp2-reuse] prompt=72 cached=3088 shared=72 prefill_end=3087 rewind=3072 host=3/33 stride=11008 -> reuse=0 slot=0 src=none
+2026-09-24 02:27:16.679  INFO  req#4 done | openai-chat | output limit | prompt 72 | output 1 | cache 0 (0.0%) | TTFT 628 ms | total 627 ms | prefill 114.8 tok/s (72 tok) | decode 0.0 tok/s
+2026-09-24 02:27:16.690  INFO  req#5 started | openai-chat non-stream | 3 messages | max output 1 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=57 frontier=56 prompt_end=53 shared_end=32 shared=45 reach=32 via=shared resident=0
+[tp2-session]   entry 1 tokens=61 frontier=60 prompt_end=57 shared_end=0 shared=40 reach=0 via=none resident=0
+[tp2-session]   entry 2 tokens=3088 frontier=3087 prompt_end=3087 shared_end=0 shared=71 reach=0 via=none resident=0
+[tp2-session] switch active_shared=71 resident_depth=64 stored=1 entries=4
+[tp2-reuse] prompt=87 cached=73 shared=71 prefill_end=72 rewind=0 host=3/33 stride=11008 -> reuse=0 slot=0 src=none
+[tp2-session] evict frontier=56 tokens=57
+2026-09-24 02:27:17.022  INFO  req#5 done | openai-chat | output limit | prompt 87 | output 1 | cache 0 (0.0%) | TTFT 333 ms | total 333 ms | prefill 261.5 tok/s (87 tok) | decode 0.0 tok/s
+2026-09-24 02:27:17.029  INFO  req#6 started | openai-chat non-stream | 1 message | max output 2 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=61 frontier=60 prompt_end=57 shared_end=0 shared=40 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=3088 frontier=3087 prompt_end=3087 shared_end=0 shared=72 reach=0 via=none resident=0
+[tp2-session]   entry 2 tokens=73 frontier=72 prompt_end=72 shared_end=63 shared=72 reach=63 via=shared resident=0
+[tp2-session] switch active_shared=71 resident_depth=64 stored=1 entries=4
+[tp2-reuse] prompt=72 cached=88 shared=71 prefill_end=87 rewind=0 host=4/33 stride=11008 -> reuse=0 slot=0 src=none
+[tp2-session] evict frontier=60 tokens=61
+2026-09-24 02:27:17.354  INFO  req#6 done | openai-chat | output limit | prompt 72 | output 2 | cache 0 (0.0%) | TTFT 269 ms | total 324 ms | prefill 268.0 tok/s (72 tok) | decode 18.0 tok/s
+2026-09-24 02:27:17.361  INFO  req#7 started | openai-chat non-stream | 3 messages | max output 1 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=3088 frontier=3087 prompt_end=3087 shared_end=0 shared=73 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=73 frontier=72 prompt_end=72 shared_end=63 shared=72 reach=72 via=frontier resident=0
+[tp2-session]   entry 2 tokens=88 frontier=87 prompt_end=87 shared_end=0 shared=71 reach=0 via=none resident=0
+[tp2-session] continue active_shared=72 resident_depth=72 frontier=73 prompt_end=72 entries=4
+[tp2-reuse] prompt=89 cached=74 shared=72 prefill_end=72 rewind=0 host=4/33 stride=11008 -> reuse=0 slot=0 src=none
+2026-09-24 02:27:17.446  INFO  req#7 done | openai-chat | output limit | prompt 89 | output 1 | cache 0 (0.0%) | TTFT 86.3 ms | total 85.7 ms | prefill 1.04k tok/s (89 tok) | decode 0.0 tok/s
+2026-09-24 02:27:17.452  INFO  req#8 started | openai-chat non-stream | 1 message | max output 3 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=3088 frontier=3087 prompt_end=3087 shared_end=0 shared=72 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=73 frontier=72 prompt_end=72 shared_end=63 shared=72 reach=63 via=shared resident=0
+[tp2-session]   entry 2 tokens=88 frontier=87 prompt_end=87 shared_end=0 shared=71 reach=0 via=none resident=0
+[tp2-session] switch active_shared=72 resident_depth=64 stored=1 entries=4
+[tp2-reuse] prompt=72 cached=90 shared=72 prefill_end=89 rewind=0 host=4/33 stride=11008 -> reuse=0 slot=0 src=none
+[tp2-session] evict frontier=3087 tokens=3088
+2026-09-24 02:27:17.720  INFO  req#8 done | openai-chat | output limit | prompt 72 | output 3 | cache 0 (0.0%) | TTFT 218 ms | total 268 ms | prefill 331.2 tok/s (72 tok) | decode 39.8 tok/s | dflash2 accepted 1/1 (100.0%)
+2026-09-24 02:27:17.728  INFO  req#9 started | openai-chat non-stream | 3 messages | max output 1 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=73 frontier=72 prompt_end=72 shared_end=63 shared=72 reach=72 via=frontier resident=0
+[tp2-session]   entry 1 tokens=88 frontier=87 prompt_end=87 shared_end=0 shared=71 reach=0 via=none resident=0
+[tp2-session]   entry 2 tokens=90 frontier=89 prompt_end=89 shared_end=0 shared=73 reach=0 via=none resident=0
+[tp2-session] continue active_shared=72 resident_depth=72 frontier=74 prompt_end=72 entries=4
+[tp2-reuse] prompt=90 cached=75 shared=72 prefill_end=72 rewind=0 host=4/33 stride=11008 -> reuse=0 slot=0 src=none
+2026-09-24 02:27:17.814  INFO  req#9 done | openai-chat | output limit | prompt 90 | output 1 | cache 0 (0.0%) | TTFT 86.8 ms | total 86.1 ms | prefill 1.04k tok/s (90 tok) | decode 0.0 tok/s
+2026-09-24 02:27:17.821  INFO  req#10 started | openai-chat non-stream | 1 message | max output 6 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=73 frontier=72 prompt_end=72 shared_end=63 shared=72 reach=63 via=shared resident=0
+[tp2-session]   entry 1 tokens=88 frontier=87 prompt_end=87 shared_end=0 shared=71 reach=0 via=none resident=0
+[tp2-session]   entry 2 tokens=90 frontier=89 prompt_end=89 shared_end=0 shared=72 reach=0 via=none resident=0
+[tp2-session] switch active_shared=72 resident_depth=64 stored=1 entries=4
+[tp2-reuse] prompt=72 cached=91 shared=72 prefill_end=90 rewind=0 host=4/33 stride=11008 -> reuse=0 slot=0 src=none
+[tp2-session] evict frontier=72 tokens=73
+2026-09-24 02:27:18.091  INFO  req#10 done | openai-chat | output limit | prompt 72 | output 6 | cache 0 (0.0%) | TTFT 220 ms | total 270 ms | prefill 328.6 tok/s (72 tok) | decode 98.8 tok/s | dflash2 accepted 4/4 (100.0%)
+2026-09-24 02:27:18.099  INFO  req#11 started | openai-chat non-stream | 3 messages | max output 1 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=88 frontier=87 prompt_end=87 shared_end=0 shared=71 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=90 frontier=89 prompt_end=89 shared_end=0 shared=73 reach=0 via=none resident=0
+[tp2-session]   entry 2 tokens=91 frontier=90 prompt_end=90 shared_end=0 shared=74 reach=0 via=none resident=0
+[tp2-session] continue active_shared=72 resident_depth=72 frontier=77 prompt_end=72 entries=4
+[tp2-reuse] prompt=93 cached=78 shared=72 prefill_end=72 rewind=0 host=4/33 stride=11008 -> reuse=0 slot=0 src=none
+2026-09-24 02:27:18.186  INFO  req#11 done | openai-chat | output limit | prompt 93 | output 1 | cache 0 (0.0%) | TTFT 88.0 ms | total 87.4 ms | prefill 1.06k tok/s (93 tok) | decode 0.0 tok/s
+2026-09-24 02:27:21.031  INFO  throughput | 5.0s | prefill 129.4 tok/s (647 tok) | decode 1.6 tok/s (8 tok) | running 0 | batch 1.00 | host 0.0% (0 us)
+2026-09-24 02:27:46.833  INFO  req#12 started | openai-chat non-stream | 1 message | max output 1 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=88 frontier=87 prompt_end=87 shared_end=0 shared=71 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=90 frontier=89 prompt_end=89 shared_end=0 shared=72 reach=0 via=none resident=0
+[tp2-session]   entry 2 tokens=91 frontier=90 prompt_end=90 shared_end=0 shared=72 reach=0 via=none resident=0
+[tp2-session] switch active_shared=72 resident_depth=64 stored=1 entries=4
+[tp2-reuse] prompt=72 cached=94 shared=72 prefill_end=93 rewind=0 host=4/33 stride=11008 -> reuse=0 slot=0 src=none
+[tp2-session] evict frontier=87 tokens=88
+2026-09-24 02:27:47.342  INFO  req#12 done | openai-chat | output limit | prompt 72 | output 1 | cache 0 (0.0%) | TTFT 509 ms | total 509 ms | prefill 141.5 tok/s (72 tok) | decode 0.0 tok/s
+2026-09-24 02:27:47.348  INFO  req#13 started | openai-chat non-stream | 1 message | max output 1 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=90 frontier=89 prompt_end=89 shared_end=0 shared=72 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=91 frontier=90 prompt_end=90 shared_end=0 shared=72 reach=0 via=none resident=0
+[tp2-session]   entry 2 tokens=94 frontier=93 prompt_end=93 shared_end=0 shared=72 reach=0 via=none resident=0
+[tp2-session] continue active_shared=72 resident_depth=72 frontier=72 prompt_end=72 entries=4
+[tp2-reuse] prompt=72 cached=73 shared=72 prefill_end=72 rewind=0 host=4/33 stride=11008 -> reuse=0 slot=0 src=none
+2026-09-24 02:27:47.426  INFO  req#13 done | openai-chat | output limit | prompt 72 | output 1 | cache 0 (0.0%) | TTFT 78.7 ms | total 78.1 ms | prefill 922.8 tok/s (72 tok) | decode 0.0 tok/s
+2026-09-24 02:27:47.428  INFO  req#14 started | openai-chat non-stream | 1 message | max output 2 | thinking template default | preserve thinking
+[tp2-session]   entry 0 tokens=90 frontier=89 prompt_end=89 shared_end=0 shared=72 reach=0 via=none resident=0
+[tp2-session]   entry 1 tokens=91 frontier=90 prompt_end=90 shared_end=0 shared=72 reach=0 via=none resident=0
+[tp2-session]   entry 2 tokens=94 frontier=93 prompt_end=93 shared_end=0 shared=72 reach=0 via=none resident=0
+[tp2-session] continue active_shared=72 resident_depth=72 frontier=72 prompt_end=72 entries=4
+[tp2-reuse] prompt=72 cached=73 shared=72 prefill_end=72 rewind=0 host=4/33 stride=11008 -> reuse=0 slot=0 src=none
+2026-09-24 02:27:47.563  INFO  req#14 done | openai-chat | output limit | prompt 72 | output 2 | cache 0 (0.0%) | TTFT 78.2 ms | total 134 ms | prefill 925.5 tok/s (72 tok) | decode 17.8 tok/s
+2026-09-24 02:27:51.030  INFO  throughput | 5.0s | prefill 43.2 tok/s (216 tok) | decode 0.2 tok/s (1 tok) | running 0 | batch 1.00 | host 0.0% (0 us)

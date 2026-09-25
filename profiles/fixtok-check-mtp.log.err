@@ -1,0 +1,21 @@
+[mem] host sessions capacity 0 | host KV 0.0 MiB/shard | retention disabled
+[mem] shard 0 capacity 2048 | weights+ctx 12452.6 | kv 36.4 | state 293.6 | record 2.6 | draft-snap 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 3330.0 of 16310.6 MiB
+[mem] host-checkpoints shard 0 slots 9 (grid 4 + tail 4 + divergence 1) x 73.4 MiB | stride 8192 tok | pinned 660.7 MiB
+[mem] shard 1 capacity 2048 | weights+ctx 12022.6 | kv 32.3 | state 293.6 | record 2.6 | draft-snap 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 3764.0 of 16310.6 MiB
+[mem] host-checkpoints shard 1 slots 9 (grid 4 + tail 4 + divergence 1) x 73.4 MiB | stride 8192 tok | pinned 660.7 MiB
+[tp2-graph] plain decode step: graph | verify step: graph | mtp chain: graph
+[mem] host sessions capacity 0 | host KV 0.0 MiB/shard | retention disabled
+[mem] shard 0 capacity 2048 | weights+ctx 12454.6 | kv 36.4 | state 293.6 | record 2.6 | draft-snap 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 3328.0 of 16310.6 MiB
+[mem] host-checkpoints shard 0 slots 9 (grid 4 + tail 4 + divergence 1) x 73.4 MiB | stride 8192 tok | pinned 660.7 MiB
+[mem] shard 1 capacity 2048 | weights+ctx 12024.6 | kv 32.3 | state 293.6 | record 2.6 | draft-snap 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 3762.0 of 16310.6 MiB
+[mem] host-checkpoints shard 1 slots 9 (grid 4 + tail 4 + divergence 1) x 73.4 MiB | stride 8192 tok | pinned 660.7 MiB
+[tp2-graph] plain decode step: graph | verify step: graph | mtp chain: graph
+[mem] host sessions capacity 3 | host KV 64.0 MiB/shard | retention enabled
+[mem] shard 0 capacity 2048 | weights+ctx 12464.6 | kv 36.4 | state 293.6 | record 2.6 | draft-snap 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 3318.0 of 16310.6 MiB
+[mem] host-checkpoints shard 0 slots 9 (grid 4 + tail 4 + divergence 1) x 73.4 MiB | stride 8192 tok | pinned 660.7 MiB
+[mem] shard 1 capacity 2048 | weights+ctx 12034.6 | kv 32.3 | state 293.6 | record 2.6 | draft-snap 0.0 | round 0.0 | workspace 192.0 | vision 0.0 | free 3752.0 of 16310.6 MiB
+[mem] host-checkpoints shard 1 slots 9 (grid 4 + tail 4 + divergence 1) x 73.4 MiB | stride 8192 tok | pinned 660.7 MiB
+[tp2-session] host budget 64.0 MiB/shard holds 1 of 2 full-context sessions (32.2 MiB each)
+[tp2-graph] plain decode step: graph | verify step: graph | mtp chain: graph
+[tp2-session] host KV arena shard 0: 64.0 MiB pageable, 2 layouts
+[tp2-session] host KV arena shard 1: 64.0 MiB pageable, 1 layouts

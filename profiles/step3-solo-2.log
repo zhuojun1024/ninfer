@@ -1,0 +1,11 @@
+[solo] opening reused=0 tokens=[62 16 15 15 15 15 15 15]
+[solo] other_a reused=0 tokens=[220 17 15 16 20 11 220 17]
+[solo] a_continued reused=71 tokens=[365 2798 360 363 62 16 15 15]
+[solo] other_b reused=0 tokens=[220 16 24 24 23 26 220 16]
+[solo] other_c reused=0 tokens=[290 198 220 220 16 15 20 20]
+[solo] other_d reused=0 tokens=[793 11 220 221 221 221 221 221]
+[solo] a_continued_evicted reused=0 tokens=[365 2798 360 363 62 16 15 15]
+[solo] shared_a reused=0 tokens=[197 197 92 198 197 197 92 198]
+[solo] shared_b reused=512 tokens=[1703 220 248046 198 248045 198 248045 198]
+[solo] digest=0x4bcc3994a5efba7d
+[solo] PASS
