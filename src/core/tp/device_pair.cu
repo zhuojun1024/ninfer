@@ -445,6 +445,10 @@ void DevicePair::start_ar_watchdog() {
             if (raw->stop.load(std::memory_order_relaxed)) { break; }
             const unsigned long long calls = raw->calls.load(std::memory_order_relaxed);
             if (calls == last_calls) {
+                // Before the first collective there is nothing to diagnose, and the model load makes
+                // that the common case: skipping it keeps a dump meaningful instead of ~100 lines of
+                // empty slots between the load and the first request.
+                if (calls == 0) { continue; }
                 if (!stalled) {
                     stalled = true;
                     std::fprintf(stderr, "[ar-watch] stalled at calls=%llu\n", calls);
