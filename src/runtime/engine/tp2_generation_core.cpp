@@ -2744,12 +2744,12 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             // First token: sample from the last chunk's last-column logits.
             ops::set_i32_scalar(logical_pos_a, static_cast<std::int32_t>(prompt_tokens),
                                 shard_a_.device.stream);
-            // The declared-name grammar binds the first generated token exactly as it binds every
-            // later one. That token is content, so an unmasked sample could leave the tool-call
-            // region before the grammar ever saw a token, and the decode loop would then carry a
-            // continuation the grammar never licensed. The decode path applies the same mask to its
-            // single [vocab, 1] column; the grammar is inspected against the empty prefix here
-            // because nothing has been committed yet.
+            // Path parity with the decode loop, deliberately not a behaviour change: the grammar
+            // starts in its free-text position, so build_mask() reports the empty prefix as
+            // unconstrained (tests/test_tool_call_constraint.cpp pins that) and no mask is applied
+            // here today. Applying the decode path's mask at the same site anyway keeps the prefill
+            // path from silently depending on that asymmetry if a constrained first position is
+            // ever introduced.
             if (constraint_live()) {
                 constraint_advance();
                 if (tool_constraint->build_mask(logits_domain, tool_mask_one)) {
