@@ -939,6 +939,12 @@ public:
                 throw std::logic_error(
                     "Program could neither retain nor discard terminal sequence");
             }
+            // A terminal Finish that could not form its own retention converges to Discard, so a
+            // rollback the Program published on the way is released here rather than catalogued.
+            if (discarded.continuation) {
+                (void)program.release_continuation(std::move(*discarded.continuation));
+                discarded.continuation.reset();
+            }
             release_active_references(lane);
             clear_catalog_entry(catalog_.at(active.publication_slot));
             reset_active_entry(active);
@@ -1007,9 +1013,26 @@ public:
         if (result.status != ConsumeStatus::Consumed) {
             throw std::logic_error("Program did not consume aborted sequence");
         }
+        ActiveEntry& active       = active_[lane.value];
+        CatalogEntry& publication = catalog_.at(active.publication_slot);
+        const bool reserved       = publication.state == CatalogState::ReservedForActive &&
+                              publication.id == active.continuation_id;
         release_active_references(lane);
-        clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
-        reset_active_entry(active_[lane.value]);
+        if (result.continuation && reserved &&
+            adopt_aborted_continuation(program, active, publication, result)) {
+            reset_active_entry(active);
+            lanes_[lane.value] = LogicalLaneState::Free;
+            return result;
+        }
+        if (result.continuation) {
+            // A rolled-back continuation without its own publication cell is released with the
+            // lane instead of displacing a cell this activation no longer owns.
+            (void)program.release_continuation(std::move(*result.continuation));
+            result.continuation.reset();
+        }
+        result.disposition = FinishDisposition::Released;
+        clear_catalog_entry(publication);
+        reset_active_entry(active);
         lanes_[lane.value] = LogicalLaneState::Free;
         return result;
     }
@@ -1095,8 +1118,9 @@ public:
         out.pressure_search_budget_exhaustions = context_stats_.pressure_search_budget_exhaustions;
         out.pressure_maximal_fallback_selections =
             context_stats_.pressure_maximal_fallback_selections;
-        out.historical_fork_hits            = context_stats_.historical_fork_hits;
-        out.actual_context_transfer_seconds = context_stats_.actual_context_transfer_seconds;
+        out.historical_fork_hits             = context_stats_.historical_fork_hits;
+        out.cancelled_continuations_retained = context_stats_.cancelled_continuations_retained;
+        out.actual_context_transfer_seconds  = context_stats_.actual_context_transfer_seconds;
 
         const auto usage                     = program.physical_usage();
         out.device_state_occupied_slots      = usage.device_state_slots;
@@ -3160,6 +3184,36 @@ private:
         clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
         reset_active_entry(active_[lane.value]);
         lanes_[lane.value] = LogicalLaneState::Free;
+    }
+
+    // A cancelled request rolls back to the highest frozen lineage checkpoint it still owned and
+    // republishes that continuation into the cell reserved for this activation. The published
+    // summary carries no endpoint, so the continuation is only reachable through an exact identity
+    // match on the retained rewrite checkpoint or long anchor.
+    [[nodiscard]] bool adopt_aborted_continuation(Program& program, ActiveEntry& active,
+                                                  CatalogEntry& publication, AbortResult& result) {
+        if (!valid_continuation_summary(result.summary)) {
+            (void)program.release_continuation(std::move(*result.continuation));
+            result.continuation.reset();
+            throw std::logic_error("Program returned an invalid rollback continuation");
+        }
+        publication.state = CatalogState::Catalogued;
+        assign_continuation_summary(publication.summary, result.summary);
+        publication.handle.emplace(std::move(*result.continuation));
+        result.continuation.reset();
+        publication.session   = active.session;
+        publication.retention = active.retention;
+        migrate_observations(publication, result.summary, active.retention);
+        advance_revision(publication.revision);
+        if (publication.session && active.update_session_index) {
+            if (!publish_session(*publication.session, active.publication_slot, publication.id,
+                                 publication.revision, active.publication_order)) {
+                publication.session.reset();
+                publication.retention = RetentionClass::RecentPrivate;
+            }
+        }
+        saturating_increment(context_stats_.cancelled_continuations_retained);
+        return true;
     }
 
     [[nodiscard]] static std::uint64_t session_hash(const CacheSessionKey& key) noexcept {

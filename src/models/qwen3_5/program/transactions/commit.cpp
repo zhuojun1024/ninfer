@@ -665,6 +665,160 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     return out;
 }
 
+// A cancelled request can only be rolled back to a frozen lineage checkpoint. The recurrent
+// state carried by the live binding describes the frontier being abandoned, so a checkpoint
+// captured earlier in the same lineage is the sole rollback target; the KV suffix above it is
+// dropped because no state can ever consume it again.
+bool ProgramImpl::can_retain_aborted_continuation(const SequenceState& sequence,
+                                                  std::uint32_t frontier) const noexcept {
+    try {
+        const auto* begin = continuation_states.data();
+        const auto* end   = begin + continuation_capacity;
+        if (&sequence < begin || &sequence >= end || !sequence.kv || !state_store ||
+            !text_kv_addresses || !text_kv_pages) {
+            return false;
+        }
+        const std::uint32_t index = static_cast<std::uint32_t>(&sequence - begin);
+        if (continuation_slots[index].role != ContinuationSlotRole::Active ||
+            !can_clear_lane_strict(sequence) || frontier == 0 ||
+            frontier > sequence.execution_frontier || frontier > sequence.text_kv_valid ||
+            sequence.state.fork_pending || sequence.state.borrows_read() ||
+            sequence.state.read != sequence.state.write) {
+            return false;
+        }
+        if (kv_pages_for_frontier(frontier) > text_kv_addresses->mapped_pages(sequence.kv->text)) {
+            return false;
+        }
+        if (sequence.kv->backend) {
+            const std::uint32_t backend_frontier =
+                backend_frontier_at(speculative_backend, frontier);
+            if (!backend_kv_addresses ||
+                kv_pages_for_frontier(backend_frontier) >
+                    backend_kv_addresses->mapped_pages(*sequence.kv->backend)) {
+                return false;
+            }
+        }
+        return true;
+    } catch (...) { return false; }
+}
+
+bool ProgramImpl::detach_aborted_continuation(SequenceState& sequence, std::uint32_t frontier,
+                                              AbortResult& out) noexcept {
+    const auto fail                      = []() noexcept { std::terminate(); };
+    const auto* begin                    = continuation_states.data();
+    const std::uint32_t continuation     = static_cast<std::uint32_t>(&sequence - begin);
+    const StateImageHandle live          = sequence.state.read;
+    const std::uint32_t backend_frontier = backend_frontier_at(speculative_backend, frontier);
+
+    // Prefix truncation is defined on an inactive address space, so the execution binding is
+    // released first. Releasability was validated against the still-active binding, and the
+    // ordinary release path accepts an already inactive bundle, so this is the last step which
+    // can still degrade instead of publishing.
+    release_active_shared_references(sequence);
+    release_sequence_growth_entitlement(sequence);
+    unbind_sequence_kv(sequence);
+    if (!text_kv_addresses->can_truncate_inactive_prefix(sequence.kv->text, frontier) ||
+        (sequence.kv->backend &&
+         (!backend_kv_addresses || !backend_kv_addresses->can_truncate_inactive_prefix(
+                                       *sequence.kv->backend, backend_frontier)))) {
+        return false;
+    }
+
+    text_kv_addresses->truncate_inactive_prefix(sequence.kv->text, frontier);
+    text_kv_addresses->set_checkpoint_requirement(sequence.kv->text, frontier);
+    if (sequence.kv->backend) {
+        backend_kv_addresses->truncate_inactive_prefix(*sequence.kv->backend, backend_frontier);
+        backend_kv_addresses->set_checkpoint_requirement(*sequence.kv->backend, backend_frontier);
+    }
+    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+
+    // The published shape matches publish_checkpoint_drop: the endpoint binding and the dropped
+    // suffix are gone, the frontier ledgers keep the lineage history the retained checkpoint was
+    // captured from, and text/mtp/dflash coverage is narrowed to the surviving frontier.
+    sequence.state             = {};
+    sequence.endpoint_valid    = false;
+    sequence.tail_hidden       = {};
+    sequence.tail_hidden_valid = false;
+    sequence.text_kv_valid     = frontier;
+    sequence.mtp_draft_count   = 0;
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        sequence.mtp_kv_valid = backend_frontier;
+    } else if (is_masked_draft_backend(speculative_backend)) {
+        sequence.dflash_context_frontier = frontier;
+    }
+    const bool live_retained =
+        (sequence.rewrite_state && *sequence.rewrite_state == live) ||
+        std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
+                    [live](const LongAnchorCheckpoint& anchor) { return anchor.state == live; });
+    if (!live_retained && state_store->valid(live) &&
+        state_store->checkpoint_references(live) == 0 && !state_store->release(live)) {
+        fail();
+    }
+
+    RequestControl& request = requests[sequence.lane];
+    request.prefill.reset();
+    request.lifecycle                     = Lifecycle::Empty;
+    request.pending                       = {};
+    request.active_resources              = {};
+    request.optional_resources            = {};
+    request.publish_continuation          = true;
+    continuation_slots[continuation].role = ContinuationSlotRole::Catalogued;
+    active_continuations[sequence.lane]   = continuation_capacity;
+    out.continuation.emplace(ContractAccess::make_continuation(
+        this, continuation, continuation_slots[continuation].generation));
+    return true;
+}
+
+bool ProgramImpl::retain_aborted_continuation(SequenceState& sequence, RequestControl& request,
+                                              AbortResult& out) noexcept {
+    try {
+        if (!request.publish_continuation || !context_cache.enabled || !sequence.kv ||
+            !state_store || sequence.state.fork_pending || sequence.state.borrows_read() ||
+            sequence.state.read != sequence.state.write) {
+            return false;
+        }
+        const auto frozen = [&](StateImageHandle state) {
+            return state_store->valid(state) &&
+                   state_store->role(state) == StateImageRole::CheckpointImmutable;
+        };
+        std::uint32_t frontier = 0;
+        if (sequence.rewrite_checkpoint.valid && sequence.rewrite_state &&
+            frozen(*sequence.rewrite_state)) {
+            frontier = sequence.rewrite_checkpoint.frontier;
+        }
+        for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
+            if (anchor.frontier > frontier && frozen(anchor.state)) { frontier = anchor.frontier; }
+        }
+        if (frontier == 0 || !can_retain_aborted_continuation(sequence, frontier)) { return false; }
+        out.summary.long_anchors.reserve(sequence.long_anchors.size());
+        populate_continuation_summary(sequence, out.summary);
+        if (out.summary.endpoint || (!out.summary.rewrite && out.summary.long_anchors.empty())) {
+            return false;
+        }
+        out.summary.active_references = 0;
+        // A reserved destination is active execution scratch, never a published checkpoint, so it
+        // leaves with the live binding.
+        if (sequence.reserved_state) {
+            if (!state_store->release(*sequence.reserved_state)) { return false; }
+            sequence.reserved_state.reset();
+        }
+        // Refreshed before any mutation: the retained rewrite checkpoint keeps its continuation
+        // hidden view, while the live binding's view is dropped with the binding itself. This is
+        // also the last step that can still fail without having changed physical state.
+        refresh_state_views(sequence);
+        if (!detach_aborted_continuation(sequence, frontier, out)) {
+            out.summary = {};
+            out.continuation.reset();
+            return false;
+        }
+        return true;
+    } catch (...) {
+        out.summary = {};
+        out.continuation.reset();
+        return false;
+    }
+}
+
 AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
     AbortResult out;
     if (has_context_transaction() || pending_transaction_ || !valid_sequence(sequence)) {
@@ -676,6 +830,17 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         return out;
     }
     SequenceState& state = active_sequence(lane);
+    if (retain_aborted_continuation(state, request, out)) {
+        out.timings     = request.timings;
+        out.speculative = std::move(request.speculative_stats);
+        invalidate_lane(lane);
+        advance_resource_revision();
+        out.disposition = runtime::FinishDisposition::Catalogued;
+        out.status      = runtime::ConsumeStatus::Consumed;
+        return out;
+    }
+    out.summary = {};
+    out.continuation.reset();
     if (!clear_lane_strict(state, request)) { return out; }
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);

@@ -62,6 +62,8 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.terminal_pending_requests != 0 ||
            report.current.active_captures_completed != report.previous.active_captures_completed ||
            report.current.active_captures_aborted != report.previous.active_captures_aborted ||
+           report.current.cancelled_continuations_retained !=
+               report.previous.cancelled_continuations_retained ||
            report.current.root_selections != report.previous.root_selections ||
            report.current.private_endpoint_selections !=
                report.previous.private_endpoint_selections ||

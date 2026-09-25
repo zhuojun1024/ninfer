@@ -1,5 +1,6 @@
 #include "ninfer/engine.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -1344,6 +1345,122 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheT
     return 0;
 }
 
+// A cancelled turn must hand its last frozen lineage checkpoint to the next request instead of
+// discarding the whole active continuation. The recurrent state cannot be rewound from the live
+// frontier, so the only rollback target is the prompt-frontier rewrite checkpoint the turn
+// captured: the follow-up request has to reuse exactly that frontier, not re-prefill from root.
+class CancelOnPublishSink final : public ninfer::OutputSink {
+public:
+    explicit CancelOnPublishSink(std::size_t cancel_after) : cancel_after_(cancel_after) {}
+
+    void start(ninfer::GenerationStart start) override {
+        prompt_tokens        = start.prompt.prompt_tokens;
+        reused_prompt_tokens = start.reused_prompt_tokens;
+        started              = true;
+    }
+
+    void progress(ninfer::PromptProgress) override {}
+
+    void timing(ninfer::GenerationTimingObservation) override {}
+
+    void publish(ninfer::OutputDelta) override {
+        if (++published_ >= cancel_after_) { requested = true; }
+    }
+
+    bool started                       = false;
+    bool requested                     = false;
+    std::uint32_t prompt_tokens        = 0;
+    std::uint32_t reused_prompt_tokens = 0;
+
+private:
+    std::size_t cancel_after_ = 0;
+    std::size_t published_    = 0;
+};
+
+int exercise_cancelled_turn_rollback(const char* artifact) {
+    auto options                                            = engine_options(artifact);
+    options.enable_vision                                   = false;
+    options.context_cache.device_state_slots                = 3;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(std::move(options));
+
+    auto text_message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage message;
+        message.role = role;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return message;
+    };
+    auto input_with_history = [&](int completed_responses, bool preserve_thinking) {
+        ninfer::PromptInput input;
+        input.messages.push_back(text_message(
+            ninfer::ChatRole::User,
+            "Use the lookup results to determine the deterministic checkpoint value."));
+        if (completed_responses >= 1) {
+            ninfer::ChatMessage assistant =
+                text_message(ninfer::ChatRole::Assistant, "The first lookup returns alpha.");
+            input.messages.push_back(std::move(assistant));
+            ninfer::ChatMessage tool = text_message(ninfer::ChatRole::Tool, "{\"value\":17}");
+            input.messages.push_back(std::move(tool));
+        }
+        input.options.preserve_thinking = preserve_thinking;
+        return input;
+    };
+    auto request_options = [](std::uint32_t outputs) {
+        ninfer::RequestOptions result;
+        result.execution.requested_output_tokens = outputs;
+        result.execution.sampling.temperature    = 0.0F;
+        result.execution.allow_prefix_reuse      = true;
+        result.stop.include_model_defaults       = false;
+        return result;
+    };
+
+    const ninfer::GenerationResult history =
+        engine.generate(engine.prepare(input_with_history(0, true)), request_options(4));
+    if (history.generated_token_ids.size() != 4 ||
+        history.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+        std::cerr << "cancelled-turn fixture did not establish a cold history\n";
+        return 1;
+    }
+
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    CancelOnPublishSink sink(2);
+    auto handle = engine.submit(engine.prepare(input_with_history(1, true)), request_options(256),
+                                ninfer::OutputConsumerMode::Streaming);
+    const ninfer::GenerationResult cancelled =
+        handle.wait(&sink, ninfer::CancellationView([&sink]() { return sink.requested; }));
+    if (!sink.started || cancelled.finish_reason != ninfer::FinishReason::Cancelled ||
+        sink.reused_prompt_tokens == 0 || sink.prompt_tokens == 0) {
+        std::cerr << "cancelled-turn fixture was not cancelled mid-decode: finished="
+                  << static_cast<int>(cancelled.finish_reason)
+                  << " reused=" << sink.reused_prompt_tokens << '/' << sink.prompt_tokens << '\n';
+        return 1;
+    }
+
+    const ninfer::RuntimeStats after_cancel = engine.runtime_stats();
+    if (after_cancel.cancelled_continuations_retained !=
+        before.cancelled_continuations_retained + 1) {
+        std::cerr << "cancellation discarded its surviving checkpoint: retained="
+                  << before.cancelled_continuations_retained << '/'
+                  << after_cancel.cancelled_continuations_retained << '\n';
+        return 1;
+    }
+
+    const ninfer::GenerationResult resumed =
+        engine.generate(engine.prepare(input_with_history(1, true)), request_options(4));
+    if (resumed.generated_token_ids.size() != 4 ||
+        resumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay ||
+        resumed.reused_prompt_tokens == 0 || resumed.reused_prompt_tokens > sink.prompt_tokens) {
+        std::cerr << "rollback checkpoint did not restore the cancelled prompt frontier: path="
+                  << static_cast<int>(resumed.prefix_reuse_path)
+                  << " reused=" << resumed.reused_prompt_tokens
+                  << " cancelled_prompt=" << sink.prompt_tokens << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_rewrite_branch(const char* artifact) {
     auto text_message = [](ninfer::ChatRole role, std::string text) {
         ninfer::ChatMessage message;
@@ -2115,6 +2232,9 @@ int exercise_artifact(const char* artifact) {
     if (const int result = exercise_last_private_alias_eviction(artifact); result != 0) {
         return result;
     }
+    if (const int result = exercise_cancelled_turn_rollback(artifact); result != 0) {
+        return result;
+    }
     if (const int result = exercise_concurrent_resource_settlement(artifact); result != 0) {
         return result;
     }
@@ -2135,6 +2255,8 @@ int main() {
         result = exercise_vision(engine);
     } else if (scenario == "all") {
         result = exercise_artifact(artifact);
+    } else if (scenario == "cancel-rollback") {
+        result = exercise_cancelled_turn_rollback(artifact);
     } else if (scenario == "concurrent") {
         result = exercise_concurrent_resource_settlement(artifact);
     } else if (scenario == "anthropic-prefix-regression") {

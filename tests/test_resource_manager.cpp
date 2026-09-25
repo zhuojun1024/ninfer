@@ -501,7 +501,10 @@ struct FakeFinishResult {
 };
 
 struct FakeAbortResult {
-    ConsumeStatus status = ConsumeStatus::InvariantMismatch;
+    ConsumeStatus status          = ConsumeStatus::InvariantMismatch;
+    FinishDisposition disposition = FinishDisposition::Released;
+    FakeContinuationSummary summary;
+    std::optional<FakeContinuationHandle> continuation;
     FakeTimings timings;
     FakeSpeculativeStats speculative;
 };
@@ -1107,12 +1110,20 @@ public:
         return result;
     }
 
-    [[nodiscard]] FakeAbortResult abort(FakeSequenceHandle) noexcept {
+    [[nodiscard]] FakeAbortResult abort(FakeSequenceHandle sequence) noexcept {
         ++abort_calls;
         advance_revision();
-        return FakeAbortResult{.status      = ConsumeStatus::Consumed,
-                               .timings     = FakeTimings{.value = 7},
-                               .speculative = FakeSpeculativeStats{.value = 9}};
+        FakeAbortResult out;
+        out.status      = ConsumeStatus::Consumed;
+        out.timings     = FakeTimings{.value = 7};
+        out.speculative = FakeSpeculativeStats{.value = 9};
+        if (abort_retains) {
+            const std::uint32_t key = sequence_content_keys_.at(sequence.id);
+            out.summary.rewrite     = rewrite_checkpoint(key, abort_retain_frontier);
+            out.continuation.emplace(sequence.id, key);
+            out.disposition = FinishDisposition::Catalogued;
+        }
+        return out;
     }
 
     [[nodiscard]] FakeReleaseResult
@@ -1152,6 +1163,8 @@ public:
     bool finish_fail_next                                = false;
     bool finish_release                                  = false;
     bool finish_with_rewrite                             = false;
+    bool abort_retains                                   = false;
+    std::uint32_t abort_retain_frontier                  = 0;
     bool abort_capture_start                             = false;
     bool report_shared_source_summary                    = false;
     bool change_shared_source_residency_on_second_report = false;
@@ -3203,6 +3216,52 @@ void test_terminal_fallback_releases_failed_retention() {
             "terminal fallback did not free every logical owner");
 }
 
+void test_cancelled_request_republishes_its_checkpoint() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest running = start_active(manager, program, 21, make_base(21), 1);
+    require(manager.catalog_state(0) == FakeManager::CatalogState::ReservedForActive,
+            "activation did not reserve its publication cell");
+
+    program.abort_retains         = true;
+    program.abort_retain_frontier = 9;
+    const FakeAbortResult aborted = manager.abort(program, running.lane, running.sequence);
+    require(aborted.disposition == FinishDisposition::Catalogued,
+            "cancellation discarded a surviving lineage checkpoint");
+    require(manager.lane_state(running.lane) == ninfer::runtime::LogicalLaneState::Free &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "rolled-back continuation was not catalogued on a freed lane");
+    require(program.released_continuations.empty(),
+            "cancellation synchronously released the republished continuation");
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.cancelled_continuations_retained == 1, "rollback retention was not counted");
+
+    auto reuse = manager.inspect(program, FakePreparedPrompt{21}, make_base(21), 2);
+    require(reuse.readiness == Readiness::Ready && reuse.choice,
+            "republished checkpoint was not reusable");
+    require(reuse.choice->summary().reusable_prompt_tokens == 9 &&
+                reuse.choice->summary().prefix_reuse_path == PrefixReusePath::PrivateTurnClosure,
+            "republished checkpoint reused the wrong frontier or reuse path");
+}
+
+void test_cancelled_request_without_checkpoint_releases() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest running = start_active(manager, program, 22, make_base(22), 1);
+
+    const FakeAbortResult aborted = manager.abort(program, running.lane, running.sequence);
+    require(aborted.disposition == FinishDisposition::Released,
+            "checkpoint-less cancellation republished a continuation");
+    require(manager.lane_state(running.lane) == ninfer::runtime::LogicalLaneState::Free &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Vacant,
+            "checkpoint-less cancellation did not release every logical owner");
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.cancelled_continuations_retained == 0,
+            "checkpoint-less cancellation counted a rollback retention");
+}
+
 void test_terminal_settlement_waits_for_open_resource_transaction() {
     FakeManager manager = make_manager(2, 3);
     FakeProgram program;
@@ -3519,6 +3578,10 @@ int main() {
              test_capture_result_is_validated_before_any_adoption);
     run_test("capture result owner identity", test_capture_result_is_adopted_by_owner_identity);
     run_test("terminal fallback", test_terminal_fallback_releases_failed_retention);
+    run_test("cancelled request republishes its checkpoint",
+             test_cancelled_request_republishes_its_checkpoint);
+    run_test("cancelled request without a checkpoint releases",
+             test_cancelled_request_without_checkpoint_releases);
     run_test("terminal waits for resource transaction",
              test_terminal_settlement_waits_for_open_resource_transaction);
     run_test("commit and discard", test_commit_and_discard_terminal_states);

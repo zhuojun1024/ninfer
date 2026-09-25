@@ -827,6 +827,14 @@ struct FinishResult {
 
 struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
+    // A cancelled request normally releases its whole active continuation. When it still owns a
+    // frozen lineage checkpoint, the recurrent state cannot be rolled back from the live frontier,
+    // so the request rolls back to that checkpoint and republishes it instead. The republished
+    // handle is moved out by the adopting caller, so `disposition` is the surviving description
+    // of the outcome and `summary` is only meaningful for a Catalogued result.
+    std::optional<ContinuationHandle> continuation;
+    ContinuationSummary summary;
+    runtime::FinishDisposition disposition = runtime::FinishDisposition::Released;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };

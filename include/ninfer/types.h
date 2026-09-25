@@ -947,6 +947,9 @@ struct RuntimeStats {
     std::uint32_t terminal_pending_requests = 0;
     std::uint64_t active_captures_completed = 0;
     std::uint64_t active_captures_aborted   = 0;
+    // Cancelled requests that rolled back to a surviving checkpoint and republished it instead of
+    // discarding the whole active continuation.
+    std::uint64_t cancelled_continuations_retained = 0;
 
     std::uint64_t root_selections                    = 0;
     std::uint64_t private_endpoint_selections        = 0;

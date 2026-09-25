@@ -1084,6 +1084,14 @@ private:
     [[nodiscard]] bool can_clear_lane_strict(const SequenceState& sequence) const;
     [[nodiscard]] bool clear_lane_strict(SequenceState& sequence, RequestControl& request) noexcept;
     void clear_lane_best_effort(SequenceState& sequence, RequestControl& request) noexcept;
+    // Cancellation rollback: publish the highest frozen lineage checkpoint the active sequence
+    // still owns instead of discarding it with the rest of the continuation.
+    [[nodiscard]] bool can_retain_aborted_continuation(const SequenceState& sequence,
+                                                       std::uint32_t frontier) const noexcept;
+    [[nodiscard]] bool retain_aborted_continuation(SequenceState& sequence, RequestControl& request,
+                                                   AbortResult& out) noexcept;
+    [[nodiscard]] bool detach_aborted_continuation(SequenceState& sequence, std::uint32_t frontier,
+                                                   AbortResult& out) noexcept;
     void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;
     [[nodiscard]] detail::PhysicalResources

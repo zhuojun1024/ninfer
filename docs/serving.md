@@ -952,8 +952,10 @@ same interval. The
 `running`, `prefilling`, `decode_ready`, `waiting`, `materializing`, `capture_pending`, and
 `terminal_pending` fields are the Engine scheduler snapshot at the end of the interval. The JSONL
 `context_cache` object reports selection, capture, transfer, COW, pressure spill, private/shared
-owner degradation and eviction, checkpoint drop, pressure search, budget exhaustion, maximal fallback, and historical-fork
-counters as interval deltas; `occupancy` and `last_selection` are end-of-interval gauges. Materialization predictions are
+owner degradation and eviction, checkpoint drop, pressure search, budget exhaustion, maximal fallback, cancellation
+rollback, and historical-fork counters as interval deltas; `occupancy` and `last_selection` are end-of-interval gauges.
+`cancellations.retained` counts cancelled requests that rolled back to a surviving checkpoint and republished it
+instead of discarding the whole active continuation. Materialization predictions are
 request-owned and appear only on the corresponding `request_done` event.
 `pressure.searches` counts plans accepted into Program resource transactions, including a transaction that later ends in
 request-local abort; committed victim counters likewise report the resulting stable cache changes.

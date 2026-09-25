@@ -477,6 +477,28 @@ hypothetical state =
 只有该完整状态可行，borrower 才具有 persistent-safe backfill 资格。证明与 `resource_revision` 绑定，
 不使用 borrower 或 donor 的预计完成时间。
 
+### 6.4 Cancellation rollback
+
+Cancellation 在 Active lane 上的默认终态是 Discard。若请求在 activation 时取得了 publication capacity，且
+active sequence 仍拥有完整的 frozen lineage checkpoint（typed rewrite checkpoint 或 long anchor），终态改为
+回滚到其中 frontier 最大的 checkpoint 并重新发布：
+
+```text
+release execution binding
+  -> truncate main/backend KV to the retained frontier
+  -> release the live mutable StateImage
+  -> publish the surviving checkpoint set
+```
+
+- Recurrent（GDN）state 无法从 live frontier 回退，因此 live mutable binding 和它上方的 KV coverage 不能
+  成为任何 continuation 的一部分，必须一起丢弃。
+- 回滚不创造新 checkpoint：发布的是原本已存在的 checkpoint 集合，且不含 endpoint。后续请求只能通过精确
+  身份匹配（rewrite restore 或 long-anchor reuse）复用它。
+- 发布的是完整 `(StateImage, KV)` 对，仍满足 [§4.1](#41-完整恢复条件) 的完整性条件；它不是 partial hit。
+- 没有这样的 checkpoint，或 truncation 的前置条件已经不成立时，终态退回 Discard（§6.2）。
+- ResourceManager 只在自身仍持有该 activation 的 `ReservedForActive` publication cell 时采用回滚结果；
+  否则释放 Program 返回的 continuation 并退回 Discard。
+
 ---
 
 ## 7. Materialization planning problem

@@ -488,11 +488,15 @@ Cancellation 在 Engine worker 的稳定边界生效：
 |---|---|
 | Waiting | 不创建 Program state，直接结束请求 |
 | Materializing | abort resource transition，并采用其完整结果 |
-| Active | 当前 GPU unit 稳定后进入 TerminalPending 并 release |
+| Active | 当前 GPU unit 稳定后进入 TerminalPending；请求仍持有完整 frozen lineage checkpoint 时回滚到其中最高的一个并重新发布，否则 release |
 | PendingBatch | 通过 cancelled row decision 提交或整体 abort |
 | 已 commit、尚未 adopt | 先 adopt 已提交结果，再执行 terminal 路径 |
 
-Cancellation 不修改 in-flight mapping，也不从未完成的 active state 发布 checkpoint。
+Cancellation 不修改 in-flight mapping，也不从未完成的 active state 发布 checkpoint。回滚只能落在请求自己仍然
+持有的 frozen lineage checkpoint（typed rewrite checkpoint 或 long anchor）上：recurrent state 无法从 live
+frontier 回退，所以 live mutable binding 与它上方的 KV 后缀一律丢弃。回滚发布的是完整
+`(StateImage, KV)` 对，不是 partial hit；没有这样的 checkpoint 时终态仍是 release，而不是让请求停留在
+TerminalPending。
 
 ### 7.3 Request-local rejection
 
