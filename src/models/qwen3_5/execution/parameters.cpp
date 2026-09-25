@@ -52,6 +52,24 @@ public:
         });
     }
 
+    // The artifact decides the codebook representation; both forms are complete parents, so the
+    // quantized one needs no region handling.
+    SelectorCodebook codebook(WeightId id) const {
+        const auto& bound = model_.weight(id);
+        return with_context(bound.name, [&] {
+            const auto format = bound.view.parts.front().parent->geometry.format;
+            if (format == QType::BF16) {
+                return SelectorCodebook{tensor(id), Weight{}, false};
+            }
+            if (format != QType::Q4_G64_FP16) {
+                throw std::invalid_argument("selector codebook must be BF16 or Q4_G64_FP16");
+            }
+            // The codebook is a direct parameter with no mathematical Use, so it is prepared
+            // straight from its complete parent instead of through a projection input.
+            return SelectorCodebook{Tensor{}, native_weight(bound.view), true};
+        });
+    }
+
     DenseParameters dense(const DenseWeights& w) const {
         return {with_context(model_.weight(w.gate).name,
                              [&] {
@@ -228,8 +246,15 @@ public:
                     DraftBlockParameters result;
                     result.input_norm          = tensor(layer.input_norm);
                     result.post_attention_norm = tensor(layer.post_attention_norm);
-                    result.query_key_value     = ops::prepare_attn_input_proj_weights(
-                        model_.input(a.query), model_.input(a.key), model_.input(a.value));
+                    // The fused three-output projection admits the stock Q8 parent only; a
+                    // quantized parent is projected through its row views (see draft.cpp).
+                    const auto qkv_format =
+                        model_.weight(a.query).view.parts.front().parent->geometry.format;
+                    if (qkv_format == QType::Q8_G32_FP16) {
+                        result.query_key_value = ops::prepare_attn_input_proj_weights(
+                            model_.input(a.query), model_.input(a.key), model_.input(a.value));
+                    }
+                    result.query_key_value_rows = {linear(a.query), linear(a.key), linear(a.value)};
                     result.context_key   = linear(a.context_key);
                     result.context_value = linear(a.context_value);
                     result.query_norm    = tensor(a.query_norm);
@@ -283,8 +308,8 @@ Parameters::Parameters(const Model& source) : model(source) {
         source.has_weight(w.draft->selector->hidden_projection)) {
         dflash_selector =
             SelectorParameters{prepare.linear(w.draft->selector->hidden_projection),
-                               prepare.tensor(w.draft->selector->predecessor_codebook),
-                               prepare.tensor(w.draft->selector->successor_codebook)};
+                               prepare.codebook(w.draft->selector->predecessor_codebook),
+                               prepare.codebook(w.draft->selector->successor_codebook)};
     }
     if (w.proposal) {
         proposal =

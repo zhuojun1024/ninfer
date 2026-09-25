@@ -12,6 +12,7 @@
 #include "ninfer/ops/rmsnorm_rope.h"
 #include "ninfer/ops/rmsnorm_pack_tail.h"
 #include "ninfer/ops/linear_topk.h"
+#include "models/qwen3_5/execution/selector.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/embedding.h"
@@ -154,7 +155,15 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         ops::rmsnorm(projected, state.execution.parameters.draft->context_norm, config.rms_norm_eps,
                      false, context, state.execution.device.stream);
 
-        if (config.dflash2) {
+        const Tensor local_positions =
+            replace_local_window ? positions.slice(0, local_offset, local_width) : positions;
+        // The stock Q8 parent runs the fused materialization; a quantized parent cannot (the op
+        // admits Q8 only) and uses the layerwise projections below instead.
+        const auto& draft_layers = state.execution.parameters.draft->layers;
+        const bool fused_context =
+            config.dflash2.has_value() && !draft_layers.empty() &&
+            draft_layers.front().context_key.weight.qtype == QType::Q8_G32_FP16;
+        if (fused_context) {
             std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
             if (config.num_hidden_layers != layers.size() ||
                 config.local_layer_count() != layers.size() || config.rms_norm_eps != 1e-6F ||
@@ -167,13 +176,16 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 layers[layer]       = {weights.context_key.weight, weights.context_value.weight,
                                        weights.key_norm, dflash_state(state).local_layer(layer)};
             }
-            const Tensor local_positions =
-                replace_local_window ? positions.slice(0, local_offset, local_width) : positions;
             ops::context_kv_materialize(
                 context.view({dimension(target.hidden_size), local_width, batch}), local_positions,
                 local_counts, lanes, layers, {local_envelope.min_count, local_envelope.max_count},
                 state.execution.work, state.execution.device.stream);
         } else {
+            if (config.dflash2.has_value() &&
+                config.local_layer_count() != config.num_hidden_layers) {
+                throw std::invalid_argument(
+                    "masked draft context: the layerwise route requires every layer local");
+            }
             for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
                 auto layer_scope = state.execution.work.scope();
                 const auto& weight =
@@ -182,12 +194,14 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                     config.layer_types[layer] == DraftAttentionKind::SlidingAttention;
                 const int layer_width   = local_layer ? local_width : width;
                 const int layer_columns = layer_width * batch;
-                Tensor layer_context    = local_layer && replace_local_window
-                                              ? context.slice(1, local_offset, local_width)
-                                              : context;
-                Tensor layer_positions  = local_layer && replace_local_window
-                                              ? positions.slice(0, local_offset, local_width)
-                                              : positions;
+                // The masked draft projects its context at the final local width already, so
+                // it consumes the normalized matrix whole; the v1 route receives the full width
+                // and selects the local window here.
+                Tensor layer_context = !config.dflash2.has_value() && local_layer &&
+                                               replace_local_window
+                                           ? context.slice(1, local_offset, local_width)
+                                           : context;
+                Tensor layer_positions = local_layer ? local_positions : positions;
                 auto layer_roots = workspace::dflash_context_layer(state.execution.work, target,
                                                                    config, layer_columns);
                 Tensor key_raw   = layer_roots.key_raw.view(
@@ -200,9 +214,10 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                     key_raw.view({dimension(config.attention.key_width()), layer_columns});
                 Tensor value_flat =
                     value.view({dimension(config.attention.key_width()), layer_columns});
-                ops::linear_pair(layer_context, weight.context_key.weight,
-                                 weight.context_value.weight, key_flat, value_flat,
-                                 state.execution.device.stream);
+                ops::linear(layer_context, weight.context_key.weight, key_flat,
+                            state.execution.device.stream);
+                ops::linear(layer_context, weight.context_value.weight, value_flat,
+                            state.execution.device.stream);
                 Tensor key = layer_roots.key.view({dimension(config.attention.head_dim),
                                                    dimension(config.attention.num_key_value_heads),
                                                    layer_columns});
@@ -323,9 +338,18 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     query.view({dimension(config.attention.query_width()), columns});
                 Tensor key_flat   = key.view({dimension(config.attention.key_width()), columns});
                 Tensor value_flat = value.view({dimension(config.attention.key_width()), columns});
-                ops::attn_input_proj(branch.prepared.view({dimension(target.hidden_size), columns}),
-                                     layer.query_key_value.weight, query_flat, key_flat, value_flat,
-                                     stream);
+                const Tensor qkv_input =
+                    branch.prepared.view({dimension(target.hidden_size), columns});
+                if (layer.query_key_value.has_value()) {
+                    ops::attn_input_proj(qkv_input, layer.query_key_value->weight, query_flat,
+                                         key_flat, value_flat, stream);
+                } else {
+                    // A quantized QKV parent cannot use the Q8-only fused projection; its row
+                    // views project through the registered quantized linear shapes instead.
+                    project(qkv_input, layer.query_key_value_rows[0], query_flat, work, stream);
+                    project(qkv_input, layer.query_key_value_rows[1], key_flat, work, stream);
+                    project(qkv_input, layer.query_key_value_rows[2], value_flat, work, stream);
+                }
                 ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, stream);
                 Tensor attention = work.alloc(
                     DType::BF16, {dimension(config.attention.head_dim),
@@ -409,11 +433,11 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
             Tensor projected =
                 work.alloc(DType::BF16, {dimension(config.dflash2->selector_rank), mask_columns});
             project(hidden, selector->hidden_projection, projected, work, stream);
-            ops::candidate_selector_path(
-                candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
+            run_candidate_selector(
+                *selector, candidates,
+                scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
                 projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
-                selector->predecessor_codebook, selector->successor_codebook, frontiers,
-                frame.sampling, drafts, proposal_q, work, stream);
+                frontiers, frame.sampling, drafts, proposal_q, work, stream);
         }
         work.reset();
     }
@@ -477,8 +501,17 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     query_raw.view({dimension(config.attention.query_width()), columns});
                 Tensor key_flat = key_raw.view({dimension(config.attention.key_width()), columns});
                 Tensor value_flat = value.view({dimension(config.attention.key_width()), columns});
-                ops::attn_input_proj(roots.hidden, weight.query_key_value.weight, query_flat,
-                                     key_flat, value_flat, state.execution.device.stream);
+                if (weight.query_key_value.has_value()) {
+                    ops::attn_input_proj(roots.hidden, weight.query_key_value->weight, query_flat,
+                                         key_flat, value_flat, state.execution.device.stream);
+                } else {
+                    project(roots.hidden, weight.query_key_value_rows[0], query_flat,
+                            state.execution.work, state.execution.device.stream);
+                    project(roots.hidden, weight.query_key_value_rows[1], key_flat,
+                            state.execution.work, state.execution.device.stream);
+                    project(roots.hidden, weight.query_key_value_rows[2], value_flat,
+                            state.execution.work, state.execution.device.stream);
+                }
                 Tensor query =
                     roots.query.view({dimension(config.attention.head_dim),
                                       dimension(config.attention.num_attention_heads), columns});

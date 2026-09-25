@@ -101,16 +101,34 @@ struct DynamicConvParameters {
 
 struct DraftBlockParameters {
     Tensor input_norm, post_attention_norm;
-    LinearParameters query_key_value, context_key, context_value;
+    // The stock artifact stores one fused QKV parent, consumed by the Q8-only three-output
+    // attention input projection. A quantized parent cannot use that op, so its three row views
+    // are bound separately and the decode projects through them instead.
+    std::optional<LinearParameters> query_key_value;
+    std::array<LinearParameters, 3> query_key_value_rows;
+    LinearParameters context_key, context_value;
     Tensor query_norm, key_norm;
     LinearParameters output;
     DenseParameters mlp;
     std::optional<DynamicConvParameters> attention_conv, mlp_conv;
 };
 
+// A selector codebook is one complete [vocab, rank] parent. The stock artifact stores it dense
+// BF16; a quantized experiment artifact stores Q4_G64_FP16 and the selector op decodes it with the
+// stored group scales, so the parameter carries whichever representation the artifact bound.
+struct SelectorCodebook {
+    Tensor dense;
+    Weight weight;
+    bool quantized = false;
+
+    [[nodiscard]] std::size_t bytes() const {
+        return quantized ? static_cast<std::size_t>(weight.payload_bytes) : dense.bytes();
+    }
+};
+
 struct SelectorParameters {
     LinearParameters hidden_projection;
-    Tensor predecessor_codebook, successor_codebook;
+    SelectorCodebook predecessor_codebook, successor_codebook;
 };
 
 struct DraftParameters {

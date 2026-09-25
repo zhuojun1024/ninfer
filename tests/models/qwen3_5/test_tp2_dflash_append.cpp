@@ -227,8 +227,14 @@ std::size_t draft_weight_bytes(const qwen::execution::DraftParameters& draft,
     for (const auto& layer : draft.layers) {
         total += layer.input_norm.bytes() + layer.post_attention_norm.bytes() +
                  layer.query_norm.bytes() + layer.key_norm.bytes();
-        total += linear_bytes(layer.query_key_value) + linear_bytes(layer.context_key) +
-                 linear_bytes(layer.context_value) + linear_bytes(layer.output);
+        // The fused QKV parent and its context_key/context_value row views are one allocation;
+        // count it once through whichever binding the artifact materializes.
+        if (layer.query_key_value) {
+            total += linear_bytes(*layer.query_key_value);
+        } else {
+            total += linear_bytes(layer.context_key);
+        }
+        total += linear_bytes(layer.output);
         total += linear_bytes(layer.mlp.gate_up) + linear_bytes(layer.mlp.down);
         if (layer.attention_conv) {
             total += layer.attention_conv->base_kernel.bytes() +
@@ -986,10 +992,16 @@ int main(int argc, char** argv) {
                     "layer0.down=%s codebook=%s\n",
                     qtype_name(draft_weights.feature_projection.weight.qtype),
                     qtype_name(draft_weights.output_head.weight.qtype),
-                    qtype_name(draft_weights.layers.front().query_key_value.weight.qtype),
+                    qtype_name(draft_weights.layers.front().query_key_value
+                                   ? draft_weights.layers.front().query_key_value->weight.qtype
+                                   : draft_weights.layers.front()
+                                         .query_key_value_rows[0]
+                                         .weight.qtype),
                     qtype_name(draft_weights.layers.front().mlp.down.weight.qtype),
-                    selector != nullptr ? dtype_name(selector->predecessor_codebook.dtype)
-                                        : "none");
+                    selector == nullptr ? "none"
+                    : selector->predecessor_codebook.quantized
+                        ? qtype_name(selector->predecessor_codebook.weight.qtype)
+                        : dtype_name(selector->predecessor_codebook.dense.dtype));
         std::printf("[mem]   peer selector: %s %.1f MiB\n",
                     parameters1.dflash_selector ? "on shard 1" : "absent",
                     static_cast<double>(

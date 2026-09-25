@@ -22,10 +22,13 @@ void bind_dflash2(Bindings& b, DraftWeights& weights, const DraftConfig& config,
     weights.selector =
         SelectorWeights{b.parameter("dflash2/candidate_selector/hidden_projection",
                                     {extra.selector_rank, h}, {"dflash2/final_hidden"}),
-                        b.direct("dflash2/candidate_selector/predecessor_codebook",
-                                 {target.vocab_size, extra.selector_rank}),
-                        b.direct("dflash2/candidate_selector/successor_codebook",
-                                 {target.vocab_size, extra.selector_rank})};
+                        // No exact format: the stock artifact stores a dense BF16 codebook and a
+                        // quantized experiment artifact a Q4_G64_FP16 one, and the model binds
+                        // whichever the artifact carries.
+                        b.parameter("dflash2/candidate_selector/predecessor_codebook",
+                                    {target.vocab_size, extra.selector_rank}),
+                        b.parameter("dflash2/candidate_selector/successor_codebook",
+                                    {target.vocab_size, extra.selector_rank})};
 }
 
 } // namespace ninfer::models::qwen3_5::loading

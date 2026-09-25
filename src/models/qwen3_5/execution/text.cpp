@@ -12,6 +12,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "models/qwen3_5/execution/selector.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
@@ -1080,10 +1081,9 @@ void TextContext::dflash_selector_tp2(const Tensor& hidden, const Tensor& candid
                                cudaMemcpyHostToDevice, peer.ctx_.stream));
     project(hidden_peer, peer.selector_->hidden_projection, projected_peer, peer.work_,
             peer.ctx_.stream);
-    ops::candidate_selector_path(
-        candidates_peer, scores_peer.view({top_k, drafts, batch}),
-        projected_peer.view({rank, drafts, batch}), anchors_peer,
-        peer.selector_->predecessor_codebook, peer.selector_->successor_codebook, frontiers_peer,
+    run_candidate_selector(
+        *peer.selector_, candidates_peer, scores_peer.view({top_k, drafts, batch}),
+        projected_peer.view({rank, drafts, batch}), anchors_peer, frontiers_peer,
         static_cast<const ops::SamplingConfig*>(configs_peer.data), drafts_peer, q_peer,
         peer.work_, peer.ctx_.stream);
     ctx_.bind_to_current_thread();
