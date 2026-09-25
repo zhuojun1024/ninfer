@@ -582,7 +582,7 @@ rendezvous id（`2<<32+122460`）也在**captured 通道**内，与复现一致�
 或一次真实 desync（id 复用/错配）。已排除环境残留注入与默认超时被改。
 
 **处置建议（待决策）**
-- (a) **抓到触发源（已实施）**：采样 A/B（`r62_sampling_ab.ps1`）、三件套（`r66_suites.ps1`）、
+- (a) **抓到触发源（已实施；默认已改为开启）**：采样 A/B（`r62_sampling_ab.ps1`）、三件套（`r66_suites.ps1`）、
   长跑（`r71_ar_stress.ps1`）一律开 `NINFER_TP2_AR_WATCHDOG=1`；失败时 `tools/tp_bootstrap/ar_watch.ps1`
   把日志**另存为不可被复跑覆盖**的 `*-FAILED.log`，并把解释后的 dump 写到 `*-FAILED.arwatch.txt`。
   判读规则按 **id 差值的量级**分类（数组保留的是各侧**最后写入**的值）：某侧整组为 0 ⇒ 该侧
@@ -612,4 +612,21 @@ rendezvous id（`2<<32+122460`）也在**captured 通道**内，与复现一致�
   **验证**：注入 700 在默认值下 elapsed 73.7 s、显式 `=2000` 下 65.6 s ⇒ 差 **8.1 s ≈ 10−2 s**，
   证明新默认生效；两次都仍是 `503,ok illegal=False`（失败语义不变、不崩）。护栏脚本
   `tools/tp_bootstrap/r85_timeout_default_check.ps1`。
-- (d) **可诊断性**：窗口内 give-up 现在表现为一个语焉不详的 illegal address；即使不修安全性，也应让它可辨识。
+- (d) **可诊断性（部分已实施）**：窗口内 give-up 原本表现为语焉不详的 illegal address；1b 的 abandon-output
+  修复已让它变成可辨识的 503（见 §3.11）。剩下的是收集触发源数据 ⇒ 见 (e)。
+- (e) **诊断线程默认开启（已实施 2026-09-25）**：`NINFER_TP2_AR_WATCHDOG` **默认开启**（显式 `=0` 关闭）。
+  理由：热路径上唯一的相关开销——`note_ar_call` 每 collective 的 `calls.fetch_add`——**本来就无条件执行**
+  （只 gate 在 `watch_ != nullptr`，而内联 transport 上线时必然分配 `watch_`），开关只控制那个线程；线程
+  每 25 ms 只读一次 host 计数 +（空闲时）两个 mapped stall flag，**不调用任何 CUDA API、不同步 stream、
+  不碰内核正在自旋读的 arrival/order 行**（32 个槽位只在确认 trip 之后才读）。
+  **同时把大 dump 限流为每次 stall 一次**：原先只 gate 了首行 `[ar-watch] stalled at`，大 dump 每 25 ms
+  重复一条（超时提到 10 s 后一次事件会刷 ~400 条）；判读需要的是**检测瞬间**的状态，重复无信息量。
+  **验证**（`tools/tp_bootstrap/r87_watchdog_default_check.ps1`，注入 700）：默认 ⇒ `stall_lines=1
+  detail_lines=1`（改前会是 ~400），`NINFER_TP2_AR_WATCHDOG=0` ⇒ `0/0`；两次都仍 `503,ok illegal=False`。
+  健康臂 **0 条 ar-watch**（干净跑不留日志）。
+  **实测背书**（`tools/tp_bootstrap/r88_watchdog_ab.ps1`，final 件 K=7，18 请求/臂、4608 token/臂）：
+  on = **75.67 tok/s** 聚合（逐请求均值 79.52、n=30），off = **73.14 tok/s**（76.71、n=31）
+  ⇒ Δ = **+3.5% 偏向"开"**，落在该口径的噪声地板内且方向物理上不合理（同一口径此前量到 graph 对 eager
+  只有 +5.2%）⇒ **无可测代价**，与代码分析一致。
+  顺带：`r72_stall_injection.ps1` 改为「默认置 1，但尊重外层显式设置」，否则它自己那行 `=1` 会盖掉
+  `=0`、无法验证关闭路径。
