@@ -8,13 +8,26 @@
 #   - an A/B gap of one id is an off-by-one between the two sides' numbering;
 #   - a gap of a whole block (hundreds) means the two sides are running different id blocks, which is
 #     what a captured graph reading a rendezvous cell that the host already re-armed looks like.
+# One dump line as the watchdog writes it. Both the interpreter and the "is there evidence" test
+# read this pattern, so the two cannot drift apart.
+$ArWatchDumpPattern = '\[ar-watch\] calls=(\d+) last=(\d+) id=(\d+) arrA=\[([^\]]*)\] ordA=\[([^\]]*)\] arrB=\[([^\]]*)\] ordB=\[([^\]]*)\]'
+
+# True when the log carries at least one dump. The watchdog writes one only when a device actually
+# tripped the bounded spin, which is what makes this the test for "there is transport evidence here".
+function Test-ArWatchDump {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $LogPath)
+
+    if (-not (Test-Path $LogPath)) { return $false }
+    return [bool](Select-String -Path $LogPath -ErrorAction SilentlyContinue -Pattern $ArWatchDumpPattern -Quiet)
+}
+
 function Get-ArWatchReport {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string] $LogPath)
 
     if (-not (Test-Path $LogPath)) { return "no log at $LogPath" }
-    $pattern = '\[ar-watch\] calls=(\d+) last=(\d+) id=(\d+) arrA=\[([^\]]*)\] ordA=\[([^\]]*)\] arrB=\[([^\]]*)\] ordB=\[([^\]]*)\]'
-    $dumps = @(Select-String -Path $LogPath -ErrorAction SilentlyContinue -Pattern $pattern)
+    $dumps = @(Select-String -Path $LogPath -ErrorAction SilentlyContinue -Pattern $ArWatchDumpPattern)
     if ($dumps.Count -eq 0) {
         return "no ar-watch dump in the log: the watchdog was not enabled, or the process died before it reported"
     }
@@ -48,13 +61,19 @@ function Get-ArWatchReport {
 }
 
 # Copy a log aside under a name a re-run cannot overwrite, and write the interpreted dump beside it.
+# Only a log that actually carries a dump is preserved. A failure without one - a test assertion, a
+# bad artifact, a port clash - is already fully described by the ordinary run log, and copying it
+# aside only scattered *-FAILED files that had to be cleaned up by hand.
 function Save-ArWatchEvidence {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string] $LogPath,
         [Parameter(Mandatory = $true)][string] $Stem
     )
-    if (-not (Test-Path $LogPath)) { return $null }
+    if (-not (Test-ArWatchDump -LogPath $LogPath)) {
+        Write-Host ("no transport evidence to preserve for " + $Stem)
+        return $null
+    }
     $kept = $Stem + "-FAILED.log"
     Copy-Item $LogPath $kept -Force
     $report = Get-ArWatchReport -LogPath $kept
