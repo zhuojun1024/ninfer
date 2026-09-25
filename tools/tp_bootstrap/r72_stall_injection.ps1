@@ -33,7 +33,9 @@ foreach ($call in $Calls) {
     Start-Sleep -Seconds 3
     $log = Join-Path $OutDir ("inject-" + $call + ".log")
     $env:NINFER_TP2_AR_FAULT_SKIP_PEER_CALL = "$call"
-    $env:NINFER_TP2_AR_WATCHDOG = "1"
+    # Default the diagnostics on (the watchdog is on in production too), but let an explicit outer
+    # setting win so NINFER_TP2_AR_WATCHDOG=0 can be used to check the off switch.
+    if (-not $env:NINFER_TP2_AR_WATCHDOG) { $env:NINFER_TP2_AR_WATCHDOG = "1" }
     $server = Start-Process -FilePath "pwsh" -PassThru -WindowStyle Hidden -ArgumentList @(
         "-NoProfile", "-File", (Join-Path $repo "tools/win_port/serve.ps1"),
         "-Model", $Model, "-Spec", "dflash2", "-DraftTokens", "$DraftTokens",
