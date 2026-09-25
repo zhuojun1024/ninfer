@@ -398,13 +398,27 @@ sessions-dflash2）；solo digest 与基线逐位相同（`0x4bcc3994a5efba7d`�
 四件（含 w4a4+w8a8）的草稿剖面完全一致（q4 88 / q8 7 / bf16 567），append 冒烟测试**全部 PASS**：
 `peer selector on shard 1 = 66.9 MiB`、proposal cost 7.03–7.08 ms、K=7 proposal 确定性。
 
-**ThinkingCap 的 tokenizer 坑（已修）**：该导出由另一个 `tokenizers` 版本序列化——`tokenizer.json` 的
-Split 预分词器用 `\p{L}+`（无 `\p{M}`）且 `trim_offsets=true`，引擎的 Qwen tokenizer 拒绝
-（`pre_tokenizer.Split is not supported`）；且 `tokenizer_config.json` 缺引擎必需的
-`added_tokens_decoder`。该导出的 `vocab.json`/`merges.txt` 与规范导出**逐字节相同**，规范导出的 33 条
-`added_tokens_decoder` 与其 `tokenizer.json` 的 added_tokens **完全一致**，故用规范 `tokenizer.json`
-替换、并把缺失的 decoder 合并进该导出自己的 `tokenizer_config.json`（保留其模型专属字段）。
-见 `tools/tp_bootstrap/r70_convert_thinkingcap.ps1`。
+**ThinkingCap 的 tokenizer 坑（已修）**：该导出由另一个 `tokenizers` 版本序列化，触发引擎前端**三处**校验
+失败（前两处 append 冒烟即暴露，第三处只在 **serve 启动**的 `compile_chat_template` 里才触发）：
+
+1. `tokenizer.json` 的 Split 预分词器用 `\p{L}+`（无 `\p{M}`）且 `trim_offsets=true` → 引擎的 Qwen
+   tokenizer 只支持规范形式，报 `pre_tokenizer.Split is not supported`。
+2. `tokenizer_config.json` 缺 `added_tokens_decoder`（
+   [tokenizer.cpp:288](src/models/qwen3_5/frontend/tokenizer.cpp) 必需）→ `missing field
+   added_tokens_decoder`。
+3. `tokenizer_config.json` 缺 `add_bos_token`，而
+   [frontend.cpp:196](src/models/qwen3_5/frontend/frontend.cpp) 写的是 `value("add_bos_token", true)`——
+   **字段缺失即默认 true**，于是命中前缀语义校验 → `FATAL: tokenizer_config.json does not match Qwen3.5
+   tokenizer prefix semantics`。规范导出显式写 `add_bos_token: false`，故其余三件不受影响。
+
+修法：该导出的 `vocab.json`/`merges.txt` 与规范导出**逐字节相同**，规范导出的 33 条
+`added_tokens_decoder` 与其 `tokenizer.json` 的 added_tokens **完全一致**（13 条
+`additional_special_tokens` 也全在其中），故用规范 `tokenizer.json` 替换，并把
+`added_tokens_decoder`/`add_bos_token`/`additional_special_tokens` 合并进该导出自己的
+`tokenizer_config.json`（保留其模型专属字段），转换脚本内部按引擎前端三条规则断言。见
+`tools/tp_bootstrap/r70_convert_thinkingcap.ps1`。**端到端验证**：`serve.ps1 -Spec dflash2 -DraftTokens 7`
+启动成功（`engine ready | qwen3.8-27b-thinkingcap | 33.9s`、`listening on 127.0.0.1:8098`，无 FATAL），
+并经 HTTP `/v1/chat/completions` 实际问答通过（HTTP 200，50 completion tokens）。
 
 **执行顺序**：② 先行（改动集中、可用既有 oracle 验证），① 并行做设计/op oracle。
 
