@@ -118,6 +118,17 @@ __device__ __forceinline__ unsigned long long ar_now_ns() {
 
 // True once the deadline taken at kernel entry has passed. A zero deadline disables the bound, so a
 // timeout of 0 keeps the transport's behavior exactly as it was before the bound existed.
+// A collective that gave up must leave its output in a defined state. This staging buffer is reused
+// by every round, and a replayed captured graph reaches the same arena memory, so leaving the
+// previous round's values in place lets a downstream consumer read stale data as an index and fault
+// inside the window - where no host-side check can intervene. Zero is always a valid token id,
+// candidate index and logit, so the round can finish and the convergence check turns the trip into
+// the intended failure instead of an illegal address.
+__device__ __forceinline__ void ar_abandon_output(uint4* out_groups, int begin, int end, int stride,
+                                                  int thread) {
+    for (int i = begin + thread; i < end; i += stride) { out_groups[i] = make_uint4(0, 0, 0, 0); }
+}
+
 __device__ __forceinline__ bool ar_expired(unsigned long long deadline) {
     return deadline != 0ULL && ar_now_ns() >= deadline;
 }
@@ -139,6 +150,15 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     // deadlock the block at its next __syncthreads.
     __shared__ int stalled;
     const unsigned long long deadline = timeout_ns == 0ULL ? 0ULL : ar_now_ns() + timeout_ns;
+    const int stride                 = blockDim.x;
+    const int blocks                 = gridDim.x;
+    // This block's contiguous slice of the 16-byte groups. Slice bounds are derived from the block
+    // index alone, so every block on this device and its peer agree on which slot covers which data.
+    // Computed before the entry check below because an abandoned call still has to fill its slice.
+    const int begin = static_cast<int>((static_cast<long long>(groups) * blockIdx.x) / blocks);
+    const int end =
+        static_cast<int>((static_cast<long long>(groups) * (blockIdx.x + 1)) / blocks);
+    auto* out_groups = reinterpret_cast<uint4*>(out);
     // A tripped pair is one call out of step, so every later rendezvous would wait out its whole
     // deadline: without this entry check a desynchronized round pays one timeout per allreduce
     // (about 128 of them) before the host can react. Both flags are read, because either side may
@@ -153,24 +173,16 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
         }
     }
     __syncthreads();
-    if (stalled != 0) { return; }
+    if (stalled != 0) { ar_abandon_output(out_groups, begin, end, stride, threadIdx.x); return; }
     const unsigned long long token = shared_token;
-    const int stride = blockDim.x;
-    const int blocks = gridDim.x;
     const int tail   = groups * 8;
     auto* host_mine        = reinterpret_cast<__nv_bfloat16*>(
         host_mine_base + static_cast<std::size_t>(token & 1) * static_cast<std::size_t>(slot_bytes));
     const auto* host_other = reinterpret_cast<const __nv_bfloat16*>(
         host_other_base + static_cast<std::size_t>(token & 1) * static_cast<std::size_t>(slot_bytes));
-    // This block's contiguous slice of the 16-byte groups. Slice bounds are derived from the block
-    // index alone, so every block on this device and its peer agree on which slot covers which data.
-    const int begin = static_cast<int>((static_cast<long long>(groups) * blockIdx.x) / blocks);
-    const int end =
-        static_cast<int>((static_cast<long long>(groups) * (blockIdx.x + 1)) / blocks);
     auto* mine_groups         = reinterpret_cast<uint4*>(host_mine);
     const auto* local_groups  = reinterpret_cast<const uint4*>(local);
     const auto* other_groups  = reinterpret_cast<const uint4*>(host_other);
-    auto* out_groups          = reinterpret_cast<uint4*>(out);
     if (blocks > 1 && blockIdx.x > 0 && threadIdx.x == 0) {
         while (*(const volatile unsigned long long*)(order_mine + blockIdx.x - 1) != token) {
             if (ar_expired(deadline)) {
@@ -183,7 +195,7 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     }
     if (blocks > 1) {
         __syncthreads();
-        if (stalled != 0) { return; }
+        if (stalled != 0) { ar_abandon_output(out_groups, begin, end, stride, threadIdx.x); return; }
     }
     for (int i = begin + threadIdx.x; i < end; i += stride) { mine_groups[i] = local_groups[i]; }
     if (blockIdx.x == 0) {
@@ -205,7 +217,7 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
         }
     }
     __syncthreads();
-    if (stalled != 0) { return; }
+    if (stalled != 0) { ar_abandon_output(out_groups, begin, end, stride, threadIdx.x); return; }
     __threadfence_system();
     int i = begin + threadIdx.x;
     for (; i + 3 * stride < end; i += 4 * stride) {
