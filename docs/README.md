@@ -14,6 +14,7 @@ run the CLI or HTTP server.
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [Windows native build](windows.md) | VS2022 + CUDA 13.3 build, native run recipe, verified Windows/WDDM behavior, TP-2 mapped-pinned findings, and platform differences |
 | [Dual RTX 5060 Ti TP-2](tp2-dual-5060ti.md) | tensor-parallel-2 server configuration, memory budget, and measurements on two RTX 5060 Ti cards |
+| [TP-2 settled decisions](tp2-decisions.md) | quick reference of settled decisions, rejected approaches, and root causes from the TP-2 campaign, with worklog pointers |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
