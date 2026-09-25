@@ -585,6 +585,9 @@ rendezvous id（`2<<32+122460`）也在**captured 通道**内，与复现一致�
 - (a) **抓到触发源（已实施；默认已改为开启）**：采样 A/B（`r62_sampling_ab.ps1`）、三件套（`r66_suites.ps1`）、
   长跑（`r71_ar_stress.ps1`）一律开 `NINFER_TP2_AR_WATCHDOG=1`；失败时 `tools/tp_bootstrap/ar_watch.ps1`
   把日志**另存为不可被复跑覆盖**的 `*-FAILED.log`，并把解释后的 dump 写到 `*-FAILED.arwatch.txt`。
+  **另存的门已是「日志里真的有 dump」**（`Test-ArWatchDump`，2026-09-25）：没有 dump 的失败——测试断言、
+  坏 artifact、抢端口——普通运行日志已经完整描述，另存只会散落需要手工清理的 `*-FAILED` 文件
+  （本战役 20 个里有 15 个是这么来的）。
   判读规则按 **id 差值的量级**分类（数组保留的是各侧**最后写入**的值）：某侧整组为 0 ⇒ 该侧
   **从未到达 arrival 写入**（内核没跑）；差值 1 ⇒ **OFF-BY-ONE**（两侧对同一次 collective 编号不同）；
   差值达一个整块（数百）⇒ **BLOCK-LEVEL**（两侧跑在不同 id 块上，正是「captured 图读到了 host 已
