@@ -159,6 +159,78 @@ bool page_payload_zero(ninfer::HostKVAllocationConstView view, std::uint32_t pag
     return true;
 }
 
+std::vector<unsigned char> read_plane(const ninfer::Tensor& plane) {
+    std::vector<unsigned char> out(plane.bytes());
+    const cudaError_t err = cudaMemcpy(out.data(), plane.data, out.size(), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("plane read failed: ") + cudaGetErrorString(err));
+    }
+    return out;
+}
+
+// The bytes zero_pages has to clear for one run, per plane order, as an oracle independent of the
+// call the implementation makes: PageMajor clears the run's contiguous pages at stride nb[3],
+// HeadMajor clears each head's run at stride nb[2] (ne[2] is the page extent and ne[3] the head
+// count in that order). Everything the oracle leaves untouched has to come back byte for byte.
+std::vector<std::vector<unsigned char>> expected_zero_pages(
+    const ninfer::DeviceKVPagePool& pool, ninfer::PagedKVPlaneOrder order, std::int32_t first,
+    std::int32_t count, const std::vector<std::vector<unsigned char>>& before) {
+    std::vector<std::vector<unsigned char>> out = before;
+    for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
+        const ninfer::Tensor& plane        = pool.plane(plane_index);
+        std::vector<unsigned char>& bytes  = out[plane_index];
+        const auto clear                   = [&bytes](std::int64_t offset, std::int64_t size) {
+            for (std::int64_t index = 0; index < size; ++index) {
+                bytes[static_cast<std::size_t>(offset + index)] = 0;
+            }
+        };
+        if (order == ninfer::PagedKVPlaneOrder::PageMajor) {
+            clear(static_cast<std::int64_t>(first) * plane.nb[3],
+                  static_cast<std::int64_t>(count) * plane.nb[3]);
+        } else {
+            for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
+                clear(static_cast<std::int64_t>(head) * plane.nb[3] +
+                          static_cast<std::int64_t>(first) * plane.nb[2],
+                      static_cast<std::int64_t>(count) * plane.nb[2]);
+            }
+        }
+    }
+    return out;
+}
+
+// zero_pages must clear exactly the run's page payloads - every plane, every head - and leave every
+// other byte of the pool alone. The pool is filled with a determined pattern first, the run starts
+// at a page that is not the first one, and the whole plane is compared afterwards, so a missed head,
+// a mixed-up page stride or a write past the run all fail here.
+int exercise_zero_pages(ninfer::DeviceContext& context, ninfer::KVPageGeometry geometry,
+                        std::int32_t first, std::int32_t count, const std::string& label) {
+    int failures                       = 0;
+    const auto order                   = geometry.device_plane_order;
+    PlannedCache plan                  = plan_cache(8, 8, 1, std::move(geometry));
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+    const std::vector<std::vector<unsigned char>> before = fill_device_pool(pool, context.stream);
+    context.synchronize();
+
+    std::vector<ninfer::DeviceKVPageLease> leases     = materialize(pool, 8);
+    const std::vector<ninfer::DeviceKVPageHandle> all = handles(leases);
+    const std::vector<ninfer::DeviceKVPageHandle> run(all.begin() + first,
+                                                     all.begin() + first + count);
+    pool.zero_pages(run, context.stream);
+    context.synchronize();
+
+    const std::vector<std::vector<unsigned char>> expected =
+        expected_zero_pages(pool, order, first, count, before);
+    for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
+        failures += expect(read_plane(pool.plane(plane_index)) == expected[plane_index],
+                           label + " zero_pages[" + std::to_string(first) + "," +
+                               std::to_string(first + count) + ") plane " +
+                               std::to_string(plane_index) +
+                               " did not clear exactly that page run");
+    }
+    return failures;
+}
+
 int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
     int failures = 0;
     ninfer::KVPageGeometry geometry{
@@ -470,6 +542,33 @@ int main() {
                     },
             },
             "K8V4 asymmetric PageMajor");
+        // A middle run and the pool's last page: the first shows a missed head or a write past the
+        // run, the second also covers the run that ends at the allocation.
+        for (const auto& [first, count] : {std::pair<std::int32_t, std::int32_t>{2, 3},
+                                           std::pair<std::int32_t, std::int32_t>{7, 1}}) {
+            failures += exercise_zero_pages(
+                context,
+                ninfer::KVPageGeometry{
+                    .device_plane_order = ninfer::PagedKVPlaneOrder::HeadMajor,
+                    .planes =
+                        {
+                            {ninfer::DType::BF16, 8, 3, 256},
+                            {ninfer::DType::FP16, 2, 3, 256},
+                        },
+                },
+                first, count, "HeadMajor");
+            failures += exercise_zero_pages(
+                context,
+                ninfer::KVPageGeometry{
+                    .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                    .planes =
+                        {
+                            {ninfer::DType::I8, 8, 2, 256},
+                            {ninfer::DType::FP16, 1, 2, 256},
+                        },
+                },
+                first, count, "PageMajor");
+        }
         if (failures != 0) {
             std::cerr << failures << " Paged KV physical-container checks failed\n";
             return 1;

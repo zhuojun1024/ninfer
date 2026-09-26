@@ -54,6 +54,14 @@ struct KVPlaneGeometry {
     friend bool operator==(const KVPlaneGeometry&, const KVPlaneGeometry&) = default;
 };
 
+// Which dim of a plane's storage is the *major* (slowest varying) one. Planes are Tensors, so
+// ne[0] is the contiguous dim and the shape an order plans runs innermost to outermost:
+//   PageMajor: {leading, page_tokens, head_extent, pages}   a page is contiguous at stride nb[3]
+//   HeadMajor: {leading, page_tokens, pages, head_extent}   a page is one head's run at stride
+//                                                          nb[2], heads at stride nb[3], and
+//                                                          ne[3] is the head count
+// Copying or zeroing a page run therefore has to iterate heads in the HeadMajor order; reading the
+// shape initializer as a memory order (head innermost) inverts which stride is which.
 enum class PagedKVPlaneOrder : std::uint8_t {
     PageMajor,
     HeadMajor,

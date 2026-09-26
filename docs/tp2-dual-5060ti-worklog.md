@@ -6641,3 +6641,27 @@ not map)`。
 **exit=0**、全部位精确断言通过；pair test 新增「4 MiB 深队列」（in-kernel 16 次 / 回退 8 次）作为这个竞态的
 回归用例（20 KB 那档抓不到它），全树 243/243 构建通过。回退档的 proposal 成本 7.80/7.97 ms vs in-kernel
 7.05 ms，符合回退每个 collective 都要 host 同步的预期。
+
+### PLAN §4.2 复核：zero_pages 的「HeadMajor 越界写」是误报（2026-09-26）
+
+**要求**：修 PLAN.md §4.2（当时唯一的「确认 latent bug：`zero_pages` HeadMajor 越界写」）。
+
+**结论**：这条 latent bug 不存在，`zero_pages` 两种 plane order 都正确；要修的是**分析**与**契约文档**。
+
+- 原文推理的前提是「H 是最内层」（把 `{leading, 64, physical_pages, head_extent}` 当成 numpy 的内存次序），
+  于是把 `nb[3]` 读成元素大小，得出"每行前移 i*elem_size"。
+- `Tensor::set_contiguous_strides`（`src/core/tensor.cpp:50-57`）从 `nb[0]=dtype_size` 起逐维相乘 ⇒
+  **`ne[0]` 最内层**。HeadMajor 下 `nb[2] = 64*leading*es`（单页字节数）、`nb[3] = physical_pages*nb[2]`
+  （head 步长），所以 `cudaMemset2DAsync` 的 `dpitch=nb[3]` 正是"每行一个 head"，行 i 覆盖 head i 的页区间；
+  末字节 `first*nb2+(H−1)*nb3+count*nb2 ≤ H*nb3` ＝ 平面末尾，且 `dpitch = physical_pages*nb2 ≥ count*nb2`
+  满足该 API 的 pitch 约束 ⇒ **无越界**。
+- 原文建议的 1D `cudaMemsetAsync(base+first*nb2, 0, count*nb2)` 只清零 head 0，是错的。
+
+**判据**：`tests/test_kv_cache.cpp` 新增 `exercise_zero_pages`——两种 plane order，先整池填确定型位型，
+对中间 run `[2,5)` 与末页 `[7,8)` 跑 `zero_pages`，再逐平面**全字节**比对期望（run 内全 0、run 外逐字节
+不变）。实测：当前实现 **PASS**；把实现临时换成原文建议的 1D memset 后 **FAIL**（5 条，含既有
+`HeadMajor selective zero left page payload bytes`）⇒ 该用例确实能判定这件事。临时改动已回退
+（`git diff -- src/core/paged_kv_cache.cpp` 为空）。
+
+**顺带**：`src/core/paged_kv_cache.h` 的 `PagedKVPlaneOrder` 补上注释（枚举名指最慢维；两种顺序的 shape
+与 page/head 步长），把这次误读的成因写进契约；PLAN §4.6 的结论与统计同步更新。

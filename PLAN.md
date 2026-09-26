@@ -234,15 +234,32 @@ dflash_round），并结合 git 历史核对上文 §3.3 已知缺陷。
 
 ### 4.2 确定性 / 潜在 bug
 
-- **[确认，latent] `src/core/paged_kv_cache.cpp:543-548` — `zero_pages` 的 HeadMajor 分支越界写。**
-  对 HeadMajor 布局（DFlash Full pool，平面形状 `[X,64,N_phys,H]`）用
-  `cudaMemset2DAsync(dst=base+first*nb2, dpitch=nb3, width=count*nb2, height=H)` 清零连续页块
-  `[first, first+count)`。第 i 行写 `[dst+i*nb3, dst+i*nb3+count*nb2)`，行 0 恰覆盖目标块，但行
-  1…H-1 各前移 `i*elem_size`，总写范围超出目标块 **(H−1)×elem_size** 字节，落进 next physical page。
-  正确实现应是 1D `cudaMemsetAsync(base+first*nb2, 0, count*nb2)`（PageMajor 分支即正确）。
-  触发条件：被零页块的下一页是存活且有意义的页时，静默腐蚀其前 (H−1)×elem_size 字节（BF16 下 6–14 字节）。
-  现状：唯一调用点 `graphs.cpp:186`（`zero_capture_pages`）只零 fresh pool 前导 dummy capture 页，
-  overflow 落在 free/dummy 页，**未触发数据损坏**，故为 latent；但作为 pool 公共 API 本身错误。
+**复核结果（2026-09-26）：本节唯一的「确认 latent bug」是误报，已撤销——`zero_pages` 的两种 plane
+order 都正确。** 推导与可执行判据如下。
+
+- **〔撤销〕`src/core/paged_kv_cache.cpp` — `zero_pages` 的 HeadMajor 分支"越界写"（原文 2026-07-18）**：
+  原文断言对 HeadMajor 布局（平面形状 `[X,64,N_phys,H]`）的
+  `cudaMemset2DAsync(dst=base+first*nb2, dpitch=nb3, width=count*nb2, height=H)` 第 i 行前移
+  `i*elem_size`，总写范围超出目标块 (H−1)×elem_size 字节，并建议改为 1D
+  `cudaMemsetAsync(base+first*nb2, 0, count*nb2)`。
+  **复核：前提错了——`ne` 的次序不是 numpy 那样的"最后一维最内层"。**
+  `Tensor::set_contiguous_strides`（`tensor.cpp:50-57`）从 `nb[0]=dtype_size` 起逐维相乘 ⇒
+  **`ne[0]` 最内层**，而 `plan_device_kv_page_pool`（`paged_kv_cache.cpp:90-93`）给 HeadMajor 建的是
+  `{leading_extent, kPagedKVPageSize, physical_pages, head_extent}` ⇒
+  `nb[2] = 64*leading*es`（**单页字节数**）、`nb[3] = physical_pages*nb[2]`（**head 步长**）、
+  `ne[3] = head_extent`（head 数；既有用例已钉住 `ne[2]=pages`/`ne[3]=heads`，见
+  `tests/test_kv_cache.cpp:247-251`）。于是 `dpitch=nb[3]` 正是"每行一个 head"，第 i 行覆盖
+  `[base+first*nb2+i*nb3, +count*nb2)` ＝ head i 的页区间（行 0 不再"恰覆盖"，各行等距），
+  末字节 `first*nb2+(H−1)*nb3+count*nb2 ≤ H*nb3` ＝ 平面末尾（run 长度 ≤ 总页数）⇒ **无越界**；
+  且 `dpitch = physical_pages*nb2 ≥ count*nb2 = width`，满足 `cudaMemset2DAsync` 的 pitch 约束。
+  原文把 shape 初始列表当成了内存顺序，才把 `nb[3]` 读成元素大小；它建议的 1D memset **只清零 head 0**，
+  其余 head 的页保持原值，不是正确实现。
+  **判据**（新增 `tests/test_kv_cache.cpp` 的 `exercise_zero_pages`）：两种 plane order 各取中间 run
+  `[2,5)` 与末页 `[7,8)`，先把整池填确定型位型、跑 `zero_pages`、再逐平面**全字节**比对期望
+  （run 内全 0、run 外逐字节不变）。当前实现 **PASS**；把实现临时换成原文建议的 1D memset 后 **FAIL**
+  （新增用例 4 条 + 既有 `selective zero left page payload bytes`，共 5 条）⇒ 该用例确实能判定这件事。
+  同时 `paged_kv_cache.h` 的 `PagedKVPlaneOrder` 补上"枚举名指最慢维、两种顺序的 shape 与
+  page/head 步长"注释，避免复现同一误读。
 
 ### 4.3 上文 §3.3 已知缺陷核实
 
@@ -276,8 +293,9 @@ dflash_round），并结合 git 历史核对上文 §3.3 已知缺陷。
 ### 4.6 结论
 
 整体工程质量高：边界校验、溢出检查、生命周期所有权、数值 oracle 约定到位，§3.3 已知缺陷当前代码全部已修复。
-新确认 **1 个 latent bug**（`zero_pages` HeadMajor 越界写，当前未触发但 API 本身错误）与 **4 项架构级隐患**
-（「双核心漂移」与「TP-2 give-up 安全性」最值得后续投入）。
+本次唯一「确认 latent bug」（`zero_pages` HeadMajor 越界写）已按 §4.2 复核**撤销**——原文用错了 `ne` 次序，
+代码两种 plane order 都正确，并已补上字节级用例；**4 项架构级隐患**中「TP-2 双核心漂移」与「TP-2 give-up
+安全性」最值得后续投入（前者见 §4.7 实施记录，后者仍未决策）。
 
 ### 4.7 §4.4.3 解决方案调研（host-staging CPU allreduce 性能悬崖）（2026-09-26）
 
