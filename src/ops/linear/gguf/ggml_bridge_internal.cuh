@@ -36,6 +36,10 @@ inline void check(cudaError_t status, const char* what) {
 // column tiles these allow, which is where ggml's own selection lands for them as well.
 inline constexpr int kMatrixColumnTiles[] = {16, 32, 64, 128};
 
+// Dynamic shared memory up to this size needs no opt-in, so a launch at or below it cannot be
+// rejected for exceeding the architectural default.
+inline constexpr std::size_t kMatrixDefaultSharedBytes = 48 * 1024;
+
 // The matrix kernel's activation carries one block_q8_1_mmq per 128 values per column; ggml over-reads
 // up to one widest column tile past the end, so the plane keeps that much slack.
 inline constexpr std::size_t kMatrixActivationSlack = 128 * sizeof(block_q8_1_mmq);
