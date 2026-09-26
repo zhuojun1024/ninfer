@@ -271,6 +271,14 @@ void position_arena(WorkspaceArena& arena, std::size_t floor, std::size_t target
     }
 }
 
+// Closes the DevicePair's capture window on every exit. capture_group rolls the CUDA stream capture
+// back when its body throws, but it cannot reset the pair's own capture state: a left-open window
+// makes every later capture throw and makes later eager collectives take the captured id path.
+struct ArCaptureGuard {
+    tp::DevicePair& pair;
+    ~ArCaptureGuard() { pair.end_capture(); }
+};
+
 } // namespace
 
 TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a, int device_b)
@@ -468,6 +476,13 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
                      : mtp_chain_mode_ == StepLaunchMode::EagerBucket ? "eager(bucket)"
                                                                      : "eager(exact)");
     }
+
+    // The rendezvous id space is one channel per captured graph, and the bucket sets above are the
+    // complete set of graphs that can ever be captured (verify window, MTP draft chain, plain decode
+    // step). Reserve them all: MTP K >= 3 alone needs 2 x 9 buckets, past the fixed 16 default, and a
+    // bucket that cannot get a channel fails every later request that needs it.
+    pair_.reserve_ar_channels(
+        verify_graphs_.size() + mtp_chain_graphs_.size() + decode_graphs_.size());
 
     frontend_ = std::make_unique<qwen::Frontend>(
         qwen::make_frontend(shard_a_.model->resources(),
@@ -976,6 +991,7 @@ void TP2GenerationCore::capture_verify_graph(WindowGraph& graph, const std::int3
     DecodeGraphDefinition* definitions[2] = {&graph.definition[0], &graph.definition[1]};
     cudaStream_t streams[2] = {shard_a.device.stream, shard_b.device.stream};
     pair_.begin_capture(graph.ar_channel);
+    const ArCaptureGuard capture_guard{pair_};
     DecodeGraphDefinition::capture_group(definitions, streams, [&] {
         // The masked-draft sink and the clamp extent are part of the captured window: without the
         // forwarding here the capture silently takes the default nullptr/nullptr and every replay
@@ -1079,6 +1095,7 @@ void TP2GenerationCore::capture_decode_graph(WindowGraph& graph, const std::int3
         graph.ar_channel = pair_.create_ar_channel();
     }
     pair_.begin_capture(graph.ar_channel);
+    const ArCaptureGuard capture_guard{pair_};
     DecodeGraphDefinition::capture_group(definitions, streams, [&] {
         shard_a.context->forward_tp2_decode_window(*shard_b.context, pair_, token, position,
                                                   envelope, logits);
@@ -1222,6 +1239,7 @@ void TP2GenerationCore::capture_mtp_chain_graph(WindowGraph& graph, Tensor& mtp_
         graph.ar_channel = pair_.create_ar_channel();
     }
     pair_.begin_capture(graph.ar_channel);
+    const ArCaptureGuard capture_guard{pair_};
     DecodeGraphDefinition::capture_group(definitions, streams, [&] {
         mtp_chain_body(shard_a, mtp_input, pins, host_drafts, graph, ws);
     });

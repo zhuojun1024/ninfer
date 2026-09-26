@@ -37,10 +37,13 @@ public:
 
     const DeviceContext& a() const noexcept { return a_; }
     const DeviceContext& b() const noexcept { return b_; }
+    // Whether peer access between the two devices is available. Reported only: the transport no
+    // longer issues peer copies, because an in-place two-copy all-reduce aliases the half the second
+    // copy must still read (see allreduce), and a sendrecv may alias a side's send and receive.
     bool p2p_available() const noexcept { return p2p_; }
     // True when allreduce runs entirely in-kernel over mapped pinned host staging with no host
-    // synchronization. Only this transport may be captured into a CUDA Graph: the P2P and
-    // host-staging fallbacks synchronize the caller's streams.
+    // synchronization. Only this transport may be captured into a CUDA Graph: the host-staging
+    // fallback synchronizes the caller's streams.
     bool in_kernel_allreduce() const noexcept { return in_kernel_available_; }
     // Largest payload the in-kernel transport carries in one call, in bytes; 0 when that transport
     // is not in use. A caller that sizes a batched payload (the TP-2 prefill chunk) bounds it by
@@ -91,6 +94,12 @@ public:
         ar_fault_skip_call_ = serial;
         ar_call_serial_     = 0;
     }
+
+    // Sizes the rendezvous id space to hold `count` captured graphs. Must be called before the first
+    // create_ar_channel (no channel may exist yet); a no-op when the in-kernel transport is
+    // unavailable or `count` does not exceed the current capacity. The TP-2 core passes the number
+    // of graph buckets it built, so a bucket can no longer exhaust a fixed id block.
+    void reserve_ar_channels(std::size_t count);
 
     // In-place all-reduce of count_bytes (multiple of 16): on return both
     // buffers contain a + b elementwise. stream_a/stream_b are the compute
@@ -171,10 +180,15 @@ private:
         bool seen_a             = false; // the base memcpy is recorded once per capture, per stream
         bool seen_b             = false;
     };
-    static constexpr std::size_t kArMaxChannels = 16;
-    unsigned long long* base_host_ = nullptr; // cudaFreeHost handle: kArMaxChannels id cells
-    void* base_dev_a_ = nullptr; // cudaMalloc on device a: kArMaxChannels scalars
-    void* base_dev_b_ = nullptr; // cudaMalloc on device b: kArMaxChannels scalars
+    // Rendezvous id channels: one per captured graph. The owning core reserves the count its graph
+    // buckets imply (reserve_ar_channels) before the first capture; this default is the floor for a
+    // caller that never reserves. The capacity is fixed once a channel exists, because a channel's
+    // device scalar is the destination a graph's memcpy node was captured with.
+    static constexpr std::size_t kArDefaultChannels = 16;
+    std::size_t ar_channel_capacity_ = kArDefaultChannels;
+    unsigned long long* base_host_ = nullptr; // cudaFreeHost handle: ar_channel_capacity_ id cells
+    void* base_dev_a_ = nullptr; // cudaMalloc on device a: ar_channel_capacity_ scalars
+    void* base_dev_b_ = nullptr; // cudaMalloc on device b: ar_channel_capacity_ scalars
     std::vector<ArChannelState> ar_channels_; // one per captured graph, created on demand
     bool capturing_              = false;
     ArChannel capture_channel_   = kNoArChannel;

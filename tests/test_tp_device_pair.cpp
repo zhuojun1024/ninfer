@@ -876,6 +876,42 @@ int bench_host_staging(ninfer::tp::DevicePair& pair, std::size_t count_bytes, in
 
 } // namespace
 
+// The rendezvous id space is sized from the owning core's graph bucket count, not a fixed block:
+// the TP-2 core reserves verify windows + MTP draft chain + plain decode step buckets, which is
+// 2 x 9 or more for MTP K >= 3 and already at the old fixed 16 for K = 2. Reserve explicitly here
+// and check that the space is exactly what was asked for and refuses one channel past it.
+int check_reserve_channels(ninfer::tp::DevicePair& pair) {
+    if (!pair.in_kernel_allreduce()) {
+        std::cout << "reserve channels: no in-kernel transport, skipped\n";
+        return 0;
+    }
+    int failures = 0;
+    constexpr std::size_t kReserved = 24;
+    pair.reserve_ar_channels(kReserved);
+    for (std::size_t i = 0; i < kReserved; ++i) {
+        try {
+            (void)pair.create_ar_channel();
+        } catch (const std::exception& error) {
+            std::cerr << "reserve channels: channel " << i << " refused: " << error.what() << '\n';
+            ++failures;
+            break;
+        }
+    }
+    bool refused = false;
+    try {
+        (void)pair.create_ar_channel();
+    } catch (const std::exception& error) {
+        refused = true;
+        std::cout << "reserve channels: overflow refused as expected: " << error.what() << '\n';
+    }
+    if (!refused) {
+        std::cerr << "reserve channels: channel " << kReserved << " past the reservation was not"
+                  << " refused\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int main() {
     int count = 0;
     const cudaError_t err = cudaGetDeviceCount(&count);
@@ -1045,6 +1081,10 @@ int main() {
             ++failures;
         }
         failures += check_allreduce(below_floor, 20480, 8);
+    }
+    {
+        ninfer::tp::DevicePair reserved(dev_a, dev_b);
+        failures += check_reserve_channels(reserved);
     }
     if (failures == 0) { std::cout << "PASS\n"; return 0; }
     std::cerr << failures << " failures\n";

@@ -27,34 +27,6 @@
 namespace ninfer::tp {
 namespace {
 
-constexpr std::int32_t kAddThreads = 256;
-
-// Elementwise in-place add of out += other for count_bytes of 2-byte BF16
-// elements. Vectorized 8-byte (4-element) loads for aligned data.
-__global__ void add_bf16_inplace(__nv_bfloat16* out, const __nv_bfloat16* other,
-                                 std::size_t elements) {
-    const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
-    const std::size_t vec    = elements / 4;
-    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         i < vec; i += stride) {
-        const uint2 o = reinterpret_cast<const uint2*>(other)[i];
-        uint2 d       = reinterpret_cast<uint2*>(out)[i];
-        const __nv_bfloat162 oh = *reinterpret_cast<const __nv_bfloat162*>(&o);
-        const __nv_bfloat162 dh = *reinterpret_cast<const __nv_bfloat162*>(&d);
-        const __nv_bfloat162 sum = __hadd2(dh, oh);
-        reinterpret_cast<uint2*>(out)[i] = *reinterpret_cast<const uint2*>(&sum);
-    }
-    for (std::size_t i = vec * 4 + static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         i < elements; i += stride) {
-        out[i] = __hadd(out[i], other[i]);
-    }
-}
-
-std::size_t add_grid(std::size_t elements) {
-    const std::size_t blocks = (elements + 4 * kAddThreads - 1) / (4 * kAddThreads);
-    return std::max<std::size_t>(1, std::min<std::size_t>(blocks, 1024));
-}
-
 // Elementwise BF16 add of two 16-byte groups (eight BF16 values).
 __device__ __forceinline__ uint4 add_bf16x8(uint4 a, uint4 b) {
     const __nv_bfloat162 a0 = *reinterpret_cast<const __nv_bfloat162*>(&a.x);
@@ -507,12 +479,60 @@ void DevicePair::clear_ar_stall() noexcept {
     // That is what makes a stalled round recoverable in place instead of needing a renumbering.
 }
 
+void DevicePair::reserve_ar_channels(std::size_t count) {
+    if (count <= ar_channel_capacity_) { return; }
+    // Without the in-kernel transport there are no id cells to grow; create_ar_channel already
+    // refuses, so this is a no-op rather than an error.
+    if (base_host_ == nullptr && base_dev_a_ == nullptr && base_dev_b_ == nullptr) { return; }
+    if (!ar_channels_.empty()) {
+        throw std::logic_error(
+            "tp allreduce: the rendezvous id space cannot grow once a channel exists");
+    }
+    unsigned long long* host = nullptr;
+    if (cudaHostAlloc(reinterpret_cast<void**>(&host), count * sizeof(unsigned long long),
+                      cudaHostAllocPortable) != cudaSuccess) {
+        (void)cudaGetLastError();
+        throw std::runtime_error("tp allreduce: failed to reserve the rendezvous id cells");
+    }
+    std::memset(host, 0, count * sizeof(unsigned long long));
+    a_.bind_to_current_thread();
+    void* dev_a = nullptr;
+    if (cudaMalloc(&dev_a, count * sizeof(unsigned long long)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFreeHost(host);
+        throw std::runtime_error("tp allreduce: failed to reserve the device-a rendezvous ids");
+    }
+    b_.bind_to_current_thread();
+    void* dev_b = nullptr;
+    if (cudaMalloc(&dev_b, count * sizeof(unsigned long long)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        a_.bind_to_current_thread();
+        cudaFree(dev_a);
+        cudaFreeHost(host);
+        throw std::runtime_error("tp allreduce: failed to reserve the device-b rendezvous ids");
+    }
+    if (base_host_ != nullptr) { cudaFreeHost(base_host_); }
+    if (base_dev_a_ != nullptr) {
+        a_.bind_to_current_thread();
+        cudaFree(base_dev_a_);
+    }
+    if (base_dev_b_ != nullptr) {
+        b_.bind_to_current_thread();
+        cudaFree(base_dev_b_);
+    }
+    base_host_           = host;
+    base_dev_a_          = dev_a;
+    base_dev_b_          = dev_b;
+    ar_channel_capacity_ = count;
+    std::fprintf(stderr, "[mem] TP-2 rendezvous id channels reserved: %zu\n", count);
+}
+
 DevicePair::ArChannel DevicePair::create_ar_channel() {
     if (base_host_ == nullptr || base_dev_a_ == nullptr || base_dev_b_ == nullptr) {
         throw std::logic_error("tp allreduce: the in-kernel transport is unavailable");
     }
-    if (ar_channels_.size() >= kArMaxChannels) {
-        throw std::logic_error("tp allreduce: the captured graphs exceed the rendezvous id channels");
+    if (ar_channels_.size() >= ar_channel_capacity_) {
+        throw std::logic_error("tp allreduce: the captured graphs exceed the reserved rendezvous id channels");
     }
     const std::size_t index = ar_channels_.size();
     ArChannelState state;
@@ -758,7 +778,7 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
         CUDA_CHECK(cudaDeviceEnablePeerAccess(device_a, 0));
         p2p_ = true;
     }
-    if (!p2p_ && !force_host_staging_) {
+    if (!force_host_staging_) {
         // Set up the in-kernel allreduce path: mapped pinned staging buffers (one per device) plus
         // arrival tokens. cudaHostAllocMapped makes the host memory directly addressable by the
         // device; the staging reservation walks the ladder, so a host that cannot map the full size
@@ -800,17 +820,17 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
                     }
                     if (ids) {
                         ids = cudaHostAlloc(reinterpret_cast<void**>(&base_host_),
-                                            kArMaxChannels * sizeof(unsigned long long),
+                                            ar_channel_capacity_ * sizeof(unsigned long long),
                                             cudaHostAllocPortable) == cudaSuccess;
                         if (ids) {
                             std::memset(base_host_, 0,
-                                        kArMaxChannels * sizeof(unsigned long long));
+                                        ar_channel_capacity_ * sizeof(unsigned long long));
                             a_.bind_to_current_thread();
-                            ids = cudaMalloc(&base_dev_a_, kArMaxChannels *
+                            ids = cudaMalloc(&base_dev_a_, ar_channel_capacity_ *
                                                                sizeof(unsigned long long)) ==
                                   cudaSuccess;
                             b_.bind_to_current_thread();
-                            ids = ids && cudaMalloc(&base_dev_b_, kArMaxChannels *
+                            ids = ids && cudaMalloc(&base_dev_b_, ar_channel_capacity_ *
                                                                       sizeof(unsigned long long)) ==
                                              cudaSuccess;
                         }
@@ -922,7 +942,9 @@ DevicePair::DevicePair(DevicePair&& other) noexcept
       arrival_host_b_(other.arrival_host_b_),
       stall_host_(other.stall_host_), stall_a_(other.stall_a_), stall_b_(other.stall_b_),
       ar_timeout_ns_(other.ar_timeout_ns_), ar_call_serial_(other.ar_call_serial_),
-      ar_fault_skip_call_(other.ar_fault_skip_call_), base_host_(other.base_host_),
+      ar_fault_skip_call_(other.ar_fault_skip_call_),
+      ar_payload_divisor_(other.ar_payload_divisor_),
+      ar_channel_capacity_(other.ar_channel_capacity_), base_host_(other.base_host_),
       base_dev_a_(other.base_dev_a_), base_dev_b_(other.base_dev_b_),
       ar_channels_(std::move(other.ar_channels_)), capturing_(other.capturing_),
       capture_channel_(other.capture_channel_), capture_index_(other.capture_index_),
@@ -930,7 +952,7 @@ DevicePair::DevicePair(DevicePair&& other) noexcept
       force_host_staging_(other.force_host_staging_), host_add_threads_(other.host_add_threads_),
       small_available_(other.small_available_), small_host_a_(other.small_host_a_),
       small_host_b_(other.small_host_b_), small_dev_a_(other.small_dev_a_),
-      small_dev_b_(other.small_dev_b_) {
+      small_dev_b_(other.small_dev_b_), watch_(std::move(other.watch_)) {
     other.p2p_              = false;
     other.in_kernel_available_ = false;
     other.small_available_  = false;
@@ -949,10 +971,41 @@ DevicePair::DevicePair(DevicePair&& other) noexcept
     other.base_dev_a_       = nullptr;
     other.base_dev_b_       = nullptr;
     other.capturing_        = false;
+    // The diagnostics thread now belongs to this object, but the state block still names other's id
+    // counter. Stop it, re-point it at this object's members (the mapped arrays' addresses do not
+    // move), and restart, so neither destruction order can leave it reading freed memory.
+    if (watch_) {
+        stop_ar_watchdog();
+        watch_->id        = &ar_last_id_;
+        watch_->arrival_a = static_cast<const unsigned char*>(arrival_host_a_);
+        watch_->arrival_b = static_cast<const unsigned char*>(arrival_host_b_);
+        watch_->stop.store(false, std::memory_order_relaxed);
+        start_ar_watchdog();
+    }
 }
 
 DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     if (this == &other) { return *this; }
+    stop_ar_watchdog();
+    watch_.reset();
+    // Release this object's own mapped/device reservations before the plain pointer assignments
+    // below take other's: those assignments would otherwise strand them.
+    if (p2p_) {
+        a_.bind_to_current_thread_noexcept();
+        b_.bind_to_current_thread_noexcept();
+        cudaDeviceDisablePeerAccess(b_.device);
+        cudaDeviceDisablePeerAccess(a_.device);
+    }
+    if (host_a_) { cudaFreeHost(host_a_); }
+    if (host_b_) { cudaFreeHost(host_b_); }
+    if (arrival_host_a_) { cudaFreeHost(arrival_host_a_); }
+    if (arrival_host_b_) { cudaFreeHost(arrival_host_b_); }
+    if (stall_host_) { cudaFreeHost(stall_host_); }
+    if (base_host_) { cudaFreeHost(base_host_); }
+    if (base_dev_a_) { a_.bind_to_current_thread_noexcept(); cudaFree(base_dev_a_); }
+    if (base_dev_b_) { b_.bind_to_current_thread_noexcept(); cudaFree(base_dev_b_); }
+    if (small_host_a_) { cudaFreeHost(small_host_a_); }
+    if (small_host_b_) { cudaFreeHost(small_host_b_); }
     a_ = std::move(other.a_);
     b_ = std::move(other.b_);
     p2p_ = other.p2p_;
@@ -986,7 +1039,8 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     force_host_staging_  = other.force_host_staging_;
     host_add_threads_    = other.host_add_threads_;
     ar_last_id_.store(other.ar_last_id_.load(), std::memory_order_relaxed);
-    stop_ar_watchdog();
+    ar_payload_divisor_  = other.ar_payload_divisor_;
+    ar_channel_capacity_ = other.ar_channel_capacity_;
     watch_               = std::move(other.watch_);
     small_available_     = other.small_available_;
     small_host_a_        = other.small_host_a_;
@@ -1011,6 +1065,14 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     other.small_host_b_     = nullptr;
     other.small_dev_a_      = nullptr;
     other.small_dev_b_      = nullptr;
+    if (watch_) {
+        stop_ar_watchdog();
+        watch_->id        = &ar_last_id_;
+        watch_->arrival_a = static_cast<const unsigned char*>(arrival_host_a_);
+        watch_->arrival_b = static_cast<const unsigned char*>(arrival_host_b_);
+        watch_->stop.store(false, std::memory_order_relaxed);
+        start_ar_watchdog();
+    }
     return *this;
 }
 
@@ -1134,30 +1196,10 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
         }
         return;
     }
-    if (p2p_ && !force_host_staging_) {
-        a_.bind_to_current_thread();
-        b_.bind_to_current_thread();
-        // The deltas were produced on the caller's compute streams, which are
-        // independent of the DevicePair's own peer-copy streams; settle them so
-        // the peer copies read completed source halves.
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
-        CUDA_CHECK(cudaStreamSynchronize(stream_b));
-        CUDA_CHECK(cudaMemcpyPeerAsync(data_a, a_.device, data_b, b_.device, count_bytes,
-                                       a_.stream));
-        CUDA_CHECK(cudaMemcpyPeerAsync(data_b, b_.device, data_a, a_.device, count_bytes,
-                                       b_.stream));
-        const std::size_t elements = count_bytes / 2;
-        const std::size_t grid     = add_grid(elements);
-        add_bf16_inplace<<<grid, kAddThreads, 0, a_.stream>>>(
-            reinterpret_cast<__nv_bfloat16*>(data_a),
-            reinterpret_cast<const __nv_bfloat16*>(data_b), elements);
-        add_bf16_inplace<<<grid, kAddThreads, 0, b_.stream>>>(
-            reinterpret_cast<__nv_bfloat16*>(data_b),
-            reinterpret_cast<const __nv_bfloat16*>(data_a), elements);
-        CUDA_CHECK(cudaStreamSynchronize(a_.stream));
-        CUDA_CHECK(cudaStreamSynchronize(b_.stream));
-        return;
-    }
+    // Two peer copies of an in-place all-reduce cannot be correct without a device scratch: the
+    // first copy overwrites the local half the second copy still has to read. Rather than exchange
+    // through scratch, every payload past the mapped staging takes the host-staging fallback below,
+    // whose reduction is the measured and qualified path on both P2P-capable and consumer hosts.
     // Host staging on the caller's compute streams: this call's parity slot holds [a | b], both
     // halves count_bytes, and the sum lands in the first half. The D2H copies are ordered after the
     // kernels that produced the deltas on those same streams, and the H2D copies are ordered before
@@ -1260,19 +1302,10 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
         }
         return;
     }
-    if (p2p_ && !force_host_staging_) {
-        a_.bind_to_current_thread();
-        b_.bind_to_current_thread();
-        // The send halves were produced on the caller's compute streams, which are independent of the
-        // DevicePair's own peer-copy streams; settle them so every copy reads a completed source half.
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
-        CUDA_CHECK(cudaStreamSynchronize(stream_b));
-        CUDA_CHECK(cudaMemcpyPeerAsync(recv_a, a_.device, send_b, b_.device, count_bytes, a_.stream));
-        CUDA_CHECK(cudaMemcpyPeerAsync(recv_b, b_.device, send_a, a_.device, count_bytes, b_.stream));
-        CUDA_CHECK(cudaStreamSynchronize(a_.stream));
-        CUDA_CHECK(cudaStreamSynchronize(b_.stream));
-        return;
-    }
+    // A sendrecv may alias a side's send and receive (see the header), and the two peer copies run
+    // on independent streams, so a peer copy could overwrite the source the other copy has not read
+    // yet. The host-staging fallback publishes both send halves before either receive is uploaded, so
+    // it is correct for that aliasing; use it for every payload here.
     // Host staging: this call's parity slot holds [a's send | b's send] and each receive copies the
     // other half back. Only the two D2H transfers need a barrier, exactly as the all-reduce fallback
     // does.
