@@ -396,3 +396,206 @@ GeForce 拒绝 P2P；授权依据 NVIDIA 芯片组允许表，消费级芯片组
   下一次调用的 D2H 覆盖上一次调用的 H2D 正在上传的半区，设备收到局部假和（表现为 logits 变化、下游
   甚至 `illegalAddress`）。改为两 parity 槽 + 增长前同步两条流；新增 4 MiB 深队列回归用例（20 KB 那档
   因 H2D 太快而抓不到）。
+
+---
+
+## 5. 上游 ninfer-all 性能项移植计划（2026-09-26 追加）
+
+> 来源：`D:\Documents\workbench\ninfer-all` —— 多 fork 整合线（基座 `ashalliants/ninfer-3090` v0.11.0，
+> 多数由 Warlax 编写），其提交在基线移动后逐条重放，故 commit hash 与本地不共享；用 `git patch-id --stable`
+> 对齐后，ninfer-all master 的 1770 条非合并提交中 1113 条与本地同补丁，657 条本地缺失（其中 perf/bench 119 条）。
+> 本节只收对 **2×5060 Ti TP-2** 有收益的项，按收益/成本排序。
+>
+> 判据（§1 与 `docs/tp2-dual-5060ti.md`）：decode 是每 shard 权重流带宽 bound（10.15 GB/forward ÷ 448 GB/s
+> ≈ 22.7 ms 下限，实测 round 38.2 ms）；另有 128 次/token allreduce（9–18 µs）、MTP 草稿链 host 串行
+> 7–10 ms、launch 间隙 ~2.9 ms（1009 kernels/forward）、16 GiB 显存硬约束。排序：减少每卡权重字节 >
+> 减少 launch/内核数 ≈ 减少通信次数 > 提高 prefill 算力 > 纯算力优化。
+
+### 5.1 执行顺序与状态
+
+| # | 项 | 上游提交 | 状态 |
+|---|---|---|---|
+| 1 | per-device `cudaFuncSetAttribute` 缓存（第二张卡 smem 上限未抬升） | `9adeb90c`（修 19 处） | **完成** 2026-09-26 |
+| 2 | 170 SM 硬编码 → 运行时设备 SM 数 | `d7bbcf57`、`7afc8e17` | **完成**（3 处代码；1 处待测量） |
+| 3 | 减内核/栈帧：RDC-off + attention gate 折叠 + INT8 scale 走 smem | `ea74dca4`、`77c9cc39`、`a941c9f4` | 3a **实测不支持已回退**；3b/3c 暂缓（见下） |
+| 4 | 减少每卡权重字节：embedding/head 与 MTP 专家 Q4/Q6 | `1da31697`、`f1982279`、`f8c75edd` | 待办 |
+| 5 | verify 段：small-T tensor-core 内核 + GDN record 窗口 staging | `ce2df46b`、`21df3069` | 待办 |
+| 6 | 大件（需产品决策）：KV codec / 设备路线 profile / fast prompt kernel | `eb9f7a23`/`ad26b362`/`2ba10da2`、`0b2f8384`/`81861a07`、`4303e604` | 待办 |
+
+### 5.2 各项范围与验证
+
+**1. per-device `cudaFuncSetAttribute`**
+- 事实：该属性是「当前设备上该函数」的属性；函数局部 `static` 让第一个设备记录结果、第二个设备跳过调用。
+  本地已有正确实现 `src/ops/common/cuda_smem.h::ensure_max_dynamic_shared_memory`（按 (kernel, device)
+  记忆，槽满后退化为无条件调用，仍正确），但只有 4 个 `small_t` 站点接入。
+- 待修（10 处函数局部 `static`，schedule 允许到 99 KiB > 48 KiB）：
+  `src/ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu:59`、
+  `src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_materialized.cu:34`、
+  `src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu:295`、
+  `src/ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu:33`、
+  `src/ops/linear/bf16/bf16_launch.cuh:42`、`src/ops/linear/bf16/shapes/n256_k5120.cu:13`、
+  `src/ops/linear/fp8/fp8_launch.cuh:59`、`src/ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu:51`、
+  `src/ops/linear_add/fp8/fp8_linear_add_a8.cu:32`、`src/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu:36`。
+- 同一机制的三处重复实现一并收敛到该 helper（逻辑等价）：`prompt_fp8.cu:27`、`prompt_k8v4.cu:22`、
+  `prompt_nvfp4_non_rdc.cu:19` 的 `static bool attr_done[64]`，以及 `prompt.cu:28-35` 的每次发射都调用。
+- 做法：全部改走 `ensure_max_dynamic_shared_memory(reinterpret_cast<const void*>(kernel), bytes)`，
+  保留既有 `if constexpr (>48 KiB)` 条件。
+- 验证：`cmake --build build-win -j` 通过；`git grep 'static const cudaError_t'` 归零；相关 op 测试
+  （`ninfer_tp_device_pair_test`、attention/linear 套件）通过；第二张卡上跑含 >48 KiB 内核的路径不再
+  返回 `cudaErrorInvalidValue`。
+
+**实施结果（2026-09-26）**
+
+- 10 处函数局部 `static` 全部改走 `ensure_max_dynamic_shared_memory`：
+  `ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu`、
+  `ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_materialized.cu`、
+  `ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu`、
+  `ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu`、`ops/linear/bf16/bf16_launch.cuh`、
+  `ops/linear/bf16/shapes/n256_k5120.cu`、`ops/linear/fp8/fp8_launch.cuh`、
+  `ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu`、`ops/linear_add/fp8/fp8_linear_add_a8.cu`、
+  `ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu`。
+- 4 处重复实现收敛到同一 helper：`prompt.cu`（原来每次发射都调）、`prompt_fp8.cu`、
+  `prompt_k8v4.cu`、`prompt_nvfp4_non_rdc.cu`（原来各自的 `static bool attr_done[64]`）。
+- `git grep 'static const cudaError_t'` 现为 0；所有站点统一带 `#include "ops/common/cuda_smem.h"`。
+- 证据：`pwsh -File tools/win_port/build.ps1 -SkipProbe` 全量构建 exit 0（192 步，89 s）；17 个受影响
+  套件全绿（device、tp_device_pair、rmsnorm、gated_rmsnorm、gdn_gating、softmax_attention、
+  rmsnorm_rope、attn_input_proj、gdn_input_proj、dynamic_grouped_conv×2、linear_fp8_a16/a8、
+  linear_bf16_a16、linear_add_bf16/fp8、linear_swiglu_fp8，317 s）。
+- **真实产物验证（2026-09-26）**：跑双卡件 `D:\LLM\qwen3_8_27b_swift15_dflash2_final.ninfer`（20.10 GB）：
+  `ninfer_qwen3_5_tp2_dflash_append_test` **PASS**（47 s，两卡同时执行前向 + DFlash2 proposal）；
+  `ninfer_qwen3_5_tp2_dflash_solo_test` 在 `D:\LLM\qwen3_8_27b_w4a4_dflash2_q4all.ninfer` 上 **PASS**（41 s）。
+  两个失败项都是**既有且已记录**的，与本轮改动无关：`tp2_sessions_test` 默认三路线下的 plain 分叉
+  （worklog:6117 规定该门禁走 `NINFER_TEST_ROUTE=dflash2`）；`tp2_dflash_solo_test` 在 swift15 件上的稳定
+  分叉（worklog:6548 记「`git stash` 后在 HEAD 重建、逐 token 相同地失败」，候选原因是该 artifact 与测试
+  基线不匹配）。⇒ 第二张卡上 >48 KiB 内核的路径已由真实两卡前向覆盖。
+- 后续候选（未做，属项目 3 范围）：仍有无条件 `cudaFuncSetAttribute` 的每次发射调用
+  （`context_kv_materialize/materialize.cu`、`linear/gguf/ggml_bridge_mmq.cuh`、
+  `linear/nvfp4/nvfp4_w4a4_tma.cu`、`linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu`、
+  `chunked/{output,prepare_wy_wu,state_passing}.cu`、`linear_topk/{fp8,q4,q8}_m64.cu`）。它们正确，但每次
+  发射都过一次 driver；TP-2 每次 forward ~1009 次发射会累到 host 侧，值得在有计时证据时一并收敛。
+
+**2. 170 SM 硬编码**
+- 落点与改法：`src/ops/launcher/rmsnorm.cu:20`（`kRmsPrefetchBlocks`）、`src/ops/launcher/rope.cu:16`、
+  `src/ops/linear_attention/gated_delta_net/chunked/output.cu:9`（`kRtx5090SmCount`）、
+  `src/ops/softmax_attention/dense/causal_cache/small_t.cu:66,230`、
+  `src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp:33,42` → 运行时查询设备 SM 数（按设备号缓存，
+  查询失败回退 170）。5060 Ti 为 36 SM ⇒ 170 块 ≈ 4.7 波，取整/预取/split-K 全部失配。
+- 验证：目标 op 既有测试；rmsnorm / gdn gating / chunked output / small_t 在 5060 Ti 上的 A/B 计时。
+
+**实施结果（2026-09-26）**
+
+- 新增 `src/ops/common/device_sm_count.h::device_sm_count(fallback = 170)`：按设备索引缓存
+  `cudaDevAttrMultiProcessorCount`，查询失败清错误并回退 170（与上游 `d7bbcf57` 的约定一致）。
+- 三处代码改成运行时查询（170 SM 设备上取值不变，行为逐位不变）：
+  `ops/launcher/rmsnorm.cu` 删除 `kRmsPrefetchBlocks = 170`，两处门限用 `device_sm_count()`；
+  `ops/launcher/rope.cu` 的 `kLargeBlockWaveCapacity = 1020` 改为 `kLargeBlockCtasPerSm(6) *
+  device_sm_count()`；`gated_delta_net/chunked/output.cu` 的 `kTargetCtas = 170 * 4` 改为
+  `device_sm_count() * kCtasPerSm`。
+- 两处**只改注释、不改代码**：`small_t.cu:66,230` 的 170 只出现在注释里，代码用的是与「一波」对齐的
+  字面 CTA 目标（160/320）；`bf16_gdn_gating_proj_plan.cpp:33,42` 也只在注释里，且注明「launcher
+  independently enforces actual-device residency」，SM 数已由调用方传入。把 160/320 改成 SM 派生值会
+  改变 5090 上的既有行为，必须先有 5060 Ti 上 batch_size>1 的 A/B 才能定。
+- 证据：构建 exit 0；18 个相关套件全绿（rmsnorm、rmsnorm_pack_tail、gated_rmsnorm、gated_delta_net、
+  gdn_gating、gdn_gating_proj、rope、rmsnorm_rope、linear_tp2_split×3，61 s）。这些测试本来就跑在本机
+  的两张 5060 Ti 上，因此新路径（36 / 216 / 144）已按 Op oracle 验收。
+- 36 SM 路径的运行覆盖：2026-09-26 的双卡真实产物运行（append PASS、solo@q4all PASS）在 36 SM 的
+  5060 Ti 上同时执行了两卡前向，新取值（36 / 216 / 144）已在真实 decode/verify 路径上跑通。
+- 待补：5060 Ti 上的 A/B 计时（rmsnorm 门限、rope block 选择、chunked GDN 波目标），以及 small_t
+  160/320 目标的测量。
+
+**实施结果（2026-09-26）：3a 实测不支持，已回退；3b/3c 暂缓**
+
+- **3a 取消 RDC（`ea74dca4`）——回退**。用上游同一指标（`cuobjdump --dump-resource-usage` 的 `STACK:`，
+  即带栈帧的函数数）在本树对比 `apps/ninfer-serve.exe`：
+  - 改前（`ninfer_cuda_archive` = `CUDA_SEPARABLE_COMPILATION ON` + `CUDA_RESOLVE_DEVICE_SYMBOLS ON`）：
+    4405 个函数、231 个 `STACK>0`、栈帧合计 8328。
+  - 改后（两者删除，全程序设备码）：4395 个函数、**269** 个 `STACK>0`（+16.5%）、合计 9200。
+    分族：rope_fixed 有→无、gdn 8→0、q8 13→8（改善）；small_t_i8 90→150、q4 10→13（变差）。
+  - 上游「1155→927」出自他们的树，本树净 +38，方向相反。TP-2 的 decode 是每 shard 权重流带宽 bound，
+    核内指令效率不在关键路径；本机无 `.ninfer` 产物、做不了端到端 A/B，因而不在无证据时引入一个
+    全量重建级的构建改动。已 `git checkout` 回退 `cmake/NinferTargets.cmake`、`src/ops/CMakeLists.txt`、
+    `src/ops/linear/gguf/sources.cmake`，并全量重建恢复。
+  - 同期一次全量 `ctest`（关闭 RDC 的构建，135 项）：4 项宿主侧失败（`chat_templates`＝Python 侧 GBK
+    编码 emoji 报错、`resource_manager`、`engine_options`、`serve_options`，均与本次改动无关的既有失败），
+    以及 `context_kv_materialize_test` 300 s 超时（单独复跑仍超时）。该超时未归因，也是回退理由之一。
+  - 附注：`src/ops/CMakeLists.txt` 记载 nvfp4 warp-specialized kernel 因 `setmaxnreg` 被 RDC 破坏而单独用
+    non-RDC 归档；一旦将来真的关闭 RDC，该归档与 `ninfer_cuda_archive` 将不再有区别。
+- **3b attention gate 折进 reduce epilogue（`77c9cc39`）——暂缓**。本地
+  `src/models/qwen3_5/execution/text.cpp` 有 3 处独立 `ops::sigmoid_mul`（613/762/1507）。折进需要给
+  causal attention Op 增加可选 gate 形参并在各路由 epilogue 实现（跨 `include/ninfer/ops/softmax_attention.h`
+  与多个 `.cuh`）。收益：每层少一次 launch，按 1009 次发射 ≈ 2.9 ms 间隙 ⇒ ~2.9 µs/次 × 28 层 ≈ 0.08 ms，
+  占 38.2 ms round 的 0.2%。收益低于风险，暂不做。
+- **3c INT8 系 attention scale 走 shared memory（`a941c9f4`）——暂缓**。落点为
+  `prompt_i8.cuh:223/224/261/262/297/298/387` 与 `small_t_i8.cuh:331/332/440/441/540` 的 computed-lane
+  `__shfl_sync`。暂缓两个理由：推荐配置是 `--kv-dtype fp8`（走 `*_fp8.cuh` 而非 i8 家族）；且本树关闭 RDC 后
+  small_t_i8 栈帧反而增多，说明该家族在本树的 lowering 与上游树不同，需先用 SASS 归因是否真有 out-of-line
+  call 再定改法。
+  - **回退验证（2026-09-26）**：回退后全量重建（533 s，exit 0），`ninfer-serve.exe` 重新测得 4405 个函数 /
+    **231** 个 `STACK>0` / 4486 条资源记录，与改前逐值一致 ⇒ 该指标在本树可复现，+38 确实由关闭 RDC 引起。
+    另：`ninfer_context_kv_materialize_test` 在 RDC 构建下同样 300 s 超时 ⇒ 该超时是**既有问题**，与本次改动
+    无关；135 项里另外 4 项宿主侧失败（chat_templates / resource_manager / engine_options / serve_options）
+    同理，均为既有。
+
+**3. 减内核/栈帧**
+- `ea74dca4`：`cmake/NinferTargets.cmake` 的 `ninfer_cuda_archive` 取消 `CUDA_SEPARABLE_COMPILATION ON`
+  与 `CUDA_RESOLVE_DEVICE_SYMBOLS ON`（上游实测带栈帧内核 1155 → 927）。
+- `77c9cc39`：attention 输出 gate 折进 causal reduce epilogue（每层少一次 launch，bit-identical）。
+- `a941c9f4`：INT8 系 attention 的 Q/K/V scale 从 shared memory 读，去掉 computed-lane shuffle。
+- 验证：Op 测试 + 全模型贪心字节一致 + decode 计时。
+
+**4. 权重字节**
+- `1da31697`（W8 词表/输出头加载时转码，27B 每张 −644 MiB）、`f1982279`（`--embedding-q6`）、
+  `f8c75edd`（`--mtp-experts-q4`）。§1 已点名约 1/4 per-token 流量是 1 byte/element，重打包省
+  ~2.6 GB/shard/token。
+- 验证：artifact 契约测试 + 困惑度 A/B + decode tok/s。
+- **适用性复核（2026-09-26，读 `D:\LLM\qwen3_8_27b_swift15_dflash2_final.ninfer.conversion.json` 与
+  `D:\LLM\w4a4_family_recipe.py`）**：上游 `1da31697` 的对象是「W8G32 的 token embedding / output head」，
+  而本 artifact 的配方把 `text/token_embedding` 与 `text/output_head` 都分配为 **`fp8_e4m3fn_row_bf16`**
+  （1 B/元素，head 带 `AllowA8`），其余矩阵是 NVFP4（128 个）或 FP8（130 个）。⇒ 上游那条「W8→Q4 载入期
+  转码」在本 artifact 上**不成立**；等价动作是把 FP8 的这两张（以及每 token 要流的 FP8 attention/GDN 投影、
+  后八层 FFN）改到 NVFP4/Q4，属**配方/转换层**改动 + 质量代价。
+- 量级：`output_head` = 248320×5120 × 1 B ≈ 1.27 GB 总量、按 shard 切半 ≈ 0.64 GB/shard/forward，占 10.15 GB
+  的 ~6%；改成 NVFP4 约省 3% 的 round ⇒ decode 约 +3%（embedding 只是容量，gather 不流全表）。质量代价与
+  接受率代价需要按仓库规则单独 A/B，故此项应先做测量再决定是否改配方。
+
+**5. verify 段**
+- `ce2df46b` small-T tensor-core 内核（MTP verify / cohort，1–32 列）；`21df3069` GDN record 窗口
+  `cp.async` staging。verify forward ≈30 ms / 38.2 ms round。
+- 验证：Op oracle + verify graph 计时 + 贪心字节一致。
+
+**6. 大件（需产品决策，先不改）**
+- KV codec：`eb9f7a23` rk4v4-e8（280 B/token/head）、`ad26b362` rk2v4-e8（216 B）、`2ba10da2` rk8v4 G32、
+  `9218b67b` 根码查表；当前 fp8 KV = 16.125 KiB/token/shard。
+- 设备路线 profile：`0b2f8384` + `81861a07`（5090 profile 会开 FP16 P·V 与 fast prompt kernel；36 SM
+  卡需重新校准）。
+- fast prompt kernel：`4303e604`（`--fast-prefill-kernel`）+ `NINFER_PREFILL_ALIGN` 整波对齐。
+
+### 5.3 明确不做
+
+- MoE 五连（`5fd7c463`/`b2ba37d2`/`d63162c8`/`ba1284d4`/`f1806721`）：跑稠密 27B。
+- T2 三元、INT8 激活路线（`--prefill-a8`/`--mlp-a8-decode`）、W4A8：decode 带宽 bound，属算力路线。
+- sm_86/3090 调参全套；`82631f68` 的 crossing 字节流水（< 256 KiB 跳过，TP-2 每次 allreduce 只 ~20 KB）。
+- 结构化输出 / vision / WebUI / disk KV / DirectStorage / D3D12 常驻（功能项，非本轮 perf）。
+
+### 5.4 TP-2 基线（2026-09-26，本机 2×5060 Ti，双卡件 swift15）
+
+- 配置：`tools/win_port/serve.ps1 -Model D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer`（默认配方：
+  `--devices 0,1 --kv-dtype fp8 --max-context 131072 --spec mtp --draft-tokens 2 --lm-head-draft --vision
+  --reasoning-effort medium`，采样 0.7/20/0.80，`--host-kv-mib 32768`）。
+- 启动：`engine ready | qwen3.8-27b-swift1.5 | total 45.6s | weights 9.66 GiB`；每 shard
+  `weights+ctx 11050.6 / 10900.6 MiB`，KV 131,072（fp8）占 2322 / 2064 MiB，free 2446 / 2026 MiB。
+- `tools/win_port/bench_serve.ps1`（一次性，非流式，数字取自服务端 timings）：
+
+| workload | prompt | prefill | decode |
+|---|---|---|---|
+| prefill_2048 | 1,832 tok | 1,206 tok/s | — |
+| prefill_8192 | 7,153 tok | 1,654 tok/s | — |
+| prefill_32768 | 28,528 tok | 1,603 tok/s | — |
+| decode_short | 23 tok | — | **75.2 tok/s**（119 tok） |
+| decode_at_8192 | 7,154 tok | — | **71.2 tok/s**（128 tok） |
+
+- 用途：作为项目 4/5 的 A/B 基线。注意：decode 走 MTP K=2 + `--lm-head-draft`，接受率随采样有轮次漂移，
+  单次结果只能判 ≥5% 级别的差异；判定更小的改动需要重复多次（worklog 的接受率判决用 30-rep）。
+- 产物格式（`*.conversion.json` + `w4a4_family_recipe.py`）：`text/token_embedding` 与 `text/output_head`
+  均为 `fp8_e4m3fn_row_bf16`；128 个 NVFP4、130 个 FP8、567 个 BF16、88 个 Q4G64、54 个 Q5G64、
+  1 个 Q6G64、7 个 Q8G32。
