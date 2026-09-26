@@ -3104,9 +3104,39 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 // and shard B's copy runs on a different stream with no ordering against shard A's
                 // D2H. Synchronize before the host buffer becomes the forward's input.
                 CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+                // The target verify: RecordForReplay leaves the live GDN state untouched, so the
+                // fold below can replay exactly the committed columns from the pre-round snapshot.
+                // The feature sink captures the window's residuals for the next round's append.
+                snapshot_state(shard_a_, kRoundScratchSlot);
+                snapshot_state(shard_b_, kRoundScratchSlot);
+                qwen::execution::DFlashFeatureSink verify_sink = round.make_verify_sink();
+                const ops::CausalAttentionExecutionEnvelope target_envelope{
+                    position + 1U, position + static_cast<std::uint32_t>(width)};
+                // DFlash2's window is a device-side product, so both shards have to be drained
+                // before the paired layer sequence starts: otherwise the in-kernel allreduce
+                // handshake can interleave with an op one shard has not finished yet and the
+                // window logits come out a few bf16 ulps apart from run to run, which the
+                // near-tied last column then turns into a different token. MTP builds its window on
+                // the host and never meets this (PLAN.md section 3.6, "S1").
+                shard_a_.device.bind_to_current_thread();
+                CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                shard_b_.device.bind_to_current_thread();
+                CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                shard_a_.device.bind_to_current_thread();
+                // Only the columns that own their position may append KV: the budget clamp pins the
+                // trailing columns to the last valid column's position, and unmasked they would all
+                // write that one cache slot from the same launch (nondeterministic winner).
+                run_verify_window(window_ids, static_cast<std::int32_t>(position), window_logits,
+                                  window_hidden, &verify_sink,
+                                  static_cast<std::int32_t>(extent) + 1);
+                timing.record(2, shard_a_.device.stream);
+                // The declared-name mask has to follow the verify forward that produces the logits:
+                // run_verify_window writes window_logits, so applying the mask before it would be
+                // overwritten and the route would sample undeclared names freely. The window ids the
+                // mask is built from were already made host-visible above.
                 if (constraint_live()) {
-                    // The mask is built on the host, so the window has to be visible first.
-                    CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
                     constraint_advance();
                     std::fill(tool_mask_columns.begin(), tool_mask_columns.end(), std::uint8_t{1});
                     bool masked = false;
@@ -3137,34 +3167,6 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                                               shard_a_.device.stream);
                     }
                 }
-                // The target verify: RecordForReplay leaves the live GDN state untouched, so the
-                // fold below can replay exactly the committed columns from the pre-round snapshot.
-                // The feature sink captures the window's residuals for the next round's append.
-                snapshot_state(shard_a_, kRoundScratchSlot);
-                snapshot_state(shard_b_, kRoundScratchSlot);
-                qwen::execution::DFlashFeatureSink verify_sink = round.make_verify_sink();
-                const ops::CausalAttentionExecutionEnvelope target_envelope{
-                    position + 1U, position + static_cast<std::uint32_t>(width)};
-                // DFlash2's window is a device-side product, so both shards have to be drained
-                // before the paired layer sequence starts: otherwise the in-kernel allreduce
-                // handshake can interleave with an op one shard has not finished yet and the
-                // window logits come out a few bf16 ulps apart from run to run, which the
-                // near-tied last column then turns into a different token. MTP builds its window on
-                // the host and never meets this (PLAN.md section 3.6, "S1").
-                shard_a_.device.bind_to_current_thread();
-                CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
-                CUDA_CHECK(cudaDeviceSynchronize());
-                shard_b_.device.bind_to_current_thread();
-                CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
-                CUDA_CHECK(cudaDeviceSynchronize());
-                shard_a_.device.bind_to_current_thread();
-                // Only the columns that own their position may append KV: the budget clamp pins the
-                // trailing columns to the last valid column's position, and unmasked they would all
-                // write that one cache slot from the same launch (nondeterministic winner).
-                run_verify_window(window_ids, static_cast<std::int32_t>(position), window_logits,
-                                  window_hidden, &verify_sink,
-                                  static_cast<std::int32_t>(extent) + 1);
-                timing.record(2, shard_a_.device.stream);
                 ops::argmax(window_logits, frame.target_argmax, public_tokens,
                             shard_a_.device.stream);
                 // DFlash2 acceptance is the sparse 16-candidate rejection sampler, not MTP's greedy

@@ -1796,7 +1796,7 @@ NInfer 没有约束层）。本轮把「路线 A：文本化轻量版」落地�
   与本改动无关；曾用「临时关掉掩码表构建」bisect 证实 HEAD 同样失败）。
 - **真实服务端到端**：用户 11:46 重启后 req#51（`openai-responses` 流式、`tools 1`、prompt 111,124 / output 733、
   `cache 110,158 (99.1%)`、TTFT 1.2 s）**正常结束、无任何报错** —— 域修复生效（修复前该请求必 500）。
-- **未做**：对照 Round 15 的 75 条探针复测（需按同一探针脚本重跑）。
+- **未做 → 已补做（Round 15c）**：对照 Round 15 的探针复测；在 dflash2 路线上 45/45 通过（见文末 Round 15c）。
 
 ### 4. 既有缺陷 1：TP-2 的采样域是打包行数（已修）
 
@@ -6773,3 +6773,37 @@ N 线性外推。
 （未做：chunk 768→3 子块这一档——TP-2 的 prefill chunk 被 normalize_engine_options 钳在 ≤1024，所以 256 宽
 最多只能切 4 块，chunk 640/896 又不是 256 的整数倍会自动退回串行，因此 768 是唯一可见但未测的块数；此外还有
 长上下文（32k–128k）与多请求口径、以及 overlap 与 §3.6 give-up 语义的交互。）
+
+## Round 15c —— dflash2 路线的掩码顺序 bug（工具标记泄漏第三次复现）
+
+**现象**：agent 会话再次把工具调用当正文吐出（`<function=tools.pwsh>` 三连），服务端 `stopReason=stop`、无结构化
+tool_calls；请求只声明 1 个工具（`run_code`），而系统提示列出整套 SDK 工具名。
+
+**根因**：`--spec dflash2` 的 verify 分支把约束掩码接错了顺序。`apply_token_mask(window_logits, ...)` 写在
+`run_verify_window(...)` **之前**，而后者正是产出 `window_logits` 的 target verify forward —— 掩码随即被覆盖，
+该路线的约束解码从未生效（等价于没有约束）。`git blame`：MTP 落点由 `71ac9883`（约束解码特性）落在正确位置，
+dflash2 落点由 `c08a6624`（*feat(tp2): run the DFlash2 loop end to end and open the option gate*，09-21）新写循环时
+抄到了 forward 之前。
+
+**修法**：把整块 `if (constraint_live()) {...}` 移到 `run_verify_window` 之后、`ops::argmax` 之前（对齐 MTP），
+并删掉块内多余的 `cudaStreamSynchronize`（`window_ids` 在上方已同步）。复核四个落点（prefill 首 token /
+plain decode / MTP verify / dflash2 verify）现在都在"logits 产出之后、采样或接受之前"。
+
+**部署**：重建后 `build-win/apps/ninfer-serve.exe` 手动同步到 `C:\ninfer\ninfer-serve.exe`，
+`Get-FileHash` 两侧相等（`99BCF3077CC6B37025DFCDBCD7935F81CC43FD718B89442DE743A1D84B160D37`）；
+`ninfer_tool_call_constraint_test` / `ninfer_tool_call_parser_test` 通过。
+
+**验收（补上 Round 15b 的"未做"）**：`%TEMP%\ab_probe.ps1`（加 `-BaseUrl` 与 `-NoProxy`）打 3456 上这条
+`--devices 0,1 --spec dflash2 --draft-tokens 5` 服务：
+
+| 变体 | n | ok | 失败类 |
+| --- | --- | --- | --- |
+| todo / read / pwsh | 15 + 15 + 15 | 45 | 无 |
+| control | 5 | 5 | 无 |
+
+工具请求 **45/45 命中 `run_code`**，`bad-name` / `malformed` / `empty` 全为 0。对照 Round 15 的"无约束"
+基线（标记类失败 19–27/75，即 25–36%）：若真实失败率仍为 25%，45 个全过的概率约 2.6e-6 ⇒ 约束解码在该路线已生效。
+
+**遗留**：单卡路线（不带 `--devices`）至今**完全没有**约束解码（`make_tool_call_constraint` /
+`apply_token_mask` 只被 `tp2_generation_core.cpp` 调用），同类泄漏在那里会 100% 复现；计划见
+`PLAN-single-gpu-tool-mask.md`。
