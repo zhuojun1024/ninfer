@@ -62,7 +62,15 @@ void require_activation(const Tensor& x, const char* label) {
 
 void require_product(const Tensor& x, const GgufProduct& p) {
     require_gguf(*p.weight, "gguf product");
-    if (p.weight->k != x.ne[0]) { throw std::invalid_argument("gguf product: K differs from x"); }
+    // A weight that gathers its input columns reads them out of the activation's own rows, so its K
+    // is the number of gathered elements and may be narrower than the activation: a tensor-parallel
+    // shard of a weight whose stored column order mixes both shards' heads pairs its half of the
+    // columns with the full-width activation their gather indexes. Every other weight multiplies the
+    // activation's rows one for one.
+    const bool gathered = p.weight->input_columns != nullptr;
+    if (gathered ? p.weight->k > x.ne[0] : p.weight->k != x.ne[0]) {
+        throw std::invalid_argument("gguf product: K differs from x");
+    }
     if (p.f32 != nullptr) {
         if (p.row < 0 || p.row + p.weight->n > p.f32_rows) {
             throw std::invalid_argument("gguf product: rows exceed the FP32 plane");
@@ -175,8 +183,12 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
     require_activation(x, "gguf product");
     if (products.empty()) { return; }
     for (const auto& p : products) { require_product(x, p); }
-    const std::int32_t k = x.ne[0];
-    const std::int32_t t = x.ne[1];
+    // The activation's own row width, and the widest weight row the products gather out of it. They
+    // differ only for a gathering weight, whose quantized activation is as wide as its own K.
+    const std::int32_t source_k = x.ne[0];
+    const std::int32_t t        = x.ne[1];
+    std::int32_t gathered_k     = 0;
+    for (const auto& p : products) { gathered_k = std::max(gathered_k, p.weight->k); }
     const auto* xb       = static_cast<const __nv_bfloat16*>(x.data);
     auto scope           = workspace.scope();
 
@@ -191,12 +203,13 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
             auto found      = std::find_if(activations.begin(), activations.end(),
                                            [&](const Activation& a) { return a.columns == w.input_columns; });
             if (found == activations.end()) {
-                void* data = workspace.alloc_bytes(gguf::vector_activation_bytes(k, t)).data;
-                gguf::quantize_vector_activation(xb, k, t, w.input_columns, data, stream);
+                void* data = workspace.alloc_bytes(gguf::vector_activation_bytes(w.k, t)).data;
+                gguf::quantize_vector_activation(xb, source_k, w.k, t, w.input_columns, data,
+                                                 stream);
                 activations.push_back({w.input_columns, data});
                 found = activations.end() - 1;
             }
-            gguf::vector_product(gguf_type(w.qtype), w.qdata, row_bytes(w), w.n, k, found->data,
+            gguf::vector_product(gguf_type(w.qtype), w.qdata, row_bytes(w), w.n, w.k, found->data,
                                  t, output(p, 0), stream);
         }
         return;
@@ -221,7 +234,8 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
     void* scratch           = nullptr;
     if (dequantized) {
         vector_activation =
-            workspace.alloc_bytes(gguf::vector_activation_bytes(k, gguf::kMaxVectorColumns)).data;
+            workspace.alloc_bytes(gguf::vector_activation_bytes(gathered_k, gguf::kMaxVectorColumns))
+                .data;
         scratch = workspace.alloc_bytes(kDequantizedScratchBytes).data;
     }
 
@@ -237,19 +251,21 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
                 return a.layout == layout && a.columns == w.input_columns;
             });
             if (found == activations.end()) {
-                void* data = workspace.alloc_bytes(gguf::matrix_activation_bytes(k, t)).data;
-                gguf::quantize_matrix_activation(type, xb, k, t, w.input_columns, data, stream);
+                void* data = workspace.alloc_bytes(gguf::matrix_activation_bytes(w.k, t)).data;
+                gguf::quantize_matrix_activation(type, xb, source_k, w.k, t, w.input_columns, data,
+                                                 stream);
                 activations.push_back({layout, w.input_columns, data});
                 found = activations.end() - 1;
             }
-            gguf::matrix_product(type, w.qdata, row_bytes(w), w.n, k, found->data, t, out, stride,
+            gguf::matrix_product(type, w.qdata, row_bytes(w), w.n, w.k, found->data, t, out, stride,
                                  fixup, stream);
         } else if (t <= kDequantizedVectorColumns) {
             for (std::int32_t first = 0; first < t; first += gguf::kMaxVectorColumns) {
                 const std::int32_t columns = std::min(gguf::kMaxVectorColumns, t - first);
-                gguf::quantize_vector_activation(xb + std::int64_t(first) * k, k, columns,
-                                                 w.input_columns, vector_activation, stream);
-                gguf::vector_product(type, w.qdata, row_bytes(w), w.n, k, vector_activation,
+                gguf::quantize_vector_activation(xb + std::int64_t(first) * source_k, source_k, w.k,
+                                                 columns, w.input_columns, vector_activation,
+                                                 stream);
+                gguf::vector_product(type, w.qdata, row_bytes(w), w.n, w.k, vector_activation,
                                      columns, output(p, first), stream);
             }
             continue;
@@ -257,11 +273,11 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
             const __nv_bfloat16* source = xb;
             if (w.input_columns != nullptr) {
                 auto* gathered = static_cast<__nv_bfloat16*>(
-                    workspace.alloc_bytes(std::size_t(k) * t * 2).data);
-                gguf::gather_columns(xb, k, t, w.input_columns, gathered, stream);
+                    workspace.alloc_bytes(std::size_t(w.k) * t * 2).data);
+                gguf::gather_columns(xb, source_k, w.k, t, w.input_columns, gathered, stream);
                 source = gathered;
             }
-            gguf::dequantized_product(type, w.qdata, row_bytes(w), w.n, k, source, t, out, stride,
+            gguf::dequantized_product(type, w.qdata, row_bytes(w), w.n, w.k, source, t, out, stride,
                                       scratch, kDequantizedScratchBytes, stream);
         }
         if (!direct) { gguf::store_plane(plane, w.n, w.n, t, output(p, 0), stream); }
@@ -297,8 +313,9 @@ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& 
                  WorkspaceArena& workspace, cudaStream_t stream) {
     require_activation(x, "gguf swiglu");
     require_gguf(gate, "gguf swiglu gate");
-    const std::int32_t t    = x.ne[1];
-    const std::int32_t rows = out.ne[0];
+    const std::int32_t source_k = x.ne[0];
+    const std::int32_t t        = x.ne[1];
+    const std::int32_t rows     = out.ne[0];
     if (out.dtype != DType::BF16 || !out.is_contiguous() || out.ne[1] != t) {
         throw std::invalid_argument("gguf swiglu: out must be contiguous BF16 [N,T]");
     }
@@ -310,8 +327,8 @@ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& 
         if (t <= gguf::kMaxVectorColumns) {
             void* activation =
                 workspace.alloc_bytes(gguf::vector_activation_bytes(gate.k, t)).data;
-            gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(x.data), gate.k, t,
-                                             gate.input_columns, activation, stream);
+            gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(x.data), source_k,
+                                             gate.k, t, gate.input_columns, activation, stream);
             gguf::vector_swiglu(gguf_type(gate.qtype), gate.qdata, row_bytes(gate), rows, gate.k,
                                 activation, t, static_cast<__nv_bfloat16*>(out.data), rows,
                                 stream);

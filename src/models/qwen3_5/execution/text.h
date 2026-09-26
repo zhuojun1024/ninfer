@@ -126,8 +126,17 @@ public:
     // writing the row-parallel output-projection delta (without the residual add) into delta.
     // A tensor-parallel driver calls this on each shard context and all-reduces the delta before
     // adding it to the shared residual. The single-GPU path uses single_layer instead.
+    // `activation` (optional) holds the mixer's output projection back: the mixer leaves this
+    // shard's half of its pre-projection activation in that [full width, T] buffer, zeroes the rest
+    // and returns without touching delta, and the driver merges the pair and calls
+    // tp_mixer_activation_delta. A weight whose output projection gathers its input columns needs
+    // that, because its stored columns address heads on both shards (see tp_mixer_activation_width).
     void tp_mixer_layer(const BlockParameters& block, Tensor& x, Tensor& delta, std::size_t layer,
-                        Phase phase);
+                        Phase phase, Tensor* activation = nullptr);
+    // Second stage of that split mixer: project the pair's full-width activation through this
+    // shard's half of the output projection, leaving the partial delta the driver all-reduces.
+    void tp_mixer_activation_delta(const BlockParameters& block, const Tensor& activation,
+                                   Tensor& delta, std::size_t layer, Phase phase);
     void tp_mlp_layer(const BlockParameters& block, Tensor& x, std::size_t layer, Phase phase);
     // Tensor-parallel FFN tail: post-mixer norm + the sharded FFN, writing the row-parallel
     // down-projection delta (without the residual add) into `delta`. The driver all-reduces the
@@ -401,9 +410,9 @@ private:
     }
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
-                  Tensor* delta = nullptr);
+                  Tensor* delta = nullptr, Tensor* activation = nullptr);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
-                 Tensor* delta = nullptr);
+                 Tensor* delta = nullptr, Tensor* activation = nullptr);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);
     // One transformer layer's mixer (attention or GDN) on this shard's device. When delta is
@@ -411,7 +420,10 @@ private:
     // otherwise the row-parallel output projection is written to delta without the residual
     // add, so a tensor-parallel driver can all-reduce the delta across shards first.
     void mixer_layer(const BlockParameters& block, Tensor& x, std::size_t layer, Phase phase,
-                     Tensor* delta = nullptr);
+                     Tensor* delta = nullptr, Tensor* activation = nullptr);
+    // Full width of the activation this layer's mixer output projection gathers, or 0 when the
+    // projection multiplies the mixer's own rows and the mixer runs in one stage.
+    [[nodiscard]] std::int32_t tp_mixer_activation_width(const BlockParameters& block) const;
     // One transformer layer's post-mixer FFN (post-attention norm + dense FFN) on this shard's
     // device, updating the residual in place. Its row-parallel down projection leaves a partial
     // residual, so the caller all-reduces before the next layer.
@@ -526,10 +538,36 @@ void TextContext::run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor
         // the ops and remain valid for the allreduce.
         Tensor mixer_delta      = work_.alloc(DType::BF16, {dimension(config_.hidden_size), x.ne[1]});
         Tensor mixer_delta_peer = peer.work_.alloc(DType::BF16, {dimension(config_.hidden_size), x.ne[1]});
+        // A mixer whose output projection gathers its input columns stores those columns in an
+        // order of its own that spans both shards' heads (a GGUF block checkpoint's tiled value
+        // heads), so neither shard can project before the pair has assembled the full-width
+        // activation the gather indexes. Each shard leaves its own heads in its half of the buffer,
+        // the pair all-reduces the disjoint halves, and both then project the shared activation
+        // into their partial delta.
+        const std::int32_t activation_width = tp_mixer_activation_width(block);
+        Tensor mixer_activation;
+        Tensor mixer_activation_peer;
+        Tensor* activation      = nullptr;
+        Tensor* activation_peer = nullptr;
+        if (activation_width > 0) {
+            mixer_activation      = work_.alloc(DType::BF16, {activation_width, x.ne[1]});
+            mixer_activation_peer = peer.work_.alloc(DType::BF16, {activation_width, x_peer.ne[1]});
+            activation            = &mixer_activation;
+            activation_peer       = &mixer_activation_peer;
+        }
         ctx_.bind_to_current_thread();
-        tp_mixer_layer(block, x, mixer_delta, layer, ph);
+        tp_mixer_layer(block, x, mixer_delta, layer, ph, activation);
         peer.ctx_.bind_to_current_thread();
-        peer.tp_mixer_layer(block_peer, x_peer, mixer_delta_peer, layer, ph);
+        peer.tp_mixer_layer(block_peer, x_peer, mixer_delta_peer, layer, ph, activation_peer);
+        if (activation != nullptr) {
+            ctx_.bind_to_current_thread();
+            pair.allreduce(activation->data, activation_peer->data, activation->bytes(),
+                           ctx_.stream, peer.ctx_.stream);
+            ctx_.bind_to_current_thread();
+            tp_mixer_activation_delta(block, *activation, mixer_delta, layer, ph);
+            peer.ctx_.bind_to_current_thread();
+            peer.tp_mixer_activation_delta(block_peer, *activation_peer, mixer_delta_peer, layer, ph);
+        }
         // The mixer output projections are row-parallel, so each shard holds a partial mixer
         // output; all-reduce the delta and add the sum to the shared residual once. The allreduce
         // stages both deltas on the compute streams that produced them (D2H after the mixer

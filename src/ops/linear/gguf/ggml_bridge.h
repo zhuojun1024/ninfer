@@ -50,8 +50,11 @@ inline constexpr int kMaxVectorColumns = 8;
 
 // Activation for the vector kernel: q8_1 blocks of 32 values, [columns][k / 32].
 [[nodiscard]] std::size_t vector_activation_bytes(int k, int columns);
-// `input_columns` (optional, [k]) makes element c of each column x[input_columns[c]].
-void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
+// `input_columns` (optional, [k]) makes element c of each column x[input_columns[c]]. `source_k`
+// is the row width of x: it equals k for a plain activation, and is wider when the gather selects
+// a subset of a wider row - a tensor-parallel shard of a GGUF weight whose stored column order
+// mixes both shards' heads, whose columns pair with the full-width activation the pair assembles.
+void quantize_vector_activation(const __nv_bfloat16* x, int source_k, int k, int columns,
                                 const std::int32_t* input_columns, void* out, cudaStream_t stream);
 
 enum class Epilogue : int {
@@ -85,8 +88,10 @@ void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, in
 // schedule share an activation, see matrix_activation_layout().
 [[nodiscard]] int matrix_activation_layout(GgmlType type);
 [[nodiscard]] std::size_t matrix_activation_bytes(int k, int columns);
-void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k, int columns,
-                                const std::int32_t* input_columns, void* out, cudaStream_t stream);
+// `source_k` is x's row width as in quantize_vector_activation; the gathered activation is k wide.
+void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int source_k, int k,
+                                int columns, const std::int32_t* input_columns, void* out,
+                                cudaStream_t stream);
 
 // Bytes of the stream-k fixup plane the matrix kernel may need for this product on the current
 // device (zero when the tiles divide evenly across the machine).
@@ -101,9 +106,10 @@ void matrix_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
 void store_plane(const float* in, std::int64_t in_column_stride, int rows, int columns,
                  const VectorOutput& out, cudaStream_t stream);
 
-// out[c * k + i] = x[c * k + input_columns[i]] for each of `columns` BF16 columns of width k.
-void gather_columns(const __nv_bfloat16* x, int k, int columns, const std::int32_t* input_columns,
-                    __nv_bfloat16* out, cudaStream_t stream);
+// out[c * k + i] = x[c * source_k + input_columns[i]]: `columns` columns of width k gathered out
+// of rows of width source_k (equal widths for a plain permutation).
+void gather_columns(const __nv_bfloat16* x, int source_k, int k, int columns,
+                    const std::int32_t* input_columns, __nv_bfloat16* out, cudaStream_t stream);
 
 // Rows per pass of dequantized_product for a scratch of `scratch_bytes`.
 [[nodiscard]] int dequantized_rows_per_pass(int k, std::size_t scratch_bytes);

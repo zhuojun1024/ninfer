@@ -46,19 +46,21 @@ const DeviceFacts& device_facts() {
 
 namespace {
 
-// x BF16 [columns][k] -> the vector kernel's planar q8 activation: ggml's q8_1 numbers, one warp per
-// 32 values, element i of column c read from x[c][input_columns[i]] when a gather is given.
+// x BF16 [columns][source_k] -> the vector kernel's planar q8 activation of `columns` x k values:
+// ggml's q8_1 numbers, one warp per 32 values, element i of column c read from
+// x[c][input_columns[i]] when a gather is given.
 constexpr int kQuantizeThreads = 256;
 
 __launch_bounds__(kQuantizeThreads) __global__
     void quantize_vector_kernel(const __nv_bfloat16* __restrict__ x,
                                 const std::int32_t* __restrict__ input_columns,
-                                std::int8_t* __restrict__ qs, half2* __restrict__ ds, int k) {
+                                std::int8_t* __restrict__ qs, half2* __restrict__ ds,
+                                int source_k, int k) {
     const int i      = blockDim.x * blockIdx.x + threadIdx.x;
     const int column = blockIdx.y;
     if (i >= k) { return; }
     const int source = input_columns != nullptr ? input_columns[i] : i;
-    const float xi   = __bfloat162float(x[std::int64_t(column) * k + source]);
+    const float xi   = __bfloat162float(x[std::int64_t(column) * source_k + source]);
     const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
     const float sum  = warp_reduce_sum<QK8_1>(xi);
     const float d    = amax / 127.0f;
@@ -106,14 +108,15 @@ constexpr int kMatrixQuantizeThreads = 128;
 template <mmq_q8_1_ds_layout ds_layout>
 __global__ void quantize_matrix_kernel(const __nv_bfloat16* __restrict__ x,
                                        const std::int32_t* __restrict__ input_columns,
-                                       block_q8_1_mmq* __restrict__ y, int k, int columns) {
+                                       block_q8_1_mmq* __restrict__ y, int source_k, int k,
+                                       int columns) {
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
 
     const std::int64_t i0 = (std::int64_t(blockDim.x) * blockIdx.y + threadIdx.x) * 4;
     if (i0 >= k) { return; }
     const int column             = blockIdx.x;
-    const __nv_bfloat16* source  = x + std::int64_t(column) * k;
+    const __nv_bfloat16* source  = x + std::int64_t(column) * source_k;
     float4 xi;
     if (input_columns != nullptr) {
         xi = make_float4(__bfloat162float(source[input_columns[i0 + 0]]),
@@ -178,13 +181,14 @@ __global__ void store_plane_kernel(const float* __restrict__ in, std::int64_t in
     vec_store(out, row, column, in[column * in_column_stride + row]);
 }
 
-__global__ void gather_columns_kernel(const __nv_bfloat16* __restrict__ x, int k,
+__global__ void gather_columns_kernel(const __nv_bfloat16* __restrict__ x, int source_k, int k,
                                       const std::int32_t* __restrict__ input_columns,
                                       __nv_bfloat16* __restrict__ out) {
     const int i      = blockIdx.x * blockDim.x + threadIdx.x;
     const int column = blockIdx.y;
     if (i >= k) { return; }
-    out[std::int64_t(column) * k + i] = x[std::int64_t(column) * k + input_columns[i]];
+    out[std::int64_t(column) * k + i] =
+        x[std::int64_t(column) * source_k + input_columns[i]];
 }
 
 cublasHandle_t blas_handle() {
@@ -316,17 +320,20 @@ std::size_t vector_activation_bytes(int k, int columns) {
     return detail::vec_scales_offset(k, columns) + std::size_t(columns) * (k / QK8_1) * sizeof(half2);
 }
 
-void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
+void quantize_vector_activation(const __nv_bfloat16* x, int source_k, int k, int columns,
                                 const std::int32_t* input_columns, void* out,
                                 cudaStream_t stream) {
     if (k <= 0 || k % detail::kQuantizeThreads != 0 || columns <= 0) {
         throw std::invalid_argument("gguf vector activation: K must be whole 256-value groups");
     }
+    if (source_k < k || (input_columns == nullptr && source_k != k)) {
+        throw std::invalid_argument("gguf vector activation: an ungathered row is the weight's K");
+    }
     auto* base = static_cast<std::uint8_t*>(out);
     const dim3 blocks(k / detail::kQuantizeThreads, columns, 1);
     detail::quantize_vector_kernel<<<blocks, detail::kQuantizeThreads, 0, stream>>>(
         x, input_columns, reinterpret_cast<std::int8_t*>(base),
-        reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k);
+        reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), source_k, k);
     detail::check(cudaGetLastError(), "vector activation launch");
 }
 
@@ -362,11 +369,14 @@ std::size_t matrix_activation_bytes(int k, int columns) {
            detail::kMatrixActivationSlack;
 }
 
-void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k, int columns,
-                                const std::int32_t* input_columns, void* out,
+void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int source_k, int k,
+                                int columns, const std::int32_t* input_columns, void* out,
                                 cudaStream_t stream) {
     if (k <= 0 || k % (4 * detail::kMatrixQuantizeThreads) != 0 || columns <= 0) {
         throw std::invalid_argument("gguf matrix activation: K must be whole 512-value groups");
+    }
+    if (source_k < k || (input_columns == nullptr && source_k != k)) {
+        throw std::invalid_argument("gguf matrix activation: an ungathered row is the weight's K");
     }
     const dim3 blocks(columns, (k + 4 * detail::kMatrixQuantizeThreads - 1) /
                                    (4 * detail::kMatrixQuantizeThreads),
@@ -375,15 +385,18 @@ void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k, in
     switch (mmq_get_q8_1_ds_layout(detail::to_ggml(type))) {
     case MMQ_Q8_1_DS_LAYOUT_D4:
         detail::quantize_matrix_kernel<MMQ_Q8_1_DS_LAYOUT_D4>
-            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(x, input_columns, y, k, columns);
+            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(x, input_columns, y, source_k, k,
+                                                                   columns);
         break;
     case MMQ_Q8_1_DS_LAYOUT_DS4:
         detail::quantize_matrix_kernel<MMQ_Q8_1_DS_LAYOUT_DS4>
-            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(x, input_columns, y, k, columns);
+            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(x, input_columns, y, source_k, k,
+                                                                   columns);
         break;
     case MMQ_Q8_1_DS_LAYOUT_D2S6:
         detail::quantize_matrix_kernel<MMQ_Q8_1_DS_LAYOUT_D2S6>
-            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(x, input_columns, y, k, columns);
+            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(x, input_columns, y, source_k, k,
+                                                                   columns);
         break;
     }
     detail::check(cudaGetLastError(), "matrix activation launch");
@@ -455,10 +468,13 @@ void store_plane(const float* in, std::int64_t in_column_stride, int rows, int c
     detail::check(cudaGetLastError(), "store plane launch");
 }
 
-void gather_columns(const __nv_bfloat16* x, int k, int columns, const std::int32_t* input_columns,
-                    __nv_bfloat16* out, cudaStream_t stream) {
+void gather_columns(const __nv_bfloat16* x, int source_k, int k, int columns,
+                    const std::int32_t* input_columns, __nv_bfloat16* out, cudaStream_t stream) {
+    if (source_k < k || k <= 0 || columns <= 0) {
+        throw std::invalid_argument("gguf gather columns: invalid row widths");
+    }
     detail::gather_columns_kernel<<<dim3((k + 255) / 256, columns, 1), 256, 0, stream>>>(
-        x, k, input_columns, out);
+        x, source_k, k, input_columns, out);
     detail::check(cudaGetLastError(), "gather columns launch");
 }
 

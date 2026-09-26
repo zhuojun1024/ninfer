@@ -1370,7 +1370,15 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
 }
 
 void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph,
-                           Tensor* delta) {
+                           Tensor* delta, Tensor* activation) {
+    // A shard's attention runs over its own query heads, so its post-attention activation is its
+    // half of the full query width. A shard mixer assembles no wider activation, so an output
+    // projection that gathers its input columns has no arrangement here (see tp_mixer_layer).
+    if (activation != nullptr) {
+        throw std::logic_error(
+            "tensor parallel split: an attention output projection that gathers its input "
+            "columns would need the mixer's full-width activation assembled across the pair");
+    }
     const auto& p   = std::get<AttentionParameters>(w.mixer);
     const auto& cfg = shard_config();
     cudaStream_t s  = ctx_.stream;
@@ -1507,7 +1515,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph,
-                          Tensor* delta) {
+                          Tensor* delta, Tensor* activation) {
     const auto& p   = std::get<GdnParameters>(w.mixer);
     const auto& cfg = shard_config();
     cudaStream_t s  = ctx_.stream;
@@ -1635,10 +1643,10 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         if (const auto* gguf = std::get_if<ops::GgufProjectionWeights>(&p.projection)) {
             // A GGUF projection stores one weight per block type, so it is not one fused GEMM. Its
             // q/k/value and z rows land in this buffer's blocks directly, in the order the slices
-            // below expect.
-            Tensor qkv_out = fused.slice(0, 0, 2 * gdn_q_rows + gdn_v_rows);
-            Tensor z_out   = fused.slice(0, 2 * gdn_q_rows + gdn_v_rows, gdn_v_rows);
-            ops::gdn_input_proj(h, *gguf, qkv_out, z_out, work_, s);
+            // below expect: the destination is the whole [q|k|v|z, T] matrix, which a head-split
+            // shard's materialized parent holds contiguously and the GGUF product requires (it
+            // writes contiguous destinations only).
+            ops::gdn_input_proj(h, *gguf, fused, work_, s);
         } else {
             const auto& proj_w = std::get<LinearParameters>(p.projection);
             ops::linear(h, proj_w.weight, fused, proj_w.policy, work_, s);
@@ -1796,6 +1804,24 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     ops::gated_rmsnorm(o, p.norm, z, cfg.rms_norm_eps, on, s);
 
     const Tensor on_flat = on.view({dimension(cfg.gdn->value_width()), T});
+    if (activation != nullptr) {
+        // The output projection's stored columns run over value heads of both shards (a GGUF block
+        // checkpoint stores them tiled), so this shard cannot project its own heads alone. Leave
+        // them in this shard's rows of the full-width grouped activation, zeroed elsewhere, and let
+        // the tensor-parallel driver merge the pair and project (see run_layers_tp2).
+        const std::int32_t local = dimension(cfg.gdn->value_width());
+        const std::int32_t full  = dimension(config_.gdn->value_width());
+        if (delta == nullptr || shard_index_ < 0 || local * 2 != full ||
+            activation->dtype != DType::BF16 || !activation->is_contiguous() ||
+            activation->ne[0] != full || activation->ne[1] != T || activation->ne[2] != 1 ||
+            activation->ne[3] != 1 || activation->data == nullptr) {
+            throw std::logic_error(
+                "the GDN activation merge needs a full-width BF16 [value_width, T] buffer");
+        }
+        CUDA_CHECK(cudaMemsetAsync(activation->data, 0, activation->bytes(), s));
+        write_row_block(on_flat, *activation, shard_index_ * local, s);
+        return;
+    }
     if (delta == nullptr) {
         ops::linear_add(on_flat, p.output.weight, x, p.output.policy, work_, s);
     } else {
@@ -1817,7 +1843,7 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
 }
 
 void TextContext::mixer_layer(const BlockParameters& block, Tensor& x, std::size_t layer,
-                              Phase ph, Tensor* delta) {
+                              Phase ph, Tensor* delta, Tensor* activation) {
     const bool prefill = ph == Phase::Prefill;
     const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
     const auto compact = dimension(config_.compact_layer_indices[layer]);
@@ -1832,9 +1858,9 @@ void TextContext::mixer_layer(const BlockParameters& block, Tensor& x, std::size
             full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
         auto scope = work_.scope();
         if (full) {
-            attn_mix(block, x, compact, ph, delta);
+            attn_mix(block, x, compact, ph, delta, activation);
         } else {
-            gdn_mix(block, x, compact, ph, delta);
+            gdn_mix(block, x, compact, ph, delta, activation);
         }
     } catch (const std::exception& error) {
         throw std::runtime_error("text/layers/" + std::to_string(layer) +
@@ -1864,9 +1890,43 @@ void TextContext::single_layer(const BlockParameters& block, Tensor& x, std::siz
     mlp_layer(block, x, layer, ph);
 }
 
+std::int32_t TextContext::tp_mixer_activation_width(const BlockParameters& block) const {
+    if (const auto* gdn = std::get_if<GdnParameters>(&block.mixer)) {
+        return gdn->output.weight.input_columns != nullptr
+                   ? dimension(config_.gdn->value_width())
+                   : 0;
+    }
+    return std::get<AttentionParameters>(block.mixer).output.weight.input_columns != nullptr
+               ? dimension(config_.attention->query_width())
+               : 0;
+}
+
 void TextContext::tp_mixer_layer(const BlockParameters& block, Tensor& x, Tensor& delta,
-                                 std::size_t layer, Phase ph) {
-    mixer_layer(block, x, layer, ph, &delta);
+                                 std::size_t layer, Phase ph, Tensor* activation) {
+    mixer_layer(block, x, layer, ph, &delta, activation);
+}
+
+void TextContext::tp_mixer_activation_delta(const BlockParameters& block, const Tensor& activation,
+                                            Tensor& delta, std::size_t layer, Phase ph) {
+    const bool prefill = ph == Phase::Prefill;
+    if (!std::holds_alternative<GdnParameters>(block.mixer)) {
+        throw std::logic_error("the tensor-parallel activation merge is a GDN mixer stage");
+    }
+    try {
+        nvtx::ScopedRange mixer_range(
+            prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn, layer);
+        auto scope   = work_.scope();
+        const auto& p = std::get<GdnParameters>(block.mixer);
+        const std::int32_t width = dimension(config_.gdn->value_width());
+        const std::int32_t columns = activation.ne[1];
+        ops::linear(activation.view({width, columns}), p.output.weight, delta, p.output.policy,
+                    work_, ctx_.stream);
+    } catch (const std::exception& error) {
+        throw std::runtime_error("text/layers/" + std::to_string(layer) +
+                                 (prefill ? " prefill" : " verify") +
+                                 " columns=" + std::to_string(activation.ne[1]) + ": " +
+                                 error.what());
+    }
 }
 
 void TextContext::tp_mlp_layer(const BlockParameters& block, Tensor& x, std::size_t layer,

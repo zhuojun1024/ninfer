@@ -240,10 +240,12 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     }
 }
 
-// Staging capacity per device. A batched prefill reduces a [hidden, T] BF16 delta per layer
-// (hidden=5120, T up to the maximum prefill chunk), so 24 MiB carries T up to 2048; exceeding the
-// staging bound would silently fall back to the host-staging path, which synchronizes both compute
-// streams on every layer.
+// Staging capacity per device. A batched prefill reduces BF16 payloads per layer: the mixer's
+// [hidden, T] delta and, for a GGUF block checkpoint whose mixer output projection gathers its
+// input columns, a [value_width, T] activation (value_width=6144 is the widest). 24 MiB carries
+// either up to T=2048, and the prefill chunk is clamped well below that; exceeding the staging
+// bound would silently fall back to the host-staging path, which synchronizes both compute streams
+// on every layer.
 constexpr std::size_t kInKernelArBytes = 24ULL << 20; // 24 MiB staging per device, per buffer
 constexpr int kArThreads               = 1024;
 constexpr int kArMaxSlices             = 8;

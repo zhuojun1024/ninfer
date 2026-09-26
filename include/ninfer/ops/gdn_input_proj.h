@@ -244,12 +244,20 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
  * GGUF forms. The q/k/value rows and the z rows are parts of one or more GGUF parents (see
  * GgufProjectionWeights), each block type its own; every part projects through the GGUF linear
  * routes, which quantize the activation to q8_1 as llama.cpp does, and the snapshot and record forms
- * run the materialized convolution over the projected q/k/value plane at every batch size.
+ * run the materialized convolution over the projected q/k/value plane at every batch size. The
+ * parts' q/k/value and z rows derive the channel profile, so the same op serves the full model and
+ * a head-split shard, whose parts hold half of every channel.
  */
 [[nodiscard]] std::size_t gdn_input_proj_workspace_capacity_bytes(
     const GgufProjectionWeights& weights, std::int32_t min_tokens, std::int32_t max_tokens);
 
 void gdn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tensor& qkv, Tensor& z,
+                    WorkspaceArena& workspace, cudaStream_t stream);
+
+// The same projection into one contiguous [q | k | v | z, T] destination, the layout the split
+// convolution and the output gate consume. A head-split shard's parts are row ranges of one
+// materialized parent, so both logical outputs are one fused projection.
+void gdn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tensor& fused,
                     WorkspaceArena& workspace, cudaStream_t stream);
 
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(

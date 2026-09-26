@@ -3,9 +3,13 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::loading {
 namespace {
@@ -124,6 +128,24 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
             }
             return false;
         };
+        // The physical row run of a fused input projection. A checkpoint stores consecutive logical
+        // blocks whose representations match as one object, so an object holds a run of the
+        // canonical block order rather than necessarily every block: the names say which blocks the
+        // object carries, their widths fix the run's rows, and the object's own row count must be
+        // exactly that run's. Null when the object is not such a run.
+        const auto run_parts = [&](
+            std::initializer_list<std::pair<std::string_view, std::int32_t>> blocks)
+            -> std::optional<std::vector<RowPart>> {
+            std::vector<RowPart> parts;
+            std::int64_t rows = 0;
+            for (const auto& [suffix, width] : blocks) {
+                if (!has_name(suffix)) { continue; }
+                parts.push_back(part(static_cast<std::int32_t>(rows), width));
+                rows += width;
+            }
+            if (parts.empty() || k != hidden || rows != n) { return std::nullopt; }
+            return parts;
+        };
 
         TPObjectSplit split;
         split.object.index = idx;
@@ -150,18 +172,30 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
             // so that route keeps it replicated.
             split.kind = options.split_output_head ? WeightSplitKind::ColumnParallel
                                                    : WeightSplitKind::Replicated;
-        } else if (n == 2 * attn_q + 2 * attn_k && k == hidden) {
-            // Attention fused input projection, physical row order [q | k | gate | v]. Each block
-            // is halved across the two GPUs and the halves concatenated in block order.
-            split.kind = WeightSplitKind::GatherRows;
-            split.parts = {part(0, attn_q), part(attn_q, attn_k), part(attn_q + attn_k, attn_q),
-                           part(2 * attn_q + attn_k, attn_k)};
+        } else if (const auto parts = run_parts({{"attention/query", attn_q},
+                                                 {"attention/key", attn_k},
+                                                 {"attention/gate", attn_q},
+                                                 {"attention/value", attn_k}})) {
+            // Attention input projection, physical row order [q | k | gate | v]. Each block is
+            // halved across the two GPUs and the halves concatenated in block order.
+            split.kind  = WeightSplitKind::GatherRows;
+            split.parts = *parts;
         } else if (n == 2 * gdn_k + 2 * gdn_v && k == hidden) {
             // GDN fused input projection, physical row order [q | k | v | z]. Each block is halved
             // across the two GPUs and the halves concatenated in block order.
             split.kind = WeightSplitKind::GatherRows;
             split.parts = {part(0, gdn_k), part(gdn_k, gdn_k), part(2 * gdn_k, gdn_v),
                            part(2 * gdn_k + gdn_v, gdn_v)};
+        } else if (n == 2 * gdn_k + gdn_v && k == hidden && has_name("gdn/query")) {
+            // A GGUF checkpoint whose z parent has a different block format stores the q/k/v triple
+            // and z separately, so the fused [q | k | v | z] object above does not exist. The triple
+            // is gathered exactly as its fused form: each block halved and the halves concatenated.
+            split.kind = WeightSplitKind::GatherRows;
+            split.parts = {part(0, gdn_k), part(gdn_k, gdn_k), part(2 * gdn_k, gdn_v)};
+        } else if (n == gdn_v && k == hidden && has_name("gdn/z")) {
+            // The separate z parent of the same checkpoint: column-parallel, keeping the shard's half
+            // of the value rows so it continues the gathered value block.
+            split.kind = WeightSplitKind::ColumnParallel;
         } else if (n == 4 && k == 2 * gdn_k + gdn_v) {
             // GDN causal conv [taps, channels]; channels are [q | k | v] and are column-gathered
             // into per-shard halves (the conv runs over the sharded qkv projection).
@@ -178,6 +212,13 @@ TPSplitSpec build_tp_split_spec(const artifact::Directory& directory, const Text
             // each halved across the two GPUs).
             split.kind = WeightSplitKind::GatherRows;
             split.parts = {part(0, intermediate), part(intermediate, intermediate)};
+        } else if (n == intermediate && k == hidden &&
+                   (has_name("mlp/gate") || has_name("mlp/up"))) {
+            // A GGUF checkpoint whose gate and up parents carry different block formats stores them
+            // as two objects instead of one fused [gate; up] parent, so the fused gather above does
+            // not match. Each is column-parallel: the shard keeps half of the intermediate rows,
+            // which is exactly the row block its row-parallel down projection consumes.
+            split.kind = WeightSplitKind::ColumnParallel;
         } else if (n == hidden && k == intermediate) {
             // FFN down (row-parallel; the intermediate input columns are split).
             split.kind = WeightSplitKind::RowParallel;

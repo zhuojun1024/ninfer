@@ -63,7 +63,11 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     if (w.n <= 0 || w.k <= 0) {
         throw std::invalid_argument("linear: weight n/k must be positive");
     }
-    if (x.ne[0] != w.k || out.ne[0] != w.n || out.ne[1] != x.ne[1]) {
+    // A gathering weight reads its input through its own column map, so its K is the number of
+    // gathered elements and the activation may be wider (see Weight::input_columns).
+    const bool gathered = w.input_columns != nullptr;
+    if ((gathered ? w.k > x.ne[0] : w.k != x.ne[0]) || out.ne[0] != w.n ||
+        out.ne[1] != x.ne[1]) {
         throw std::invalid_argument("linear: expected [K,T] x [N,K] -> [N,T]");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {

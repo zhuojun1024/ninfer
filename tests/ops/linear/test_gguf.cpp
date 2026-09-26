@@ -182,6 +182,42 @@ int run_type(const TypeCase& c, std::uint32_t seed) {
     Weight gathered        = gate;
     gathered.input_columns = static_cast<const std::int32_t*>(columns_device.p);
 
+    // A gather whose domain is wider than the matrix itself: a tensor-parallel shard of a weight
+    // whose stored column order mixes both shards' heads holds half of the stored columns, and its
+    // gather indexes the full-width activation the pair assembles.
+    constexpr std::int32_t kX = 2 * kK;
+    std::vector<__nv_bfloat16> wide_host(std::size_t(kX) * max_t);
+    for (auto& v : wide_host) { v = __float2bfloat16(normal(rng)); }
+    const auto wide_float = to_float(wide_host);
+    DeviceBuffer wide_device(wide_host.size() * sizeof(__nv_bfloat16));
+    wide_device.copy_from_host(wide_host.data(), wide_host.size() * sizeof(__nv_bfloat16));
+    std::vector<std::int32_t> wide_columns(kK);
+    {
+        std::vector<std::int32_t> pool(kX);
+        for (std::int32_t i = 0; i < kX; ++i) { pool[i] = i; }
+        std::shuffle(pool.begin(), pool.end(), rng);
+        std::copy(pool.begin(), pool.begin() + kK, wide_columns.begin());
+    }
+    DeviceBuffer wide_columns_device(wide_columns.size() * sizeof(std::int32_t));
+    wide_columns_device.copy_from_host(wide_columns.data(),
+                                       wide_columns.size() * sizeof(std::int32_t));
+    Weight wide        = gate;
+    wide.input_columns = static_cast<const std::int32_t*>(wide_columns_device.p);
+
+    const auto wide_product = [&](std::int32_t t) {
+        std::vector<double> out(std::size_t(kRows) * t);
+        for (std::int32_t col = 0; col < t; ++col) {
+            for (std::int32_t r = 0; r < kRows; ++r) {
+                double acc = 0;
+                const float* w = exact.data() + std::size_t(r) * kK;
+                const float* x = wide_float.data() + std::size_t(col) * kX;
+                for (std::int32_t i = 0; i < kK; ++i) { acc += double(w[i]) * x[wide_columns[i]]; }
+                out[std::size_t(col) * kRows + r] = acc;
+            }
+        }
+        return out;
+    };
+
     const auto product = [&](std::int32_t row0, std::int32_t t, bool permuted) {
         std::vector<double> out(std::size_t(kRows) * t);
         for (std::int32_t col = 0; col < t; ++col) {
@@ -221,6 +257,7 @@ int run_type(const TypeCase& c, std::uint32_t seed) {
         return ok ? 0 : 1;
     };
 
+
     for (const std::int32_t t : widths) {
         Tensor x(x_device.p, DType::BF16, {kK, t});
         DeviceBuffer out_device(std::size_t(kRows) * t * sizeof(__nv_bfloat16));
@@ -238,6 +275,13 @@ int run_type(const TypeCase& c, std::uint32_t seed) {
         out_device.copy_to_host(host.data(), host.size() * sizeof(__nv_bfloat16));
         failures += run_check("gathered T=" + std::to_string(t), to_float(host),
                               product(0, t, true));
+
+        Tensor x_wide(wide_device.p, DType::BF16, {kX, t});
+        ops::linear(x_wide, wide, out, ops::LinearPolicy::A16Only, workspace, nullptr);
+        check(cudaDeviceSynchronize(), "wide gathered linear");
+        out_device.copy_to_host(host.data(), host.size() * sizeof(__nv_bfloat16));
+        failures += run_check("wide gather T=" + std::to_string(t), to_float(host),
+                              wide_product(t));
 
         std::vector<__nv_bfloat16> residual(std::size_t(kRows) * t);
         for (auto& v : residual) { v = __float2bfloat16(normal(rng)); }

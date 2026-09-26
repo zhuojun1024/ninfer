@@ -2,6 +2,8 @@
 
 #include "core/tp/weight_splitter.h"
 
+#include <map>
+#include <optional>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::loading {
@@ -33,9 +35,64 @@ std::vector<BoundWeight> shard_views(std::span<const PendingWeight> pending,
                                      const artifact::MaterializedArtifact& shard_backing,
                                      const TPSplitSpec& spec, int shard) {
     if (shard != 0 && shard != 1) { throw std::invalid_argument("shard must be 0 or 1"); }
+    // Auxiliary input gathers ('input_columns') index the full-width activation a mixer projects,
+    // not a shard's own half of it: a matrix whose stored column order is its own (a GGUF block
+    // checkpoint's tiled value heads) pairs its columns with heads from anywhere in the pair. Such
+    // a matrix is therefore row-parallel - the shard holds half of the stored columns, and the same
+    // half of the gather travels with them, so column c of the half is the parent's column
+    // shard * k/2 + c and the gather still indexes the activation the pair assembles. A complete or
+    // column-parallel placement instead would pair a shard's columns with an activation that does
+    // not cover the gather's domain, or leave the shard a whole product its all-reduce would
+    // double.
+    //
+    // A component placed on one shard alone runs its whole mixer there, so its activation already is
+    // the gather's domain and its auxiliary stays whole. One auxiliary shared by the two placements
+    // has no single answer and is refused.
+    std::map<std::size_t, bool> gather_is_halved;
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        const auto& item = pending[index];
+        std::optional<WeightId> gathered;
+        for (const auto& use : item.uses) {
+            if (use.input_columns) {
+                gathered = use.input_columns;
+                break;
+            }
+        }
+        if (!gathered) { continue; }
+        if (gathered->index >= pending.size()) {
+            throw std::invalid_argument("shard view: " + item.reference.name +
+                                        " names an input gather outside the model");
+        }
+        const auto& gather = pending[gathered->index];
+        if (gather.reference.shape.size() != 1 || item.reference.shape.size() != 2 ||
+            gather.reference.shape[0] != item.reference.shape[1]) {
+            throw std::invalid_argument("shard view: " + item.reference.name +
+                                        " must gather a [K] vector over its input columns");
+        }
+        bool halved = false;
+        for (const auto& part : item.reference.binding.parts) {
+            if (!spec.on_shard(part.object, 0) || !spec.on_shard(part.object, 1)) { continue; }
+            const auto* object = spec.find(part.object);
+            const WeightSplitKind kind = object ? object->kind : WeightSplitKind::Replicated;
+            if (kind != WeightSplitKind::RowParallel) {
+                throw std::invalid_argument(
+                    "tensor parallel split: " + item.reference.name +
+                    " gathers its input columns, which only a row-parallel (K) split pairs with "
+                    "the full-width activation the pair assembles");
+            }
+            halved = true;
+        }
+        const auto known = gather_is_halved.find(gathered->index);
+        if (known != gather_is_halved.end() && known->second != halved) {
+            throw std::invalid_argument("shard view: " + item.reference.name +
+                                        " shares an input gather with a differently placed weight");
+        }
+        gather_is_halved[gathered->index] = halved;
+    }
     std::vector<BoundWeight> out;
     out.reserve(pending.size());
-    for (const auto& item : pending) {
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        const auto& item = pending[index];
         if (item.reference.residency != artifact::Residency::Device) {
             throw std::invalid_argument("shard view: only device-resident weights are supported");
         }
@@ -65,23 +122,31 @@ std::vector<BoundWeight> shard_views(std::span<const PendingWeight> pending,
         bw.uses           = item.uses;
         WeightView view;
         view.shape = item.reference.shape;
+        const auto gather = gather_is_halved.find(index);
+        if (gather != gather_is_halved.end() && gather->second) {
+            // This shard's half of the gather, in step with the half of the matrix's stored columns
+            // it holds. The auxiliary itself stays whole on the device, so the half is a window of
+            // the parent's [K] vector.
+            if (item.reference.binding.parts.size() != 1 || item.reference.shape[0] % 2 != 0) {
+                throw std::invalid_argument(
+                    "shard view: " + item.reference.name +
+                    " must be an even [K] gather over one object");
+            }
+            const auto& part         = item.reference.binding.parts.front();
+            const std::uint64_t half = item.reference.shape[0] / 2;
+            WeightRegion region;
+            region.parent = &shard_backing.device_parent(part.object);
+            region.begin  = part.begin + static_cast<std::uint64_t>(shard) * half;
+            region.end    = region.begin + half;
+            view.shape[0] = half;
+            view.parts.push_back(region);
+            bw.view = std::move(view);
+            out.push_back(std::move(bw));
+            continue;
+        }
         for (const auto& part : item.reference.binding.parts) {
             const auto* split = spec.find(part.object);
             const WeightSplitKind kind = split ? split->kind : WeightSplitKind::Replicated;
-            if (kind == WeightSplitKind::RowParallel || kind == WeightSplitKind::GatherCols) {
-                // A weight whose Use gathers its input columns stores them in an order of its own
-                // (a GGUF block checkpoint's tiled value heads). A K split would hand this shard a
-                // block of that stored order while its activation holds only this shard's own heads,
-                // so the two halves would no longer pair up. Refuse it by name instead of computing a
-                // wrong product.
-                for (const auto& use : item.uses) {
-                    if (!use.input_columns) { continue; }
-                    throw std::invalid_argument(
-                        "tensor parallel split: " + item.reference.name +
-                        " gathers its input columns, which a column-parallel TP-2 split cannot "
-                        "represent");
-                }
-            }
             WeightRegion shard_part;
             shard_part.parent = &shard_backing.device_parent(part.object);
             if (kind == WeightSplitKind::Replicated) {

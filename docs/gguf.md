@@ -39,6 +39,34 @@ last bits; prompts use llama.cpp's own arithmetic.
 The GGUF head of the reduced proposal table materializes BF16 logits per chunk and ranks them through
 the same grouped K-split reduction the fused producers use.
 
+## Tensor parallelism
+
+A converted artifact also runs on the dual-GPU tensor-parallel route (`ninfer-serve --devices
+0,1`). The split follows the block layout instead of a repacked format:
+
+- An output-row split (the vocabulary head, and a `gate`/`up` parent stored as one object) keeps
+  whole rows, so each shard stores contiguous code-plane rows.
+- A K split (the FFN `down` projection) keeps whole 256-element blocks, so each shard holds valid
+  blocks and the partial products are reduced as usual.
+- The release stores a projection whose parts carry different types as separate objects rather
+  than one parent (`[q|k]` or `[q|k|v]` plus a `z` object, four separate attention blocks, two
+  separate `gate`/`up` objects). The split spec reads the logical blocks an object carries from
+  its binding names, halves each of them, and concatenates the halves, and `ops::gdn_input_proj`
+  derives its channel profile from the parts instead of the full model's.
+- Some layers of the GSQ-RCO release store their grouped value projection in tiled value-head
+  order and describe that order with an `input_columns` column map whose entries address heads of
+  both shards. That projection therefore runs in two stages: each shard leaves its own heads in
+  its half of the activation, the pair all-reduces the disjoint halves, and both shards then
+  project the assembled activation with their half of the K.
+
+The integer tensor-core kernel distributes a matrix's K dimension over its grid with stream-K,
+and that partition follows the grid shape, so one output column's rounding depends on how many
+columns the call carries. A chunked prefill consequently does not reproduce a single-chunk
+prefill bit for bit on this route, and a near-tie token can resolve differently;
+[`ninfer_qwen3_5_tp2_forward_test`](../tests/models/qwen3_5/test_tp2_forward.cpp) holds a
+block-quantized artifact to the sampled token plus the leading-logit bound, and keeps its
+byte-exact criterion for the other formats.
+
 ## Serving
 
 A converted artifact starts like any other; MTP, DFlash2 and Vision work as with the official

@@ -493,6 +493,23 @@ int main(int argc, char** argv) {
         // is a genuinely different problem shape (narrower activation MMA schedule, and its first
         // three columns take the convolution state branch instead of the input taps), so it is held
         // to the sampled token plus bounded leading-logit drift.
+        //
+        // A checkpoint whose text mixers carry ggml block weights projects through the vendored
+        // integer MMQ kernel, which distributes a matrix's K dimension over its grid with stream-K:
+        // the partition follows the grid (row tiles x column tiles), so one output column's rounding
+        // changes with the number of columns in the call and a chunked walk cannot reproduce a
+        // single-chunk walk bit for bit. Those splits are therefore held to the sampled token plus
+        // the leading-logit bound, which still catches a lost KV mapping or a broken GDN state
+        // hand-off; every other route tiles each column independently and stays exact.
+        const bool block_quantized = std::any_of(
+            parameters0.text.layers.begin(), parameters0.text.layers.end(), [](const auto& layer) {
+                const auto* attention = std::get_if<qwen::execution::AttentionParameters>(&layer.mixer);
+                const auto& projection = attention != nullptr
+                                             ? attention->projection
+                                             : std::get<qwen::execution::GdnParameters>(layer.mixer)
+                                                   .projection;
+                return std::holds_alternative<ops::GgufProjectionWeights>(projection);
+            });
         struct SplitCase {
             const char* label;
             std::vector<std::int32_t> cuts;
@@ -507,18 +524,21 @@ int main(int argc, char** argv) {
             const auto split = host_logits(device0.get(), run_prefill(prompt_ids, test_case.cuts));
             const float gap = top_five_gap(split, whole_long);
             const float drift = max_abs_diff(split, whole_long);
+            const bool require_exact = test_case.require_exact && !block_quantized;
             std::cout << "    chunking " << test_case.label << ": top5_gap=" << gap
-                      << " max_logit_diff=" << drift << " argmax=" << argmax_of(split) << "\n";
+                      << " max_logit_diff=" << drift << " argmax=" << argmax_of(split)
+                      << (require_exact ? " (bit-exact)" : " (bounded)") << "\n";
             print_top("  split ", split);
             if (argmax_of(split) != argmax_of(whole_long)) {
                 std::cerr << "FAIL: chunked prefill argmax differs from the single-chunk walk ("
                           << test_case.label << ")\n";
                 return 1;
             }
-            if (test_case.require_exact ? (drift != 0.0F) : (gap > kLeadingLogitTolerance)) {
+            if (require_exact ? (drift != 0.0F) : (gap > kLeadingLogitTolerance)) {
                 std::cerr << "FAIL: chunked prefill diverges from the single-chunk walk ("
-                          << test_case.label << ", top5 gap " << gap << ", max diff " << drift
-                          << ")\n";
+                          << test_case.label
+                          << (require_exact ? ", bit-exact split" : ", bounded split")
+                          << ", top5 gap " << gap << ", max diff " << drift << ")\n";
                 return 1;
             }
         }

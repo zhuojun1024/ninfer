@@ -125,21 +125,43 @@ void ffn_delta(const Tensor& hidden, const FfnParameters& parameters, Tensor& de
     (void)hints;
     const auto* p = std::get_if<DenseParameters>(&parameters);
     if (p == nullptr) { throw std::invalid_argument("ffn_delta: only the dense FFN is sharded"); }
-    const auto& gu    = p->gate_up.weight;
-    const auto& down  = p->down.weight;
+    const auto& gu     = p->gate_up.weight;
+    const auto& down   = p->down.weight;
     const auto columns = hidden.ne[1];
     // The fused linear_swiglu kernels are registered for the full-model gate_up geometry, so the
     // sharded FFN (half the intermediate rows) uses the shape-generic linear + silu_mul pair, the
     // same decomposition as the mtp branch above. delta = down(silu(gate) * up), the row-parallel
     // partial output written without a residual add.
-    Tensor gate_up = workspace.alloc(DType::BF16, {gu.n, columns});
-    {
-        auto call = workspace.scope();
-        ops::linear(hidden, gu, gate_up, p->gate_up.policy, workspace, stream);
+    //
+    // A GGUF checkpoint whose gate and up parents carry different block formats stores them as two
+    // objects, and gate_up then holds the gate alone (see DenseParameters): both halves are
+    // projected and multiplied instead of slicing one fused parent.
+    const Weight* up = p->up ? &p->up->weight : nullptr;
+    if (up != nullptr && up->n != gu.n) {
+        throw std::invalid_argument("ffn_delta: gate and up must both be [rows, hidden]");
     }
-    Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
-    ops::silu_mul(gate_up.slice(0, 0, gu.n / 2), gate_up.slice(0, gu.n / 2, gu.n / 2), activation,
-                  stream);
+    Tensor activation = workspace.alloc(DType::BF16, {up != nullptr ? gu.n : gu.n / 2, columns});
+    if (up != nullptr) {
+        Tensor gate    = workspace.alloc(DType::BF16, {gu.n, columns});
+        Tensor up_rows = workspace.alloc(DType::BF16, {up->n, columns});
+        {
+            auto call = workspace.scope();
+            ops::linear(hidden, gu, gate, p->gate_up.policy, workspace, stream);
+        }
+        {
+            auto call = workspace.scope();
+            ops::linear(hidden, *up, up_rows, p->up->policy, workspace, stream);
+        }
+        ops::silu_mul(gate, up_rows, activation, stream);
+    } else {
+        Tensor gate_up = workspace.alloc(DType::BF16, {gu.n, columns});
+        {
+            auto call = workspace.scope();
+            ops::linear(hidden, gu, gate_up, p->gate_up.policy, workspace, stream);
+        }
+        ops::silu_mul(gate_up.slice(0, 0, gu.n / 2), gate_up.slice(0, gu.n / 2, gu.n / 2),
+                      activation, stream);
+    }
     {
         auto call = workspace.scope();
         ops::linear(activation, down, delta, p->down.policy, workspace, stream);

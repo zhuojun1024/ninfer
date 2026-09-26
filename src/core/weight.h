@@ -98,8 +98,10 @@ struct Weight {
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
 
-    // INT32 [K] input gather of a GGUF matrix whose stored columns are a permutation of its
-    // input's: column c multiplies input element input_columns[c]. Null for every other matrix.
+    // INT32 [k] input gather of a GGUF matrix whose stored columns are ordered by its input's:
+    // column c multiplies input element input_columns[c]. The gather indexes the activation's rows,
+    // so an input wider than k is read exactly where the gather points (a tensor-parallel shard of a
+    // matrix whose stored order mixes both shards' columns). Null for every other matrix.
     const std::int32_t* input_columns = nullptr;
 };
 
