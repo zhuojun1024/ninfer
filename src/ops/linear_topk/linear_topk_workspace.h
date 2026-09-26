@@ -9,6 +9,9 @@ namespace ninfer::ops::detail {
 
 inline constexpr std::int32_t kLinearTopK                = 16;
 inline constexpr std::int32_t kLinearTopKMaxChunkColumns = 128;
+// A head whose product materializes BF16 logits per chunk reduces them in grouped K-split, and that
+// plane is [head_rows, columns] wide, so its chunk is far narrower than the fused producers'.
+inline constexpr std::int32_t kLinearTopKMaterializedChunkColumns = 16;
 inline constexpr std::int32_t kLinearTopKGroupedRows     = 128;
 inline constexpr std::int32_t kLinearTopKDirectRows      = 16;
 inline constexpr std::int32_t kLinearTopKMergeFanIn      = 32;
