@@ -418,8 +418,8 @@ GeForce 拒绝 P2P；授权依据 NVIDIA 芯片组允许表，消费级芯片组
 | 1 | per-device `cudaFuncSetAttribute` 缓存（第二张卡 smem 上限未抬升） | `9adeb90c`（修 19 处） | **完成** 2026-09-26 |
 | 2 | 170 SM 硬编码 → 运行时设备 SM 数 | `d7bbcf57`、`7afc8e17` | **完成**（3 处代码；1 处待测量） |
 | 3 | 减内核/栈帧：RDC-off + attention gate 折叠 + INT8 scale 走 smem | `ea74dca4`、`77c9cc39`、`a941c9f4` | 3a **实测不支持已回退**；3b/3c 暂缓（见下） |
-| 4 | 减少每卡权重字节：embedding/head 与 MTP 专家 Q4/Q6 | `1da31697`、`f1982279`、`f8c75edd` | 待办 |
-| 5 | verify 段：small-T tensor-core 内核 + GDN record 窗口 staging | `ce2df46b`、`21df3069` | 待办 |
+| 4 | 减少每卡权重字节：embedding/head 与 MTP 专家 Q4/Q6 | `1da31697`、`f1982279`、`f8c75edd` | 待决策：本 artifact 是 FP8 词表/头，等价动作＝把要流的 FP8 张量改 NVFP4（~17%，需质量 A/B） |
+| 5 | verify 段：small-T tensor-core 内核 + GDN record 窗口 staging | `ce2df46b`、`21df3069` | 5b 已移植（Op 级 −22~27%，端到端测不出）；5a 复核后不做 |
 | 6 | 大件（需产品决策）：KV codec / 设备路线 profile / fast prompt kernel | `eb9f7a23`/`ad26b362`/`2ba10da2`、`0b2f8384`/`81861a07`、`4303e604` | 待办 |
 
 ### 5.2 各项范围与验证
@@ -563,6 +563,30 @@ GeForce 拒绝 P2P；授权依据 NVIDIA 芯片组允许表，消费级芯片组
   `cp.async` staging。verify forward ≈30 ms / 38.2 ms round。
 - 验证：Op oracle + verify graph 计时 + 贪心字节一致。
 
+**实施结果（2026-09-26）**
+
+- 归因（§5.4）：round 33.9 ms 里 verify 29.1（86%）、proposal 3.7（11%）；verify 的每 shard 权重流下限
+  22.7 ms ⇒ 固定余量 3.9 ms（T=1 实测 26.6 ms），再加 2 列只多 2.5 ms（T=3 实测 29.1 ms）。
+- **5b `21df3069` GDN record 窗口 staging：已移植并验证**（`recurrent.cuh`，+92 行；用 `cp.async` 预取
+  窗口的 key/query/本 CTA 的 value 行/gate 到 shared memory，再在原位做同样的运算）。
+  - Op 级（`ninfer_gdn_replay_bench --profile 27b --component recurrent`，B=1）：T=3 冷 L2
+    22.1 → 16.2 µs（−27%），warm 16.1 → 16.3 µs（噪声内）；T=8 冷 L2 36.5 → 28.3 µs（−22%），
+    warm 28.5 → 27.5 µs（−3%）。
+  - 端到端：MTP 路线**测不出**——同一 workload 的 verify 相位 29.07 → 29.13 ms（0.2%）；decode tok/s
+    从 70.4 → 76.4 是接受率漂移（committed/round 2.39 → 2.58，与 tok/s 同比例），不是速度。DFlash2
+    路线按 T=8 的 ~8 µs/layer × 48 折算也只有约 0.4 ms，低于相位计时分辨率。故本项只主张 **Op 级** 结论。
+  - 正确性：`gated_delta_net_test`（op oracle）、`gated_delta_net_replay_record_test`、
+    `gdn_replay_fold_test`、`gdn_replay_records_test`、`gdn_input_proj_conv_record_test` 全绿；
+    真实双卡件 `tp2_dflash_append_test`（含 proposal/accept 摘要）PASS ⇒ 逐位一致。
+- **5a `ce2df46b` small-T tensor-core 内核：复核范围后判定不适用于 TP-2 主线**。该提交只落在 **q4/q5
+  路线**（`linear/q4/q4_small_t_mma`、`linear/q5/q5_small_t_mma`、`linear_add/q5`、`linear_swiglu/q4`、
+  `linear_topk/q4`、`attn_input_proj/q4_q5`、`gdn_input_proj/q4_q5`，约 25 文件 / 1500+ 行含新测试），
+  而双卡件 `swift15` 的主体是 NVFP4（128 张）+ FP8（130 张），q4/q5 只覆盖草稿权重 ⇒ 最多碰到 3.7 ms
+  proposal 段的一部分；而 1–32 列的「小 T 低效」在本机表现为 verify 的 2.5 ms 列扩展成本（占 round 7%）。⇒ 不做。
+- 结论与顺序建议：唯一有两位数空间的是**权重字节**（22.7 / 33.9 ms = 67% 的流），即项目 4 的广义形式
+  （把每 token 要流的 FP8 张量改 NVFP4/Q4；文档估 −2.6 GB/shard ≈ −5.8 ms ≈ 17%），代价是质量/接受率，
+  必须先做困惑度 A/B 再决定是否改配方。
+
 **6. 大件（需产品决策，先不改）**
 - KV codec：`eb9f7a23` rk4v4-e8（280 B/token/head）、`ad26b362` rk2v4-e8（216 B）、`2ba10da2` rk8v4 G32、
   `9218b67b` 根码查表；当前 fp8 KV = 16.125 KiB/token/shard。
@@ -599,3 +623,21 @@ GeForce 拒绝 P2P；授权依据 NVIDIA 芯片组允许表，消费级芯片组
 - 产物格式（`*.conversion.json` + `w4a4_family_recipe.py`）：`text/token_embedding` 与 `text/output_head`
   均为 `fp8_e4m3fn_row_bf16`；128 个 NVFP4、130 个 FP8、567 个 BF16、88 个 Q4G64、54 个 Q5G64、
   1 个 Q6G64、7 个 Q8G32。
+
+**verify 段归因（2026-09-26，`NINFER_TP2_TIMING=1` 的服务端阶段计时）**
+
+| 段 | 每 round（ms） | 占比 |
+|---|---:|---:|
+| avg_round | 33.92 | 100% |
+| **verify** | **29.07 / 29.90** | **~86%** |
+| mtp（proposal） | 3.69 / 3.77 | ~11% |
+| accept + copy + sync_wait + fold | 0.37 | ~1% |
+
+（两段独立样本：`rounds=36 committed=86` 与 `rounds=24 committed=63`，即 2.39 token/round ⇒ 70.5 tok/s，
+与 §5.4 的 bench_serve 数字一致。）
+
+- 结论：项目 5 的方向正确——verify 是唯一值得动的段，proposal 只剩 11%。
+- 但上限要算清楚：verify 的每 shard 权重流是 10.15 GB ⇒ 22.7 ms 带宽下限，实测 29 ms ⇒ **非带宽余量
+  只有 ~6.3 ms（占 round 18%）**。small-T tensor-core 内核与 GDN staging 能抢的是这 6.3 ms 的一部分。
+- 下一步要区分这 6.3 ms 里「小 T GEMM 效率 / 128 次 collective / 图内 kernel 间隙」各占多少，
+  再决定 5a（`ce2df46b` 新内核族）与 5b（`21df3069` GDN staging）谁先做。
