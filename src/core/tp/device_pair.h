@@ -42,6 +42,11 @@ public:
     // synchronization. Only this transport may be captured into a CUDA Graph: the P2P and
     // host-staging fallbacks synchronize the caller's streams.
     bool in_kernel_allreduce() const noexcept { return in_kernel_available_; }
+    // Largest payload the in-kernel transport carries in one call, in bytes; 0 when that transport
+    // is not in use. A caller that sizes a batched payload (the TP-2 prefill chunk) bounds it by
+    // this: a payload past the staging buffer silently takes the host-staging fallback, which
+    // synchronizes both compute streams on every collective.
+    std::size_t in_kernel_allreduce_bytes() const noexcept { return in_kernel_bytes_; }
 
     // Bounded-spin safety for the in-kernel transport. Every rendezvous spin carries a wall-clock
     // deadline (NINFER_TP2_AR_TIMEOUT_MS, default 10000, 0 disables it): a spin that can never be
@@ -113,7 +118,15 @@ private:
     DeviceContext a_;
     DeviceContext b_;
     bool p2p_ = false;
+    // Host-staging fallback: one buffer holding two parity slots, each [a | b]. The two devices'
+    // compute streams are independent, so a single shared buffer would let the next call's download
+    // overwrite the half the previous call's upload is still reading from (see host_staging).
     std::unique_ptr<PinnedHostBuffer> staging_;
+    std::size_t staging_slot_bytes_ = 0; // capacity of one slot: 2 * the largest payload seen
+    bool staging_parity_            = false;
+    // Returns this call's parity slot, growing the buffer (after synchronizing both compute streams)
+    // when the payload is the largest so far.
+    char* host_staging(std::size_t count_bytes, cudaStream_t stream_a, cudaStream_t stream_b);
     // In-kernel allreduce (WSL2, no P2P): mapped pinned host staging + arrival ids. Each device's
     // kernel writes its delta to its own mapped host buffer, signals an arrival id, spins on the
     // peer's id, then reads the peer's buffer and sums in place - all inside the kernel, so the host
@@ -165,6 +178,14 @@ private:
     std::uint64_t ar_eager_next_ = 1ULL << 62;
     // Published id, read by the watchdog thread and by the engine's stall message.
     std::atomic<unsigned long long> ar_last_id_{0};
+    // Diagnostics: NINFER_TP2_AR_FORCE_HOST_STAGING=1 keeps every collective on the host-staging
+    // fallback, which is how the test suite qualifies that transport's arithmetic where the
+    // in-kernel one would otherwise take every call.
+    bool force_host_staging_ = false;
+    // Host threads the host-staging reduction uses; 0 takes what the machine has (capped). Only
+    // NINFER_TP2_AR_ADD_THREADS sets it, so the fallback's reduction can be measured at one thread
+    // against the automatic split on the machine it runs on.
+    unsigned host_add_threads_ = 0;
     // Decode-sized staging: a single token's [hidden, 1] delta is a few KiB, so the prefill-sized
     // slots are almost all waste, and sharing them would let a small call's parity slot alias a
     // prefill payload the peer is still reading.
@@ -180,6 +201,14 @@ private:
     std::shared_ptr<ArWatchState> watch_;
     void note_ar_call(std::size_t count_bytes);
     void stop_ar_watchdog();
+    // A capture records launches and cannot contain the fallback's per-collective stream
+    // synchronization, so a payload past the staging while a capture is open is a hard error rather
+    // than a quiet transport change. Called by allreduce and sendrecv.
+    void require_capturable_payload(std::size_t count_bytes) const;
+    // Reserves the largest staging-ladder rung both devices can map, leaving host_a_/host_b_ and
+    // dev_a_/dev_b_ holding it. Returns its capacity per parity slot, or 0 when no rung fits: the
+    // pair then has no in-kernel transport and every collective takes the host-staging fallback.
+    std::size_t reserve_in_kernel_staging();
     // True when the injected collective is the one whose peer launch must be skipped.
     bool fault_skip_peer();
     // What one collective runs with: the ordinal baked at capture (0 for eager, where the host

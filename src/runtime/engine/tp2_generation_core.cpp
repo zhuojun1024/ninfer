@@ -694,7 +694,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     // spec keeps dflash2/* shard-local), so only that shard pays for the target-feature staging, the
     // draft's own local K/V and the round's proposal workspace. The round owns all of it
     // (program/dflash_round.h) so the production assembly is exactly the one the loader-only test
-    // drives. One prefill chunk of features is enough because TP-2 clamps its chunk to
+    // drives. One prefill chunk of features is enough because TP-2 clamps its chunk to at most
     // kPrefillChunkMaximum (1024) while the draft's local window is 2048, so no prefill ever stages
     // more than one window's worth of target residual.
     if (shard.parameters->draft.has_value()) {
@@ -704,8 +704,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
             // but through the per-layer path (and a full KV layer) that this core does not own.
             throw std::logic_error("TP-2 masked draft requires the DFlash2 context layout");
         }
-        const std::uint32_t feature_columns = std::min<std::uint32_t>(
-            std::max<std::uint32_t>(options_.prefill_chunk, 64U), kPrefillChunkMaximum);
+        const std::uint32_t feature_columns = prefill_chunk_width(config);
         const std::uint32_t draft_window = options_.speculative.draft_tokens;
         // The proposal gets an arena of its own, sized by the planner the single-device route uses.
         // It is deliberately not carved out of the shard workspace: propose_dflash2_batch resets the
@@ -1292,6 +1291,34 @@ std::vector<TokenId> TP2GenerationCore::mtp_propose_window(Shard& shard, Tensor&
     return host;
 }
 
+// Width one TP-2 prefill chunk runs with. The engine option sets it, the model's chunk maximum
+// bounds it, and the cross-device all-reduce staging buffer bounds it again: a chunk's every layer
+// issues a BF16 all-reduce - the mixer and FFN deltas at [hidden, T], a gather mixer's activation at
+// its own full width, a Vision handoff at [hidden, count] - and the DevicePair carries one payload in
+// one transport call. A payload past the in-kernel staging buffer would take the host-staging
+// fallback, which synchronizes both compute streams on every collective, so a chunk that does not fit
+// is narrowed here instead of silently changing transport. The widest payload per token is the
+// largest of those widths; the draft's feature staging and the prefill sinks are sized from this
+// same width.
+std::uint32_t TP2GenerationCore::prefill_chunk_width(const qwen::TextConfig& config) const {
+    const std::uint32_t width =
+        std::min<std::uint32_t>(std::max<std::uint32_t>(options_.prefill_chunk, 64U),
+                                kPrefillChunkMaximum);
+    const std::size_t staging = pair_.in_kernel_allreduce_bytes();
+    // Zero means the pair has no in-kernel transport: the host-staging fallback grows its pinned
+    // buffer to any payload, so only the option and the workspace bound the chunk.
+    if (staging == 0) { return width; }
+    std::uint64_t widest = config.hidden_size;
+    if (config.gdn) { widest = std::max(widest, config.gdn->value_width()); }
+    if (config.attention) { widest = std::max(widest, config.attention->query_width()); }
+    const std::size_t per_token = static_cast<std::size_t>(widest) * sizeof(std::uint16_t);
+    const std::size_t fits      = per_token == 0 ? width : staging / per_token;
+    // The narrowest chunk is 64 tokens. A model wide enough that even that overflows the buffer keeps
+    // the 64-token chunk and is carried by the fallback's own capacity rather than refused here.
+    return static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(width, std::max<std::size_t>(fits, 64U)));
+}
+
 std::optional<qwen::execution::DFlashFeatureSink>
 TP2GenerationCore::make_dflash_prefill_sink(Shard& shard) {
     if (shard.dflash_round == nullptr) { return std::nullopt; }
@@ -1300,8 +1327,7 @@ TP2GenerationCore::make_dflash_prefill_sink(Shard& shard) {
     // positions prefix, consume_prefill_chunk slices the feature prefix). Only the prefill fields are
     // set: the batch (verify-window) fields stay null until the masked draft has its verify wiring.
     // One resident session, so the draft ring's lane is 0 and the whole captured chunk is committed.
-    const std::uint32_t chunk = std::min<std::uint32_t>(
-        std::max<std::uint32_t>(options_.prefill_chunk, 64U), kPrefillChunkMaximum);
+    const std::uint32_t chunk = prefill_chunk_width(shard.model->config().text);
     return shard.dflash_round->make_prefill_sink(qwen::execution::ExecutionCore{
         .device           = shard.device,
         .parameters       = *shard.parameters,
@@ -2542,9 +2568,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // prefill end, which is always a boundary.
     // Chunk width from the engine option, clamped to what the cross-device allreduce staging buffer
     // (DevicePair) and the per-chunk activation peak (workspace) can carry.
-    const std::uint32_t prefill_chunk =
-        std::min<std::uint32_t>(std::max<std::uint32_t>(options_.prefill_chunk, 64),
-                                kPrefillChunkMaximum);
+    const std::uint32_t prefill_chunk = prefill_chunk_width(shard_a_.model->config().text);
     // The tail anchors cover the last few chunk ends of the walk. Their count is bounded by the tail
     // sub-ring, so a narrow chunk cannot flood the ring with anchors that all sit within one chunk of
     // the prompt end.

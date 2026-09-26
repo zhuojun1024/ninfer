@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -12,8 +13,10 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -633,6 +636,244 @@ int check_ar_timeout(ninfer::tp::DevicePair& pair, std::size_t count_bytes) {
     return failures;
 }
 
+
+// Sets or clears `name` for the pair constructed next: the host-staging hook is read once, at
+// construction, so the process-wide value is restored before anything else is built.
+void set_env(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value == nullptr ? "" : value);
+#else
+    if (value == nullptr) {
+        unsetenv(name);
+    } else {
+        setenv(name, value, 1);
+    }
+#endif
+}
+
+// The host-staging reduction must reproduce the device transport's BF16 add bit for bit, including
+// the cases its rounding is *defined* on rather than merely close to: signed zeros, denormals, exact
+// ties in both directions, sums that round up into infinity, and NaN payloads, which
+// __float2bfloat16 canonicalizes. Every pattern pair is pushed through the real transport as one
+// payload, so the check covers the vector loop and its chunking rather than a private helper.
+int check_host_add_patterns(ninfer::tp::DevicePair& pair) {
+    const std::uint16_t patterns[] = {
+        0x0000, 0x8000,                         // +-0
+        0x0001, 0x8001, 0x007F, 0x807F,         // smallest denormals, both signs
+        0x3F80, 0xBF80,                         // +-1
+        0x3F81, 0xBF81,                         // +-(1 + 2^-8)
+        0x4000, 0xC000, 0x3F00, 0xBF00,         // +-2, +-0.5
+        0x3780, 0xB780,                         // +-2^-16: the exact tie neighbour of 1.0
+        0x3380, 0xB380,                         // +-2^-24
+        0x7F7F, 0xFF7F,                         // largest finite, both signs
+        0x7F80, 0xFF80,                         // +-infinity
+        0x7FC0, 0xFFC0, 0x7FA0, 0xFFA0, 0x7FFF, // quiet and signaling NaNs, both signs
+    };
+    constexpr std::size_t kCount = sizeof(patterns) / sizeof(patterns[0]);
+
+    std::vector<std::uint16_t> host_a, host_b;
+    host_a.reserve(kCount * kCount + 8);
+    host_b.reserve(kCount * kCount + 8);
+    for (std::size_t i = 0; i < kCount; ++i) {
+        for (std::size_t j = 0; j < kCount; ++j) {
+            host_a.push_back(patterns[i]);
+            host_b.push_back(patterns[j]);
+        }
+    }
+    // Pad to the 16-byte group the transport requires; +0 leaves the expected sum unchanged.
+    while (host_a.size() % 8 != 0) {
+        host_a.push_back(0);
+        host_b.push_back(0);
+    }
+    const std::size_t count_bytes = host_a.size() * sizeof(std::uint16_t);
+    const std::size_t elements    = host_a.size();
+
+    // Count the cases the rounding is defined on, so a corpus that stopped covering them shows up
+    // instead of passing quietly.
+    std::size_t ties = 0, infinities = 0, nans = 0;
+    for (std::size_t i = 0; i < elements; ++i) {
+        const auto* a = reinterpret_cast<const __nv_bfloat16*>(&host_a[i]);
+        const auto* b = reinterpret_cast<const __nv_bfloat16*>(&host_b[i]);
+        const float sum = __bfloat162float(*a) + __bfloat162float(*b);
+        if (std::isnan(sum)) {
+            ++nans;
+            continue;
+        }
+        if (std::isinf(sum)) {
+            ++infinities;
+            continue;
+        }
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &sum, sizeof(bits));
+        if ((bits & 0xFFFFu) == 0x8000u) { ++ties; }
+    }
+    if (ties == 0 || infinities == 0 || nans == 0) {
+        std::cerr << "host add patterns: corpus lost its edge cases (ties " << ties << ", inf "
+                  << infinities << ", nan " << nans << ")\n";
+        return 1;
+    }
+
+    pair.a().bind_to_current_thread();
+    ninfer::DeviceBuffer buf_a(count_bytes);
+    pair.b().bind_to_current_thread();
+    ninfer::DeviceBuffer buf_b(count_bytes);
+    cudaStream_t stream_a = nullptr, stream_b = nullptr;
+    pair.a().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
+    pair.b().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
+    pair.a().bind_to_current_thread();
+    buf_a.copy_from_host(host_a.data(), count_bytes);
+    pair.b().bind_to_current_thread();
+    buf_b.copy_from_host(host_b.data(), count_bytes);
+
+    pair.allreduce(buf_a.p, buf_b.p, count_bytes, stream_a, stream_b);
+    pair.a().bind_to_current_thread();
+    cudaStreamSynchronize(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamSynchronize(stream_b);
+
+    std::vector<__nv_bfloat16> got_a(elements), got_b(elements);
+    pair.a().bind_to_current_thread();
+    buf_a.copy_to_host(got_a.data(), count_bytes);
+    pair.b().bind_to_current_thread();
+    buf_b.copy_to_host(got_b.data(), count_bytes);
+
+    int failures = 0;
+    for (std::size_t i = 0; i < elements; ++i) {
+        const __nv_bfloat16 expected = __float2bfloat16(
+            __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&host_a[i])) +
+            __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&host_b[i])));
+        if (bits_of(got_a[i]) == bits_of(expected) && bits_of(got_b[i]) == bits_of(expected)) {
+            continue;
+        }
+        if (failures < 4) {
+            std::cerr << "host add patterns: element " << i << " a=0x" << std::hex << host_a[i]
+                      << " b=0x" << host_b[i] << " expected=0x" << bits_of(expected) << " shard a=0x"
+                      << bits_of(got_a[i]) << " shard b=0x" << bits_of(got_b[i]) << std::dec << '\n';
+        }
+        ++failures;
+    }
+
+    pair.a().bind_to_current_thread();
+    cudaStreamDestroy(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamDestroy(stream_b);
+    if (failures == 0) {
+        std::cout << "host add patterns[" << elements << "]: bit-exact (ties " << ties << ", inf "
+                  << infinities << ", nan " << nans << ")\n";
+    }
+    return failures;
+}
+
+// Print-only (NINFER_TP2_AR_STAGING_BENCH=1): what one host-staging collective costs end to end next
+// to the scalar BF16 add the reduction used to run, so the change is attributable on the host it
+// targets rather than argued from instruction counts.
+int bench_host_staging(ninfer::tp::DevicePair& pair, std::size_t count_bytes, int iterations) {
+    const std::size_t elements = count_bytes / 2;
+    pair.a().bind_to_current_thread();
+    ninfer::DeviceBuffer buf_a(count_bytes);
+    pair.b().bind_to_current_thread();
+    ninfer::DeviceBuffer buf_b(count_bytes);
+    std::vector<__nv_bfloat16> host_a(elements), host_b(elements);
+    std::mt19937 rng(0xB0A7u);
+    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
+    for (std::size_t i = 0; i < elements; ++i) {
+        host_a[i] = __float2bfloat16(dist(rng));
+        host_b[i] = __float2bfloat16(dist(rng));
+    }
+    pair.a().bind_to_current_thread();
+    buf_a.copy_from_host(host_a.data(), count_bytes);
+    pair.b().bind_to_current_thread();
+    buf_b.copy_from_host(host_b.data(), count_bytes);
+
+    cudaStream_t stream_a = nullptr, stream_b = nullptr;
+    pair.a().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
+    pair.b().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
+
+    // Warm both directions before timing: this host's copy-engine path costs several times its
+    // steady-state rate on the first large transfers of a process.
+    for (int i = 0; i < 5; ++i) {
+        pair.allreduce(buf_a.p, buf_b.p, count_bytes, stream_a, stream_b);
+        pair.a().bind_to_current_thread();
+        cudaStreamSynchronize(stream_a);
+        pair.b().bind_to_current_thread();
+        cudaStreamSynchronize(stream_b);
+    }
+
+    // Per-call times, reported as the minimum next to the mean: the minimum is the transport's own
+    // cost, while the mean carries whatever else the machine did during the run.
+    std::vector<double> per_call;
+    per_call.reserve(static_cast<std::size_t>(iterations));
+    for (int i = 0; i < iterations; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        pair.allreduce(buf_a.p, buf_b.p, count_bytes, stream_a, stream_b);
+        // The transport leaves its uploads in the caller's streams; a real round would run the next
+        // layer on them, so settle them here or this measures enqueue cost.
+        pair.a().bind_to_current_thread();
+        cudaStreamSynchronize(stream_a);
+        pair.b().bind_to_current_thread();
+        cudaStreamSynchronize(stream_b);
+        per_call.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count());
+    }
+    const double transport_min = *std::min_element(per_call.begin(), per_call.end());
+    const double transport_ms =
+        std::accumulate(per_call.begin(), per_call.end(), 0.0) / static_cast<double>(iterations);
+
+    // The same payload through sendrecv's fallback: the identical D2H / barrier / H2D with no
+    // reduction at all, which is what separates the transfer cost from the add's residual cost.
+    for (int i = 0; i < 5; ++i) {
+        pair.sendrecv(buf_a.p, buf_a.p, buf_b.p, buf_b.p, count_bytes, stream_a, stream_b);
+        pair.a().bind_to_current_thread();
+        cudaStreamSynchronize(stream_a);
+        pair.b().bind_to_current_thread();
+        cudaStreamSynchronize(stream_b);
+    }
+    std::vector<double> transfer_call;
+    transfer_call.reserve(static_cast<std::size_t>(iterations));
+    for (int i = 0; i < iterations; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        pair.sendrecv(buf_a.p, buf_a.p, buf_b.p, buf_b.p, count_bytes, stream_a, stream_b);
+        pair.a().bind_to_current_thread();
+        cudaStreamSynchronize(stream_a);
+        pair.b().bind_to_current_thread();
+        cudaStreamSynchronize(stream_b);
+        transfer_call.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count());
+    }
+    const double transfer_min = *std::min_element(transfer_call.begin(), transfer_call.end());
+
+    // The retired reduction: one scalar __hadd pass over the same element count.
+    std::vector<__nv_bfloat16> scalar(elements);
+    const auto scalar_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        for (std::size_t e = 0; e < elements; ++e) { scalar[e] = __hadd(host_a[e], host_b[e]); }
+    }
+    const double scalar_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - scalar_start)
+            .count() /
+        iterations;
+
+    const double mb = static_cast<double>(count_bytes) / (1024.0 * 1024.0);
+    std::cout << "host staging[" << (count_bytes >> 20) << " MiB, cores "
+              << std::thread::hardware_concurrency() << "]: allreduce min " << transport_min
+              << " ms, mean " << transport_ms << " ms (" << (2.0 * mb / transport_min)
+              << " GB/s both directions at the minimum) | transfers only (sendrecv) min "
+              << transfer_min << " ms | retired scalar add " << scalar_ms << " ms ("
+              << (mb / scalar_ms) << " GB/s)\n";
+
+    pair.a().bind_to_current_thread();
+    cudaStreamDestroy(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamDestroy(stream_b);
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -652,7 +893,9 @@ int main() {
     int failures = 0;
     {
         ninfer::tp::DevicePair pair(dev_a, dev_b);
-        std::cout << "p2p_available=" << pair.p2p_available() << '\n';
+        std::cout << "p2p_available=" << pair.p2p_available()
+                  << " in_kernel=" << pair.in_kernel_allreduce()
+                  << " staging_bytes=" << pair.in_kernel_allreduce_bytes() << '\n';
         // 20480 bytes = 10240 BF16 elements, the 27B hidden allreduce size.
         failures += check_allreduce(pair, 20480, 64);
         // Small and larger shapes.
@@ -664,10 +907,21 @@ int main() {
         // into five slices).
         failures += check_allreduce(pair, 81920, 64);
         failures += check_allreduce(pair, 2433024, 64);
+        // Past the retired 24 MiB staging bound and inside the current 48 MiB one: the payload has to
+        // stay on the in-kernel transport, which is what the wider buffer buys.
+        failures += check_allreduce(pair, 25 << 20, 8);
+        // Past the staging buffer entirely: the size-triggered host-staging fallback.
+        failures += check_allreduce(pair, 50 << 20, 2);
+        // The directed rounding corpus through the in-kernel transport: the two transports have to
+        // agree on every case the BF16 rounding is defined on, not only on finite random payloads.
+        failures += check_host_add_patterns(pair);
         // The same shapes as a deep queue on both shards, which is how a layer
         // stack issues them.
         failures += check_allreduce_queue(pair, 20480, 200);
         failures += check_allreduce_queue(pair, 81920, 200);
+        // A prefill-sized payload back to back: each call's upload is still in flight when the next
+        // call's download starts, which is what the parity slot has to cover.
+        failures += check_allreduce_queue(pair, 4 << 20, 16);
         // Byte-exact exchange at the shapes the split proposal head's candidate union and the peer
         // selector transport use, then at the small and sliced staging classes.
         failures += check_sendrecv(pair, 960, 64);
@@ -695,6 +949,102 @@ int main() {
             ++failures;
         }
         failures += check_allreduce(moved, 20480, 8);
+    }
+    // The host-staging fallback on a pair of its own, forced through its construction hook: this
+    // host's mapped-pinned transport takes every call that is not past its staging buffer, so the
+    // forced path is the only way to qualify the fallback's reduction at every payload class and
+    // its behaviour past the staging bound.
+    {
+        set_env("NINFER_TP2_AR_FORCE_HOST_STAGING", "1");
+        ninfer::tp::DevicePair fallback(dev_a, dev_b);
+        set_env("NINFER_TP2_AR_FORCE_HOST_STAGING", nullptr);
+        if (fallback.in_kernel_allreduce()) {
+            std::cerr << "forced pair still reports an in-kernel transport\n";
+            ++failures;
+        }
+        std::cout << "host-staging pair: in_kernel=" << fallback.in_kernel_allreduce()
+                  << " staging_bytes=" << fallback.in_kernel_allreduce_bytes() << '\n';
+        failures += check_allreduce(fallback, 20480, 32);
+        failures += check_allreduce(fallback, 1 << 20, 16);
+        // Several chunks, at a payload that is not a whole number of chunk widths.
+        failures += check_allreduce(fallback, (3 << 20) + 16, 8);
+        // Past the staging buffer: the fallback carries it, and the reduction splits into strips.
+        failures += check_allreduce(fallback, 50 << 20, 2);
+        // A deep queue reuses the pinned staging: every call's D2H is ordered after the previous
+        // call's uploads on the same streams.
+        failures += check_allreduce_queue(fallback, 20480, 32);
+        // The same queue at a prefill payload. A single shared staging buffer fails here: the two
+        // devices' streams are independent, so the next call's D2H overwrites the half the previous
+        // call's H2D is still uploading from, and this queue's own results prove it.
+        failures += check_allreduce_queue(fallback, 4 << 20, 8);
+        failures += check_host_add_patterns(fallback);
+        failures += check_sendrecv(fallback, 960, 16);
+        if (std::getenv("NINFER_TP2_AR_STAGING_BENCH") != nullptr) {
+            failures += bench_host_staging(fallback, 10 << 20, 20);
+            failures += bench_host_staging(fallback, 50 << 20, 12);
+            // The same payloads on a pair pinned to one reduction thread, in the same process: the
+            // split's own A/B, so the automatic thread count is a measured choice.
+            set_env("NINFER_TP2_AR_FORCE_HOST_STAGING", "1");
+            set_env("NINFER_TP2_AR_ADD_THREADS", "1");
+            ninfer::tp::DevicePair single_thread(dev_a, dev_b);
+            set_env("NINFER_TP2_AR_FORCE_HOST_STAGING", nullptr);
+            set_env("NINFER_TP2_AR_ADD_THREADS", nullptr);
+            failures += bench_host_staging(single_thread, 10 << 20, 20);
+            failures += bench_host_staging(single_thread, 50 << 20, 12);
+        }
+    }
+    // A host whose mapped window refuses the full staging keeps the in-kernel transport at the
+    // largest rung it can map (the ladder in the pair's constructor), and only the payloads that no
+    // longer fit take the fallback. Capping the ladder reproduces such a host here, and - unlike the
+    // forced pair above - the size-keyed boundary is real: one pair carries both transports, so a
+    // 12 MiB rung still takes every payload the TP-2 core produces at the default chunk clamp.
+    {
+        set_env("NINFER_TP2_AR_STAGING_MIB", "24");
+        ninfer::tp::DevicePair middle(dev_a, dev_b);
+        set_env("NINFER_TP2_AR_STAGING_MIB", nullptr);
+        std::cout << "24 MiB rung: in_kernel=" << middle.in_kernel_allreduce()
+                  << " staging_bytes=" << middle.in_kernel_allreduce_bytes() << '\n';
+        if (!middle.in_kernel_allreduce() || middle.in_kernel_allreduce_bytes() != (24U << 20)) {
+            std::cerr << "24 MiB rung was not taken\n";
+            ++failures;
+        }
+        failures += check_allreduce(middle, 20 << 20, 8);
+        // Past the rung, in the same pair and process: the size-keyed fallback.
+        failures += check_allreduce(middle, 25 << 20, 2);
+    }
+    {
+        set_env("NINFER_TP2_AR_STAGING_MIB", "12");
+        ninfer::tp::DevicePair floor_rung(dev_a, dev_b);
+        set_env("NINFER_TP2_AR_STAGING_MIB", nullptr);
+        std::cout << "12 MiB rung: in_kernel=" << floor_rung.in_kernel_allreduce()
+                  << " staging_bytes=" << floor_rung.in_kernel_allreduce_bytes() << '\n';
+        if (!floor_rung.in_kernel_allreduce() || floor_rung.in_kernel_allreduce_bytes() != (12U << 20)) {
+            std::cerr << "12 MiB rung was not taken\n";
+            ++failures;
+        }
+        // A payload at the rung writes to the last byte of each parity slot: a slot stride still
+        // tied to the full staging size (the retired constant) would publish past the reservation.
+        // 12 MiB is also the widest payload the TP-2 prefill issues at the widest activation.
+        failures += check_allreduce(floor_rung, 12U << 20, 8);
+        failures += check_sendrecv(floor_rung, 12U << 20, 4);
+        failures += check_allreduce_queue(floor_rung, 4 << 20, 16);
+        // Past the floor rung.
+        failures += check_allreduce(floor_rung, (12U << 20) + 16, 4);
+    }
+    {
+        // A mapped window below the ladder's floor: no rung maps, so the pair has no in-kernel
+        // transport and every payload takes the fallback - the state a host without mapped pinned
+        // memory (or one whose window cannot hold the smallest rung) is in.
+        set_env("NINFER_TP2_AR_STAGING_MIB", "8");
+        ninfer::tp::DevicePair below_floor(dev_a, dev_b);
+        set_env("NINFER_TP2_AR_STAGING_MIB", nullptr);
+        std::cout << "below the floor: in_kernel=" << below_floor.in_kernel_allreduce()
+                  << " staging_bytes=" << below_floor.in_kernel_allreduce_bytes() << '\n';
+        if (below_floor.in_kernel_allreduce() || below_floor.in_kernel_allreduce_bytes() != 0) {
+            std::cerr << "a cap below the ladder floor still reported an in-kernel transport\n";
+            ++failures;
+        }
+        failures += check_allreduce(below_floor, 20480, 8);
     }
     if (failures == 0) { std::cout << "PASS\n"; return 0; }
     std::cerr << failures << " failures\n";

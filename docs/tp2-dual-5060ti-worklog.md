@@ -6401,7 +6401,8 @@ digest 与改动前逐位相同 ⇒ 该次是既有偶发，非本次改动引�
 - 时钟：`ar_now_ns()` 用 `%globaltimer`（ns，设备内一致），deadline 语义正确（`device_pair.cu:113-123`）。
 - 边界：`ar_exchange` 的 group/tail 循环、parity 槽（`(token&1)*slot_bytes`）、stall 标志
   （`stall_host_` 128 B = 2×64 B，`ar_stalled()` 读 flags[0]/flags[16]）与 store helper 的 `lane<=k`
-  逐项核对无越界；`count_bytes <= slot_bytes` 恒成立（小路径 64 KiB / 大路径 24 MiB 与各自守卫一致）。
+  逐项核对无越界；`count_bytes <= slot_bytes` 恒成立（小路径 64 KiB / 大路径 48 MiB——2026-09-26
+  由 24 MiB 扩容，见文末该条目——与各自守卫一致）。
 
 **机制判断**：一次失败的自旋会让**那一轮的本地偏和未被对端更新**（内核提前 return），
 而 host 只在**每轮收敛点**检查 trip 标志（`abort_if_ar_stalled()` 调用点 2751/3317）。
@@ -6497,3 +6498,146 @@ rendezvous id（`2<<32+122460`）也在**captured 通道**内，与复现一致�
   只有 +5.2%）⇒ **无可测代价**，与代码分析一致。
   顺带：`r72_stall_injection.ps1` 改为「默认置 1，但尊重外层显式设置」，否则它自己那行 `=1` 会盖掉
   `=0`、无法验证关闭路径。
+
+---
+
+**TP-2 host-staging 回退重写 + staging 容量显式化（2026-09-26）**
+
+**S1 · 回退归约重写**（`src/core/tp/device_pair.cu`）
+
+- **旧**：回退路径用标量 `__hadd` 循环逐元素加，实测 10 MiB 载荷 **25.8–32.6 ms（0.31 GB/s）**，
+  是回退的主导成本（同尺寸纯传输只要 3.1–5.9 ms）；50 MiB 载荷 **160.8 ms**。
+- **新**：SSE2 向量加，8 个 BF16/迭代。BF16→FP32 是左移 16 位（BF16 就是 FP32 的高半），FP32 相加
+  后按 `cuda_bf16.hpp` 的 `__float2bfloat16` 做 RNE 回舍（含把 NaN 规范化为 `0x7fff`）；32 MiB 以上
+  的载荷再按原子计数器分片到最多 8 个 host 线程。
+- **结构**：`2×D2H → 双流同步 → 归约 → 2×H2D`。曾先实现 1 MiB 分块流水（add 与 H2D 重叠），
+  实测比单次大拷贝**慢约 1 ms**（20 次小 H2D 的 copy-engine 开销 > 重叠收益），故回到单次拷贝结构。
+- **实测**（`NINFER_TP2_AR_STAGING_BENCH=1`，强制回退对，多轮取 min）：
+
+  | 载荷 | 旧（标量加 + 纯传输） | 新 allreduce min | 纯传输 min |
+  |---|---|---|---|
+  | 10 MiB | ≈ 35.5 ms（32.4 + 3.1） | **5.2–8.0 ms** | 3.1–5.9 ms |
+  | 50 MiB | ≈ 175.7 ms（160.8 + 14.9） | **20.5 ms**（8 线程）/ 25.0 ms（强制 1 线程） | 14.9 ms |
+
+  ⇒ 10 MiB 约 **5–7×**、50 MiB 约 **8×** 改善。本机 copy-engine 路径本身双模态（同一 10 MiB 两向模式
+  在 3.1 与 5.9 ms 之间跳），故表格给区间。
+- **线程阈值 32 MiB 的依据**：10 MiB 时 8 线程的 add 实测 4.1–4.4 ms，反而慢于单线程 2.1–2.5 ms
+  （Windows 每次 `std::thread` 创建约数百微秒 ×7）；50 MiB 时 8 线程 8.4 ms 胜单线程 12.0 ms。
+  阈值取在两者之间，生产宽度的 10 MiB 载荷因此不创建线程（同进程 A/B 两条配置的 10 MiB 耗时一致）。
+- **诊断钩子**：`NINFER_TP2_AR_FORCE_HOST_STAGING=1`（构造时读；本机 in-kernel 可用，不加此钩子
+  就永远不会执行回退路径）与 `NINFER_TP2_AR_ADD_THREADS`（覆盖归约线程数，供同进程 A/B）。
+- **位精确验证**：`test_tp_device_pair.cpp::check_host_add_patterns` 用 736 个定向位型对
+  （ties 12 / inf 84 / nan 247，含 ±0、denormal、精确 tie 两个方向、上溢到 inf、qNaN/sNaN 两个符号）
+  真的过一次传输，in-kernel 与回退两条路径都逐位等于 host oracle `__float2bfloat16(a+b)`。
+
+**S2 · staging 容量 24 → 48 MiB + chunk 钳位显式化**
+
+- `kInKernelArBytes` 24 → **48 MiB**（每卡每 parity 槽），成本是每卡 +48 MiB pinned、两卡合计 +96 MiB
+  （回退/内联对现在每卡 2×48 MiB，且仅 `!p2p_` 时分配），不动设备内存预算。
+- 新增 `DevicePair::in_kernel_allreduce_bytes()`；`TP2GenerationCore::prefill_chunk_width(config)` 把
+  chunk 宽度由「模型最宽 allreduce 每 token 载荷」反推：
+  `max(hidden_size, gdn->value_width(), attention->query_width()) × 2 B × T ≤ staging`。三处 chunk
+  计算点（`build_shard` 的 `feature_columns`、`make_dflash_prefill_sink`、`execute_walk`）统一走它。
+  此前「载荷 ≤ staging」只是 5120×1024×2 = 10 MiB < 24 MiB 的数值巧合，调大 `kPrefillChunkMaximum`
+  或加宽模型都会静默掉进回退路径。
+- **验证**：`ninfer_tp_device_pair_test` **PASS**——新增 25 MiB 用例（`staging_bytes=50331648`，留在
+  in-kernel；旧 24 MiB 下会掉回退）与 50 MiB 用例（超 staging ⇒ 回退 + 分片归约）都逐位正确；强制
+  回退对另加 3 MiB+16（非整 chunk 宽）、50 MiB、20 KiB×32 深队列、sendrecv 用例。
+
+**验证期发现的既有问题（非本次引入）**：`ninfer_qwen3_5_tp2_dflash_solo_test` 在
+`D:\LLM\qwen3_8_27b_swift15_dflash2_final.ninfer` 上稳定失败——`a_continued`（reused=71）首采样
+`[59399 475 327 363 …]` 与 from-scratch 的 `a_continued_evicted` `[365 4577 62 16 …]` 不一致。
+把本次四个源文件 `git stash` 后在 HEAD 重建，**逐 token 完全相同地失败** ⇒ 与 S1/S2 无关；改动后
+重复一次也是同一组 token ⇒ 确定性、非偶发（不同于 §3.10 的自然 give-up 偶发）。本批次未定性，需单独
+排查（候选：该 artifact 与测试基线不匹配，或 recall 路径的既有缺陷）。另：solo/sessions 这类媒体路径
+测试需要 FFmpeg 在 PATH（本机 `C:\ninfer`），否则加载期 `0xC0000135`。
+
+**仍未做**：回退的下限现在是本机 copy-engine 速率（10 MiB 两向 ≈ 3.1 ms，内联传输同载荷 ≈ 2.7 ms）。
+把回退的 D2H/H2D 换成「内核直写 mapped pinned」是当时记下的下一步，下一节复核后否决并改为 staging
+阶梯。
+
+### TP-2 staging 阶梯：mapped 预留逐级退化（2026-09-26）
+
+**触发**：上一批（S1+S2）把回退的下限记为「本机 copy-engine 速率」，并把「回退的 D2H/H2D 换成内核直写
+mapped pinned」列为可选后续。用户选择做这条路线；动手前复核了它的前提，结论是否决、改为 staging 阶梯。
+
+**复核（为什么否决内核直写回退）**
+
+- **收益很小**：同载荷（每卡 20 MiB 双向）copy engine 只比内核路径慢约 14%（回退的 sendrecv 纯传输
+  3.09-3.14 ms vs in-kernel 2.70 ms，后者还含对端握手）。回退总时 5.2 ms 里 2.1 ms 是 CPU 加法（S1
+  已到底），所以换传输整体只值 ≤8%。
+- **生产不可达**：触发回退只有两条路——载荷 > staging，或 mapped pinned 不可用。前者在本产品不可达：
+  prefill 最宽载荷是 gather 激活 6144 x 1024 x 2 = 12 MiB，词表并行头合并在生产 prefill 里是 `[V,1]`
+  （`tp2_generation_core.cpp:2722` 传 `logits_columns = nullptr`），verify 窗口是 `[V, W<=16]` <= 7.6 MiB；
+  后者（mapped pinned 不可用）恰恰意味着设备无法寻址 host 内存，内核直写按定义不可能。
+
+**改为实现**：`DevicePair` 的 staging 预留走**阶梯**，最大档优先：48 → 24 → 12 MiB（每卡、每 parity 槽，
+即每次尝试 2 x 档位）。`reserve_in_kernel_staging()` 逐档尝试，失败档释放后再降一档；全部失败则和
+以前一样没有 in-kernel 传输、全部走回退。新env `NINFER_TP2_AR_STAGING_MIB` 给阶梯设上限，用来从脚本
+复现受限主机。选中低于满档时打印一行 `[mem] TP-2 in-kernel allreduce staging N of 48 (larger rungs did
+not map)`。
+
+**下限 12 MiB 的依据**：12 MiB 是「本产品任何载荷都不收窄」的容量——最大的 eager allreduce 正好是
+1024 token x 6144 列 x 2 = 12 MiB 整，而**图内**最宽载荷是词表分片头的整窗合并
+`V x (K+1) x 2` = 248320 x 16 x 2 = 7.6 MiB（K=15 上限）。再低一档就必须收窄 prefill chunk，或者让图内
+的合并掉进回退——而回退每个 collective 都要同步两条计算流，**捕获期内非法**。所以阶梯止于 12 MiB，
+更小的窗口让主机继续用回退（正确，只是慢），而不是拿一个会在捕获期炸掉的传输。
+
+**关键回归点**：发射内核时的 slot 步长原来是常量 `kInKernelArBytes`（48 MiB）。档位可选后它必须跟随
+`in_kernel_bytes_`，否则 parity 槽会按 48 MiB 偏移写到一个只有 2 x 档位大小的映射区之外。测试用
+"正好等于档位"的载荷（12 MiB 打在 12 MiB 槽上，写到每槽最后一字节）覆盖这一点。
+
+**捕获期守卫**：新增 `require_capturable_payload()`——捕获开启时，载荷超过 staging 直接抛
+`std::logic_error`（说明回退的流同步无法进图），而不是静默换传输后在驱动层报一个难懂的捕获错误。
+
+**验证**
+
+- `ninfer_tp_device_pair_test` **PASS**：24 MiB 档（20 MiB 走 in-kernel、25 MiB 越界走回退）、12 MiB 档
+  （12 MiB 满载 allreduce + sendrecv、4 MiB x 16 深队列、12 MiB+16 越界）、8 MiB 上限（低于下限 ⇒
+  `in_kernel=0`，全部回退），默认对仍报 48 MiB / 25 MiB 用例不变。
+- **端到端**：`ninfer_qwen3_5_tp2_dflash_append_test`（swift15 dflash2 artifact，chunk 1024）在
+  `NINFER_TP2_AR_STAGING_MIB=12` 下 **exit=0**，全部位精确断言通过（sink logits 位相同、direct/split
+  append 位相同、ring 可复现），proposal 成本 7.057 ms vs 基线 7.045 ms（噪声内）；日志首行确认选中
+  12 MiB 档。12 MiB 档下 chunk 仍是 1024（`fits = 12 MiB / 12288 = 1024`），所以收窄分支在当前模型上
+  仍不可达——它是给更宽的模型/更小的档位留的显式不变式。
+- 全树 `cmake --build build-win` 243/243 通过。
+
+**仍未做**：低于 12 MiB 的主机仍只能用 copy-engine 回退（内核直写在那里不可能）；若将来出现
+`V x (K+1) x 2 > 12 MiB` 的模型，捕获会被 `require_capturable_payload` 明确拒绝，需要重新定档或
+在核心侧收窄 verify 窗口。
+
+### TP-2 host-staging 回退的 parity 竞态（2026-09-26，阶梯验证中发现）
+
+**发现**：验证阶梯的「低于下限」结果（= 没有 in-kernel 传输、每个 collective 都走回退）时，
+`ninfer_qwen3_5_tp2_dflash_append_test`（swift15 dflash2 artifact、chunk 1024）在 DFlash2 proposal
+阶段以 `device_pair.cu:1133 CUDA_CHECK(cudaStreamSynchronize(stream_b)) failed: cudaErrorIllegalAddress`
+失败；`NINFER_TP2_AR_FORCE_HOST_STAGING=1` 与 `NINFER_TP2_AR_STAGING_MIB=8` 两次都停在同一位置。
+
+**定位**（四组判别，同一 artifact/配置）：
+
+| 配置 | 传输 | 结果 |
+|---|---|---|
+| `NINFER_TP2_VERIFY_GRAPH=0` | in-kernel | PASS ⇒ eager verify 无罪 |
+| `NINFER_TP2_DECODE_GRAPH=exact` | in-kernel | PASS ⇒ EagerExact 无罪 |
+| `NINFER_TP2_AR_FORCE_HOST_STAGING=1` | 回退 | **FAIL**（illegalAddress） |
+| 同上 + `CUDA_LAUNCH_BLOCKING=1` | 回退 | PASS ⇒ **是竞态，不是寻址错误** |
+
+**根因**：回退的 pinned staging 是**一个共享缓冲**，而相邻两次调用跑在两条**互相独立**的 compute stream 上。
+一次调用把两半 D2H 进 `[a | b]`、把和写回 `[a]`，然后两次 H2D 都从 `[a]` 上传（设备 a 与设备 b 各一份）。
+上一次调用的 H2D（stream_b 从 `[a]` 读）与下一次调用的 D2H（stream_a 写 `[a]`）之间**没有任何顺序**：
+设备 b 收到的是「被下一层的原始 delta 覆盖了一部分」的假和。in-kernel 传输早就为跨调用复用做了 parity
+双缓冲（`host_mine_base + (token & 1) * slot_bytes`），回退没有。被污染的 hidden 往下传，既能表现为
+「装上 sink 后 target logits 变了」（我加诊断改变时序时看到的那次），也能表现为下游越界索引 ⇒
+`illegalAddress`。
+
+**为什么既有测试没抓到**：pair test 的每个用例之间都有一次同步拷贝（隐式等待两条流），而回退档的深队列
+用例只有 20 KB —— H2D 约 10 µs，比主机两次调用之间的工作还短，永远碰不上重叠窗口。
+
+**修复**：新增 `DevicePair::host_staging()`：缓冲改为「两个 parity 槽 × 每槽 `[a | b]`」，按调用交替取槽；
+增长时先 `cudaStreamSynchronize` 两条流再释放旧缓冲（否则在飞的 H2D 会读已释放的 pinned 内存）。回退的
+`allreduce` 与 `sendrecv` 都改走它（两者共享同一个槽序，正是它们交错调用时的需要）。
+
+**证据**：修复前该路由两次 `illegalAddress`、修复后 `FORCE_HOST_STAGING` 与 `STAGING_MIB=8` 两条路由
+**exit=0**、全部位精确断言通过；pair test 新增「4 MiB 深队列」（in-kernel 16 次 / 回退 8 次）作为这个竞态的
+回归用例（20 KB 那档抓不到它），全树 243/243 构建通过。回退档的 proposal 成本 7.80/7.97 ms vs in-kernel
+7.05 ms，符合回退每个 collective 都要 host 同步的预期。

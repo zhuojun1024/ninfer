@@ -214,3 +214,167 @@ TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，
 - **工具边界**：`CUDA_LAUNCH_BLOCKING=1` / compute-sanitizer 与本传输不兼容（A 侧 launch 变阻塞，B 侧
   内核要等它返回后才 launch ⇒ 第 1 次 collective 必然 give-up，自死锁）⇒ 无法用 launch 串行化工具做
   kernel 级归因，只能靠源码级探针二分。
+
+
+---
+
+## 4. 架构精读与缺陷分析（2026-07-18，追加）
+
+> 本节为一次独立的全架构精读（不使用子代理），在旧 TP-2 计划之上追加，不改动上文。
+
+### 4.1 精读范围
+
+通读 `docs/maintainer/` 三份架构权威文档（engine-architecture、paged-kv-cache、resource-scheduling），
+逐层精读 C++ 核心：`src/core`（paged_kv_cache、host_kv_arena、tp/device_pair、arena、
+linear_attention_state、gdn_replay_records）、`src/runtime`（engine_core、scheduler、
+tp2_generation_core、contract、kv_capacity）、`src/serve`（generation_service、http_server/transport、
+openai/anthropic 路由、translate）、`src/ops`（sampling、causal_attention、kv_cache_append）、
+`src/models/qwen3_5`（execution/text、program/decode、frontend/output_session、prefix_identity、
+dflash_round），并结合 git 历史核对上文 §3.3 已知缺陷。
+
+### 4.2 确定性 / 潜在 bug
+
+- **[确认，latent] `src/core/paged_kv_cache.cpp:543-548` — `zero_pages` 的 HeadMajor 分支越界写。**
+  对 HeadMajor 布局（DFlash Full pool，平面形状 `[X,64,N_phys,H]`）用
+  `cudaMemset2DAsync(dst=base+first*nb2, dpitch=nb3, width=count*nb2, height=H)` 清零连续页块
+  `[first, first+count)`。第 i 行写 `[dst+i*nb3, dst+i*nb3+count*nb2)`，行 0 恰覆盖目标块，但行
+  1…H-1 各前移 `i*elem_size`，总写范围超出目标块 **(H−1)×elem_size** 字节，落进 next physical page。
+  正确实现应是 1D `cudaMemsetAsync(base+first*nb2, 0, count*nb2)`（PageMajor 分支即正确）。
+  触发条件：被零页块的下一页是存活且有意义的页时，静默腐蚀其前 (H−1)×elem_size 字节（BF16 下 6–14 字节）。
+  现状：唯一调用点 `graphs.cpp:186`（`zero_capture_pages`）只零 fresh pool 前导 dummy capture 页，
+  overflow 落在 free/dummy 页，**未触发数据损坏**，故为 latent；但作为 pool 公共 API 本身错误。
+
+### 4.3 上文 §3.3 已知缺陷核实
+
+①②③④⑧ 在当前代码**均已修复**（证据见 4.2 与 §3.3 各条括注）；⑤（give-up 安全）已缓解但仍是开放架构问题；
+⑥⑦⑨⑩ 为已知限制/未决，本次未展开。
+
+### 4.4 设计缺陷与隐患（架构层面）
+
+1. **双执行核心漂移风险**：TP-2 走独立 `TP2GenerationCore`，绕过 EngineCore 调度器/CUDA Graph/
+   ResourceManager（单请求 lockstep）。请求生命周期、容量、取消、前缀复用、checkpoint ring 等逻辑在两条
+   路径重复实现，须长期保持语义一致——已多次产出 prefill/decode 不对称类缺陷（工具掩码、首 token 时序、
+   MTP ids 交换皆实例）。最大维护性隐患。
+2. **TP-2 in-kernel allreduce give-up 安全性开放**：超时落在 captured 窗口内时 kernel 清零本侧输出片避免
+   不一致数据被当地址，但本轮仍以混合 real/zero 数据完成，靠 host `ar_stalled()` + 收敛检查转失败。
+   已缓解（有界自旋+看门狗+`abort_if_ar_stalled`），「让 give-up 本身安全」待决策。
+3. **host-staging CPU allreduce 回退是性能悬崖**：in-kernel 传输不可用时回退到 host staging，逐元素加在
+   CPU host loop 完成且同步双流，大 prefill 载荷极慢。文档化回退，但构成显著性能断崖。
+4. **TP-2 前缀复用容量硬上限**：device reuse snapshot 固定 `kReuseSnapshotCount=2`（每槽 73 MiB/shard），
+   更深分歧靠 host checkpoint ring（一次 PCIe 往返）。显式容量权衡，深分歧场景复用成本被结构性抬高。
+
+### 4.5 排查后排除的疑点
+
+- **`engine_core.h` worker 循环尾部 `queue_cv_.wait_for(1ms)`**：初判给每个 decode round 加 1 ms 延迟，
+  复核**不成立**——各执行分支（control/prefill/decode）都 `continue` 直接回环顶，1 ms 等待只在「无执行
+  单元（action==Wait）」空转路径到达，忙时为紧循环。
+- `host_kv_arena`（first-fit + coalesce + plan/apply 偏移一致）、`kv_capacity`（溢出检查完备）、
+  `sampling`（greedy/stochastic 双路、RNG 纯函数可 graph replay）、`causal_attention`（online-softmax
+  split merge、envelope 校验）、`output_session`（UTF-8 增量解码、stop 匹配、reasoning 通道分离、
+  preview/commit）、`prefix_identity`（FNV 风格 digest）均审毕，实现严谨，未见确定性缺陷。
+
+### 4.6 结论
+
+整体工程质量高：边界校验、溢出检查、生命周期所有权、数值 oracle 约定到位，§3.3 已知缺陷当前代码全部已修复。
+新确认 **1 个 latent bug**（`zero_pages` HeadMajor 越界写，当前未触发但 API 本身错误）与 **4 项架构级隐患**
+（「双核心漂移」与「TP-2 give-up 安全性」最值得后续投入）。
+
+### 4.7 §4.4.3 解决方案调研（host-staging CPU allreduce 性能悬崖）（2026-09-26）
+
+> 对 §4.4 第 3 点（in-kernel 传输不可用时回退 host staging，CPU host loop 逐元素加 + 同步双流，
+> 大 prefill 载荷极慢）的可用方案调研。仅调研与评估，未改代码。
+
+**现状清点（代码证据）**
+
+- 三档传输（`src/core/tp/device_pair.cu`）：in-kernel（mapped pinned staging + arrival id，
+  `815-871`；当前生产路径，已测到距 Gen4 x4 链路双向带宽下界 2%：`809-814` 注释）→ P2P
+  （`872-895`，需 `cudaDeviceCanAccessPeer`，WSL2 下 `542-552` 探测失败）→ host staging 回退
+  （`896-928`）。
+- 回退触发条件仅两个：(a) 构造时 `cudaHostAllocMapped` 失败（`in_kernel_available_==false`，
+  `553-623`）；(b) 载荷 > `kInKernelArBytes`（24 MiB，`249`）。
+- 触发 (b) 在当前产品参数下**不可达**：prefill chunk 钳在 `kPrefillChunkMaximum=1024`
+  （`tp2_generation_core.cpp:164,2545-2547`），最大载荷为 mixer/MLP delta
+  5120×1024×2 = 10 MiB、gather activation 6144×1024×2 = 12 MiB，均 < 24 MiB。但「载荷 ≤ staging」
+  只是数值巧合——chunk 钳位（`2545-2547`）只引用 `kPrefillChunkMaximum`，并未从
+  `in_kernel_bytes_` 推导，是隐含不变式而非显式约束。现实触发是 (a)：非 WSL2 / mapped-pinned
+  不可用的环境。
+- 悬崖成本分解（`896-928`）：① **标量单线程 CPU `__hadd` 循环**（`919-921`）——单线程约
+  0.5–2 GB/s，10 MiB 载荷约 5–20 ms/次（in-kernel 同载荷 2.7 ms），是主导项；② 两条计算流
+  `cudaStreamSynchronize`（`913-914`）——每层全流水线中断；③ **不可 graph 捕获**——
+  `tp2_generation_core.cpp:385,451` 在 `in_kernel_allreduce()==false` 时把 MTP 链、decode、
+  verify 图全部降级 EagerExact。PCIe 流量与 in-kernel 相同（每卡 2× 载荷），故悬崖不是带宽问题，
+  是「CPU 计算 + 全同步 + 无图」问题。
+- 放大倍数：每层 2–3 个 collective（`text.h:564,576,589`）× 64 层，每 chunk 128–192 次；
+  回退时单 chunk allreduce 成本从 ~0.35 s 升到 2–4 s 量级。
+- 测试覆盖缺口：`tests/test_tp_device_pair.cpp` 的最大载荷用例是 2433024 B（`666`），
+  >24 MiB 的回退路径与 mapped-pinned 不可用路径**均无现有用例**（`51` 注释声称三路径位精确一致，
+  但回退路径在本机上从未被执行）。
+
+**外部佐证（web）**
+
+- 消费级双卡 PHB 拓扑的标准驱动**不开 P2P**；裸机也需打补丁的 open kernel module（BAR1）才可用
+  （[vLLM forum：双 5090 SHM vs P2P](https://discuss.vllm.ai/t/dual-rtx-5090-tp-2-shm-vs-patched-bar1-p2p-cumem-single-pass-2-7-mean-point-estimate/2870)：
+  P2P 开启平均仅 +2.67%、workload 相关，另一组多轮测量为 −5–7%）。WSL2 为 Hyper-V PCI passthrough +
+  Microsoft 托管内核，补丁模块不可行。→ P2P 路线对本产品目标（WSL2 双 5060 Ti）**不适用**，
+  且裸机收益也只是百分之几。
+- NCCL 在无 P2P 时走 **SHM transport**（GPU 经 PCIe 写共享 host 内存、对端 GPU 读回，
+  [Demystifying NCCL](https://arxiv.org/html/2507.04786v1)；
+  [NCCL issue #1838](https://github.com/NVIDIA/nccl/issues/1838)）——与 NInfer 的 in-kernel
+  mapped-pinned 路线同构，说明 in-kernel 路径已是该环境的标准解，host 侧不存在更优传输路线。
+
+**方案评估**
+
+| # | 方案 | 效果 | 成本/风险 | 结论 |
+|---|---|---|---|---|
+| S1 | **修复回退本身**：CPU 加改 SIMD + 多线程（AVX2/AVX-512，float 域加回 BF16 RNE 以保位精确），载荷分块 + 双缓冲流水（D2H(i+1) 与加(i) 重叠） | 回退从「~5–10× 悬崖」降为「链路受限」，与 in-kernel 同量级；不引入图降级以外的额外损失 | 改动限于 `device_pair.cu` host 侧循环；位精确可由现有三路径一致断言直接验证 | **推荐（主）** |
+| S2 | **扩大 in-kernel staging**：`kInKernelArBytes` 24→48/96 MiB（成本仅 host pinned RAM）+ 让 prefill chunk 钳位从 `in_kernel_bytes_` 推导，把「载荷 ≤ staging」变成显式不变式 | 封死触发条件 (b)，对更宽模型/更大 chunk 免疫 | 一个常量 + 一行钳位；风险极低 | **推荐（辅）** |
+| S3 | P2P（裸机 BAR1 补丁） | 裸机百分之几、workload 相关 | WSL2 不可行；引入驱动依赖 | **排除** |
+| S4 | copy-engine 事件式大载荷路径 | — | 已实测排除：`device_pair.cu:813-814`「copy engines were slower」；`test_tp_device_pair.cpp:422-427` 的 ceiling 探针（`NINFER_TP2_AR_COPY_BENCH`）确认 sliced in-kernel 已距链路下界 2% | **排除（已有内部证据）** |
+| S5 | 载荷量化（delta 降 FP8，字节减半） | 带宽减半 | 改变 residual 数值语义，需全套 oracle 合格；in-kernel 已在链路下界，当前目标无收益 | **超出当前 scope，不做** |
+
+**建议**
+
+- 一批做 **S1 + S2**（diff 限于 `device_pair.cu` + `tp2_generation_core.cpp` 钳位 +
+  `tests/test_tp_device_pair.cpp`）：回退变链路受限、(b) 触发被封死、chunk 钳位显式化。
+  图降级（EagerExact）保留——host 同步是回退的固有属性，S1 后非 WSL2 环境的退化只剩「无图」，
+  不再是悬崖。
+- 验证：`test_tp_device_pair.cpp` 增加 >24 MiB 载荷用例（走回退路径，三路径位精确断言复用）；
+  加一个可强制回退的测试钩子（如跳过 mapped-pinned 初始化的 env），对回退路径做前后 A/B 计时。
+
+**裸机 Windows 适用性**：结论原样成立。典型桌面 PHB 拓扑下 P2P 同样不被授权（闭源驱动对
+GeForce 拒绝 P2P；授权依据 NVIDIA 芯片组允许表，消费级芯片组不在内；[club-3090 六门模型](https://github.com/noonghunna/club-3090/blob/master/docs/PCIE_P2P.md)），
+传输分层与 WSL2 一致，S1+S2 收益/代价逐条成立。唯一分叉：若 P2P 恰好被授权（允许表内工作站
+芯片组 / PIX 交换拓扑），`DevicePair` 自动走 P2P 路径，host staging 悬崖不存在、S1+S2 不需要；
+该场景的正确改进是 kernel-based P2P 交换（可 graph 捕获），超出当前目标范围。
+
+**实施结果（2026-09-26）：S1 + S2 已落地**
+
+- **S1**（`src/core/tp/device_pair.cu`）：回退归约改为 SSE2 向量加（8 BF16/迭代；BF16→FP32 左移、
+  FP32 加、按 `__float2bfloat16` 做 RNE 回舍并把 NaN 规范化到 `0x7fff`）+ 32 MiB 以上按 host 线程
+  分片（最多 8）。结构为 `2×D2H → 双流同步 → 归约 → 2×H2D`——先实现的 1 MiB 分块流水实测比单次
+  大拷贝**慢约 1 ms**（20 次小 H2D 的 CE 开销 > 重叠收益），故回退为单次拷贝。
+  实测（`NINFER_TP2_AR_STAGING_BENCH=1`）：10 MiB 载荷旧 ≈ 35.5 ms（标量加 32.4 + 传输 3.1）→
+  新 **5.2–8.0 ms**（5–7×）；50 MiB 旧 ≈ 175.7 ms → 新 **20.5 ms**（8×）。
+  线程阈值取 32 MiB 的依据：10 MiB 时 8 线程 add 4.1–4.4 ms 反慢于单线程 2.1–2.5 ms（Windows
+  线程创建约数百微秒），50 MiB 时 8 线程 8.4 ms 胜单线程 12.0 ms。
+- **S2**（`device_pair.{h,cu}` / `tp2_generation_core.{h,cpp}`）：`kInKernelArBytes` 24 → 48 MiB；
+  新增 `DevicePair::in_kernel_allreduce_bytes()` 与 `TP2GenerationCore::prefill_chunk_width()`，
+  三处 chunk 计算点统一由 staging 容量反推，「载荷 ≤ staging」由数值巧合变为显式不变式。
+- **验证**：`ninfer_tp_device_pair_test` PASS。新增 25 MiB（留在 in-kernel；旧 24 MiB 下会掉回退）、
+  50 MiB（超 staging ⇒ 回退 + 分片）、强制回退对上的 3 MiB+16 / 50 MiB / 深队列 / sendrecv，以及
+  736 例定向位型（ties 12 / inf 84 / nan 247）——两条传输路径都位精确。
+- **触发条件复核（2026-09-26 续）**：把回退的 D2H/H2D 换成「内核直写 mapped pinned」这条路线被
+  实测和可达性复核否决——同载荷（每卡 20 MiB 双向）copy engine 只比内核路径慢约 14%
+  （3.14 vs 2.70 ms），换掉它对回退整体只值 ≤8%（回退总时里 2.1 ms 是 CPU 加法，S1 已到底）；
+  而**生产配置下按尺寸触发的回退不可达**：prefill 最大载荷 10–12 MiB（hidden 5120 / gather 6144
+  × chunk 1024），词表并行头合并是 `[V,1]`（生产 prefill 传 `logits_columns = nullptr`）与
+  verify 窗口的 `[V, W≤16]` ≤ 8 MiB，全在 48 MiB 内。能触发回退的主机恰恰是「mapped pinned
+  不可用」那一类——那里内核直写按定义不可能。
+- **改为 S6 · staging 阶梯**：预留逐级退化 48→24→12 MiB（两级 parity 槽/卡；12 MiB 是"本产品任何载荷
+  都不收窄"的档位，可捕获的最宽载荷是词表分片头合并 7.6 MiB），保住 in-kernel
+  传输并让 S2 的 chunk 钳位自动适配较小档位，取代原来的「全有或全无 → 每个 collective 都 host
+  同步」。`NINFER_TP2_AR_STAGING_MIB` 给测试复现受限主机用。
+- **顺带修复（阶梯验证中发现）**：回退的 pinned staging 没有 parity，两条独立 compute stream 共用一块 ⇒
+  下一次调用的 D2H 覆盖上一次调用的 H2D 正在上传的半区，设备收到局部假和（表现为 logits 变化、下游
+  甚至 `illegalAddress`）。改为两 parity 槽 + 增长前同步两条流；新增 4 MiB 深队列回归用例（20 KB 那档
+  因 H2D 太快而抓不到）。

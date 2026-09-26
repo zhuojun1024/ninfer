@@ -5,6 +5,14 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+// The host-staging fallback's BF16 add is the one hot-path arithmetic this file performs on the
+// host, so it carries an SSE2 path of its own (baseline on every x86-64 host). A host without it
+// keeps the scalar __hadd loop.
+#if defined(_M_X64) || defined(_M_IX86) || defined(__SSE2__) || defined(__x86_64__)
+#define NINFER_TP2_HOST_ADD_SSE2 1
+#include <emmintrin.h>
+#endif
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +20,7 @@
 #include <chrono>
 #include <cstdio>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -62,6 +71,124 @@ __device__ __forceinline__ uint4 add_bf16x8(uint4 a, uint4 b) {
     *reinterpret_cast<__nv_bfloat162*>(&r.z) = __hadd2(a2, b2);
     *reinterpret_cast<__nv_bfloat162*>(&r.w) = __hadd2(a3, b3);
     return r;
+}
+
+// Payload past which the reduction is split across host threads. Thread creation is what sets this
+// bound, not the arithmetic: measured on the 2x RTX 5060 Ti host, the reduction's own cost is
+// 2.1-2.5 ms at 10 MiB and 12.0 ms at 50 MiB single-threaded, against 4.1-4.4 ms at 10 MiB and
+// 8.4 ms at 50 MiB across eight threads - the split loses about 2 ms to spawning at the prefill
+// payload width (10 MiB) and wins about 3.5 ms past this threshold. A host with cheaper threads
+// (Linux) wins earlier; the bound only decides when the threads are worth creating.
+constexpr std::size_t kParallelAddMinimumBytes = 32ULL << 20;
+// Threads one reduction uses at most. The pass is memory-bound, and past this the strips stop
+// paying for their own spawn and join.
+constexpr unsigned kMaxAddThreads = 8;
+
+#if defined(NINFER_TP2_HOST_ADD_SSE2)
+// Four FP32 sums (as bit patterns) rounded to BF16, nearest-even, with NaN canonicalized to 0x7fff:
+// bit for bit what cuda_bf16.hpp's __float2bfloat16 does on the host, which is the rounding the
+// device's __hadd goes through.
+__m128i bf16_round_x4(__m128i bits) {
+    const __m128i magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7fffffff));
+    const __m128i is_nan    = _mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x7f800000));
+    const __m128i kept      = _mm_srli_epi32(bits, 16);
+    // The dropped half moved to the top of the word, so the two rounding tests are comparisons
+    // against half. Unsigned compares are signed compares after flipping the sign bit.
+    const __m128i dropped =
+        _mm_xor_si128(_mm_slli_epi32(bits, 16), _mm_set1_epi32(static_cast<int>(0x80000000u)));
+    const __m128i over_half = _mm_cmpgt_epi32(dropped, _mm_setzero_si128());
+    const __m128i half      = _mm_cmpeq_epi32(dropped, _mm_setzero_si128());
+    const __m128i tie_up =
+        _mm_and_si128(half, _mm_cmpgt_epi32(_mm_and_si128(kept, _mm_set1_epi32(1)),
+                                           _mm_setzero_si128()));
+    // The masks are all-ones, so subtracting adds one.
+    const __m128i rounded = _mm_sub_epi32(kept, _mm_or_si128(over_half, tie_up));
+    return _mm_or_si128(_mm_and_si128(is_nan, _mm_set1_epi32(0x7fff)),
+                        _mm_andnot_si128(is_nan, rounded));
+}
+
+// Four BF16 pairs summed in FP32. The widening is a left shift: a BF16 value is the high half of the
+// FP32 bit pattern it converts to, so the conversion is exact and needs no exponent arithmetic.
+__m128i bf16_sum_x4(__m128i a_bits, __m128i b_bits) {
+    const __m128 fa = _mm_castsi128_ps(_mm_slli_epi32(a_bits, 16));
+    const __m128 fb = _mm_castsi128_ps(_mm_slli_epi32(b_bits, 16));
+    return _mm_castps_si128(_mm_add_ps(fa, fb));
+}
+#endif
+
+// Elementwise in-place BF16 add of two host halves: out[i] = a[i] + b[i] with the device transport's
+// exact rounding (see bf16_round_x4). This is the host-staging fallback's whole arithmetic and used
+// to be its whole cost: the scalar __hadd loop it replaces ran at 0.31 GB/s, an order of magnitude
+// under the link it feeds, which is what made the fallback a performance cliff rather than a slower
+// transport. Eight values per iteration now, and about 10x the retired loop's rate end to end.
+void add_bf16_host(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out,
+                   std::size_t elements) {
+#if defined(NINFER_TP2_HOST_ADD_SSE2)
+    const auto* au = reinterpret_cast<const std::uint16_t*>(a);
+    const auto* bu = reinterpret_cast<const std::uint16_t*>(b);
+    auto* ou       = reinterpret_cast<std::uint16_t*>(out);
+    const __m128i zero = _mm_setzero_si128();
+    std::size_t i      = 0;
+    for (; i + 8 <= elements; i += 8) {
+        const __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(au + i));
+        const __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bu + i));
+        const __m128i lo = bf16_round_x4(
+            bf16_sum_x4(_mm_unpacklo_epi16(va, zero), _mm_unpacklo_epi16(vb, zero)));
+        const __m128i hi = bf16_round_x4(
+            bf16_sum_x4(_mm_unpackhi_epi16(va, zero), _mm_unpackhi_epi16(vb, zero)));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(ou + i), _mm_packus_epi32(lo, hi));
+    }
+    for (; i < elements; ++i) { out[i] = __hadd(a[i], b[i]); }
+#else
+    for (std::size_t i = 0; i < elements; ++i) { out[i] = __hadd(a[i], b[i]); }
+#endif
+}
+
+// out[i] = a[i] + b[i] over `elements`, split across `threads` strips handed out by an atomic
+// counter, in place (out may alias a). The counter is what makes the split total and single-visit:
+// a thread the OS refused (emplace_back throwing under thread pressure) only narrows the reduction,
+// it never leaves a strip unadded, and no strip is handed out twice - which the in-place add
+// requires, since adding a strip twice would add its operand twice.
+void add_bf16_host_split(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out,
+                         std::size_t elements, unsigned threads) {
+    if (threads <= 1 || elements < 8) {
+        add_bf16_host(a, b, out, elements);
+        return;
+    }
+    // Strips are whole 16-byte groups (eight BF16), so every strip but the last runs the vector loop
+    // over its whole range and the last covers the remainder.
+    const std::size_t groups    = (elements + 7) / 8;
+    const std::size_t strips    = std::min<std::size_t>(threads, groups);
+    const std::size_t per_strip = ((groups + strips - 1) / strips) * 8;
+    // Strip 0 is nobody's in particular: this thread and every worker take the next one the counter
+    // hands out, so the split covers the payload whatever number of workers the spawn managed.
+    std::atomic<std::size_t> next{0};
+    const auto reduce = [&] {
+        for (;;) {
+            const std::size_t strip = next.fetch_add(1, std::memory_order_relaxed);
+            if (strip >= strips) { return; }
+            const std::size_t begin = std::min(elements, strip * per_strip);
+            const std::size_t end   = std::min(elements, begin + per_strip);
+            add_bf16_host(a + begin, b + begin, out + begin, end - begin);
+        }
+    };
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(threads) - 1);
+    try {
+        for (unsigned t = 1; t < threads; ++t) { workers.emplace_back(reduce); }
+    } catch (const std::system_error&) {
+        // Fewer threads than asked for; the counter still covers every strip.
+    }
+    reduce();
+    for (std::thread& worker : workers) { worker.join(); }
+}
+
+// Host threads one reduction uses: one below the parallel threshold, otherwise what the machine has,
+// capped. `requested` is the NINFER_TP2_AR_ADD_THREADS override, or 0 for the automatic count.
+unsigned add_threads(std::size_t count_bytes, unsigned requested) {
+    if (count_bytes < kParallelAddMinimumBytes) { return 1; }
+    const unsigned available = std::max(1U, std::thread::hardware_concurrency());
+    return std::min<unsigned>(kMaxAddThreads, requested != 0 ? requested : available);
 }
 
 // In-kernel all-reduce (WSL2, no P2P): both devices run this kernel on their
@@ -240,13 +367,28 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     }
 }
 
-// Staging capacity per device. A batched prefill reduces BF16 payloads per layer: the mixer's
-// [hidden, T] delta and, for a GGUF block checkpoint whose mixer output projection gathers its
-// input columns, a [value_width, T] activation (value_width=6144 is the widest). 24 MiB carries
-// either up to T=2048, and the prefill chunk is clamped well below that; exceeding the staging
-// bound would silently fall back to the host-staging path, which synchronizes both compute streams
-// on every layer.
-constexpr std::size_t kInKernelArBytes = 24ULL << 20; // 24 MiB staging per device, per buffer
+// Staging capacity per device, per parity slot. A batched prefill reduces BF16 payloads per layer:
+// the mixer's and the FFN's [hidden, T] deltas and, for a GGUF block checkpoint whose mixer output
+// projection gathers its input columns, a [value_width, T] activation (value_width=6144 is the
+// widest). 48 MiB carries the maximum prefill chunk (1024 tokens: a 6144-wide payload is 12 MiB)
+// with a factor of four to spare, and the TP-2 core narrows the chunk to whatever the buffer holds
+// (TP2GenerationCore::prefill_chunk_width) rather than letting a wider one fall back to the
+// host-staging transport, which synchronizes both compute streams on every collective.
+constexpr std::size_t kInKernelArBytes = 48ULL << 20; // 48 MiB staging per device, per buffer
+
+// The staging ladder, largest rung first. The reservation is per device and two parity slots deep,
+// so a host whose mapped-host window cannot hold the full size keeps the in-kernel transport at the
+// largest rung both devices can map instead of dropping every collective to the host-staging
+// fallback, which synchronizes both compute streams per collective.
+// The floor is 12 MiB, the capacity at which nothing in this product narrows. The widest all-reduce
+// the TP-2 core issues is a full prefill chunk at the widest activation the route reduces (1024
+// tokens x 6144 BF16 columns = 12 MiB exactly), and the widest payload a *captured* graph can
+// contain is the vocabulary-split head merge over a whole verify window (vocab x (drafts + 1) x 2 =
+// 7.6 MiB for the 27B's 248320-row head at K = 15). A rung below the floor would have to narrow the
+// prefill chunk (TP2GenerationCore::prefill_chunk_width) or refuse a capture (see
+// require_capturable_payload), so the ladder stops there and such a host keeps the fallback.
+constexpr std::size_t kInKernelArLadder[] = {kInKernelArBytes, kInKernelArBytes / 2,
+                                             kInKernelArBytes / 4};
 constexpr int kArThreads               = 1024;
 constexpr int kArMaxSlices             = 8;
 // A slot holds one rendezvous id as an unsigned long long: the ids are host-authored and never
@@ -517,6 +659,59 @@ void DevicePair::start_ar_watchdog() {
         }
     });}
 
+// Reserves the staging ladder's largest rung both devices can map (see kInKernelArLadder). A failed
+// rung frees the partial reservation before the next attempt: half a staging pair is worse than
+// none, because the pair would look available while one side had nothing to publish into.
+std::size_t DevicePair::reserve_in_kernel_staging() {
+    // NINFER_TP2_AR_STAGING_MIB caps the ladder, which is how a host whose mapped window refuses a
+    // rung is reproduced from a script (and how the size-keyed fallback is reached on a host whose
+    // full staging takes every production payload).
+    std::size_t ceiling = kInKernelArBytes;
+    if (const char* cap = std::getenv("NINFER_TP2_AR_STAGING_MIB")) {
+        const unsigned long long mib = std::strtoull(cap, nullptr, 10);
+        if (mib != 0) {
+            ceiling = static_cast<std::size_t>(mib) << 20;
+        }
+    }
+    for (const std::size_t staging : kInKernelArLadder) {
+        if (staging > ceiling) {
+            continue;
+        }
+        a_.bind_to_current_thread();
+        void* host_a = nullptr;
+        void* dev_a  = nullptr;
+        if (cudaHostAlloc(&host_a, 2 * staging,
+                          cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer(&dev_a, host_a, 0) != cudaSuccess) {
+            if (host_a != nullptr) {
+                cudaFreeHost(host_a);
+            }
+            (void)cudaGetLastError();
+            continue;
+        }
+        b_.bind_to_current_thread();
+        void* host_b = nullptr;
+        void* dev_b  = nullptr;
+        if (cudaHostAlloc(&host_b, 2 * staging,
+                          cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer(&dev_b, host_b, 0) != cudaSuccess) {
+            if (host_b != nullptr) {
+                cudaFreeHost(host_b);
+            }
+            (void)cudaGetLastError();
+            a_.bind_to_current_thread();
+            cudaFreeHost(host_a);
+            continue;
+        }
+        host_a_ = host_a;
+        host_b_ = host_b;
+        dev_a_  = dev_a;
+        dev_b_  = dev_b;
+        return staging;
+    }
+    return 0;
+}
+
 DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) {
     if (device_a == device_b) {
         throw std::invalid_argument("tp DevicePair: devices must be distinct");
@@ -539,6 +734,14 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
     if (const char* fault = std::getenv("NINFER_TP2_AR_FAULT_SKIP_PEER_CALL")) {
         ar_fault_skip_call_ = std::strtoull(fault, nullptr, 10);
     }
+    // Diagnostics: keep every collective on the host-staging fallback (see force_host_staging_).
+    // This is the only way to qualify that transport where the in-kernel one takes every call.
+    if (const char* forced = std::getenv("NINFER_TP2_AR_FORCE_HOST_STAGING")) {
+        force_host_staging_ = forced[0] != '0';
+    }
+    if (const char* threads = std::getenv("NINFER_TP2_AR_ADD_THREADS")) {
+        host_add_threads_ = static_cast<unsigned>(std::strtoul(threads, nullptr, 10));
+    }
     int can_a_to_b = 0;
     int can_b_to_a = 0;
     const cudaError_t err_a = cudaDeviceCanAccessPeer(&can_a_to_b, device_a, device_b);
@@ -550,72 +753,74 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
         CUDA_CHECK(cudaDeviceEnablePeerAccess(device_a, 0));
         p2p_ = true;
     }
-    if (!p2p_) {
-        // Set up the in-kernel allreduce path: mapped pinned staging buffers
-        // (one per device) plus arrival tokens. cudaHostAllocMapped makes the
-        // host memory directly addressable by the device (verified available on
-        // WSL2); if it is not, allreduce falls back to the host-staging path.
+    if (!p2p_ && !force_host_staging_) {
+        // Set up the in-kernel allreduce path: mapped pinned staging buffers (one per device) plus
+        // arrival tokens. cudaHostAllocMapped makes the host memory directly addressable by the
+        // device; the staging reservation walks the ladder, so a host that cannot map the full size
+        // keeps this transport at a smaller one instead of dropping to the host-staging fallback,
+        // which synchronizes both compute streams per collective. When no rung maps, allreduce
+        // falls back to that path.
         // The staging area is double buffered by allreduce call parity: the peer publishes its
         // arrival token before it reads its slice, so without two buffers a device could overwrite
         // the buffer the peer is still reading from the previous layer.
-        a_.bind_to_current_thread();
-        if (cudaHostAlloc(&host_a_, 2 * kInKernelArBytes,
-                          cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
-            cudaHostGetDevicePointer(&dev_a_, host_a_, 0) == cudaSuccess) {
-            b_.bind_to_current_thread();
-            if (cudaHostAlloc(&host_b_, 2 * kInKernelArBytes,
-                              cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
-                cudaHostGetDevicePointer(&dev_b_, host_b_, 0) == cudaSuccess) {
-                a_.bind_to_current_thread();
-                if (cudaHostAlloc(&arrival_host_a_, kArTokenBytes, cudaHostAllocPortable |
+        const std::size_t staging = reserve_in_kernel_staging();
+        if (staging != 0) {
+            a_.bind_to_current_thread();
+            if (cudaHostAlloc(&arrival_host_a_, kArTokenBytes, cudaHostAllocPortable |
+                                 cudaHostAllocMapped) == cudaSuccess &&
+                cudaHostGetDevicePointer((void**)&arrival_a_, arrival_host_a_, 0) == cudaSuccess) {
+                b_.bind_to_current_thread();
+                if (cudaHostAlloc(&arrival_host_b_, kArTokenBytes, cudaHostAllocPortable |
                                      cudaHostAllocMapped) == cudaSuccess &&
-                    cudaHostGetDevicePointer((void**)&arrival_a_, arrival_host_a_, 0) == cudaSuccess) {
-                    b_.bind_to_current_thread();
-                    if (cudaHostAlloc(&arrival_host_b_, kArTokenBytes, cudaHostAllocPortable |
-                                         cudaHostAllocMapped) == cudaSuccess &&
-                        cudaHostGetDevicePointer((void**)&arrival_b_, arrival_host_b_, 0) == cudaSuccess) {
-                        // The rendezvous id cells and the bounded-spin flags. A channel cell is
-                        // host memory whose device scalars are written by the graph's memcpy node;
-                        // the eager cell is mapped so the eager kernels read it directly.
-                        bool ids = false;
-                        if (cudaHostAlloc(reinterpret_cast<void**>(&stall_host_),
-                                          2 * kArTokenStrideBytes, cudaHostAllocPortable |
-                                              cudaHostAllocMapped) == cudaSuccess) {
-                            std::memset(stall_host_, 0, 2 * kArTokenStrideBytes);
-                            ids = cudaHostGetDevicePointer(reinterpret_cast<void**>(&stall_a_),
-                                                           stall_host_, 0) == cudaSuccess;
-                            if (ids) {
-                                stall_b_ = reinterpret_cast<int*>(
-                                    reinterpret_cast<char*>(static_cast<void*>(stall_a_)) +
-                                    kArTokenStrideBytes);
-                            } else {
-                                stall_a_ = nullptr;
-                            }
+                    cudaHostGetDevicePointer((void**)&arrival_b_, arrival_host_b_, 0) == cudaSuccess) {
+                    // The rendezvous id cells and the bounded-spin flags. A channel cell is
+                    // host memory whose device scalars are written by the graph's memcpy node;
+                    // the eager cell is mapped so the eager kernels read it directly.
+                    bool ids = false;
+                    if (cudaHostAlloc(reinterpret_cast<void**>(&stall_host_),
+                                      2 * kArTokenStrideBytes, cudaHostAllocPortable |
+                                          cudaHostAllocMapped) == cudaSuccess) {
+                        std::memset(stall_host_, 0, 2 * kArTokenStrideBytes);
+                        ids = cudaHostGetDevicePointer(reinterpret_cast<void**>(&stall_a_),
+                                                       stall_host_, 0) == cudaSuccess;
+                        if (ids) {
+                            stall_b_ = reinterpret_cast<int*>(
+                                reinterpret_cast<char*>(static_cast<void*>(stall_a_)) +
+                                kArTokenStrideBytes);
                         } else {
-                            stall_host_ = nullptr;
+                            stall_a_ = nullptr;
                         }
+                    } else {
+                        stall_host_ = nullptr;
+                    }
+                    if (ids) {
+                        ids = cudaHostAlloc(reinterpret_cast<void**>(&base_host_),
+                                            kArMaxChannels * sizeof(unsigned long long),
+                                            cudaHostAllocPortable) == cudaSuccess;
                         if (ids) {
-                            ids = cudaHostAlloc(reinterpret_cast<void**>(&base_host_),
-                                                kArMaxChannels * sizeof(unsigned long long),
-                                                cudaHostAllocPortable) == cudaSuccess;
-                            if (ids) {
-                                std::memset(base_host_, 0,
-                                            kArMaxChannels * sizeof(unsigned long long));
-                                a_.bind_to_current_thread();
-                                ids = cudaMalloc(&base_dev_a_, kArMaxChannels *
-                                                                   sizeof(unsigned long long)) ==
-                                      cudaSuccess;
-                                b_.bind_to_current_thread();
-                                ids = ids && cudaMalloc(&base_dev_b_, kArMaxChannels *
-                                                                          sizeof(unsigned long long)) ==
-                                                 cudaSuccess;
-                            }
+                            std::memset(base_host_, 0,
+                                        kArMaxChannels * sizeof(unsigned long long));
+                            a_.bind_to_current_thread();
+                            ids = cudaMalloc(&base_dev_a_, kArMaxChannels *
+                                                               sizeof(unsigned long long)) ==
+                                  cudaSuccess;
+                            b_.bind_to_current_thread();
+                            ids = ids && cudaMalloc(&base_dev_b_, kArMaxChannels *
+                                                                      sizeof(unsigned long long)) ==
+                                             cudaSuccess;
                         }
-                        if (ids) {
-                            std::memset(arrival_host_a_, 0, kArTokenBytes);
-                            std::memset(arrival_host_b_, 0, kArTokenBytes);
-                            in_kernel_bytes_ = kInKernelArBytes;
-                            in_kernel_available_ = true;
+                    }
+                    if (ids) {
+                        std::memset(arrival_host_a_, 0, kArTokenBytes);
+                        std::memset(arrival_host_b_, 0, kArTokenBytes);
+                        in_kernel_bytes_ = staging;
+                        in_kernel_available_ = true;
+                        if (staging != kInKernelArBytes) {
+                            std::fprintf(stderr,
+                                         "[mem] TP-2 in-kernel allreduce staging %.1f MiB of %.1f "
+                                         "(larger rungs did not map)\n",
+                                         static_cast<double>(staging) / 1048576.0,
+                                         static_cast<double>(kInKernelArBytes) / 1048576.0);
                         }
                     }
                 }
@@ -698,7 +903,8 @@ DevicePair::~DevicePair() {
 
 DevicePair::DevicePair(DevicePair&& other) noexcept
     : a_(std::move(other.a_)), b_(std::move(other.b_)), p2p_(other.p2p_),
-      staging_(std::move(other.staging_)), in_kernel_available_(other.in_kernel_available_),
+      staging_(std::move(other.staging_)), staging_slot_bytes_(other.staging_slot_bytes_),
+     staging_parity_(other.staging_parity_), in_kernel_available_(other.in_kernel_available_),
       in_kernel_bytes_(other.in_kernel_bytes_), host_a_(other.host_a_), host_b_(other.host_b_),
       dev_a_(other.dev_a_), dev_b_(other.dev_b_), arrival_a_(other.arrival_a_),
       arrival_b_(other.arrival_b_), arrival_host_a_(other.arrival_host_a_),
@@ -710,6 +916,7 @@ DevicePair::DevicePair(DevicePair&& other) noexcept
       ar_channels_(std::move(other.ar_channels_)), capturing_(other.capturing_),
       capture_channel_(other.capture_channel_), capture_index_(other.capture_index_),
       ar_eager_next_(other.ar_eager_next_), ar_last_id_(other.ar_last_id_.load()),
+      force_host_staging_(other.force_host_staging_), host_add_threads_(other.host_add_threads_),
       small_available_(other.small_available_), small_host_a_(other.small_host_a_),
       small_host_b_(other.small_host_b_), small_dev_a_(other.small_dev_a_),
       small_dev_b_(other.small_dev_b_) {
@@ -739,6 +946,8 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     b_ = std::move(other.b_);
     p2p_ = other.p2p_;
     staging_ = std::move(other.staging_);
+    staging_slot_bytes_ = other.staging_slot_bytes_;
+    staging_parity_     = other.staging_parity_;
     in_kernel_available_ = other.in_kernel_available_;
     in_kernel_bytes_     = other.in_kernel_bytes_;
     host_a_              = other.host_a_;
@@ -763,6 +972,8 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     capture_channel_     = other.capture_channel_;
     capture_index_       = other.capture_index_;
     ar_eager_next_       = other.ar_eager_next_;
+    force_host_staging_  = other.force_host_staging_;
+    host_add_threads_    = other.host_add_threads_;
     ar_last_id_.store(other.ar_last_id_.load(), std::memory_order_relaxed);
     stop_ar_watchdog();
     watch_               = std::move(other.watch_);
@@ -792,9 +1003,44 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     return *this;
 }
 
+// Parity slot for one host-staging collective. The previous call's uploads may still be reading the
+// other slot on either device's stream, and the two streams are independent, so a shared buffer
+// cannot serve back-to-back collectives: the next call's download would overwrite the half the
+// previous call's upload is still sending from (observed as changed logits in a prefill, and
+// downstream as an out-of-range index - see the staging note in the class header).
+char* DevicePair::host_staging(std::size_t count_bytes, cudaStream_t stream_a,
+                               cudaStream_t stream_b) {
+    const std::size_t slot = 2 * count_bytes;
+    if (!staging_ || staging_slot_bytes_ < slot) {
+        // Growth releases the buffer those uploads are reading from; both streams are about to be
+        // synchronized by this call anyway, so wait before reallocating.
+        if (staging_) {
+            CUDA_CHECK(cudaStreamSynchronize(stream_a));
+            CUDA_CHECK(cudaStreamSynchronize(stream_b));
+        }
+        staging_            = std::make_unique<PinnedHostBuffer>(2 * slot);
+        staging_slot_bytes_ = slot;
+    }
+    char* pinned =
+        static_cast<char*>(staging_->data()) + (staging_parity_ ? staging_slot_bytes_ : 0);
+    staging_parity_ = !staging_parity_;
+    return pinned;
+}
+
+void DevicePair::require_capturable_payload(std::size_t count_bytes) const {
+    if (capturing_ && count_bytes > in_kernel_bytes_) {
+        throw std::logic_error("tp collective: a " + std::to_string(count_bytes) +
+                               "-byte payload exceeds the " + std::to_string(in_kernel_bytes_) +
+                               "-byte in-kernel all-reduce staging while a capture is open; the "
+                               "host-staging fallback synchronizes the caller's streams, which a "
+                               "capture cannot contain");
+    }
+}
+
 void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
                            cudaStream_t stream_a, cudaStream_t stream_b) {
     require_bytes(count_bytes);
+    require_capturable_payload(count_bytes);
     if (count_bytes == 0) { return; }
     // In-kernel path (WSL2, no P2P, mapped pinned available): both devices run
     // ar_exchange<true> on their compute streams. Each writes its delta to its own
@@ -851,7 +1097,7 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
             return;
         }
         const int slices     = ar_slices(count_bytes);
-        const int slot_bytes = static_cast<int>(kInKernelArBytes);
+        const int slot_bytes = static_cast<int>(in_kernel_bytes_);
         const bool skip_peer = fault_skip_peer();
         a_.bind_to_current_thread();
         ar_exchange<true><<<slices, kArThreads, 0, stream_a>>>(
@@ -869,7 +1115,7 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
         }
         return;
     }
-    if (p2p_) {
+    if (p2p_ && !force_host_staging_) {
         a_.bind_to_current_thread();
         b_.bind_to_current_thread();
         // The deltas were produced on the caller's compute streams, which are
@@ -893,16 +1139,11 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
         CUDA_CHECK(cudaStreamSynchronize(b_.stream));
         return;
     }
-    // Host staging on the caller's compute streams: pinned buffer holds [a | b],
-    // both halves count_bytes. The D2H copies are ordered after the kernels that
-    // produced the deltas on those same streams, and the H2D copies are ordered
-    // before the caller's next work (residual_add) on them, so only the two D2H
-    // transfers need a barrier.
-    const std::size_t total = 2 * count_bytes;
-    if (!staging_ || staging_->size() < total) {
-        staging_ = std::make_unique<PinnedHostBuffer>(total);
-    }
-    char* pinned = static_cast<char*>(staging_->data());
+    // Host staging on the caller's compute streams: this call's parity slot holds [a | b], both
+    // halves count_bytes, and the sum lands in the first half. The D2H copies are ordered after the
+    // kernels that produced the deltas on those same streams, and the H2D copies are ordered before
+    // the caller's next work (residual_add) on them, so only the two D2H transfers need a barrier.
+    char* pinned = host_staging(count_bytes, stream_a, stream_b);
     // Bind before each copy: cudaMemcpyAsync orders on the stream's device, and
     // the driver validates the current device against the stream.
     a_.bind_to_current_thread();
@@ -912,13 +1153,14 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
                                cudaMemcpyDeviceToHost, stream_b));
     CUDA_CHECK(cudaStreamSynchronize(stream_a));
     CUDA_CHECK(cudaStreamSynchronize(stream_b));
-    const std::size_t elements = count_bytes / 2;
-    const __nv_bfloat16* fa = reinterpret_cast<const __nv_bfloat16*>(pinned);
-    const __nv_bfloat16* fb = reinterpret_cast<const __nv_bfloat16*>(pinned + count_bytes);
-    __nv_bfloat16* sum      = reinterpret_cast<__nv_bfloat16*>(pinned);
-    for (std::size_t i = 0; i < elements; ++i) {
-        sum[i] = __hadd(fa[i], fb[i]);
-    }
+    // Reduce in place across the machine's cores, then upload. The copy engines set this transport's
+    // floor (both directions run at once; measured 3.1 ms for a 10 MiB payload on this host), and the
+    // scalar __hadd pass this replaced ran at 0.31 GB/s, so the reduction was the fallback's dominant
+    // cost and is now vectorized and split (see add_bf16_host_split).
+    add_bf16_host_split(reinterpret_cast<const __nv_bfloat16*>(pinned),
+                        reinterpret_cast<const __nv_bfloat16*>(pinned + count_bytes),
+                        reinterpret_cast<__nv_bfloat16*>(pinned), count_bytes / 2,
+                        add_threads(count_bytes, host_add_threads_));
     a_.bind_to_current_thread();
     CUDA_CHECK(cudaMemcpyAsync(data_a, pinned, count_bytes, cudaMemcpyHostToDevice, stream_a));
     b_.bind_to_current_thread();
@@ -930,6 +1172,7 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
 void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, void* recv_b,
                           std::size_t count_bytes, cudaStream_t stream_a, cudaStream_t stream_b) {
     require_bytes(count_bytes);
+    require_capturable_payload(count_bytes);
     if (count_bytes == 0) { return; }
     // In-kernel transport: both devices run ar_exchange<false> on their compute streams. Each device
     // publishes its own send bytes to its mapped host staging, signals an arrival id, spins on the
@@ -972,7 +1215,7 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
             return;
         }
         const int slices     = ar_slices(count_bytes);
-        const int slot_bytes = static_cast<int>(kInKernelArBytes);
+        const int slot_bytes = static_cast<int>(in_kernel_bytes_);
         const bool skip_peer = fault_skip_peer();
         a_.bind_to_current_thread();
         ar_exchange<false><<<slices, kArThreads, 0, stream_a>>>(
@@ -990,7 +1233,7 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
         }
         return;
     }
-    if (p2p_) {
+    if (p2p_ && !force_host_staging_) {
         a_.bind_to_current_thread();
         b_.bind_to_current_thread();
         // The send halves were produced on the caller's compute streams, which are independent of the
@@ -1003,13 +1246,10 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
         CUDA_CHECK(cudaStreamSynchronize(b_.stream));
         return;
     }
-    // Host staging: the pinned buffer holds [a's send | b's send] and each receive copies the other
-    // half back. Only the two D2H transfers need a barrier, exactly as the all-reduce fallback does.
-    const std::size_t total = 2 * count_bytes;
-    if (!staging_ || staging_->size() < total) {
-        staging_ = std::make_unique<PinnedHostBuffer>(total);
-    }
-    char* pinned = static_cast<char*>(staging_->data());
+    // Host staging: this call's parity slot holds [a's send | b's send] and each receive copies the
+    // other half back. Only the two D2H transfers need a barrier, exactly as the all-reduce fallback
+    // does.
+    char* pinned = host_staging(count_bytes, stream_a, stream_b);
     a_.bind_to_current_thread();
     CUDA_CHECK(cudaMemcpyAsync(pinned, send_a, count_bytes, cudaMemcpyDeviceToHost, stream_a));
     b_.bind_to_current_thread();

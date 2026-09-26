@@ -587,6 +587,34 @@ comparison meaningful; the served configuration samples (`0.7 / 20 / 0.80`).
   and only the MTP verify window's round-local overlay still applied. The request now owns an
   `I32[public_token_count]` count array, reset with the request, that `ops::sample` and the speculative
   accept kernel increment as they produce tokens.
+- The host-staging fallback's reduction is vectorized and split across host threads. The fallback
+  hands its payload to the copy engines and used to reduce with a scalar `__hadd` loop at 0.31 GB/s,
+  an order of magnitude under the link it feeds. It is now an SSE2 pass (eight BF16 per iteration:
+  the widening is a shift, the FP32 sum rounds back to BF16 nearest-even with the NaN
+  canonicalization `__float2bfloat16` performs) that a payload past 32 MiB splits across up to eight
+  host threads. Measured at a 10 MiB payload on the 2x RTX 5060 Ti host: the retired loop cost
+  25.8-32.6 ms on its own against a 3.1-5.9 ms two-way copy floor, and the collective now completes in
+  5.2-8.0 ms; at 50 MiB it is 20.5 ms against the retired 160.8 ms loop plus 14.9 ms of transfers.
+- The cross-device all-reduce staging buffer is 48 MiB per device per parity slot (was 24 MiB), and the
+  prefill chunk is derived from it rather than clamped only by the model's maximum:
+  `DevicePair::in_kernel_allreduce_bytes()` exposes the capacity and
+  `TP2GenerationCore::prefill_chunk_width` bounds the chunk by the model's widest all-reduce payload
+  per token - `max(hidden_size, GDN value_width, attention query_width)` BF16 columns. A payload past
+  the buffer used to change transport silently; the chunk narrows instead, and the draft's feature
+  staging and the prefill sinks are sized from the same width.
+- The staging reservation walks a ladder (48, 24, 12, 6 MiB per parity slot) rather than asking for the
+  full size once. A host whose mapped-host window cannot hold the top rung keeps the in-kernel transport
+  at the largest rung both devices map, and the chunk clamp above narrows the prefill to that capacity:
+  dropping to the host-staging fallback instead would synchronize both compute streams on every
+  collective, which is the larger penalty. The 6 MiB floor still carries a 512-token chunk at the widest
+  activation this route reduces. `NINFER_TP2_AR_STAGING_MIB` caps the ladder so a constrained host is
+  reproducible from a script.
+- The host-staging fallback's pinned staging is double buffered by call parity. The two devices' compute
+  streams are independent, so one shared buffer let the next collective's download overwrite the half the
+  previous collective's upload was still sending from: a device could receive a partial sum, which the
+  DFlash2 route turned into changed logits and then an illegal address (the pair test hid it because every
+  case synchronized between collectives). Growth now synchronizes both streams before releasing the
+  previous buffer, which an in-flight upload could still be reading.
 
 ## Work log
 

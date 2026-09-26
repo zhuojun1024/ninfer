@@ -266,6 +266,10 @@ private:
 
     void build_shard(Shard& shard, int shard_index);
 
+    // Width one prefill chunk runs with: the engine option, bounded by the model's chunk maximum and
+    // by what the cross-device all-reduce staging buffer carries in one payload (see the definition).
+    [[nodiscard]] std::uint32_t prefill_chunk_width(const models::qwen3_5::TextConfig& config) const;
+
     // MTP prefill priming on shard 0: runs the MTP layer over one prefill chunk, appending its own
     // K/V from the chunk's final-norm hidden. last_token is the token sampled from the final chunk's
     // logits, which the MTP layer's last prompt column embeds; that column's hidden becomes the first
