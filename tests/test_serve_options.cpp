@@ -406,6 +406,20 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
+    // The Engine normalizes a TP-2 generation route to one active request and one queued request
+    // (normalize_engine_options). The service layer and the HTTP thread pool must size themselves
+    // from the same numbers, or a request the service accepted is rejected by the Engine as
+    // overloaded instead of waiting in its FIFO.
+    const ServeOptions tp2 = parse({"ninfer-serve", "model.ninfer", "--devices", "0,1",
+                                    "--max-concurrency", "3", "--max-pending-requests", "5"});
+    const EffectiveRequestCapacity tp2_capacity = effective_request_capacity(tp2);
+    failures += check(tp2_capacity.max_concurrency == 1 && tp2_capacity.max_pending_requests == 1,
+                      "TP-2 route did not normalize the service request capacity");
+    const EffectiveRequestCapacity single_capacity = effective_request_capacity(defaults);
+    failures += check(single_capacity.max_concurrency == defaults.max_concurrency &&
+                          single_capacity.max_pending_requests == defaults.max_pending_requests,
+                      "single-GPU route did not keep the configured request capacity");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

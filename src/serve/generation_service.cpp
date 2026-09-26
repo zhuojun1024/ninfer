@@ -261,8 +261,9 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         throw std::invalid_argument(
             "--reasoning-effort is not supported by the loaded chat template");
     }
+    const EffectiveRequestCapacity capacity = effective_request_capacity(options_);
     request_capacity_    = std::make_shared<RequestCapacity>(
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+        static_cast<std::size_t>(capacity.max_concurrency) + capacity.max_pending_requests);
 }
 
 std::shared_ptr<RequestLifetime>

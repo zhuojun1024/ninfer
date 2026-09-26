@@ -415,4 +415,11 @@ std::string resolve_public_model_id(const ServeOptions& options,
     return std::string(artifact_model_name);
 }
 
+EffectiveRequestCapacity effective_request_capacity(const ServeOptions& options) {
+    // Mirrors normalize_engine_options: the TP-2 generation route runs exactly one request at a
+    // time with one queued behind it. A single-GPU or scoring route keeps the configured values.
+    if (options.device_b >= 0) { return EffectiveRequestCapacity{1, 1}; }
+    return EffectiveRequestCapacity{options.max_concurrency, options.max_pending_requests};
+}
+
 } // namespace ninfer::serve
