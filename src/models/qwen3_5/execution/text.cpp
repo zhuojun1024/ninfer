@@ -214,6 +214,47 @@ private:
     T previous_;
 };
 
+// Non-timing events that order the collective stream against the compute stream of one device for
+// the overlapped TP-2 prefill. The produce/done slots are reused every layer: cudaStreamWaitEvent
+// captures the event state at the host call, so re-recording one for the next layer cannot affect a
+// wait that was already enqueued.
+class Tp2OverlapEvents {
+public:
+    explicit Tp2OverlapEvents(std::size_t count)
+        : produced_(count, nullptr), done_(count, nullptr) {
+        if (cudaGetDevice(&device_) != cudaSuccess) {
+            throw std::runtime_error("TP-2 prefill overlap: cudaGetDevice failed");
+        }
+        for (std::size_t i = 0; i < count; ++i) {
+            if (cudaEventCreateWithFlags(&produced_[i], cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&done_[i], cudaEventDisableTiming) != cudaSuccess) {
+                release();
+                throw std::runtime_error("TP-2 prefill overlap: cudaEventCreate failed");
+            }
+        }
+    }
+    ~Tp2OverlapEvents() { release(); }
+    Tp2OverlapEvents(const Tp2OverlapEvents&)            = delete;
+    Tp2OverlapEvents& operator=(const Tp2OverlapEvents&) = delete;
+
+    [[nodiscard]] cudaEvent_t produced(std::size_t index) const { return produced_[index]; }
+    [[nodiscard]] cudaEvent_t done(std::size_t index) const { return done_[index]; }
+
+private:
+    void release() noexcept {
+        (void)cudaSetDevice(device_);
+        for (cudaEvent_t& event : produced_) {
+            if (event != nullptr) { (void)cudaEventDestroy(event); event = nullptr; }
+        }
+        for (cudaEvent_t& event : done_) {
+            if (event != nullptr) { (void)cudaEventDestroy(event); event = nullptr; }
+        }
+    }
+    std::vector<cudaEvent_t> produced_;
+    std::vector<cudaEvent_t> done_;
+    int device_ = 0;
+};
+
 } // namespace
 
 void DFlashFeatureSink::begin(const Tensor& value) {
@@ -299,11 +340,11 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                          std::uint32_t text_kv_base, qwen3_5::PagedKVCacheView mtp_kv,
                          const qwen3_5::PagedKVCache* batch_text_kv,
-                         const qwen3_5::PagedKVCache* batch_mtp_kv)
+                         const qwen3_5::PagedKVCache* batch_mtp_kv, std::uint32_t prefill_overlap)
     : ctx_(ctx), parameters_(weights), config_(weights.model.config().text), work_(work), kv_(kv),
       mtp_kv_(mtp_kv), state_(state), io_(io), prefill_hidden_(prefill_hidden),
-      prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv),
-      batch_mtp_kv_(batch_mtp_kv) {
+      prefill_chunk_(prefill_chunk), prefill_overlap_(prefill_overlap),
+      text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -2393,8 +2434,22 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
         }
     }
     NullTap tap;
+    const std::int32_t overlap_width = static_cast<std::int32_t>(prefill_overlap_);
+    bool overlap_ok = overlap_width > 0 && phase == Phase::Prefill && sink == nullptr &&
+                      vision == nullptr && pair.in_kernel_allreduce() &&
+                      tokens % overlap_width == 0 && tokens / overlap_width >= 2;
+    if (overlap_ok) {
+        for (const auto& layer : parameters_.text.layers) {
+            if (tp_mixer_activation_width(layer) != 0) {
+                overlap_ok = false;
+                break;
+            }
+        }
+    }
     auto run_layers = [&] {
-        if (sink != nullptr) {
+        if (overlap_ok) {
+            run_layers_tp2_overlap(peer, pair, x, x_peer, phase, overlap_width, first_position);
+        } else if (sink != nullptr) {
             run_layers_tp2(peer, pair, x, x_peer, phase, *sink);
         } else {
             run_layers_tp2(peer, pair, x, x_peer, phase, tap);
@@ -2496,6 +2551,167 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
         CUDA_CHECK(cudaMemcpyAsync(hidden_columns->data, xf.data, xf.bytes(),
                                    cudaMemcpyDeviceToDevice, ctx_.stream));
     }
+}
+
+void TextContext::run_layers_tp2_overlap(TextContext& peer, tp::DevicePair& pair, Tensor& x,
+                                         Tensor& x_peer, Phase ph, int width,
+                                         std::int32_t first_position) {
+    const std::int32_t hidden = dimension(config_.hidden_size);
+    const std::int32_t tokens = x.ne[1];
+    // The split must be exact: a remainder block would run at a width the schedule has not been
+    // measured at, and 320/384 and 128 both cost more than they hide. A chunk that does not hold two
+    // whole sub-blocks keeps the plain lockstep loop instead (forward_tp2_prefill's gate).
+    if (width <= 0 || width % 64 != 0 || tokens <= 0 || tokens % width != 0 || tokens / width < 2 ||
+        x_peer.ne[1] != tokens) {
+        throw std::invalid_argument(
+            "run_layers_tp2_overlap: a chunk needs at least two whole 64-aligned sub-blocks");
+    }
+    const int parts = tokens / width;
+    const Tensor* const base_cache = active_cache_positions_;
+    const Tensor* const base_rope  = active_rope_positions_;
+    const auto* const base_envelope = active_causal_attention_envelope_;
+    const Tensor* const base_cache_peer = peer.active_cache_positions_;
+    const Tensor* const base_rope_peer  = peer.active_rope_positions_;
+    const auto* const base_envelope_peer = peer.active_causal_attention_envelope_;
+    if (base_cache == nullptr || base_rope == nullptr || base_envelope == nullptr ||
+        base_cache_peer == nullptr || base_rope_peer == nullptr || base_envelope_peer == nullptr) {
+        throw std::logic_error("run_layers_tp2_overlap: the chunk bindings are not installed");
+    }
+    const Tensor base_cache_t      = *base_cache;
+    const Tensor base_rope_t       = *base_rope;
+    const Tensor base_cache_t_peer = *base_cache_peer;
+    const Tensor base_rope_t_peer  = *base_rope_peer;
+
+    // Every sub-block is exactly `width` wide. That width is 64-aligned, which keeps each sub-block
+    // on the ops' documented scheduling boundary, so the result stays bit-identical to the
+    // single-block loop.
+    std::vector<std::int32_t> offset(static_cast<std::size_t>(parts), 0);
+    std::vector<std::int32_t> length(static_cast<std::size_t>(parts), 0);
+    for (int s = 0; s < parts; ++s) {
+        offset[static_cast<std::size_t>(s)] = s * width;
+        length[static_cast<std::size_t>(s)] = width;
+    }
+    std::vector<Tensor> xs, xs_peer, cache_s, rope_s, cache_s_peer, rope_s_peer;
+    for (int s = 0; s < parts; ++s) {
+        xs.push_back(x.slice(1, offset[s], length[s]));
+        xs_peer.push_back(x_peer.slice(1, offset[s], length[s]));
+        cache_s.push_back(base_cache_t.slice(0, offset[s], length[s]));
+        rope_s.push_back(base_rope_t.slice(0, offset[s], length[s]));
+        cache_s_peer.push_back(base_cache_t_peer.slice(0, offset[s], length[s]));
+        rope_s_peer.push_back(base_rope_t_peer.slice(0, offset[s], length[s]));
+    }
+    ctx_.bind_to_current_thread();
+    Tp2OverlapEvents ev_local(static_cast<std::size_t>(parts));
+    peer.ctx_.bind_to_current_thread();
+    Tp2OverlapEvents ev_peer(static_cast<std::size_t>(parts));
+
+    for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
+        const auto& block      = parameters_.text.layers[layer];
+        const auto& block_peer = peer.parameters_.text.layers[layer];
+        if (tp_mixer_activation_width(block) != 0 ||
+            peer.tp_mixer_activation_width(block_peer) != 0) {
+            throw std::logic_error(
+                "run_layers_tp2_overlap: a gather mixer needs the activation merge");
+        }
+        auto layer_scope      = work_.scope();
+        auto layer_scope_peer = peer.work_.scope();
+        std::vector<Tensor> mix, mix_peer, ffn, ffn_peer;
+        for (int s = 0; s < parts; ++s) {
+            mix.push_back(work_.alloc(DType::BF16, {hidden, length[s]}));
+            mix_peer.push_back(peer.work_.alloc(DType::BF16, {hidden, length[s]}));
+            ffn.push_back(work_.alloc(DType::BF16, {hidden, length[s]}));
+            ffn_peer.push_back(peer.work_.alloc(DType::BF16, {hidden, length[s]}));
+        }
+        // Stage 1: every sub-block's mixer runs first, so the collective of sub-block s can be issued
+        // as soon as its own mixer landed and overlap the next sub-block's mixer.
+        for (int s = 0; s < parts; ++s) {
+            const std::uint32_t visible = static_cast<std::uint32_t>(first_position) +
+                                          static_cast<std::uint32_t>(offset[s] + length[s]);
+            const ops::CausalAttentionExecutionEnvelope envelope{visible, visible};
+            ctx_.bind_to_current_thread();
+            {
+                ScopedPositions bound_cache(active_cache_positions_, cache_s[s]);
+                ScopedPositions bound_rope(active_rope_positions_, rope_s[s]);
+                ScopedEnvelope  bound_envelope(active_causal_attention_envelope_, envelope);
+                tp_mixer_layer(block, xs[s], mix[s], layer, ph, nullptr);
+            }
+            CUDA_CHECK(cudaEventRecord(ev_local.produced(s), ctx_.stream));
+            peer.ctx_.bind_to_current_thread();
+            {
+                ScopedPositions bound_cache(peer.active_cache_positions_, cache_s_peer[s]);
+                ScopedPositions bound_rope(peer.active_rope_positions_, rope_s_peer[s]);
+                ScopedEnvelope  bound_envelope(peer.active_causal_attention_envelope_, envelope);
+                peer.tp_mixer_layer(block_peer, xs_peer[s], mix_peer[s], layer, ph, nullptr);
+            }
+            CUDA_CHECK(cudaEventRecord(ev_peer.produced(s), peer.ctx_.stream));
+        }
+        for (int s = 0; s < parts; ++s) {
+            ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaStreamWaitEvent(ctx_.collective_stream, ev_local.produced(s), 0));
+            peer.ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaStreamWaitEvent(peer.ctx_.collective_stream, ev_peer.produced(s), 0));
+            pair.allreduce(mix[s].data, mix_peer[s].data, mix[s].bytes(), ctx_.collective_stream,
+                           peer.ctx_.collective_stream);
+            ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaEventRecord(ev_local.done(s), ctx_.collective_stream));
+            peer.ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaEventRecord(ev_peer.done(s), peer.ctx_.collective_stream));
+        }
+        for (int s = 0; s < parts; ++s) {
+            ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaStreamWaitEvent(ctx_.stream, ev_local.done(s), 0));
+            ops::residual_add(mix[s], xs[s], ctx_.stream);
+            peer.ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaStreamWaitEvent(peer.ctx_.stream, ev_peer.done(s), 0));
+            ops::residual_add(mix_peer[s], xs_peer[s], peer.ctx_.stream);
+        }
+        // Stage 2: the FFN tail follows the same shape, overlapping the next sub-block's FFN.
+        for (int s = 0; s < parts; ++s) {
+            ctx_.bind_to_current_thread();
+            tp_mlp_delta(block, xs[s], ffn[s], layer, ph);
+            CUDA_CHECK(cudaEventRecord(ev_local.produced(s), ctx_.stream));
+            peer.ctx_.bind_to_current_thread();
+            peer.tp_mlp_delta(block_peer, xs_peer[s], ffn_peer[s], layer, ph);
+            CUDA_CHECK(cudaEventRecord(ev_peer.produced(s), peer.ctx_.stream));
+        }
+        for (int s = 0; s < parts; ++s) {
+            ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaStreamWaitEvent(ctx_.collective_stream, ev_local.produced(s), 0));
+            peer.ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaStreamWaitEvent(peer.ctx_.collective_stream, ev_peer.produced(s), 0));
+            pair.allreduce(ffn[s].data, ffn_peer[s].data, ffn[s].bytes(), ctx_.collective_stream,
+                           peer.ctx_.collective_stream);
+            ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaEventRecord(ev_local.done(s), ctx_.collective_stream));
+            peer.ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaEventRecord(ev_peer.done(s), peer.ctx_.collective_stream));
+        }
+        for (int s = 0; s < parts; ++s) {
+            ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaStreamWaitEvent(ctx_.stream, ev_local.done(s), 0));
+            ops::residual_add(ffn[s], xs[s], ctx_.stream);
+            peer.ctx_.bind_to_current_thread();
+            CUDA_CHECK(cudaStreamWaitEvent(peer.ctx_.stream, ev_peer.done(s), 0));
+            ops::residual_add(ffn_peer[s], xs_peer[s], peer.ctx_.stream);
+        }
+    }
+    // The collective stream is a different stream from the one the caller's next chunk uses, so
+    // order the last collectives forward before any consumer can run, then restore the bindings the
+    // outer scopes installed (the Scoped* guards reset their slot to null on the way out).
+    ctx_.bind_to_current_thread();
+    for (int s = 0; s < parts; ++s) {
+        CUDA_CHECK(cudaStreamWaitEvent(ctx_.stream, ev_local.done(s), 0));
+    }
+    active_cache_positions_           = base_cache;
+    active_rope_positions_            = base_rope;
+    active_causal_attention_envelope_ = base_envelope;
+    peer.ctx_.bind_to_current_thread();
+    for (int s = 0; s < parts; ++s) {
+        CUDA_CHECK(cudaStreamWaitEvent(peer.ctx_.stream, ev_peer.done(s), 0));
+    }
+    peer.active_cache_positions_           = base_cache_peer;
+    peer.active_rope_positions_            = base_rope_peer;
+    peer.active_causal_attention_envelope_ = base_envelope_peer;
 }
 
 void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,

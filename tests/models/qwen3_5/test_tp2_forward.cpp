@@ -197,12 +197,15 @@ int main(int argc, char** argv) {
 
         tp::DevicePair pair(dev0, dev1);
 
+        // Exercise the production TP-2 prefill overlap: the chunk-split invariant below must stay
+        // bit-exact with the sub-block pipeline enabled, which is what makes the width a safe
+        // default rather than an opt-in.
         qwen::execution::TextContext card0(
             *device0, parameters0, *shard0.workspace, {}, *shard0.state, shard0.io,
-            shard0.prefill_hidden, 1, 0, {}, &shard0.decoder->text_kv);
+            shard0.prefill_hidden, 1, 0, {}, &shard0.decoder->text_kv, nullptr, 256);
         qwen::execution::TextContext card1(
             *device1, parameters1, *shard1.workspace, {}, *shard1.state, shard1.io,
-            shard1.prefill_hidden, 1, 0, {}, &shard1.decoder->text_kv);
+            shard1.prefill_hidden, 1, 0, {}, &shard1.decoder->text_kv, nullptr, 256);
         card0.set_shard_config(&cfg0, 0);
         card1.set_shard_config(&cfg1, 1);
 
@@ -580,6 +583,21 @@ int main(int argc, char** argv) {
         if (wide_gap > kLeadingLogitTolerance) {
             std::cerr << "FAIL: 1024-token chunk leading logits diverge (top5 gap " << wide_gap
                       << ")\n";
+            return 1;
+        }
+
+        // 3b. The measured optimum is a 256-token sub-block, which enables the overlap at a 512-token
+        //     chunk as two sub-blocks. That split must land on the same values as two plain 256-token
+        //     chunks, which is the shape a 512-token --prefill-chunk actually runs.
+        const std::vector<int> half_ids(wide_ids.begin(), wide_ids.begin() + 512);
+        const auto half_overlap = host_logits(device0.get(), run_prefill(half_ids, {0, 512}));
+        const auto half_serial  = host_logits(device0.get(), run_prefill(half_ids, {0, 256, 512}));
+        const float half_gap    = top_five_gap(half_overlap, half_serial);
+        std::cout << "  overlap 256x2 vs 2x256 chunks: top5_gap=" << half_gap
+                  << " max_logit_diff=" << max_abs_diff(half_overlap, half_serial)
+                  << " argmax=" << argmax_of(half_overlap) << "\n";
+        if (argmax_of(half_overlap) != argmax_of(half_serial) || half_gap > kLeadingLogitTolerance) {
+            std::cerr << "FAIL: the 256-wide overlap split diverges from two 256-token chunks\n";
             return 1;
         }
 

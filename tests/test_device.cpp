@@ -35,6 +35,10 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
         std::cerr << label << " load stream is null\n";
         ++failures;
     }
+    if (ctx.collective_stream == nullptr) {
+        std::cerr << label << " collective stream is null\n";
+        ++failures;
+    }
     if (ctx.compute_capability() <= 0) {
         std::cerr << label << " compute capability is not positive\n";
         ++failures;
@@ -76,7 +80,7 @@ int main() {
 
     const cudaStream_t original_stream = ctx.stream;
     ninfer::DeviceContext moved(std::move(ctx));
-    if (ctx.stream != nullptr || ctx.transfer_stream != nullptr) {
+    if (ctx.stream != nullptr || ctx.transfer_stream != nullptr || ctx.collective_stream != nullptr) {
         ++failures;
         std::cerr << "move construction did not null source streams\n";
     }

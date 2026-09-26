@@ -881,7 +881,8 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         const qwen::PagedKVCache* batch_text = &shard.decoder->text_kv;
         shard.context = std::make_unique<qwen::execution::TextContext>(
             shard.device, *shard.parameters, *shard.workspace, empty_kv, *shard.state, shard.io,
-            shard.prefill_hidden, options_.prefill_chunk, 0, mtp_view, batch_text, batch_mtp);
+            shard.prefill_hidden, options_.prefill_chunk, 0, mtp_view, batch_text, batch_mtp,
+            options_.prefill_overlap);
         shard.context->set_shard_config(&scfg, shard_index);
         if (mtp_shard) { shard.context->set_mtp_proposal_extent(mtp_drafts_); }
     }

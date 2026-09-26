@@ -609,6 +609,19 @@ comparison meaningful; the served configuration samples (`0.7 / 20 / 0.80`).
   collective, which is the larger penalty. The 6 MiB floor still carries a 512-token chunk at the widest
   activation this route reduces. `NINFER_TP2_AR_STAGING_MIB` caps the ladder so a constrained host is
   reproducible from a script.
+- The prefill all-reduce overlaps compute. A prefill chunk is split into equal sub-blocks of
+  `--prefill-overlap` tokens (default 256; `0` disables) and each sub-block's in-kernel collective
+  runs on a second stream while the next sub-block's mixer/FFN keeps the compute stream busy: the
+  producer records an event on the compute stream, the collective stream waits on it, and the compute
+  stream waits on the collective's done event before the residual add. Measured on 2x RTX 5060 Ti at a
+  6.3k-token prompt with a 1024-token chunk, 7 repetitions: **0.587 ms/token with the overlap off
+  versus 0.516 at 256 (-12%)**. The width rather than the sub-block count is the knob because the gain
+  is non-monotone in width - 320/384 costs 0.612 and 128 costs 0.655, both worse than doing nothing -
+  and a chunk is split only when it holds at least two whole sub-blocks, so a width the schedule
+  handles badly can never make a chunk slower. At a 512-token chunk the same 256-wide split is
+  0.625 → 0.572 ms/token (-8.4%), faster than the 1024-token serial chunk (0.587). The result stays
+  bit-identical to the lockstep loop
+  (the `ninfer_qwen3_5_tp2_forward_test` chunk-split invariant covers it with the overlap enabled).
 - The host-staging fallback's pinned staging is double buffered by call parity. The two devices' compute
   streams are independent, so one shared buffer let the next collective's download overwrite the half the
   previous collective's upload was still sending from: a device could receive a partial sum, which the

@@ -97,6 +97,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             if (chunk > 1024U) { chunk = 1024U; }
             options.prefill_chunk = chunk - chunk % 128U;
         }
+        // The overlap splits a chunk at an activation/MMA schedule boundary, so its sub-block width
+        // stays 64-aligned. A width wider than half the chunk disables the split instead of narrowing
+        // it, which keeps every enabled chunk on a measured width.
+        options.prefill_overlap -= options.prefill_overlap % 64U;
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
         // The TP-2 core drives its own single-request round loop. MTP proposes from the artifact's
         // own nextn head. DFlash2 also owns a draft component the shard split materializes whole on

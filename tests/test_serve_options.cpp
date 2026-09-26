@@ -420,6 +420,21 @@ int main() {
                           single_capacity.max_pending_requests == defaults.max_pending_requests,
                       "single-GPU route did not keep the configured request capacity");
 
+    // The TP-2 prefill overlap splits a chunk at the ops' 64-token schedule boundary, so its width
+    // is either 0 (off) or a multiple of 64.
+    failures += check(defaults.prefill_overlap == 256, "the prefill overlap default changed");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-overlap", "128"})
+                          .prefill_overlap == 128,
+                      "the prefill overlap width was not parsed");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-overlap", "0"})
+                          .prefill_overlap == 0,
+                      "the prefill overlap could not be disabled");
+    bool overlap_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--prefill-overlap", "100"});
+    } catch (const std::invalid_argument&) { overlap_rejected = true; }
+    failures += check(overlap_rejected, "a misaligned prefill overlap width was accepted");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

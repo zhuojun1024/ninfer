@@ -171,6 +171,13 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Target sub-block width for the TP-2 prefill all-reduce overlap. A TP-2 prefill chunk is split
+    // into equal sub-blocks of this width so each sub-block's cross-device collective can run on a
+    // second stream while the next sub-block computes; 0 disables it. A chunk is split only when it
+    // holds at least two exact sub-blocks, so a width the schedule handles badly can never make a
+    // chunk slower: 256 is the measured optimum on 2x RTX 5060 Ti (320/384 and 128 both cost more
+    // than they hide). See docs/tp2-dual-5060ti.md.
+    std::uint32_t prefill_overlap      = 256;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

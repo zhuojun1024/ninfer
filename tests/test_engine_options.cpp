@@ -60,6 +60,19 @@ int main() {
                           "a non-TP-2 disabled-cache route kept the host state-image budget");
     }
 
+    {
+        // The overlap width snaps to the 64-token schedule boundary the split relies on; zero stays
+        // disabled so an opt-out cannot be turned back on by alignment.
+        ninfer::EngineOptions options = generation_options();
+        options.device_b              = 1;
+        options.prefill_overlap       = 200;
+        failures += check(ninfer::runtime::normalize_engine_options(options).prefill_overlap == 192,
+                          "TP-2 route did not align the prefill overlap width");
+        options.prefill_overlap = 0;
+        failures += check(ninfer::runtime::normalize_engine_options(options).prefill_overlap == 0,
+                          "TP-2 route enabled a disabled prefill overlap");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " engine option checks failed\n";
         return 1;

@@ -168,8 +168,16 @@ q4 88 / q8 7 / bf16 567）：`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_final.ninfer`
   重拿更大 envelope）；视觉编码期 shard 0 空闲（可接受）。
 - 归档 §6：KV dtype 扫描补全（nvfp4/k8v4 只验证了可启动与吞吐，无质量数据）。
 - 若要从源权重真正复刻官方工件的 DFlash2 draft，需先获取其 BF16 源检查点（本机只有 FP8/EXL3/GGUF）。
-- L2：AR 与 MMA 重叠（环形 staging + 事件同步 + 子块流水）：浅层上限 ~1.5×；大重构，跨卡 rendezvous 死锁
-  风险（worklog Round 35c 已评估）。
+- L2：AR 与 MMA 重叠——**已实现并实测：+11% prefill（N=4）**。实现：prefill chunk 切成 N 个子块（64 对齐），
+  每个子块的 collective 走第二条流（`DeviceContext::collective_stream`），与下一子块的 mixer/FFN 重叠
+  （`run_layers_tp2_overlap`，选项 `--prefill-overlap W`=子块宽度，默认 256，0 关）。实测（chunk 1024、~6.3k prompt、7 reps 取中位）：N=0 0.587 ms/token、N=2 0.554、**N=3 0.612（比基线还差）**、
+  **N=4 0.516（−12%，两批次复现）**、N=5 0.547、N=8 0.655 ⇒ 最优点确在 **N=4（子块 256）**，且 **N 不可插值**
+  （320/384 落进更慢的调度档），定档应按"子块宽度 = 256"而非按 N 外推（chunk 512 复验：串行 0.625 →
+  256 宽 overlap 0.572，−8.4%，且快过 chunk 1024 串行基线 0.587）；数值与单块逐位一致（tp2_forward_test
+  的 chunk-split 不变量在 N=2/N=4 仍 exact）。三条前置证据：§5.4 的 divisor 臂（AR 是
+  严格串行的 48% 块时）、`tools/tp_bootstrap/bench_ar_overlap.cu`（AR 不被占满 SM 的 compute 饿死，引擎粒度
+  下只膨胀 7–18%）、以及 Round 12 的 −5% 只是其 host 侧调度形态的问题。**剩余**：默认值/N 的选择、与 decode
+  路径无关、以及跨卡 rendezvous 的失效语义（见 §3.6）。
 - 若仍攻 attention：只剩计算路径效率（FP8 PV + 压缩非张量 FP32 遍数），且需先解锁 profiler 权限（ncu
   2025.4.1 已装，`ERR_NVGPUCTRPERM` 被拒；管理员 PowerShell 或 NVIDIA Developer Settings 允许 GPU
   performance counters）。预期 attention 项 ~1.2–1.4×（245k 端到端 ~1.1–1.3×）。

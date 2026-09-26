@@ -41,10 +41,13 @@ Historical reference only: current state and remaining work live in `PLAN.md`
 
 ## Rejected optimizations (measured)
 
-- **Prefill AR∥MMA sub-block pipeline: ~5% slower, rolled back.** In-kernel AR
-  spin time is already masked by the peer's compute; the sub-block split also
-  re-streams weights per layer. If a truly compute-bound prefill appears later,
-  reuse the 64-alignment constraint and event topology. (worklog L1425–1468)
+- **Prefill AR∥MMA sub-block pipeline (R12 host-side chunk interleave): ~5%
+  slower, rolled back.** That implementation, not the lever: a re-implementation
+  with per-sub-block events and a dedicated collective stream nets **+11%**
+  (see the L2 entry below). R12's stated reason — the in-kernel AR spin is
+  "already masked by the peer's compute" — was also contradicted by the
+  2026-09-26 divisor arm (AR is 48% of block time and strictly serial).
+  (worklog L1425–1468)
 - **Multi-block AR: no difference** (TTFT 859/877/879/879/830/861 ms for
   1/2/4/8/16 blocks) — not a single-SM issue. (worklog L653–655)
 - **Copy-engine rendezvous (small payloads): slower (951 vs 857 ms) and shard
@@ -206,9 +209,21 @@ Historical reference only: current state and remaining work live in `PLAN.md`
 - **Ring K/V quantization (CyclicKVCache): deferred.** Locked in three places
   (`CyclicKVCache` layout, SWA validation, `context_kv_materialize`
   `validate_cache`); ~55 MiB, worst cost/benefit. (worklog L5534)
-- **L2 (AR∥MMA overlap, ring staging + event sync): unscheduled.** Shallow
-  ceiling ~1.5×; large refactor with cross-card rendezvous deadlock risk
-  (Round 35c evaluated). (worklog L5291)
+- **L2 (AR∥MMA overlap): retested with a corrected schedule; +11% prefill.**
+  The prefill chunk is split into N 64-aligned sub-blocks and each sub-block's
+  collective runs on a second stream (`DeviceContext::collective_stream`) while
+  the next sub-block's mixer/FFN keeps the compute stream busy
+  (`run_layers_tp2_overlap`, `--prefill-overlap W` / `EngineOptions::prefill_overlap`,
+  default 256, `0` disables). Chunk 1024, ~6.3k-token prompt, 7 reps (median): N=0 0.587 ms/token, N=2
+  0.554, **N=3 0.612 (slower than doing nothing)**, **N=4 0.516 (−12%,
+  reproduced across two batches)**, N=5 0.547, N=8 0.655. N=4 (256-wide
+  sub-blocks) is the real optimum, and **N does not interpolate** — 320/384
+  falls into a slower activation/MMA schedule class — so a policy must key on
+  the 256-token sub-block width, not extrapolate N. Re-verified at chunk 512:
+  0.625 serial → 0.572 with 256-wide sub-blocks (−8.4%). Bit-identical to the
+  single-block loop (tp2_forward_test chunk-split invariant exact at N=2 and
+  N=4). This supersedes R12's −5% and the "unscheduled" status. (worklog L5291
+  + the two 2026-09-27 entries)
 - **Gate revision (sampling-led acceptance verdict): separate from the
   promotion.** The literal greedy gate `|Δacc| ≤ 1.0pp` failed at K=7
   (−1.60 pp, proven cross-arm text drift); the promotion is done (r69,

@@ -97,7 +97,12 @@ public:
                 std::uint32_t text_kv_base,
                 qwen3_5::PagedKVCacheView mtp_kv           = qwen3_5::PagedKVCacheView(),
                 const qwen3_5::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr);
+                const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr,
+                // TP-2 prefill all-reduce overlap: split a prefill chunk into equal sub-blocks of
+                // this width and run each sub-block's collective on the pair's second stream while
+                // the next sub-block computes. 0 disables it; only a chunk holding at least two
+                // whole sub-blocks is split. Single-GPU contexts ignore it.
+                std::uint32_t prefill_overlap = 0);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -151,6 +156,12 @@ public:
     template <class Tap>
     void run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor& x, Tensor& x_peer,
                         Phase ph, Tap& tap);
+    // Tensor-parallel prefill with the all-reduce overlapped against compute. The chunk is split into
+    // `parts` 64-aligned sub-blocks and each sub-block's collective runs on the pair's second stream
+    // while the next sub-block keeps the compute stream busy. The 64-token boundary keeps the result
+    // bit-identical to run_layers_tp2's single block. Experimental; the caller env-gates it.
+    void run_layers_tp2_overlap(TextContext& peer, tp::DevicePair& pair, Tensor& x, Tensor& x_peer,
+                                Phase ph, int width, std::int32_t first_position);
 
     // Tensor-parallel single-token forward at `position`: embedding on both shards, the lockstep
     // layer loop, the final norm, and the lm_head. The head is either replicated in full on both
@@ -489,6 +500,7 @@ private:
     qwen3_5::RoundState& io_;
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
+    std::uint32_t prefill_overlap_;
     std::uint32_t text_kv_base_;
     const Tensor* active_cache_positions_                                          = nullptr;
     const Tensor* active_rope_positions_                                           = nullptr;

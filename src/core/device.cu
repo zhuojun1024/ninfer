@@ -83,37 +83,56 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
             cuda_error_message("cudaStreamCreateWithFlags(transfer_stream) failed", err));
     }
 
-    stream          = compute;
-    transfer_stream = load;
+    cudaStream_t collective = nullptr;
+    err = cudaStreamCreateWithFlags(&collective, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        destroy_stream(compute);
+        destroy_stream(load);
+        throw std::runtime_error(
+            cuda_error_message("cudaStreamCreateWithFlags(collective_stream) failed", err));
+    }
+
+    stream            = compute;
+    transfer_stream   = load;
+    collective_stream = collective;
 }
 
 DeviceContext::~DeviceContext() {
-    if (stream != nullptr || transfer_stream != nullptr) { bind_to_current_thread_noexcept(); }
+    if (stream != nullptr || transfer_stream != nullptr || collective_stream != nullptr) {
+        bind_to_current_thread_noexcept();
+    }
+    destroy_stream(collective_stream);
     destroy_stream(transfer_stream);
     destroy_stream(stream);
 }
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
     : device(other.device), stream(other.stream), transfer_stream(other.transfer_stream),
-      props(other.props) {
-    other.stream          = nullptr;
-    other.transfer_stream = nullptr;
+      collective_stream(other.collective_stream), props(other.props) {
+    other.stream            = nullptr;
+    other.transfer_stream   = nullptr;
+    other.collective_stream = nullptr;
 }
 
 DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (stream != nullptr || transfer_stream != nullptr) { bind_to_current_thread_noexcept(); }
+    if (stream != nullptr || transfer_stream != nullptr || collective_stream != nullptr) {
+        bind_to_current_thread_noexcept();
+    }
+    destroy_stream(collective_stream);
     destroy_stream(transfer_stream);
     destroy_stream(stream);
 
-    device          = other.device;
-    props           = other.props;
-    stream          = other.stream;
-    transfer_stream = other.transfer_stream;
+    device            = other.device;
+    props             = other.props;
+    stream            = other.stream;
+    transfer_stream   = other.transfer_stream;
+    collective_stream = other.collective_stream;
 
-    other.stream          = nullptr;
-    other.transfer_stream = nullptr;
+    other.stream            = nullptr;
+    other.transfer_stream   = nullptr;
+    other.collective_stream = nullptr;
     return *this;
 }
 

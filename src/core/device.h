@@ -22,6 +22,9 @@ struct DeviceContext {
     int device                   = 0;
     cudaStream_t stream          = nullptr;
     cudaStream_t transfer_stream = nullptr;
+    // Second compute stream for the TP-2 prefill all-reduce overlap: the collective's kernels run
+    // here while the compute stream keeps producing the next sub-block (see run_layers_tp2_overlap).
+    cudaStream_t collective_stream = nullptr;
     cudaDeviceProp props{};
 
     explicit DeviceContext(int device_id = 0);

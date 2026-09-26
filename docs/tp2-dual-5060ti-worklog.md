@@ -6665,3 +6665,111 @@ not map)`。
 
 **顺带**：`src/core/paged_kv_cache.h` 的 `PagedKVPlaneOrder` 补上注释（枚举名指最慢维；两种顺序的 shape
 与 page/head 步长），把这次误读的成因写进契约；PLAN §4.6 的结论与统计同步更新。
+
+---
+
+### L2（AR∥MMA 重叠）复核：in-kernel AR 与占满 SM 的 compute 能否共跑（2026-09-27）
+
+**背景**：§3.14 的 L2 条目（worklog:5291）此前只有 Round 35c 的成本模型（AR ≈65% 的深度无关项、上限 ~1.5×）
+与 Round 12 的一次实测否决（worklog:1425，host 侧两子块交错，−5%）。2026-09-26 的
+NINFER_TP2_AR_PAYLOAD_DIVISOR 实测（PLAN §5.4）给出相反的前提：AR 是**严格串行**的 324 ms/块（compute 344 ms，
+AR 占 **48%**），AR 字节→0 的天花板 ≈2.98k tok/s（**+94%，约 1.94×**）。即 L2 的收益前提成立，而 Round 12
+给的理由①（"AR 自旋已被对端 compute 掩盖"）不成立。
+
+**本次判别的问题**：把 AR 移到第二条流时，占满 SM 的 compute 会不会让 AR 内核**上不了机**（饿死）？若会，
+L2 是硬件墙（可判否决）；若不会而只是变慢，则 Round 12 的 −5% 是调度问题（不可否决）。
+
+**方法与复现**（tools/tp_bootstrap/bench_ar_overlap.cu，独立 CUDA，无引擎依赖）：复刻生产协议（ordered-slice
+写 mapped pinned host → 发 arrival id → 自旋等对端 id → 读回并加，<<<8,1024>>>），payload 取 5 MiB / 10 MiB
+（chunk 512 / 1024 的 mixer delta）；AR 独占时 **1.43 / 2.70 ms/次**（与 Round 35c 记的 2.70 ms 一致，已贴链路
+地板）。两卡各开第二条流跑 AR，compute 流压 SM；用跨流 event 量 ar_start_offset（AR 相对 compute 的启动延迟）
+与 ar_inflate（相对独占的膨胀）。
+
+    nvcc -O3 -std=c++17 -arch=sm_120a -o build-win/bench_ar_overlap.exe tools/tp_bootstrap/bench_ar_overlap.cu
+    .\build-win\bench_ar_overlap.exe 0 1 16 60 <blocks_per_sm> <chain> <style>
+
+（style=0 FP32-FMA 占满，style=1 HBM 流式占满；chain = compute 侧一次排几个内核。）
+
+**结果**（16 次 collective/臂；AR **从未被饿死**：ar_start_offset 全程 0.008–0.34 ms）：
+
+| compute 形态 | 5 MiB 膨胀 | 10 MiB 膨胀 | 判定 |
+|---|---:|---:|---|
+| 单长内核，1 blk/SM | +2.0% | +14.5% | 全部隐藏 |
+| 单长内核，8 blk/SM（FMA / HBM） | +152…184% / +204% | +101…109% / +104% | 部分 |
+| 2 内核，8 blk/SM（HBM） | +199% | +102% | 部分 |
+| **64 内核，8 blk/SM（FMA / HBM）** | **+33.5% / +18.3%** | **+8.7% / +7.2%** | **全部隐藏** |
+
+**结论**：
+1. "compute 占满 GPU ⇒ AR 内核上不了机"被**否证**：288 个 block 的长内核下，AR 的 8 个 block 仍在 ~0.02 ms
+   启动。L2 的措辞"资源不冲突"不严格成立（AR 的搬运由 SM 指令发起，长内核下会膨胀 2–3×），但那是**粒度**
+   问题：引擎的 compute 是"每层一串小内核"，落在 64 内核一档，AR 只膨胀 **7–18%** 且在窗口内跑完。
+2. Round 12 的 −5% 与 divisor 的 +94% 天花板之间的矛盾，最可能来自 Round 12 的 event/双流拓扑，而非硬件。
+   ⇒ L2 状态由"已否决"改为"**调度待重做**"（PLAN §3.4 与 tp2-decisions.md 已同步）。
+
+**局限**：合成 compute 不是真实 tensor-core prefill GEMM；本实验只证明"共跑可行且与粒度强相关"，没有复现
+Round 12 的子块依赖拓扑，因此不能证明"引擎重做后一定赚"——那需要一次引擎级 A/B（下一步）。
+
+### L2 引擎级 A/B：子块数 + event 拓扑（2026-09-27）
+
+**实现**（本次改动的全部代码）：
+- DeviceContext 加第二条计算流 collective_stream（与 stream/transfer_stream 同生命周期；device.{h,cu} 与
+  test_device.cpp 同步）。
+- TextContext::run_layers_tp2_overlap（execution/text.{h,cpp}）：把 prefill chunk 切成等宽子块，每层按
+  「全部子块 mixer → 各子块 AR（collective 流）→ 各子块 residual → 全部子块 FFN → 各子块 AR → residual」
+  排布；每个 AR 用一对 event 把 collective 流与 compute 流互锁（produced 记在 compute 流、done 记在 collective
+  流），positions/rope/envelope 用 ScopedPositions/ScopedEnvelope 绑到子块切片。选项
+  `--prefill-overlap W`（EngineOptions::prefill_overlap，默认 256，0 关）——**宽度**是自变量而不是块数（见下
+  面的细扫）；只在 Phase::Prefill、无 DFlash sink、无 vision、in-kernel 传输、全部层无 gather mixer
+  （tp_mixer_activation_width==0）、且 chunk 是该宽度的整数倍并至少含两块时启用。
+  （实现先用环境变量 NINFER_TP2_PREFILL_OVERLAP=N 做实验，定档时已替换为上述选项，环境变量删除。）
+
+**正确性**：ninfer_qwen3_5_tp2_forward_test --artifact …swift15_dflash2_final.ninfer，N=2 与 N=4 都 exit 0，
+且 chunking 300 -> 128+172 / 64+236 与 T=1024 one chunk vs 4x256 的 max_logit_diff=0（逐位一致）。
+
+**实测**（本机 2×5060 Ti，ninfer-serve 跑 swift15，--prefill-chunk 1024，约 7,160 token 单请求，取服务端
+timings 块的 prompt_ms，每档 5 reps，各档之间重启服务）：
+
+| N | prompt_ms（reps） | prefill |
+|---:|---|---:|
+| 0（基线，两次独立启动） | 4557/4268/4222 与 4292/4251/4180/4178/4175 | **1,677–1,714 tok/s** |
+| 2 | 4213/3957/3892 | 1,708–1,839 |
+| **4** | 3780/3669/3698/3819/3778 | **1,875–1,951（中位 1,905）** |
+| 8 | 4748/4702/4723/4595/4596 | 1,516–1,558 |
+
+按每 token 的 prefill 时间：基线 ≈0.587 ms、N=2 ≈0.560（−4.6%）、**N=4 ≈0.522（−11.0%）**、N=8 ≈0.650（+11%）。
+⇒ 最优在 **N=4**；切口更细会把 GEMM tile 压窄到得不偿失。
+
+**N 细扫（同批，chunk 1024，prompt_n≈6,284，7 reps，取中位数）**：N=2 与 N=8 之间跨度太大，补测 N=3/N=5 后
+曲线为
+
+| N | 子块宽度 | ms/token（中位） | 相对基线 |
+|---:|---|---:|---:|
+| 0（基线） | — | 0.587 | — |
+| 2 | 512 | 0.554 | −5.6% |
+| **3** | **320+320+384** | **0.612** | **+4.2%（比基线还差）** |
+| **4** | **256×4** | **0.516** | **−12.1%** |
+| 5 | 192×4+256 | 0.547 | −6.8% |
+| 8 | 128×8 | 0.655 | +11.6% |
+
+N=4 在两个独立批次复现（0.5151 / 0.5172，差 0.4%），是可靠最优点。**但 N 不能插值**：N=3 的 320 宽（尾块
+384）比基线还慢，说明子块宽度落进某个激活/MMA 调度档位会整体变慢，所以定档要按"子块宽度 = 256"，不能按
+N 线性外推。
+
+**固定宽度策略在 chunk 512 的验证**（同批，prompt_n≈6,283，7 reps 取中位）：
+
+| 配置 | 子块宽度 | ms/token | 相对同档基线 |
+|---|---|---:|---:|
+| chunk 1024 串行 | — | 0.587 | — |
+| chunk 1024 + overlap | 256×4 | **0.516** | **−12.1%** |
+| chunk 512 串行 | — | 0.625 | — |
+| chunk 512 + overlap | 256×2 | **0.572** | **−8.4%** |
+
+⇒ 「固定 256 宽、chunk 至少含两块才启用」在两档都成立；chunk 512 开 overlap 后（0.572）甚至快过 chunk 1024
+的串行基线（0.587）。chunk 512 串行本身比 chunk 1024 慢 6.5%，overlap 把其中大部分补回来。
+
+**结论**：Round 12 的 −5% 是**它的调度形态**（host 侧两子块交错 + event 拓扑）的问题，不是「AR 与 MMA 无法
+共跑」；换成「每子块一对 produced/done event + 独立 collective 流」后，同一 chunk 宽度下净赚 **+11% prefill**，
+数值逐位不变。这与 2026-09-26 divisor 臂的「AR 是严格串行的 48% 块时」自洽：N=4 下能拿回其中一部分。
+（未做：chunk 768→3 子块这一档——TP-2 的 prefill chunk 被 normalize_engine_options 钳在 ≤1024，所以 256 宽
+最多只能切 4 块，chunk 640/896 又不是 256 的整数倍会自动退回串行，因此 768 是唯一可见但未测的块数；此外还有
+长上下文（32k–128k）与多请求口径、以及 overlap 与 §3.6 give-up 语义的交互。）
