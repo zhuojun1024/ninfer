@@ -64,6 +64,25 @@ class Entry:
             ids = self.referenced_objects(value)
             if ids:
                 self.binding_objects[name] = ids
+        # Every place the directory can reference a packed object, keyed by the component that owns
+        # the reference: a binding name, a Use's auxiliary binding (owned by the Use's parameter), and
+        # a component resource. plan_graft must see all of them, or an object shared with a
+        # non-grafted component would be overwritten without its other view being noticed.
+        self.object_components = {}
+        for name, value in self.bindings.items():
+            self._note_object_users(value, name)
+        for use in self.directory.get("uses", ()):
+            parameter = str(use.get("parameter", ""))
+            for value in use.get("auxiliaries", {}).values():
+                self._note_object_users(value, parameter)
+        for component, value in self.directory["components"].items():
+            for ref in value.get("resources", {}).values():
+                self._note_object_users(ref, component)
+
+    def _note_object_users(self, value, owner: str) -> None:
+        component = owner.split("/", 1)[0]
+        for object_id in self.referenced_objects(value):
+            self.object_components.setdefault(object_id, set()).add(component)
 
     @staticmethod
     def referenced_objects(value) -> list:
@@ -79,11 +98,6 @@ class Entry:
 
 
 def plan_graft(base: Entry, donor: Entry, components: list) -> dict:
-    users = {}
-    for name, ids in base.binding_objects.items():
-        for object_id in ids:
-            users.setdefault(object_id, set()).add(name)
-
     objects = {}
     counts = {}
     for component in components:
@@ -100,10 +114,10 @@ def plan_graft(base: Entry, donor: Entry, components: list) -> dict:
                 raise SystemExit(f"{component}: {name} views different objects "
                                  f"(base {target}, donor {source})")
             for object_id in target:
-                foreign = sorted(u for u in users.get(object_id, ())
-                                 if u.split("/")[0] not in components)
+                foreign = sorted(c for c in base.object_components.get(object_id, ())
+                                 if c not in components)
                 if foreign:
-                    raise SystemExit(f"{object_id} is also a view of {foreign[:3]}; "
+                    raise SystemExit(f"{object_id} is also referenced by {foreign[:3]}; "
                                      f"refusing an ambiguous graft")
                 objects[object_id] = object_id
         counts[component] = len(names)
