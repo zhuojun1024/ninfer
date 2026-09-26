@@ -734,6 +734,11 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
     if (const char* fault = std::getenv("NINFER_TP2_AR_FAULT_SKIP_PEER_CALL")) {
         ar_fault_skip_call_ = std::strtoull(fault, nullptr, 10);
     }
+    // Diagnostics: exchange only 1/N of every in-kernel collective's partial (see the member).
+    if (const char* divisor = std::getenv("NINFER_TP2_AR_PAYLOAD_DIVISOR")) {
+        const long long requested = std::strtoll(divisor, nullptr, 10);
+        if (requested >= 2) { ar_payload_divisor_ = static_cast<int>(requested > 64 ? 64 : requested); }
+    }
     // Diagnostics: keep every collective on the host-staging fallback (see force_host_staging_).
     // This is the only way to qualify that transport where the in-kernel one takes every call.
     if (const char* forced = std::getenv("NINFER_TP2_AR_FORCE_HOST_STAGING")) {
@@ -821,6 +826,12 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
                                          "(larger rungs did not map)\n",
                                          static_cast<double>(staging) / 1048576.0,
                                          static_cast<double>(kInKernelArBytes) / 1048576.0);
+                        }
+                        if (ar_payload_divisor_ > 1) {
+                            std::fprintf(stderr,
+                                         "[mem] TP-2 allreduce payload divisor %d (diagnostic: only "
+                                         "1/%d of every collective crosses PCIe)\n",
+                                         ar_payload_divisor_, ar_payload_divisor_);
                         }
                     }
                 }
@@ -1072,6 +1083,14 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
             reinterpret_cast<char*>(arrival_a_) + kArSlotBytes);
         auto* order_b = reinterpret_cast<unsigned long long*>(
             reinterpret_cast<char*>(arrival_b_) + kArSlotBytes);
+        // Diagnostics may shrink the range a collective actually exchanges; the caller's payload and
+        // the staging decision still describe the full size. See NINFER_TP2_AR_PAYLOAD_DIVISOR.
+        int exchange_groups = groups;
+        int exchange_count  = count;
+        if (ar_payload_divisor_ > 1) {
+            exchange_groups = groups / ar_payload_divisor_;
+            exchange_count  = exchange_groups * 8;
+        }
         if (small_available_ && count_bytes <= kArSmallBytes) {
             // Decode-sized: one block, one launch. About 128 calls ride each decode round, so the
             // launch the retired token bump used to add was pure latency at this payload. The thread
@@ -1082,16 +1101,16 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
             ar_exchange<true><<<1, kArThreads, 0, stream_a>>>(
                 reinterpret_cast<const __nv_bfloat16*>(data_a),
                 reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(small_dev_a_),
-                static_cast<const char*>(small_dev_b_), count, arrival_a_, arrival_b_, order_a,
-                id.base_a, id.call_index, id.value, static_cast<int>(kArSmallBytes), groups,
+                static_cast<const char*>(small_dev_b_), exchange_count, arrival_a_, arrival_b_, order_a,
+                id.base_a, id.call_index, id.value, static_cast<int>(kArSmallBytes), exchange_groups,
                 stall_a_, stall_b_, ar_timeout_ns_);
             if (!skip_peer) {
                 b_.bind_to_current_thread();
                 ar_exchange<true><<<1, kArThreads, 0, stream_b>>>(
                     reinterpret_cast<const __nv_bfloat16*>(data_b),
                     reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(small_dev_b_),
-                    static_cast<const char*>(small_dev_a_), count, arrival_b_, arrival_a_, order_b,
-                    id.base_b, id.call_index, id.value, static_cast<int>(kArSmallBytes), groups,
+                    static_cast<const char*>(small_dev_a_), exchange_count, arrival_b_, arrival_a_, order_b,
+                    id.base_b, id.call_index, id.value, static_cast<int>(kArSmallBytes), exchange_groups,
                     stall_b_, stall_a_, ar_timeout_ns_);
             }
             return;
@@ -1103,15 +1122,15 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
         ar_exchange<true><<<slices, kArThreads, 0, stream_a>>>(
             reinterpret_cast<const __nv_bfloat16*>(data_a),
             reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(dev_a_),
-            static_cast<const char*>(dev_b_), count, arrival_a_, arrival_b_, order_a, id.base_a,
-            id.call_index, id.value, slot_bytes, groups, stall_a_, stall_b_, ar_timeout_ns_);
+            static_cast<const char*>(dev_b_), exchange_count, arrival_a_, arrival_b_, order_a, id.base_a,
+            id.call_index, id.value, slot_bytes, exchange_groups, stall_a_, stall_b_, ar_timeout_ns_);
         if (!skip_peer) {
             b_.bind_to_current_thread();
             ar_exchange<true><<<slices, kArThreads, 0, stream_b>>>(
                 reinterpret_cast<const __nv_bfloat16*>(data_b),
                 reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(dev_b_),
-                static_cast<const char*>(dev_a_), count, arrival_b_, arrival_a_, order_b, id.base_b,
-                id.call_index, id.value, slot_bytes, groups, stall_b_, stall_a_, ar_timeout_ns_);
+                static_cast<const char*>(dev_a_), exchange_count, arrival_b_, arrival_a_, order_b, id.base_b,
+                id.call_index, id.value, slot_bytes, exchange_groups, stall_b_, stall_a_, ar_timeout_ns_);
         }
         return;
     }
@@ -1196,21 +1215,29 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
             reinterpret_cast<char*>(arrival_a_) + kArSlotBytes);
         auto* order_b = reinterpret_cast<unsigned long long*>(
             reinterpret_cast<char*>(arrival_b_) + kArSlotBytes);
+        // Diagnostics may shrink the range a collective actually exchanges; the caller's payload and
+        // the staging decision still describe the full size. See NINFER_TP2_AR_PAYLOAD_DIVISOR.
+        int exchange_groups = groups;
+        int exchange_count  = count;
+        if (ar_payload_divisor_ > 1) {
+            exchange_groups = groups / ar_payload_divisor_;
+            exchange_count  = exchange_groups * 8;
+        }
         if (small_available_ && count_bytes <= kArSmallBytes) {
             const bool skip_peer = fault_skip_peer();
             a_.bind_to_current_thread();
             ar_exchange<false><<<1, kArThreads, 0, stream_a>>>(
                 static_cast<const __nv_bfloat16*>(send_a), static_cast<__nv_bfloat16*>(recv_a),
-                static_cast<char*>(small_dev_a_), static_cast<const char*>(small_dev_b_), count,
+                static_cast<char*>(small_dev_a_), static_cast<const char*>(small_dev_b_), exchange_count,
                 arrival_a_, arrival_b_, order_a, id.base_a, id.call_index, id.value,
-                static_cast<int>(kArSmallBytes), groups, stall_a_, stall_b_, ar_timeout_ns_);
+                static_cast<int>(kArSmallBytes), exchange_groups, stall_a_, stall_b_, ar_timeout_ns_);
             if (!skip_peer) {
                 b_.bind_to_current_thread();
                 ar_exchange<false><<<1, kArThreads, 0, stream_b>>>(
                     static_cast<const __nv_bfloat16*>(send_b), static_cast<__nv_bfloat16*>(recv_b),
-                    static_cast<char*>(small_dev_b_), static_cast<const char*>(small_dev_a_), count,
+                    static_cast<char*>(small_dev_b_), static_cast<const char*>(small_dev_a_), exchange_count,
                     arrival_b_, arrival_a_, order_b, id.base_b, id.call_index, id.value,
-                    static_cast<int>(kArSmallBytes), groups, stall_b_, stall_a_, ar_timeout_ns_);
+                    static_cast<int>(kArSmallBytes), exchange_groups, stall_b_, stall_a_, ar_timeout_ns_);
             }
             return;
         }
@@ -1220,15 +1247,15 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
         a_.bind_to_current_thread();
         ar_exchange<false><<<slices, kArThreads, 0, stream_a>>>(
             static_cast<const __nv_bfloat16*>(send_a), static_cast<__nv_bfloat16*>(recv_a),
-            static_cast<char*>(dev_a_), static_cast<const char*>(dev_b_), count, arrival_a_,
-            arrival_b_, order_a, id.base_a, id.call_index, id.value, slot_bytes, groups, stall_a_,
+            static_cast<char*>(dev_a_), static_cast<const char*>(dev_b_), exchange_count, arrival_a_,
+            arrival_b_, order_a, id.base_a, id.call_index, id.value, slot_bytes, exchange_groups, stall_a_,
             stall_b_, ar_timeout_ns_);
         if (!skip_peer) {
             b_.bind_to_current_thread();
             ar_exchange<false><<<slices, kArThreads, 0, stream_b>>>(
                 static_cast<const __nv_bfloat16*>(send_b), static_cast<__nv_bfloat16*>(recv_b),
-                static_cast<char*>(dev_b_), static_cast<const char*>(dev_a_), count, arrival_b_,
-                arrival_a_, order_b, id.base_b, id.call_index, id.value, slot_bytes, groups,
+                static_cast<char*>(dev_b_), static_cast<const char*>(dev_a_), exchange_count, arrival_b_,
+                arrival_a_, order_b, id.base_b, id.call_index, id.value, slot_bytes, exchange_groups,
                 stall_b_, stall_a_, ar_timeout_ns_);
         }
         return;

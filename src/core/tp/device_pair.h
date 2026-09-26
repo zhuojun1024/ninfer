@@ -153,6 +153,12 @@ private:
     unsigned long long ar_timeout_ns_ = 0; // 0 disables the deadline
     std::uint64_t ar_call_serial_     = 0; // in-kernel collectives issued since the last arming
     std::uint64_t ar_fault_skip_call_ = 0; // fault injection, see set_ar_fault_skip_peer_call
+    // Diagnostics only: divides the bytes each in-kernel collective exchanges, without changing the
+    // payload the caller passed or the staging decision. A run with a divisor above one is
+    // numerically wrong by construction (the skipped region keeps whatever the destination held,
+    // which for an in-place all-reduce is the local partial) and bounds what compressing the
+    // exchanged payload could buy. Set by NINFER_TP2_AR_PAYLOAD_DIVISOR.
+    int ar_payload_divisor_ = 1;
     // Rendezvous ids (see create_ar_channel). All channels share one pinned cell block and one
     // device scalar block per device; a channel's memcpy node copies its 8-byte cell into its own
     // scalar inside the captured graph.
