@@ -600,6 +600,15 @@ GeForce 拒绝 P2P；授权依据 NVIDIA 芯片组允许表，消费级芯片组
 - T2 三元、INT8 激活路线（`--prefill-a8`/`--mlp-a8-decode`）、W4A8：decode 带宽 bound，属算力路线。
 - sm_86/3090 调参全套；`82631f68` 的 crossing 字节流水（< 256 KiB 跳过，TP-2 每次 allreduce 只 ~20 KB）。
 - 结构化输出 / vision / WebUI / disk KV / DirectStorage / D3D12 常驻（功能项，非本轮 perf）。
+- 权重字节（本节 4 的广义形式：把每 token 要流的 FP8 张量改 NVFP4/Q4）：**2026-09-26 用户决定先放弃**，
+  理由是需要配方/转换层改动 + 质量与接受率代价，收益（文档估 ~17%）不足以先进。
+- NCCL（本机 `D:\nccl-windows` = SystemPanic/nccl-windows 的 NCCL 2.29.7 构建，含
+  `build/bin/nccl.dll`、`nccl_static.lib`、`install/`）：**不集成**。无 P2P 时 NCCL 走 SHM transport
+  （GPU 经 PCIe 写共享 host 内存、对端读回），与 NInfer 的 in-kernel mapped-pinned 机制同构；而
+  `tests/test_tp_device_pair.cpp:425-429` 的 copy-engine ceiling 探针已确认分片 in-kernel 路径在链路原始
+  下界的 2% 以内。NCCL 相对本路径的唯一结构优势是 P2P/NVLink，本机拿不到（打补丁 BAR1 才可开，外部测量
+  只值 +2.67% / −5~7%），且每次 collective 要独立发射（128 次/token 光发射 ~0.2 ms），还要引入 53 MB DLL
+  与硬依赖。仅保留作**外部参照计**（20 KB allreduce 落点是否也在 9–18 µs）。
 
 ### 5.4 TP-2 基线（2026-09-26，本机 2×5060 Ti，双卡件 swift15）
 
@@ -641,3 +650,25 @@ GeForce 拒绝 P2P；授权依据 NVIDIA 芯片组允许表，消费级芯片组
   只有 ~6.3 ms（占 round 18%）**。small-T tensor-core 内核与 GDN staging 能抢的是这 6.3 ms 的一部分。
 - 下一步要区分这 6.3 ms 里「小 T GEMM 效率 / 128 次 collective / 图内 kernel 间隙」各占多少，
   再决定 5a（`ce2df46b` 新内核族）与 5b（`21df3069` GDN staging）谁先做。
+
+**AR 载荷字节的上界实测（2026-09-26，诊断开关 `NINFER_TP2_AR_PAYLOAD_DIVISOR`）**
+
+新增诊断（`device_pair.{h,cu}`，默认 1 即逐位不变，`ninfer_tp_device_pair_test` 仍 PASS）：让每次
+in-kernel collective 只交换 1/N 的 partial，其余区间保持目的缓冲原值（就地 allreduce 即本卡 partial）。
+数值必然错，只为给「压缩 AR 载荷」定上界。同一 workload（prefill 8192、`bench_serve`）：
+
+| divisor | prefill | 块时/1024 tok | decode verify | 结论 |
+|---:|---:|---:|---:|---|
+| 1 | 1,533.9 tok/s | 668 ms | 29.5 / 30.6 ms | 基线 |
+| 2 | **2,025.7** (+32%) | 506 ms | 噪声内 | |
+| 4 | **2,414.3** (+57%) | 424 ms | 28.1 / 28.9 ms | |
+
+- 两次差值给出同一个解：**AR ≈ 324 ms、compute ≈ 344 ms**（÷1→÷2 省 162 ms = AR/2；÷2→÷4 再省 81 ms =
+  AR/4）。即 AR 占 prefill 块时 **48%**，与旧成本模型一致。
+- ⇒ **任何「AR 字节 → 0」的天花板 = 344 ms/块 ≈ 2.98k tok/s（+94%）**；÷2 拿 1/3，÷4 拿约 60%。
+- **decode 无收益**：÷4 只把 verify 从 29.5 降到 28.1 ms（≈4%，且在轮次噪声内）——小载荷是延迟 bound，
+  带宽只占每次 9–18 µs 里的 ~3 µs。
+- 与硬件的对比：把卡 2 从 Gen4 x4 挪到直连 x8/x16 槽 = 链路 ×2~3.5 = **免费的 ÷2~÷3.5**，无质量代价、
+  零代码 ⇒ 优先级高于压缩；两者不叠加（共同封顶在 344 ms 的 compute 地板）。
+- 对「字典映射压缩」的判据：无损字典在 bf16 激活上拿不到 2×；要走到 ÷2/÷4 必须是有损量化（FP8 块 scale /
+  INT4 码本），故它属于 PLAN §5.3 那条 S5「载荷量化」的范畴，需要重建 oracle 与质量/接受率 A/B。
