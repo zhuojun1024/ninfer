@@ -73,7 +73,9 @@ byte-exact criterion for the other formats.
 ## Serving
 
 A converted artifact starts like any other; MTP, DFlash2 and Vision work as with the official
-artifact:
+artifact. Text, token table, output head and MTP head keep their GGUF blocks; Vision and DFlash2
+use the official formats, so a draft converted here carries the same Q4_G64_FP16 projections and
+selector codebooks as one converted by `qwen3_8_27b`:
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_gsq_rco_iq3_s.ninfer \

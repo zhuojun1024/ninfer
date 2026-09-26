@@ -25,7 +25,7 @@ import torch
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
 from .methods import AuxiliaryValue, cast_direct, grouped_absmax, import_encoded
-from .official_recipes import Q4, Q5, Q6, Q8
+from .official_recipes import Q4, Q5, Q6, Q8, assign_dflash_formats
 from .sources.gguf import GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
 from .qwen3_8_text import (
@@ -304,16 +304,16 @@ def text_sources(
                 ),
                 g + tensor,
             )
-        ssm_a = untile(gguf.readdirect_source(g + "ssm_a"), 1).astype(np.float64)
+        ssm_a = untile(gguf.read_direct(g + "ssm_a"), 1).astype(np.float64)
         if not np.all(ssm_a < 0):
             raise ValueError(f"{g}ssm_a must be strictly negative (-exp(A_log))")
         direct[n + "a_log"] = direct_source(
             np.log(-ssm_a).astype(np.float32), torch.float32, g + "ssm_a"
         )
         direct[n + "dt_bias"] = direct_source(
-            untile(gguf.readdirect_source(g + "ssm_dt.bias"), 1), torch.float32, g + "ssm_dt.bias"
+            untile(gguf.read_direct(g + "ssm_dt.bias"), 1), torch.float32, g + "ssm_dt.bias"
         )
-        taps = gguf.readdirect_source(g + "ssm_conv1d.weight")
+        taps = gguf.read_direct(g + "ssm_conv1d.weight")
         channels = np.concatenate(
             [taps[: 2 * GDN_KEY_DIM], untile(taps[2 * GDN_KEY_DIM :], GDN_HEAD_DIM)]
         )
@@ -388,16 +388,7 @@ def _companions(model, recipe, sources) -> None:
                     method=cast_direct,
                     source=source,
                 )
-        elif name.startswith(("dflash/", "dflash2/")) and parameter.projection:
-            if name.endswith(
-                (
-                    "/attention_conv/kernel_projection",
-                    "/mlp_conv/kernel_projection",
-                    "/candidate_selector/hidden_projection",
-                )
-            ):
-                continue
-            recipe.assign(name, format=Q8, method=grouped_absmax)
+    assign_dflash_formats(model, recipe)
     for backend in ("dflash", "dflash2"):
         if backend not in model.components:
             continue

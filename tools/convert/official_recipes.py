@@ -40,38 +40,48 @@ DFLASH2_CODEBOOKS = (
 )
 
 
-def _optional(model, recipe):
+def assign_dflash_formats(model, recipe):
+    """The qualified draft formats: Q4_G64_FP16 on the roles the r62-r68 campaigns covered.
+
+    The masked DFlash2 draft runs its projections and its selector codebooks on Q4; DFlash v1 and
+    MTP keep Q8. Every recipe that carries a draft shares this policy, so the formats an artifact
+    is built with are the ones the campaign qualified rather than a per-recipe choice.
+    """
+
     # The selector codebooks are direct [vocab, rank] parents rather than projections, so they are
     # assigned before the projection filter below.
     for name in DFLASH2_CODEBOOKS:
         if name in model.parameters:
             _assign(recipe, name, Q4)
     for name, parameter in model.parameters.items():
-        if not parameter.projection:
+        if not parameter.projection or not name.startswith(("mtp/", "dflash/", "dflash2/")):
             continue
-        if name.startswith("vision/"):
-            if name == "vision/patch_embedding":
-                format = Q6
-            elif name.startswith("vision/merger/"):
-                format = Q8
-            elif name.endswith(
-                ("/attention/query", "/attention/key", "/attention/value", "/mlp/fc1")
-            ):
-                format = Q4
-            else:
-                format = Q5
-            _assign(recipe, name, format)
-        elif name.startswith(("mtp/", "dflash/", "dflash2/")):
-            if name.endswith(
-                ("/moe/router", "/moe/shared_score", "/candidate_selector/hidden_projection")
-            ):
-                continue
-            if name in DFLASH2_Q4_NAMES or (
-                name.startswith("dflash2/") and name.endswith(DFLASH2_Q4_ROLES)
-            ):
-                _assign(recipe, name, Q4)
-            else:
-                _assign(recipe, name, Q8)
+        if name.endswith(
+            ("/moe/router", "/moe/shared_score", "/candidate_selector/hidden_projection")
+        ):
+            continue
+        if name in DFLASH2_Q4_NAMES or (
+            name.startswith("dflash2/") and name.endswith(DFLASH2_Q4_ROLES)
+        ):
+            _assign(recipe, name, Q4)
+        else:
+            _assign(recipe, name, Q8)
+
+
+def _optional(model, recipe):
+    for name, parameter in model.parameters.items():
+        if not parameter.projection or not name.startswith("vision/"):
+            continue
+        if name == "vision/patch_embedding":
+            format = Q6
+        elif name.startswith("vision/merger/"):
+            format = Q8
+        elif name.endswith(("/attention/query", "/attention/key", "/attention/value", "/mlp/fc1")):
+            format = Q4
+        else:
+            format = Q5
+        _assign(recipe, name, format)
+    assign_dflash_formats(model, recipe)
     for backend in ("dflash", "dflash2"):
         if backend not in model.components:
             continue

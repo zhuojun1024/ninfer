@@ -97,8 +97,9 @@ same way `bonsai2_27b_ternary` does, by row gathers and exact small-tensor trans
 convention a row copy cannot undo is the tiled value-head order of the GDN output projection's
 input columns: its Use carries an `input_columns` auxiliary, and the runtime reads the activation
 through that permutation when it quantizes it. Vision comes from the release's `mmproj` file in the
-official Vision formats, DFlash2 from `--source dflash2`, and `--proposal` gathers the proposal
-head's rows from the output head in its own block format.
+official Vision formats, DFlash2 from `--source dflash2` in the qualified draft formats that
+`assign_dflash_formats` assigns to every recipe, and `--proposal` gathers the proposal head's rows
+from the output head in its own block format.
 
 ```bash
 python3 -m tools.convert \

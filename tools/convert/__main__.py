@@ -49,26 +49,6 @@ class SourceInputs(Mapping):
             )
         return self._sources[name]
 
-
-class SourceInputs(Mapping):
-    """Named optional sources are opened only when a recipe or component requests one."""
-
-    def __init__(self, base, paths, stack):
-        self._sources = {"base": base}
-        self._paths = dict(paths)
-        self._stack = stack
-
-    def __getitem__(self, name):
-        if name not in self._sources:
-            if name not in self._paths:
-                raise ValueError(
-                    f"selected recipe requires source {name!r}; provide --source {name}=PATH"
-                )
-            self._sources[name] = self._stack.enter_context(
-                SafetensorsSource(self._paths[name])
-            )
-        return self._sources[name]
-
     def __iter__(self):
         return iter(dict.fromkeys((*self._sources, *self._paths)))
 
