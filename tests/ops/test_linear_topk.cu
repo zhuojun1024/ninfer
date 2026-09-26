@@ -109,6 +109,44 @@ FixtureWeight make_fp8() {
     return result;
 }
 
+// A GGUF head's block format, one binary16 scale and 32 int8 codes per block (ggml q8_0). The head
+// has no fused producer: its product materializes BF16 logits that the shared grouped reduction
+// ranks. The reduced table is either whole or the half a TP-2 vocabulary split materializes.
+FixtureWeight make_gguf(std::int32_t rows) {
+    const GgufBlockShape block = gguf_block_shape(QType::GGUF_Q8_0);
+    if (block.elements != 32 || block.bytes != 34) {
+        throw std::runtime_error("linear_topk GGUF fixture: unexpected q8_0 block shape");
+    }
+    const std::uint64_t blocks = static_cast<std::uint64_t>(rows) * (kHidden / block.elements);
+    FixtureWeight result{DeviceBuffer(static_cast<std::size_t>(blocks) * block.bytes), {}, 0};
+    result.payload.fill(0);
+    result.weight.payload          = result.payload.p;
+    result.weight.payload_bytes    = result.payload.bytes;
+    result.weight.high_plane_bytes = 0;
+    result.weight.qtype            = QType::GGUF_Q8_0;
+    result.weight.layout           = QuantLayout::GgufBlocks;
+    result.weight.scale_dtype      = DType::FP16;
+    result.weight.group_size       = static_cast<std::uint32_t>(block.elements);
+    result.weight.shape[0]         = rows;
+    result.weight.shape[1]         = kHidden;
+    result.weight.padded_shape[0]  = rows;
+    result.weight.padded_shape[1]  = kHidden;
+    result.weight.ndim             = 2;
+    result.weight.qdata            = result.payload.p;
+    result.weight.qhigh            = nullptr;
+    result.weight.scales           = nullptr;
+    result.weight.n                = rows;
+    result.weight.k                = kHidden;
+    result.weight.group            = block.elements;
+    return result;
+}
+
+std::int32_t gguf_code(std::int32_t k) {
+    const int value = 1 + k % 113;
+    return k % 5 == 0 ? -value : value;
+}
+
+
 const std::array<std::int32_t, 17> kFullWinnerRows{
     3,     127,   511,   512,   1023,   4095,   8191,   15872,  16383,
     16384, 16895, 32767, 65535, 131071, 196607, 247808, 248076,
@@ -170,6 +208,25 @@ void patch_rowsplit_row(FixtureWeight& fixture, QType qtype, std::int32_t row, f
                                            sizeof(std::uint16_t));
 }
 
+void patch_gguf_row(FixtureWeight& fixture, std::int32_t row, float factor) {
+    const GgufBlockShape block  = gguf_block_shape(QType::GGUF_Q8_0);
+    const std::int32_t blocks   = kHidden / block.elements;
+    const std::size_t row_bytes = static_cast<std::size_t>(blocks) * block.bytes;
+    std::vector<std::uint8_t> bytes(row_bytes, 0);
+    for (std::int32_t index = 0; index < blocks; ++index) {
+        const auto scale = quantized_weight::detail::f32_to_f16(factor * group_base_scale(index));
+        const std::size_t base = static_cast<std::size_t>(index) * block.bytes;
+        bytes[base]            = static_cast<std::uint8_t>(scale & 0xffU);
+        bytes[base + 1]        = static_cast<std::uint8_t>(scale >> 8);
+        for (std::int32_t lane = 0; lane < block.elements; ++lane) {
+            const std::int32_t code = gguf_code(index * block.elements + lane);
+            bytes[base + 2 + static_cast<std::size_t>(lane)] =
+                static_cast<std::uint8_t>(static_cast<std::int8_t>(code));
+        }
+    }
+    fixture.payload.copy_from_host(bytes.data(), bytes.size(),
+                                   static_cast<std::size_t>(row) * row_bytes);
+}
 void patch_fp8_row(FixtureWeight& fixture, std::int32_t row, float factor) {
     std::vector<std::uint8_t> codes(kHidden);
     for (std::int32_t k = 0; k < kHidden; ++k) { codes[static_cast<std::size_t>(k)] = fp8_code(k); }
@@ -206,6 +263,12 @@ std::vector<double> base_scores(QType qtype, const std::vector<std::uint16_t>& h
                     weight =
                         quantized_weight::detail::decode_e4m3fn(fp8_code(k)) *
                         static_cast<double>(bf16_to_f32(f32_to_bf16(static_cast<float>(factor))));
+                } else if (qtype == QType::GGUF_Q8_0) {
+                    const int block  = k / 32;
+                    const auto scale =
+                        quantized_weight::detail::f32_to_f16(factor * group_base_scale(block));
+                    weight = static_cast<double>(gguf_code(k)) *
+                             quantized_weight::detail::f16_to_f32(scale);
                 } else {
                     const int group = k / (qtype == QType::Q8_G32_FP16 ? 32 : 64);
                     const auto scale =
@@ -402,13 +465,20 @@ int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
     return failures;
 }
 
-// Qualified at both reduced-head geometries: the whole table and one shard's half of it.
+// Qualified at both reduced-head geometries, the whole table and one shard's half of it, for the
+// row-split Q4 head and for a GGUF block head.
 template <std::size_t N>
-int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score, std::int32_t rows,
-           const std::array<std::int32_t, N>& winner_rows, const char* profile) {
-    FixtureWeight fixture = make_rowsplit(QType::Q4_G64_FP16, rows);
+int run_reduced_head(QType qtype, const DeviceBuffer& hidden, const std::vector<double>& base_score,
+                     std::int32_t rows, const std::array<std::int32_t, N>& winner_rows,
+                     const char* profile) {
+    FixtureWeight fixture =
+        qtype == QType::GGUF_Q8_0 ? make_gguf(rows) : make_rowsplit(QType::Q4_G64_FP16, rows);
     for (std::size_t index = 0; index < winner_rows.size(); ++index) {
-        patch_rowsplit_row(fixture, QType::Q4_G64_FP16, winner_rows[index], factor_for(index));
+        if (qtype == QType::GGUF_Q8_0) {
+            patch_gguf_row(fixture, winner_rows[index], factor_for(index));
+        } else {
+            patch_rowsplit_row(fixture, QType::Q4_G64_FP16, winner_rows[index], factor_for(index));
+        }
     }
     std::vector<std::int32_t> host_map(rows);
     for (std::int32_t row = 0; row < rows; ++row) { host_map[row] = kValidRows - 1 - row; }
@@ -416,8 +486,8 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score, st
     map.copy_from_host(host_map.data(), map.bytes);
     const auto expected = expected_order(winner_rows, &host_map);
 
-    const std::size_t capacity = ops::linear_topk_workspace_capacity_bytes(
-        QType::Q4_G64_FP16, rows, kHidden, 1, kMaxColumns);
+    const std::size_t capacity =
+        ops::linear_topk_workspace_capacity_bytes(qtype, rows, kHidden, 1, kMaxColumns);
     GuardedDeviceBuffer graph_scratch(capacity);
     WorkspaceArena workspace(DeviceSpan{graph_scratch.data(), graph_scratch.bytes()});
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(std::int32_t));
@@ -485,6 +555,33 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score, st
     return failures;
 }
 
+// Every reduced-head geometry the routes materialize has to resolve, and a geometry no route
+// produces has to keep failing instead of ranking rows that do not exist.
+int verify_head_profiles() {
+    int failures = 0;
+    const auto accepts = [&](QType qtype, std::int32_t rows, const char* label, bool expected) {
+        bool accepted = true;
+        try {
+            (void)ops::linear_topk_workspace_capacity_bytes(qtype, rows, kHidden, 1, 8);
+        } catch (const std::exception&) { accepted = false; }
+        if (accepted != expected) {
+            std::cerr << "linear_topk head profile " << label << " acceptance mismatch\n";
+            ++failures;
+        }
+    };
+    accepts(QType::Q8_G32_FP16, kFullRows, "q8-full", true);
+    accepts(QType::FP8_E4M3FN_ROW_BF16, kFullRows, "fp8-full", true);
+    accepts(QType::Q4_G64_FP16, kShortRows, "q4-optimized", true);
+    accepts(QType::Q4_G64_FP16, kHalfRows, "q4-optimized-half", true);
+    accepts(QType::GGUF_Q8_0, kFullRows, "gguf-full", true);
+    accepts(QType::GGUF_Q8_0, kShortRows, "gguf-optimized", true);
+    accepts(QType::GGUF_Q8_0, kHalfRows, "gguf-optimized-half", true);
+    accepts(QType::GGUF_Q8_0, kHalfRows / 2, "gguf-quarter", false);
+    accepts(QType::Q4_G64_FP16, kHalfRows / 2, "q4-quarter", false);
+    accepts(QType::GGUF_Q8_0, kHidden, "gguf-hidden", false);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -503,11 +600,22 @@ int main() {
         failures += run_full(QType::FP8_E4M3FN_ROW_BF16, "fp8-full", hidden,
                              base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden));
         failures +=
-            run_q4(hidden, base_scores(QType::Q4_G64_FP16, host_hidden), kShortRows,
-                   kShortWinnerRows, "q4-optimized");
+            run_reduced_head(QType::Q4_G64_FP16, hidden,
+                             base_scores(QType::Q4_G64_FP16, host_hidden), kShortRows,
+                             kShortWinnerRows, "q4-optimized");
         failures +=
-            run_q4(hidden, base_scores(QType::Q4_G64_FP16, host_hidden), kHalfRows,
-                   kHalfWinnerRows, "q4-optimized-half");
+            run_reduced_head(QType::Q4_G64_FP16, hidden,
+                             base_scores(QType::Q4_G64_FP16, host_hidden), kHalfRows,
+                             kHalfWinnerRows, "q4-optimized-half");
+        failures +=
+            run_reduced_head(QType::GGUF_Q8_0, hidden,
+                             base_scores(QType::GGUF_Q8_0, host_hidden), kShortRows,
+                             kShortWinnerRows, "gguf-optimized");
+        failures +=
+            run_reduced_head(QType::GGUF_Q8_0, hidden,
+                             base_scores(QType::GGUF_Q8_0, host_hidden), kHalfRows,
+                             kHalfWinnerRows, "gguf-optimized-half");
+        failures += verify_head_profiles();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

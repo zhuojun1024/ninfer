@@ -34,6 +34,14 @@ constexpr std::int32_t reduced_head_rows(HeadProfile profile) {
                                                   : detail::kLinearTopKOptimizedRows;
 }
 
+// The reduced (indexed) proposal table's two admissible row counts: the whole table, or the half
+// one shard of a vocabulary split materializes. A GGUF head reads its rows from the weight, so a
+// single profile serves both counts.
+constexpr bool is_reduced_rows(std::int32_t head_rows) {
+    return head_rows == detail::kLinearTopKOptimizedRows ||
+           head_rows == detail::kLinearTopKOptimizedHalfRows;
+}
+
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
@@ -65,10 +73,10 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
     if (head_rows == detail::kLinearTopKOptimizedHalfRows && qtype == QType::Q4_G64_FP16) {
         return HeadProfile::Q4OptimizedHalf;
     }
-    // A GGUF head has no fused producer: both the full table and the indexed proposal table rank
-    // over materialized BF16 logits.
-    if (is_gguf(qtype) && (head_rows == detail::kLinearTopKFullRows ||
-                           head_rows == detail::kLinearTopKOptimizedRows)) {
+    // A GGUF head has no fused producer: the full table and the indexed proposal table, whole or
+    // halved by a vocabulary split, all rank over materialized BF16 logits.
+    if (is_gguf(qtype) &&
+        (head_rows == detail::kLinearTopKFullRows || is_reduced_rows(head_rows))) {
         return HeadProfile::Gguf;
     }
     throw std::invalid_argument("linear_topk: unsupported head profile");
@@ -325,7 +333,7 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
     const HeadProfile profile = resolve_profile(head.qtype, head.n, head.k);
     if (is_reduced_head(profile)) {
         require_q4(head, reduced_head_rows(profile));
-    } else if (profile == HeadProfile::Gguf && head.n == detail::kLinearTopKOptimizedRows) {
+    } else if (profile == HeadProfile::Gguf && is_reduced_rows(head.n)) {
         detail::require_gguf(head, "linear_topk GGUF proposal head");
     } else {
         throw std::invalid_argument("linear_topk: invalid optimized-head profile");

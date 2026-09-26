@@ -53,6 +53,9 @@ A converted artifact also runs on the dual-GPU tensor-parallel route (`ninfer-se
   separate `gate`/`up` objects). The split spec reads the logical blocks an object carries from
   its binding names, halves each of them, and concatenates the halves, and `ops::gdn_input_proj`
   derives its channel profile from the parts instead of the full model's.
+- The reduced proposal head of speculative decode is rank-split like any other output-row split,
+  and `linear_topk` serves both of its geometries from the one GGUF profile: the whole table and
+  the half one shard materializes.
 - Some layers of the GSQ-RCO release store their grouped value projection in tiled value-head
   order and describe that order with an `input_columns` column map whose entries address heads of
   both shards. That projection therefore runs in two stages: each shard leaves its own heads in
