@@ -27,7 +27,10 @@ __launch_bounds__(kSamplerBlock) __global__
     // With penalties disabled this remains the exact raw-logit argmax route.
     if (!(cfg.temperature > 0.0f)) {
         float bv             = -CUDART_INF_F;
-        int bi               = INT_MAX;
+        // 0 is a valid id: a row whose domain is all NaN never improves this initial best
+        // (sampling_better ignores NaN), so the old INT_MAX sentinel used to flow out as the token
+        // and to index token_counts far out of bounds.
+        int bi               = 0;
         const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
         if (!penalties) {
             for (int v = tid; v < token_domain; v += blockDim.x) {
@@ -59,7 +62,9 @@ __launch_bounds__(kSamplerBlock) __global__
         }
         if (tid == 0) {
             out[row] = red_idx[0];
-            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[red_idx[0]], 1); }
+            if (cfg.token_counts != nullptr && red_idx[0] >= 0 && red_idx[0] < token_domain) {
+                atomicAdd(&cfg.token_counts[red_idx[0]], 1);
+            }
         }
         return;
     }

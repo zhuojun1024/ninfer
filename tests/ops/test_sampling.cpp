@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -368,6 +369,36 @@ int greedy_contract() {
     return failures;
 }
 
+// A row whose whole domain is NaN: sampling_better ignores NaN, so the greedy pass must keep its
+// initial best (id 0, a valid token) instead of the retired INT_MAX sentinel, which used to flow out
+// as the sampled token and index token_counts far out of bounds. The guard pages around the counts
+// buffer turn that write into a detected integrity failure.
+int nan_greedy_contract() {
+    constexpr int physical_rows = 4096;
+    constexpr int token_domain  = 4000;
+    constexpr int batch         = 3;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * batch,
+                              std::numeric_limits<float>::quiet_NaN());
+    const std::vector<int> counts(static_cast<std::size_t>(token_domain), 0);
+    ops::SamplingConfig config;
+    config.temperature = 0.0f;
+    config.top_k       = 1;
+    config.top_p       = 0.0f;
+    config.min_p       = 0.0f;
+    config.seed        = 7;
+    const RunResult result = run_homogeneous_batch(logits, physical_rows, token_domain, batch,
+                                                   config, 0, ops::kSamplePurposeDecode, &counts);
+    int failures           = result.integrity_failures;
+    failures += verify_exact("sample all-NaN row selects the initial valid id", result.tokens,
+                             std::vector<int>(static_cast<std::size_t>(batch), 0));
+    for (const std::vector<int>& row : result.counts) {
+        std::vector<int> expected_counts = counts;
+        ++expected_counts[0];
+        failures += verify_exact("sample all-NaN row increments token 0", row, expected_counts);
+    }
+    return failures;
+}
+
 int deterministic_stochastic_contract() {
     std::vector<float> column = {5.0f, 4.5f, 4.0f, 3.0f, -1.0f};
     round_to_bf16(column);
@@ -634,6 +665,7 @@ int main() {
         ++failures;
     } catch (const std::invalid_argument&) {}
     failures += greedy_contract();
+    failures += nan_greedy_contract();
     failures += deterministic_stochastic_contract();
     failures += heterogeneous_batch_contract();
     failures += filtered_distribution_contract();

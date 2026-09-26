@@ -286,7 +286,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         for (int i = 0; i <= extent; ++i) {
             const std::int64_t base = static_cast<std::int64_t>(i) * physical_rows;
             float best_value        = -CUDART_INF_F;
-            int best_index          = INT_MAX;
+            // 0 is a valid id: an all-NaN row never improves this best, and the old INT_MAX sentinel
+            // would be accepted as the terminal token and indexed into token_counts out of bounds.
+            int best_index          = 0;
             for (int v = tid; v < token_domain; v += blockDim.x) {
                 const float value = sampling_adjusted_logit(__bfloat162float(row_logits[base + v]),
                                                             v, cfg, row_drafts, i);
