@@ -298,7 +298,8 @@ void ProgramImpl::prepare_graphs() {
                                         io,
                                         prefill_hidden,
                                         prefill_chunk,
-                                        proposal_head};
+                                        proposal_head,
+                                        &tool_call_mask};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {

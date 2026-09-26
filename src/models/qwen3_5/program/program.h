@@ -23,6 +23,7 @@ namespace ninfer::models::qwen3_5 {
 
 namespace execution {
 class Parameters;
+class ToolCallMask;
 }
 
 namespace detail {
@@ -890,6 +891,9 @@ public:
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress
     advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    // Binds a request's declared-name mask to its lane. The Engine owns the binding and keeps it
+    // alive until the lane is released; Program only ever holds the pointer.
+    void attach_tool_call_mask(SequenceHandle sequence, execution::ToolCallMask* mask) noexcept;
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,

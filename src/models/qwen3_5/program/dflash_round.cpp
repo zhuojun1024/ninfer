@@ -313,6 +313,7 @@ ExecutionCore DFlash2Round::round_execution(const ExecutionCore& source, DeviceA
         .prefill_hidden   = source.prefill_hidden,
         .prefill_chunk    = source.prefill_chunk,
         .proposal_head    = source.proposal_head,
+        .tool_call_mask   = source.tool_call_mask,
     };
 }
 

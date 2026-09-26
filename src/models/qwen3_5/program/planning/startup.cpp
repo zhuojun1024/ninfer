@@ -244,6 +244,22 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
+    // One mask column per request for a plain decode, and one per request and verify column for a
+    // speculative round. The packed embedding rows are the mask domain; the tokenizer's public
+    // domain is narrower, so rows it does not define stay excluded by build_mask itself.
+    {
+        const std::uint32_t mask_columns =
+            plan.causal_scoring
+                ? 1U
+                : (plan.speculative_backend == SpeculativeBackend::None
+                       ? plan.max_concurrency
+                       : plan.max_concurrency * (plan.draft_window + 1U));
+        out.tool_call_mask =
+            add_tensor(builder, DType::U8,
+                       {dimension(config.vocab_size),
+                        static_cast<std::int32_t>(mask_columns)},
+                       "tool call mask");
+    }
     if (plan.causal_scoring) {
         out.score_hidden =
             add_tensor(builder, DType::BF16,

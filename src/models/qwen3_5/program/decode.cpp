@@ -7,6 +7,7 @@
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
+#include "ninfer/ops/token_mask.h"
 
 #include <algorithm>
 #include <chrono>
@@ -52,6 +53,12 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                                    state_destinations, envelope, hidden, logits);
         ops::scatter(hidden, state_destinations, state.continuation_hidden_store,
                      state.execution.device.stream);
+        // The declared-name mask is a stable device input, so the node belongs in the captured body
+        // and is fed by the host immediately before each replay.
+        if (state.execution.tool_call_mask != nullptr) {
+            ops::apply_token_mask(logits, state.execution.tool_call_mask->slice(1, 0, batch_size),
+                                  state.execution.device.stream);
+        }
         ops::sample(logits, sampled,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
@@ -151,6 +158,75 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
+}
+
+void ProgramImpl::attach_tool_call_mask(SequenceHandle sequence,
+                                        execution::ToolCallMask* mask) noexcept {
+    const std::uint32_t lane = ContractAccess::lane(sequence).value;
+    if (lane >= max_concurrency) { return; }
+    requests[lane].tool_mask = mask;
+}
+
+void ProgramImpl::prepare_tool_call_mask_single(std::span<const std::uint32_t> lanes) {
+    prepare_tool_call_mask(lanes, 1, {});
+}
+
+void ProgramImpl::prepare_tool_call_mask(std::span<const std::uint32_t> lanes, std::uint32_t width,
+                                         std::span<const TokenId> drafts) {
+    const std::size_t rows = lanes.size();
+    if (rows == 0 || width == 0) { return; }
+    const std::size_t vocabulary =
+        static_cast<std::size_t>(dimension(parameters.model.config().text.vocab_size));
+    const std::size_t columns = static_cast<std::size_t>(width) * rows;
+    if (columns * vocabulary > tool_call_mask_host.size()) {
+        throw std::logic_error("declared-name mask exceeds the resident device buffer");
+    }
+    // A verify round whose drafts cross the round boundary supplies one draft per column; when the
+    // proposal is produced inside the same graph the later columns have no host-visible prefix and
+    // only the anchor column, which the committed text alone determines, is constrained.
+    const bool complete_columns = !drafts.empty();
+    if (complete_columns && drafts.size() != rows * (width - 1U)) {
+        throw std::logic_error("declared-name mask draft span is invalid");
+    }
+
+    std::fill_n(tool_call_mask_host.begin(), static_cast<std::ptrdiff_t>(columns * vocabulary),
+                std::uint8_t{1});
+    std::vector<std::uint8_t> mask_one;
+    bool constrained = false;
+    for (std::size_t row = 0; row < rows; ++row) {
+        execution::ToolCallMask* binding = requests[lanes[row]].tool_mask;
+        if (binding == nullptr || !binding->live()) { continue; }
+        binding->advance();
+        std::string drafted_prefix;
+        for (std::uint32_t column = 0; column < width; ++column) {
+            if (column != 0 && !complete_columns) { break; }
+            if (binding->build_after(drafted_prefix, vocabulary, mask_one)) {
+                const std::size_t base =
+                    (static_cast<std::size_t>(column) * rows + row) * vocabulary;
+                std::copy(mask_one.begin(), mask_one.end(),
+                          tool_call_mask_host.begin() + static_cast<std::ptrdiff_t>(base));
+                constrained = true;
+            }
+            if (column + 1U < width && complete_columns) {
+                drafted_prefix.append(
+                    binding->piece(static_cast<std::size_t>(drafts[row * (width - 1U) + column])));
+            }
+        }
+    }
+
+    if (constrained) {
+        CUDA_CHECK(cudaMemcpyAsync(tool_call_mask.data, tool_call_mask_host.data(),
+                                   columns * vocabulary, cudaMemcpyHostToDevice, device.stream));
+        tool_call_mask_all_ones = false;
+        return;
+    }
+    if (tool_call_mask_all_ones) { return; }
+    // Restore the whole resident buffer so a later round with a different column count can skip the
+    // upload without inheriting a stale constrained prefix.
+    std::fill(tool_call_mask_host.begin(), tool_call_mask_host.end(), std::uint8_t{1});
+    CUDA_CHECK(cudaMemcpyAsync(tool_call_mask.data, tool_call_mask_host.data(),
+                               tool_call_mask_host.size(), cudaMemcpyHostToDevice, device.stream));
+    tool_call_mask_all_ones = true;
 }
 
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -331,10 +407,12 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
 
+        prepare_tool_call_mask_single(lanes);
+
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, &tool_call_mask},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -491,9 +569,15 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                       std::min(capacity, frontier + extent + draft_window));
         }
 
+        prepare_tool_call_mask(
+            lanes, width,
+            std::span<const TokenId>(mtp_host_ingress->current_drafts.data(),
+                                     static_cast<std::size_t>(lanes.size()) * draft_window));
+
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
                                                    replay_records ? &*replay_records : nullptr, io,
-                                                   prefill_hidden, prefill_chunk, proposal_head},
+                                                   prefill_hidden, prefill_chunk, proposal_head,
+                                                   &tool_call_mask},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
                                                   *io.mtp_decode,
@@ -685,10 +769,15 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                       backend_kv_cache() ? frontier : 0U);
         }
 
+        // The proposal is produced and verified inside the same captured graph, so the later verify
+        // columns have no host-visible draft prefix; only the anchor column, whose grammar position
+        // the committed text alone determines, is constrained here.
+        prepare_tool_call_mask(lanes, width, {});
+
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, &tool_call_mask},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,

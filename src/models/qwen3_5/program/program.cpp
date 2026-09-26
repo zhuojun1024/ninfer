@@ -349,6 +349,11 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence,
     return impl_->advance_prefill(sequence, failed_timing);
 }
 
+void Program::attach_tool_call_mask(SequenceHandle sequence,
+                                    execution::ToolCallMask* mask) noexcept {
+    impl_->attach_tool_call_mask(sequence, mask);
+}
+
 CaptureAssessment
 Program::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                          const SharedPrefixHandle* replacement,

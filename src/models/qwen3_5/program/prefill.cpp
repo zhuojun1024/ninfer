@@ -8,6 +8,7 @@
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/token_mask.h"
 
 #include <algorithm>
 #include <array>
@@ -46,6 +47,11 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
     card.set_sampling(sampling);
+    // The prefill samples a single column, so it consumes the first column of the resident mask.
+    // The buffer is refilled by the caller before the chunk, and prefill is never captured.
+    if (execution.tool_call_mask != nullptr) {
+        card.set_prefill_token_mask(execution.tool_call_mask->slice(1, 0, 1));
+    }
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
@@ -150,6 +156,10 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
     project(hidden, state.execution.parameters.text.output_head, logits, state.execution.work,
             state.execution.device.stream);
+    if (state.execution.tool_call_mask != nullptr) {
+        ops::apply_token_mask(logits, state.execution.tool_call_mask->slice(1, 0, 1),
+                              state.execution.device.stream);
+    }
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
@@ -200,6 +210,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
     const std::uint32_t base               = staged.base;
     const std::uint32_t initial_mtp_extent = staged.initial_mtp_extent;
     request.lifecycle                      = Lifecycle::Empty;
+    request.tool_mask                      = nullptr;
     try {
         const std::uint32_t state_slots = request_plan.demand.active_entitlement.device.state_slots;
         const bool preserving_source =
@@ -992,7 +1003,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         execution::PrefillContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, &tool_call_mask},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1034,6 +1045,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
             staged.mtp_bridge = MtpBridgeMode::None;
         }
+
+        // The first generated token samples the grammar position after the prompt, which is the
+        // request's empty committed content, so this is path parity with the decode loop rather
+        // than a constrained position today. It keeps a future constrained first position correct.
+        prepare_tool_call_mask_single(std::span<const std::uint32_t>(&sequence.lane, 1));
 
         if (staged.cursor < staged.prompt_tokens) {
             const std::uint32_t nominal =

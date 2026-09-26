@@ -22,6 +22,15 @@ struct ModelInstance {
     const std::uint32_t capacity;
     std::unique_ptr<models::qwen3_5::Program> program;
 
+    // One request's declared-name grammar binding. It needs the Frontend's shared mask table, so it
+    // can only be built here, where the Frontend lives; the Engine then hands the pointer to the
+    // Program for the request's lane lifetime.
+    [[nodiscard]] std::shared_ptr<models::qwen3_5::frontend::ToolCallConstraint>
+    make_tool_call_constraint(const models::qwen3_5::PreparedPrompt& prompt) const {
+        return frontend.make_tool_call_constraint(
+            models::qwen3_5::PreparedPromptAccess::view(prompt).tool_call_output);
+    }
+
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
     ~ModelInstance();
     ModelInstance(const ModelInstance&)            = delete;

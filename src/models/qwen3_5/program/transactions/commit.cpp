@@ -652,6 +652,7 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     request.optional_resources                  = {};
     request.lifecycle                           = Lifecycle::Empty;
     request.pending                             = {};
+    request.tool_mask                           = nullptr;
     continuation_slots[continuation_index].role = ContinuationSlotRole::Catalogued;
     active_continuations[lane]                  = continuation_capacity;
     invalidate_lane(lane);

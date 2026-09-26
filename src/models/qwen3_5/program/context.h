@@ -38,6 +38,10 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // Resident declared-name mask, U8 [vocab, columns]. It is a device input the host fills before
+    // each replay: the mask kernel is inside the captured body, so its address must be stable and
+    // the decision to include it is fixed at capture. Null only on routes that never constrain.
+    const Tensor* tool_call_mask = nullptr;
 };
 
 struct PrefillContext {
@@ -129,6 +133,10 @@ struct TargetVerifyFrameView {
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
+    // Declared-name mask for the flattened [vocab, width*batch] verify logits. It is applied
+    // between the verify projection and its argmax, so a masked column cannot be captured by the
+    // greedy/sparse accept kernels.
+    const Tensor* logits_mask = nullptr;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,

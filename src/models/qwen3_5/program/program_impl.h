@@ -15,6 +15,7 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
+#include "models/qwen3_5/program/tool_call_mask.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -406,6 +407,8 @@ struct RequestControl {
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
+    // Non-owning binding to the engine request's mask state; cleared whenever the lane is released.
+    execution::ToolCallMask* tool_mask = nullptr;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -500,6 +503,9 @@ public:
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing);
+    // Binds one request's declared-name mask to its lane. The Engine owns the object and calls this
+    // once the lane is published, so the Program never outlives the binding it points at.
+    void attach_tool_call_mask(SequenceHandle sequence, execution::ToolCallMask* mask) noexcept;
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -601,6 +607,14 @@ public:
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+    // Resident declared-name mask and its pinned-free host staging. The buffer address is fixed at
+    // startup so the captured decode bodies can read it; only its prefix for the current round is
+    // uploaded, from the same stream, before the graph is replayed.
+    Tensor tool_call_mask;
+    std::vector<std::uint8_t> tool_call_mask_host;
+    // True while the whole resident buffer is known to be all ones, which lets a round with no
+    // constrained lane skip the upload entirely.
+    bool tool_call_mask_all_ones = true;
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;
@@ -1141,6 +1155,14 @@ private:
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
+    // Fills and uploads the resident declared-name mask. Every lane contributes one column per
+    // request row; a constrained lane overrides the all-ones default. `drafts` is row-major
+    // [lanes.size() * (width - 1)] and extends each later column's grammar with the drafts the
+    // earlier columns would commit; an empty span means the drafts are not host-visible and only the
+    // anchor column is constrained.
+    void prepare_tool_call_mask(std::span<const std::uint32_t> lanes, std::uint32_t width,
+                                std::span<const TokenId> drafts);
+    void prepare_tool_call_mask_single(std::span<const std::uint32_t> lanes);
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();

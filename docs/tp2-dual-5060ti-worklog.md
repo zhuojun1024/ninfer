@@ -6807,3 +6807,54 @@ plain decode / MTP verify / dflash2 verify）现在都在"logits 产出之后、
 **遗留**：单卡路线（不带 `--devices`）至今**完全没有**约束解码（`make_tool_call_constraint` /
 `apply_token_mask` 只被 `tp2_generation_core.cpp` 调用），同类泄漏在那里会 100% 复现；计划见
 `PLAN-single-gpu-tool-mask.md`。
+
+## Round 15d —— 单卡路线的约束解码（已落地；dflash2 部分覆盖）
+
+**背景**：约束解码此前只实现在 TP-2 核心里（`make_tool_call_constraint` 与 `apply_token_mask` 的调用点
+全在 `tp2_generation_core.cpp`），单卡路线（`ProgramImpl` + `program/*`）完全缺失，同类泄漏在那里必然复现
+（模型吐未声明名 → parser 拒收 → 原样当正文）。
+
+**改法（掩码作为每次 replay 的设备输入）**：单卡路线的采样在 CUDA Graph 里（`ordinary_batch_body` 含
+`ops::sample`，MTP/DFlash 的 verify 同样被 capture），而掩码依赖已生成文本（host 侧状态），capture 时算不出来。
+故：常驻 `U8 [vocab, columns]` 设备 buffer（列数 = 无 spec `max_concurrency`；有 spec
+`max_concurrency*(draft_window+1)`，进 `device_reservation_bytes` 记账），图内核只含 `apply_token_mask`，
+每次 replay **之前**在**同一 stream** 上图外做 H2D；无约束时维护"整块全 1"不变式可跳过上传。
+不拆 body、不按约束状态另抓图。
+
+落点：新 `program/tool_call_mask.h`（`live`/`advance`/`build_single`/`build_after`/`piece`，语义逐字对齐
+TP-2）；`program/decode.cpp`（ordinary body 在 `ops::sample` 前掩码 + 三种 decode 的 host 填掩码与 H2D）；
+`execution/text.cpp` 的 `target_verify_batch`（在 `project` 与 `argmax` 之间）；`prefill.cpp`（末列）；
+`speculative/mtp.cpp`、`execution/draft.cpp`、`speculative/target_verification.cpp`；
+`program/planning/startup.{h,cpp}`（常驻 buffer 与记账）；`program.cpp/.h`、`program_impl.{h,cpp}`、
+`graphs.cpp`、`dflash_round.cpp`、`storage/context.cpp`、`transactions/commit.cpp`（lane 释放/复用清指针）；
+`runtime_types.h`、`model_instance.h`、`request_record.h`、`engine_core.h`（move prompt 前用 Frontend 构造
+约束、materialize 后 `attach_tool_call_mask`）。
+
+**真机验收**（工件 `Qwen3.8-27B-GSQ-RCO-IQ3_S-dflash2q4.ninfer`，单卡 8099，`--max-context 8192
+--kv-dtype fp8`；12.2 GiB 权重在 16 GB 卡上 32k 会在启动期 FATAL，必须降到 8k。探针同 Round 15/15c）：
+
+| 路线 | 修复前 | 修复后 |
+| --- | --- | --- |
+| ordinary（无 spec） | 87/90，`bad-name` 3 | 88/90，`bad-name` **0** |
+| mtp（draft-window 5） | 未测 | **90/90，失败全 0** |
+| dflash2（draft-window 5） | 42/45，`bad-name` 3（6.7%） | 59/60，`bad-name` 1（1.7%） |
+
+**已知缺口（本轮不做）**：单卡 dflash2 只覆盖 anchor 列——`dflash_decode_batch` 把 append→propose→
+verify→accept 全抓进一张图，列 ≥1 的掩码需要"该列之前的 draft"，而它是同图内的 device 产物且不回传 host，
+没有图内回读的缝隙。对照 TP-2 是 eager propose + D2H `verify_ids` + **只 capture verify**，故 draft 对 host
+可见。要归零需把 append+propose 拆出 verify 图（capture 拓扑重构 + dflash2 解码性能复测）。当前选择：保持
+现状，单卡起 agent 时用 `--spec mtp`（实测 90/90）；anchor 列掩码语义正确（该列语法位置只由 committed
+文本决定），作为有收益的降级保留。
+
+**未解释项**：修复后 ordinary 臂 2 条 `empty`（1 条 `incomplete=max_output_tokens` 良性；1 条 756 ms 且无
+`incomplete`）。掩码在 Free 态必然不生效、首 token 处 `raw_content` 为空 ⇒ 机制上不可能由掩码造成；倾向
+"只有 reasoning item、没有 message item"的探针判类假象。两条都不计入 `bad-name`。
+
+**构建/单测**：`cmake --build build-win --target ninfer-serve -j 12` 通过；`ninfer_tool_call_constraint_test` /
+`ninfer_tool_call_parser_test` / `ninfer_token_mask_test` / `ninfer_qwen3_5_runtime_mechanisms_test` /
+`ninfer_qwen3_5_context_store_test` / `ninfer_qwen3_5_state_image_layout_test` / `ninfer_decode_graph_test` /
+`ninfer_public_api_test` 通过；`ninfer_qwen3_5_frontend_test` / `vision_workspace_test` /
+`engine_options_test` 加载即 `0xC0000135`（工作树缺 FFmpeg 运行时 DLL），与本改动无关。
+
+**部署状态**：未部署到 `C:\ninfer\`（那里仍是 Round 15c 验收过的 TP-2 修复件，hash `99BCF307…`），
+新件在 `build-win/apps/ninfer-serve.exe`。

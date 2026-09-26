@@ -682,6 +682,15 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
                                                target_positions, state.execution.device.stream);
 
+        // The target verify projection and its argmax both live inside target_verify_batch, so the
+        // declared-name mask enters between them as a resident device input the host refills before
+        // each replay. Only the anchor column is host-derivable on this route.
+        Tensor tool_mask_columns;
+        if (state.execution.tool_call_mask != nullptr) {
+            tool_mask_columns =
+                state.execution.tool_call_mask->slice(1, 0, width * batch_size);
+        }
+
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
@@ -720,6 +729,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     .replay_records  = state.execution.replay_records,
                     .sampling        = frame.sampling,
                     .feature_sink    = &sink,
+                    .logits_mask     = tool_mask_columns.data != nullptr ? &tool_mask_columns
+                                                                         : nullptr,
                 },
                 target_envelope);
         }

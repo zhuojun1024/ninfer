@@ -1017,6 +1017,7 @@ bool ProgramImpl::clear_lane_strict(SequenceState& sequence, RequestControl& req
     request.active_resources     = {};
     request.optional_resources   = {};
     request.publish_continuation = true;
+    request.tool_mask            = nullptr;
     return true;
 }
 
@@ -1041,6 +1042,7 @@ void ProgramImpl::clear_lane_best_effort(SequenceState& sequence,
     request.active_resources     = {};
     request.optional_resources   = {};
     request.publish_continuation = true;
+    request.tool_mask            = nullptr;
     const auto* begin            = continuation_states.data();
     const auto* end              = begin + continuation_capacity;
     if (&sequence >= begin && &sequence < end) {

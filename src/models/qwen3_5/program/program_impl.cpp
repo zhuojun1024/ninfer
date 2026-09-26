@@ -234,6 +234,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
+    tool_call_mask = plan.persistent.tool_call_mask.bind(backing);
+    // The captured mask kernel reads this buffer on every replay, so it starts as the unconstrained
+    // all-ones input the graph is compiled against.
+    tool_call_mask_host.assign(static_cast<std::size_t>(tool_call_mask.bytes()), std::uint8_t{1});
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
     }
@@ -294,6 +298,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(
             cudaMemsetAsync(io.mtp->position.data, 0, io.mtp->position.bytes(), device.stream));
     }
+    CUDA_CHECK(cudaMemsetAsync(tool_call_mask.data, 1, tool_call_mask.bytes(), device.stream));
     if (!causal_scoring) {
         CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
         CUDA_CHECK(

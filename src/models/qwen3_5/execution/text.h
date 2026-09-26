@@ -117,6 +117,10 @@ public:
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
+    // Declared-name mask for the prefill's final-column sample. It stays empty on the
+    // causal-scoring route, which never samples and must keep the unmasked distribution.
+    void set_prefill_token_mask(const Tensor& mask) noexcept { prefill_token_mask_ = mask; }
+
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
     }
@@ -339,16 +343,20 @@ public:
                                const Tensor& linear_state_destination_slots,
                                ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                Tensor& logits);
+    // `logits_mask` is the declared-name mask for the flattened [vocab, width*batch] verify
+    // logits. It is applied between the verify projection and its argmax, so a masked column can
+    // never be licensed by the greedy or sparse accept kernels. Null means unconstrained.
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens);
+                             Tensor& logits, Tensor& target_tokens, const Tensor* logits_mask);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
+                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink,
+                             const Tensor* logits_mask);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -453,7 +461,8 @@ private:
                                   const Tensor& kv_table_rows,
                                   const Tensor& linear_state_source_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                                  Tensor& logits, Tensor& target_tokens, Tap& tap);
+                                  Tensor& logits, Tensor& target_tokens,
+                                  const Tensor* logits_mask, Tap& tap);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
@@ -528,6 +537,7 @@ private:
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
+    Tensor prefill_token_mask_;
     const MtpParameters* mtp_                   = nullptr;
     // DFlash2 selector weights when this shard materializes them (the one-device route, or the peer
     // shard under TP-2); the masked draft's shard drives the peer's copy instead.

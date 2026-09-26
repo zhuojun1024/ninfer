@@ -210,10 +210,16 @@ public:
                 throw RequestError(RequestErrorKind::ThinkingBudgetCapacityInsufficient,
                                    error.what());
             }
+            // The declared-name grammar needs the Frontend's shared mask table, so it is built
+            // here from the immutable prompt and stored beside the output session it consults.
+            auto tool_constraint = instance_.make_tool_call_constraint(prompt);
             request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
                                                 std::move(output), prompt_summary, prepare_seconds,
                                                 std::move(options), consumer_mode, observation,
                                                 pending_deadline, submitted);
+            if (tool_constraint != nullptr) {
+                request->tool_call_mask.emplace(std::move(tool_constraint), request->output);
+            }
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -1527,6 +1533,8 @@ private:
                     const SequenceHandle sequence = activation.sequence();
                     resources_.adopt(*instance_.program, std::move(activation));
                     request->sequence.emplace(sequence);
+                    instance_.program->attach_tool_call_mask(
+                        sequence, request->tool_call_mask ? &*request->tool_call_mask : nullptr);
                     request->budget.emplace(std::move(control.budget));
                     request->lane.emplace(control.destination);
                     request->remaining_service_work      = control.summary.service_work_quanta;

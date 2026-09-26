@@ -110,6 +110,7 @@ struct RequestRecord {
     using OutputSession  = typename ModelContract::OutputSession;
     using BasePlan       = typename ModelContract::RequestBasePlan;
     using SequenceHandle = typename ModelContract::SequenceHandle;
+    using ToolCallMask   = typename ModelContract::ToolCallMask;
     using StreamEvent    = std::variant<GenerationTimingObservation, OutputDelta>;
 
     RequestRecord(std::uint64_t request_identity, std::uint64_t publication_sequence,
@@ -183,6 +184,9 @@ struct RequestRecord {
     std::optional<FinishReason> terminal_reason;
 
     std::optional<BasePlan> base_plan;
+    // Declared-name constrained decoding. The Engine owns this binding for the request's lifetime
+    // and hands its address to the Program once the request's lane becomes active.
+    std::optional<ToolCallMask> tool_call_mask;
     std::uint64_t remaining_service_work = 0;
     std::uint64_t backfill_epoch         = 0;
     BackfillClass backfill_class         = BackfillClass::None;

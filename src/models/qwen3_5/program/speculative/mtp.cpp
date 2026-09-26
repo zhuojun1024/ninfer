@@ -116,6 +116,16 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
         Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
 
+        // The verify target projection writes target_logits and then argmaxes it, all inside
+        // target_verify_batch; the declared-name mask must enter between those two steps so the
+        // accepted token is drawn from the constrained distribution. It is a stable resident buffer
+        // the host refills before each replay, so the node is capture-safe.
+        Tensor tool_mask_columns;
+        if (state.execution.tool_call_mask != nullptr) {
+            tool_mask_columns =
+                state.execution.tool_call_mask->slice(1, 0, width * batch_size);
+        }
+
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
                                                verify_ids, target_positions,
                                                state.execution.device.stream);
@@ -144,6 +154,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                      .selected_hidden         = selected_hidden,
                                      .replay_records          = state.execution.replay_records,
                                      .sampling                = frame.sampling,
+                                     .logits_mask             = tool_mask_columns.data != nullptr
+                                                                    ? &tool_mask_columns
+                                                                    : nullptr,
                                  },
                                  envelopes.target_verify);
         }

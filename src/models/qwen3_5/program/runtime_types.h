@@ -1,6 +1,7 @@
 #pragma once
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/program/program.h"
+#include "models/qwen3_5/program/tool_call_mask.h"
 
 namespace ninfer::models::qwen3_5 {
 
@@ -14,6 +15,8 @@ struct RuntimeTypes {
     using SequencePlan               = qwen3_5::SequencePlan;
     using RequestBasePlan            = qwen3_5::RequestBasePlan;
     using AdmissionCandidate         = qwen3_5::AdmissionCandidate;
+    using ToolCallConstraint         = qwen3_5::frontend::ToolCallConstraint;
+    using ToolCallMask               = qwen3_5::execution::ToolCallMask;
     using ResourcePlan               = qwen3_5::ResourcePlan;
     using PersistentBackfillProof    = qwen3_5::PersistentBackfillProof;
     using SequenceHandle             = qwen3_5::SequenceHandle;
