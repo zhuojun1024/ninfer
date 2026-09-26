@@ -25,6 +25,8 @@ using LinearParameters = ops::SingleProjectionWeight;
 struct DenseParameters {
     LinearParameters gate_up;
     LinearParameters down;
+    // The up matrix when gate and up are separate GGUF parents; gate_up then holds the gate alone.
+    std::optional<LinearParameters> up;
 };
 
 using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights>;

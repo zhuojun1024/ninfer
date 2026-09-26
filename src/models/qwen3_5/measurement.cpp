@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <map>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen3_5 {
@@ -74,8 +75,10 @@ std::string prefill_signature(const Model& model) {
         }
         for (const auto& use : weight->uses) {
             if (!use.input.starts_with("text/") && !use.input.starts_with("vision/")) { continue; }
-            item["uses"].push_back(
-                {use.input, use.policy, use.activation_input_divisor.has_value()});
+            Json fact = {use.input, use.policy, use.activation_input_divisor.has_value()};
+            // Only a gathered Use adds a fact, so every other signature stays what it was.
+            if (use.input_columns) { fact.push_back("input_columns"); }
+            item["uses"].push_back(std::move(fact));
         }
         inventory.push_back(std::move(item));
     }

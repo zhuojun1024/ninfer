@@ -1391,36 +1391,49 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                             dimension(cfg.attention->num_key_value_heads), T});
     Tensor v         = projection.value.view({dimension(cfg.attention->head_dim),
                                               dimension(cfg.attention->num_key_value_heads), T});
-    // The fused QKV+gate projection is a single GEMM whose output rows are laid out
-    // [q | k | gate | v]. The per-shard fused weight (q/gate rows halved, k/v rows unchanged)
-    // is run through the generic linear op, then the output is viewed into q/k/gate/v. This
-    // mirrors the FFN-delta decomposition and avoids the shape-specific fused attn GEMM kernels
-    // (which are registered for the full-model row counts only).
-    const std::int32_t q_rows  = dimension(cfg.attention->query_width());
-    const std::int32_t k_rows  = dimension(cfg.attention->key_width());
-    const std::int32_t fused_n = 2 * q_rows + 2 * k_rows;
-    Tensor fused = work_.alloc(DType::BF16, {fused_n, T});
-    const auto& proj_w = std::get<LinearParameters>(p.projection);
-    ops::linear(h, proj_w.weight, fused, proj_w.policy, work_, s);
-    if (T > 1) {
-        // Batched width: the four blocks are strided row windows of the fused output, so they are
-        // materialized into the (already sized) workspace projection buffers.
-        copy_row_block(fused, 0, q_rows, projection.query, s);
-        copy_row_block(fused, q_rows, k_rows, projection.key, s);
-        copy_row_block(fused, q_rows + k_rows, q_rows, projection.gate, s);
-        copy_row_block(fused, 2 * q_rows + k_rows, k_rows, projection.value, s);
+    if (const auto* gguf = std::get_if<ops::GgufProjectionWeights>(&p.projection)) {
+        // A GGUF projection stores one weight per block type, so it cannot run as the single fused
+        // GEMM below. The projection op reads them part by part and writes q/gate/k/v directly, in
+        // the same row order the fused buffer would have used.
+        Tensor q_flat    = q.view({dimension(cfg.attention->query_width()), T});
+        Tensor gate_flat = gate.view({dimension(cfg.attention->query_width()), T});
+        Tensor k_flat    = k.view({dimension(cfg.attention->key_width()), T});
+        Tensor v_flat    = v.view({dimension(cfg.attention->key_width()), T});
+        ops::attn_input_proj(h, *gguf, q_flat, gate_flat, k_flat, v_flat, work_, s);
     } else {
-        // Single column: the slices are contiguous, so q/k/gate/v alias the fused buffer directly.
-        q    = fused.slice(0, 0, q_rows).view({dimension(cfg.attention->head_dim),
-                                               dimension(cfg.attention->num_attention_heads), T});
-        k    = fused.slice(0, q_rows, k_rows).view({dimension(cfg.attention->head_dim),
-                                                    dimension(cfg.attention->num_key_value_heads), T});
-        gate = fused.slice(0, q_rows + k_rows, q_rows)
-                   .view({dimension(cfg.attention->head_dim),
-                          dimension(cfg.attention->num_attention_heads), T});
-        v    = fused.slice(0, 2 * q_rows + k_rows, k_rows)
-                   .view({dimension(cfg.attention->head_dim),
-                          dimension(cfg.attention->num_key_value_heads), T});
+        // The fused QKV+gate projection is a single GEMM whose output rows are laid out
+        // [q | k | gate | v]. The per-shard fused weight (q/gate rows halved, k/v rows unchanged)
+        // is run through the generic linear op, then the output is viewed into q/k/gate/v. This
+        // mirrors the FFN-delta decomposition and avoids the shape-specific fused attn GEMM kernels
+        // (which are registered for the full-model row counts only).
+        const std::int32_t q_rows  = dimension(cfg.attention->query_width());
+        const std::int32_t k_rows  = dimension(cfg.attention->key_width());
+        const std::int32_t fused_n = 2 * q_rows + 2 * k_rows;
+        Tensor fused = work_.alloc(DType::BF16, {fused_n, T});
+        const auto& proj_w = std::get<LinearParameters>(p.projection);
+        ops::linear(h, proj_w.weight, fused, proj_w.policy, work_, s);
+        if (T > 1) {
+            // Batched width: the four blocks are strided row windows of the fused output, so they
+            // are materialized into the (already sized) workspace projection buffers.
+            copy_row_block(fused, 0, q_rows, projection.query, s);
+            copy_row_block(fused, q_rows, k_rows, projection.key, s);
+            copy_row_block(fused, q_rows + k_rows, q_rows, projection.gate, s);
+            copy_row_block(fused, 2 * q_rows + k_rows, k_rows, projection.value, s);
+        } else {
+            // Single column: the slices are contiguous, so q/k/gate/v alias the fused buffer
+            // directly.
+            q = fused.slice(0, 0, q_rows).view({dimension(cfg.attention->head_dim),
+                                                dimension(cfg.attention->num_attention_heads), T});
+            k = fused.slice(0, q_rows, k_rows)
+                    .view({dimension(cfg.attention->head_dim),
+                           dimension(cfg.attention->num_key_value_heads), T});
+            gate = fused.slice(0, q_rows + k_rows, q_rows)
+                       .view({dimension(cfg.attention->head_dim),
+                              dimension(cfg.attention->num_attention_heads), T});
+            v = fused.slice(0, 2 * q_rows + k_rows, k_rows)
+                    .view({dimension(cfg.attention->head_dim),
+                           dimension(cfg.attention->num_key_value_heads), T});
+        }
     }
 
     const auto results = workspace::text_attention_results(work_, cfg, T);
@@ -1619,8 +1632,17 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         const std::int32_t gdn_v_rows = dimension(cfg.gdn->value_width());
         const std::int32_t fused_n    = 2 * gdn_q_rows + 2 * gdn_v_rows;
         Tensor fused = work_.alloc(DType::BF16, {fused_n, T});
-        const auto& proj_w = std::get<LinearParameters>(p.projection);
-        ops::linear(h, proj_w.weight, fused, proj_w.policy, work_, s);
+        if (const auto* gguf = std::get_if<ops::GgufProjectionWeights>(&p.projection)) {
+            // A GGUF projection stores one weight per block type, so it is not one fused GEMM. Its
+            // q/k/value and z rows land in this buffer's blocks directly, in the order the slices
+            // below expect.
+            Tensor qkv_out = fused.slice(0, 0, 2 * gdn_q_rows + gdn_v_rows);
+            Tensor z_out   = fused.slice(0, 2 * gdn_q_rows + gdn_v_rows, gdn_v_rows);
+            ops::gdn_input_proj(h, *gguf, qkv_out, z_out, work_, s);
+        } else {
+            const auto& proj_w = std::get<LinearParameters>(p.projection);
+            ops::linear(h, proj_w.weight, fused, proj_w.policy, work_, s);
+        }
         auto projection = workspace::gdn_projection(work_, cfg, T);
         qc = projection.query;
         kc = projection.key;

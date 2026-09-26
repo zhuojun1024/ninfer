@@ -15,6 +15,39 @@ from .proposal import DEFAULT_RANKING, add_official_proposal
 from .qwen3_5 import build_model
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
+from .gguf_blocks import RECIPES as GGUF_RECIPES
+from .sources.gguf import GGUFFile
+
+
+def _open_named_source(name: str, path: Path):
+    """A .gguf source carries its own reader; the block recipe needs no gguf-py."""
+    if path.suffix == ".gguf":
+        if name == "gguf":
+            return GGUFFile(path)
+        from .sources.gguf_source import GGUFSource
+
+        return GGUFSource(path)
+    return SafetensorsSource(path)
+
+
+class SourceInputs(Mapping):
+    """Named optional sources are opened only when a recipe or component requests one."""
+
+    def __init__(self, base, paths, stack):
+        self._sources = {"base": base}
+        self._paths = dict(paths)
+        self._stack = stack
+
+    def __getitem__(self, name):
+        if name not in self._sources:
+            if name not in self._paths:
+                raise ValueError(
+                    f"selected recipe requires source {name!r}; provide --source {name}=PATH"
+                )
+            self._sources[name] = self._stack.enter_context(
+                _open_named_source(name, self._paths[name])
+            )
+        return self._sources[name]
 
 
 class SourceInputs(Mapping):
@@ -59,8 +92,9 @@ def _pairs(values, label):
 
 
 def _function(value: str):
-    if value in RECIPES:
-        return RECIPES[value]
+    recipes = {**RECIPES, **GGUF_RECIPES}
+    if value in recipes:
+        return recipes[value]
     filename, separator, function = value.rpartition(":")
     if not separator or not Path(filename).is_file():
         # An absolute Windows path contains a drive colon, so an existing whole

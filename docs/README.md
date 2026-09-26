@@ -11,6 +11,7 @@ run the CLI or HTTP server.
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
+| [GGUF block formats](gguf.md) | GGUF releases with a ggml type per tensor: the fifteen block formats, their products and serving |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [Windows native build](windows.md) | VS2022 + CUDA 13.3 build, native run recipe, verified Windows/WDDM behavior, TP-2 mapped-pinned findings, and platform differences |
 | [Dual RTX 5060 Ti TP-2](tp2-dual-5060ti.md) | tensor-parallel-2 server configuration, memory budget, and measurements on two RTX 5060 Ti cards |

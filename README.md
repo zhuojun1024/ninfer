@@ -237,6 +237,9 @@ The official artifacts provide the following capabilities, with optional compone
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming,
   tools, local response state, token counting, and usage accounting.
 
+An artifact converted with `qwen3_8_27b_gguf` keeps every tensor in its GGUF release's own ggml
+block type instead; see [GGUF block formats](docs/gguf.md).
+
 The 35B-A3B target additionally supports DFlash with draft windows from one to fifteen for Text and
 image/video Vision prompts. Qwen3.8-27B artifacts with the DFlash2 companion weights support
 `--spec dflash2 --draft-tokens 7` for the same Text/Vision Engine path, with draft counts 1..15
@@ -270,6 +273,7 @@ capacities remain fixed for the process lifetime.
 - [Performance](docs/performance.md)
 - [Perplexity evaluation](docs/perplexity.md)
 - [Weight conversion and custom recipes](docs/weight-conversion.md)
+- [GGUF block formats](docs/gguf.md)
 - [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
 - [Serve TTFT benchmark](tools/bench/ttft/)
 - [CLI examples](examples/cli/)

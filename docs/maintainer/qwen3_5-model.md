@@ -101,7 +101,7 @@ A simple split at the middle of the source matrix would change the model.
 The Dense groupwise attention recipe packs Q/K into Q4 and gate/V into Q5. A supported FP8 or NVFP4
 recipe can pack their union into one parent. The same four logical roles then become either the
 two-weight or one-weight native fused call. Dense gate/up and MoE expert banks follow their finite
-packing and execution rules. [Storage layouts](storage-layouts.md#8-logical-views-and-native-operands)
+packing and execution rules. [Storage layouts](storage-layouts.md#9-logical-views-and-native-operands)
 describes the difference between logical views and native operand restrictions.
 
 `tie_word_embeddings` records a training relationship; bindings choose whether physical data is
@@ -212,6 +212,19 @@ y = y_routed + sigmoid(W_shared_score h) * shared
 The shared expert always executes and is outside top-k. Logical expert id e identifies router row e
 and the corresponding expert matrices. Physical bank ordering and fused dispatch preserve that
 relationship. Router loss coefficients and training-only outputs add no inference term.
+
+## GGUF block checkpoints
+
+An artifact converted with `qwen3_8_27b_gguf` stores its text projections, token table, output head
+and MTP head in `gguf_*` formats, one ggml type per tensor, so the parts of a fused projection can
+differ in type. The execution layer keeps each GGUF part as its own weight
+(`ops::GgufProjectionWeights`): the GDN input projection lands q/k/v (output 0) and z (output 1)
+rows, the attention projection query, gate, key and value, and parts that are contiguous rows of one
+parent run as one product. FFN gate and up run as one `[gate; up]` product when they are one
+parent, otherwise the gate writes an FP32 plane that the up product's epilogue multiplies by
+`silu`. The MTP layer's projections stay separate unless they join the same way. The GDN output
+projection reads its input through the Use's `input_columns` permutation (llama.cpp's tiled value
+heads), applied while the activation is quantized.
 
 ## Prefill, decode and MTP
 

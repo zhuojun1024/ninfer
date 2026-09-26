@@ -38,7 +38,12 @@ public:
     std::vector<PendingWeight> weights;
 
 private:
+    // One device weight per distinct input-gather binding, however many Uses name it.
+    WeightId input_columns(const artifact::Binding& binding, std::uint64_t width,
+                           const std::string& use);
+
     std::map<std::string, WeightId, std::less<>> parameters_;
+    std::map<std::string, WeightId, std::less<>> columns_;
 };
 
 [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,

@@ -27,6 +27,8 @@ struct WeightUse {
     std::string input;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
     std::optional<float> activation_input_divisor;
+    // INT32 [K] input gather of a GGUF matrix stored over permuted input columns.
+    std::optional<WeightId> input_columns;
 };
 
 struct BoundWeight {

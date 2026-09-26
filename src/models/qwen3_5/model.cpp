@@ -17,7 +17,15 @@ Model::~Model() = default;
 ops::WeightInput Model::input(WeightUseId id) const {
     const auto& parameter = weight(id.parameter);
     const auto& use       = parameter.uses.at(id.use_index);
-    return {parameter.view, use.policy, use.activation_input_divisor};
+    ops::WeightInput result{parameter.view, use.policy, use.activation_input_divisor};
+    // A GGUF matrix whose stored columns permute its input's carries the gather as its own device
+    // weight; the consuming Op reads it through Weight::input_columns.
+    if (use.input_columns) {
+        const auto& columns = weight(*use.input_columns).view;
+        result.input_columns =
+            weight_tensor(columns, {static_cast<std::int32_t>(columns.shape[0])});
+    }
+    return result;
 }
 
 ops::WeightInput Model::input(WeightId id) const {
