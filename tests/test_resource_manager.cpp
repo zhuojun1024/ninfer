@@ -784,7 +784,7 @@ public:
     }
 
     [[nodiscard]] ContextTransactionReserveStatus
-    start_resource_transaction(FakeResourcePlan&& plan, FakePreparedPrompt&& prompt,
+    start_resource_transaction(FakeResourcePlan&& plan, FakePreparedPrompt& prompt,
                                CancellationFlagView cancellation) {
         ++start_calls;
         started_source_id   = plan.admission.private_source_id;

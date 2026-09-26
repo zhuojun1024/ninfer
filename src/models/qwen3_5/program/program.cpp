@@ -313,9 +313,10 @@ Program::shared_capture_split_prefill_work(const AdmissionCandidate& candidate,
 }
 
 runtime::ContextTransactionReserveStatus
-Program::start_resource_transaction(ResourcePlan&& plan, PreparedPrompt&& prompt,
+Program::start_resource_transaction(ResourcePlan&& plan, PreparedPrompt& prompt,
                                     runtime::CancellationFlagView cancellation) {
     if (plan.revision_.value == 0 || plan.revision_ != impl_->resource_revision()) {
+        // A revision change is recoverable: the caller re-plans. Do not consume the prompt here.
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
     return impl_->reserve_materialization(

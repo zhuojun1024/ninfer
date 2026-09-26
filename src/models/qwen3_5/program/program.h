@@ -877,7 +877,9 @@ public:
                                       const PreparedPrompt& prompt,
                                       std::span<const std::uint32_t> frontiers);
     [[nodiscard]] runtime::ContextTransactionReserveStatus
-    start_resource_transaction(ResourcePlan&& plan, PreparedPrompt&& prompt,
+    // `prompt` is consumed only once the revision gate has passed: a Stale return must leave the
+    // caller's prompt intact, so it can re-plan and retry the request.
+    start_resource_transaction(ResourcePlan&& plan, PreparedPrompt& prompt,
                                runtime::CancellationFlagView cancellation);
     [[nodiscard]] std::optional<PersistentBackfillProof>
     prove_persistent_backfill(const RequestBasePlan& blocked_head, const ResourcePlan& candidate,

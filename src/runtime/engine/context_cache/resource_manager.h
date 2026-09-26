@@ -435,12 +435,17 @@ public:
         MaterializationRecord& open = std::get<MaterializationRecord>(transaction_);
         reserve_logical_materialization(open);
 
+        // `prompt` is passed as an lvalue: the Program moves it only after its revision gate, so a
+        // Stale return leaves the caller's prompt intact for the re-plan.
         const ContextTransactionReserveStatus status = program.start_resource_transaction(
-            std::move(*choice.plan_), std::move(prompt), cancellation);
+            std::move(*choice.plan_), prompt, cancellation);
         choice.plan_.reset();
         if (status == ContextTransactionReserveStatus::Aborted) {
             rollback_logical_materialization(open);
             transaction_.template emplace<std::monostate>();
+            // The program returns Aborted before consuming the prompt when only the revision moved
+            // (see Program::start_resource_transaction), so a non-cancelled abort is the retryable
+            // Stale; only a requested cancellation settles the request.
             return cancellation.requested() ? MaterializationReserveResult::Aborted
                                             : MaterializationReserveResult::Stale;
         }
