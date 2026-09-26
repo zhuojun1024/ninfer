@@ -118,21 +118,35 @@ void check_shard_shapes(const qwen::execution::Parameters& parameters, const qwe
             if (!draft.selector.has_value()) {
                 throw std::runtime_error("shard 0 DFlash2 draft has no selector weights");
             }
-            // The masked draft resolves its top-k on shard 0 alone against the whole reduced
-            // vocabulary, so the proposal head must stay whole here (MTP splits it and merges
-            // the pair's row blocks in proposal_argmax).
-            if (weights.proposal.has_value()) {
+            // The reduced proposal head is a draft-only table that either route halves: MTP merges
+            // the pair's row blocks in proposal_argmax, and the masked draft ranks each half
+            // through linear_topk and merges both candidate lists back to the whole table's stable
+            // sixteen. Shard 0 therefore holds its own row block, not a replicated table.
+            if (expect_proposal_split && weights.proposal.has_value()) {
                 const auto& head = model.weight(weights.proposal->head).view;
-                if (head.shape[0] != 131072 || head.shape[1] != 5120) {
-                    throw std::runtime_error("shard 0 DFlash2 proposal head is not replicated");
+                if (head.shape[0] != 65536 || head.shape[1] != 5120) {
+                    throw std::runtime_error("shard 0 DFlash2 proposal head is not [65536,5120]");
                 }
+            }
+            // The selector's whole-vocabulary codebooks are the peer shard's bytes on TP-2: the
+            // masked draft hands its state over and shard 1 runs the selector against the whole
+            // codebook, so shard 0 must not pay for them.
+            if (draft.selector.has_value() &&
+                model.has_weight(draft.selector->predecessor_codebook)) {
+                throw std::runtime_error("shard 0 holds the DFlash2 selector codebook");
+            }
+        } else {
+            if (model.has_weight(draft.feature_projection)) {
+                throw std::runtime_error("shard 1 materialized the shard-local DFlash2 draft");
+            }
+            if (!draft.selector.has_value() ||
+                !model.has_weight(draft.selector->predecessor_codebook)) {
+                throw std::runtime_error("shard 1 did not materialize the DFlash2 selector codebook");
             }
             const auto& codebook = model.weight(draft.selector->predecessor_codebook).view;
             if (codebook.shape[0] != 248320 || codebook.shape[1] != 256) {
-                throw std::runtime_error("shard 0 DFlash2 predecessor codebook is not [248320,256]");
+                throw std::runtime_error("shard 1 DFlash2 predecessor codebook is not [248320,256]");
             }
-        } else if (model.has_weight(draft.feature_projection)) {
-            throw std::runtime_error("shard 1 materialized the shard-local DFlash2 draft");
         }
     }
     const auto layer0   = weights.text.layers[0];
@@ -256,7 +270,7 @@ int main(int argc, char** argv) {
         const bool expect_mtp     = options.speculative == SpeculativeBackend::Mtp;
         const bool expect_dflash2 = options.speculative == SpeculativeBackend::DFlash2;
         const bool expect_split   = !options.speculative_enabled() || options.proposal_enabled();
-        const bool expect_proposal_split = options.proposal_enabled() && !expect_dflash2;
+        const bool expect_proposal_split = options.proposal_enabled();
         check_shard_shapes(parameters0, *model0, 0, expect_mtp, expect_split, expect_proposal_split,
                            expect_dflash2, options.vision);
         check_shard_shapes(parameters1, *model1, 1, expect_mtp, expect_split, expect_proposal_split,
