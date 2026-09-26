@@ -3,6 +3,7 @@ from __future__ import annotations
 import struct
 from dataclasses import replace
 
+import numpy as np
 import pytest
 import torch
 
@@ -11,7 +12,7 @@ from tools.artifact.codecs.row_split import decode_row_split_codes
 from tools.artifact.codecs.nvfp4 import encode_nvfp4
 from tools.artifact.schema import binding_parts
 from tools.artifact.writer import ArtifactWriter
-from tools.convert.methods import grouped_absmax, import_encoded
+from tools.convert.methods import AuxiliaryValue, grouped_absmax, import_encoded
 from tools.convert.model import Model, Parameter
 from tools.artifact.tensor_output import TensorOutput
 from tools.convert.recipe import Recipe
@@ -134,6 +135,32 @@ def test_row_overrides_preserve_binding_order_and_coverage(tmp_path):
             parts, ([1], [2, 4], [8]), ("q4_g64_fp16", "q5_g64_fp16", "q4_g64_fp16")
         ):
             _assert_quantized_rows(artifact, part, amplitudes, format)
+
+
+def test_identical_auxiliaries_are_stored_once():
+    # Every GDN layer's output projection carries the same input-column permutation. The container
+    # stores one object per referenced vector and any number of Uses may reference it (see
+    # docs/maintainer/artifact-container.md), and the loader binds one tensor per distinct binding.
+    # The recipe must therefore intern identical auxiliary values instead of writing one object per
+    # Use: without this, 48 GDN layers stored 48 copies of the same map.
+    model = Model({"text": {"config": {}}})
+    for name in ("first", "second", "third"):
+        values = torch.ones(4, 128, dtype=torch.bfloat16)
+        model.add(Parameter(name, (4, 128), array_source(values, name), inputs=("input",)))
+    recipe = Recipe(model)
+    recipe.assign("*", format="q8_g32_fp16", method=grouped_absmax)
+    columns = AuxiliaryValue("int32", (128,), np.arange(128, dtype="<i4").tobytes())
+    for name in model.parameters:
+        recipe.use(
+            name, "input", activation_policy="AllowA8", auxiliaries={"input_columns": columns}
+        )
+    prepared = recipe.prepare(device="cpu", rows_per_chunk=128)
+    assert len(prepared.uses) == 3
+    assert len(prepared.auxiliaries) == 1
+    assert all(
+        use["auxiliaries"]["input_columns"]["object"] == prepared.auxiliaries[0][0].id
+        for use in prepared.uses
+    )
 
 
 def test_shared_weight_keeps_use_independent_and_can_be_overridden():

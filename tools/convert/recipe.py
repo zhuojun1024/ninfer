@@ -453,6 +453,12 @@ class Recipe:
 
         uses = []
         auxiliary_outputs = []
+        # Auxiliary objects are interned by their stored bytes: the container allows any number of
+        # Uses to reference one object (see docs/maintainer/artifact-container.md), and the loader
+        # binds one device tensor per distinct binding. Without this, a per-Use auxiliary that is
+        # identical across layers (the GGUF GDN input-column map, one per GDN layer) is stored once
+        # per Use.
+        auxiliary_objects: dict[tuple, TensorSpec] = {}
         for (name, input_name), policy in self.policies.items():
             # Explicitly shared weights retain independent Use and calibration records.
             key = (name, input_name, "activation_input_divisor")
@@ -480,13 +486,17 @@ class Recipe:
                 layout = default_layout(value.format)
                 if len(value.data) != encoded_size(layout, value.format, value.shape):
                     raise ValueError(f"{name}/{role}: auxiliary data length is invalid")
-                spec = TensorSpec(
-                    f"auxiliary/{len(auxiliary_outputs):06d}",
-                    value.shape,
-                    value.format,
-                    layout,
-                )
-                auxiliary_outputs.append((spec, value.data))
+                auxiliary_key = (value.format, layout, value.shape, value.data)
+                spec = auxiliary_objects.get(auxiliary_key)
+                if spec is None:
+                    spec = TensorSpec(
+                        f"auxiliary/{len(auxiliary_outputs):06d}",
+                        value.shape,
+                        value.format,
+                        layout,
+                    )
+                    auxiliary_outputs.append((spec, value.data))
+                    auxiliary_objects[auxiliary_key] = spec
                 referenced[role] = {"object": spec.id}
             if referenced:
                 use["auxiliaries"] = referenced
