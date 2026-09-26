@@ -2,6 +2,7 @@
 // positions then launch causal attention over absolute cached history.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
+#include "ops/common/cuda_smem.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh"
@@ -20,19 +21,14 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                                                   cudaStream_t stream) {
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
-    // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling. The opt-in
-    // attribute is per-device (cudaFuncSetAttribute configures the current device's copy of the
-    // kernel), so it must be applied on every launch rather than once per process: a TP-2 forward
-    // runs the same kernel on two devices, and the second device's copy would otherwise keep the
-    // 48 KiB default and reject the 96 KiB launch. Idempotent, so the per-call cost is negligible.
-    const cudaError_t attr_bf16 =
-        cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptSmemBytes);
-    CUDA_CHECK(attr_bf16);
-    const cudaError_t attr_i8 =
-        cudaFuncSetAttribute(causal_attention_prompt_i8_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
-    CUDA_CHECK(attr_i8);
+    // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling. The opt-in is
+    // per (kernel, device), so it goes through the shared authority rather than a per-process cache.
+    ensure_max_dynamic_shared_memory(
+        reinterpret_cast<const void*>(causal_attention_prompt_bf16_kernel<Geometry, Metadata>),
+        kCausalPromptSmemBytes);
+    ensure_max_dynamic_shared_memory(
+        reinterpret_cast<const void*>(causal_attention_prompt_i8_kernel<Geometry, Metadata>),
+        kCausalPromptI8SmemBytes);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.storage == KvCacheStorage::Int8Group64) {

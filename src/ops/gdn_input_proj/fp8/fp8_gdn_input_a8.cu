@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 
+#include "ops/common/cuda_smem.h"
 #include "core/device.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_output.cuh"
 #include "ops/linear/fp8/fp8_a8_schedule.cuh"
@@ -30,10 +31,10 @@ void launch_mma(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace wor
                                    static_cast<__nv_bfloat16*>(z.data)};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attribute = cudaFuncSetAttribute(
-            fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue, Fp8GdnInputOutput>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        CUDA_CHECK(attribute);
+        ensure_max_dynamic_shared_memory(
+            reinterpret_cast<const void*>(fp8_mma_kernel<Geometry, Schedule, FullTokens,
+                                                         Fp8IdentityEpilogue, Fp8GdnInputOutput>),
+            Schedule::kSharedBytes);
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
