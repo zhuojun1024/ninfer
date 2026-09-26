@@ -51,6 +51,18 @@ WeightGeometry shard_geometry(const WeightGeometry& full, std::int32_t n,
         g.alignment      = full.alignment;
         return g;
     }
+    if (full.layout == QuantLayout::GgufBlocks) {
+        // A GGUF block weight derives its planes entirely from its format and shape, exactly as the
+        // RowSplit branch above does. This must run before any arena is sized: the generic
+        // element-width fallback below would charge four bytes per element for a ~0.44 B/element
+        // format and over-allocate a shard by about nine times, which surfaces as a cudaMalloc OOM
+        // rather than as the actual condition. A shard whose K is not a whole number of blocks has no
+        // representation and fails here with that reason.
+        const std::uint64_t shape[2] = {static_cast<std::uint64_t>(n), static_cast<std::uint64_t>(k)};
+        WeightGeometry g = weight_geometry(full.format, full.layout, shape);
+        g.alignment      = full.alignment;
+        return g;
+    }
     const auto align256 = [](std::uint64_t v) { return (v + 255) / 256 * 256; };
     if (full.layout == QuantLayout::BlockScaleK16M128x4) {
         g.code_bytes_per_row = static_cast<std::uint64_t>(k) / 2;

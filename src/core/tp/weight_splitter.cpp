@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::tp {
 namespace {
@@ -317,6 +318,87 @@ WeightShard slice_bf16_cols(std::span<const std::uint8_t> full, const Weight& fu
 }
 
 
+// GGUF block payload geometry: one code plane of n rows, each (k / block_elements) whole blocks. A
+// block carries its codes and its scale together, so the code plane is the entire payload.
+struct GgufGeometry {
+    std::uint64_t row_bytes     = 0;
+    std::uint64_t payload_bytes = 0;
+    static GgufGeometry of(QType format, std::int32_t n, std::int32_t k) {
+        require_gguf_block_columns(format, k, "GGUF block payload geometry");
+        const GgufBlockShape block = gguf_block_shape(format);
+        GgufGeometry g;
+        g.row_bytes     = static_cast<std::uint64_t>(k / block.elements) * block.bytes;
+        g.payload_bytes = static_cast<std::uint64_t>(n) * g.row_bytes;
+        return g;
+    }
+};
+
+// GGUF row slice: rows [row_begin, row_begin + row_count). Every row is whole blocks, so the slice is
+// one contiguous copy of the code plane.
+WeightShard slice_gguf_rows(std::span<const std::uint8_t> full, const Weight& full_weight,
+                            std::int32_t row_begin, std::int32_t row_count) {
+    if (row_count <= 0 || row_begin < 0 || row_begin + row_count > full_weight.n) {
+        throw std::invalid_argument("weight splitter: invalid GGUF row slice");
+    }
+    const GgufGeometry full_geo  = GgufGeometry::of(full_weight.qtype, full_weight.n, full_weight.k);
+    const GgufGeometry shard_geo = GgufGeometry::of(full_weight.qtype, row_count, full_weight.k);
+
+    WeightShard shard;
+    shard.payload.assign(static_cast<std::size_t>(shard_geo.payload_bytes), 0);
+    std::memcpy(shard.payload.data(),
+                full.data() + static_cast<std::size_t>(row_begin) * full_geo.row_bytes,
+                static_cast<std::size_t>(shard_geo.payload_bytes));
+    shard.weight                  = full_weight;
+    shard.weight.n                = row_count;
+    shard.weight.shape[0]         = row_count;
+    shard.weight.padded_shape[0]  = row_count;
+    shard.weight.payload          = shard.payload.data();
+    shard.weight.payload_bytes    = shard.payload.size();
+    shard.weight.qdata            = shard.payload.data();
+    shard.weight.qhigh            = nullptr;
+    shard.weight.scales           = nullptr;
+    shard.weight.high_plane_bytes = 0;
+    return shard;
+}
+
+// GGUF column slice: columns [col_begin, col_begin + col_count) of every row. Both ends must be whole
+// blocks, which is what keeps every block's codes and scale together; the shard therefore holds the
+// parent's represented values, block for block.
+WeightShard slice_gguf_cols(std::span<const std::uint8_t> full, const Weight& full_weight,
+                            std::int32_t col_begin, std::int32_t col_count) {
+    const std::int32_t n = full_weight.n, k = full_weight.k;
+    require_gguf_block_columns(full_weight.qtype, col_count, "GGUF block weight column split");
+    const GgufBlockShape block = gguf_block_shape(full_weight.qtype);
+    if (col_begin < 0 || (col_begin % block.elements) != 0 || col_begin + col_count > k) {
+        throw std::invalid_argument("weight splitter: invalid GGUF column slice");
+    }
+    const std::uint64_t full_row_bytes =
+        static_cast<std::uint64_t>(k / block.elements) * block.bytes;
+    const std::uint64_t shard_row_bytes =
+        static_cast<std::uint64_t>(col_count / block.elements) * block.bytes;
+    const std::uint64_t byte_begin =
+        static_cast<std::uint64_t>(col_begin / block.elements) * block.bytes;
+
+    WeightShard shard;
+    shard.payload.assign(static_cast<std::size_t>(n) * shard_row_bytes, 0);
+    for (std::int32_t r = 0; r < n; ++r) {
+        std::memcpy(shard.payload.data() + static_cast<std::size_t>(r) * shard_row_bytes,
+                    full.data() + static_cast<std::size_t>(r) * full_row_bytes + byte_begin,
+                    shard_row_bytes);
+    }
+    shard.weight                  = full_weight;
+    shard.weight.k                = col_count;
+    shard.weight.shape[1]         = col_count;
+    shard.weight.padded_shape[1]  = col_count;
+    shard.weight.payload          = shard.payload.data();
+    shard.weight.payload_bytes    = shard.payload.size();
+    shard.weight.qdata            = shard.payload.data();
+    shard.weight.qhigh            = nullptr;
+    shard.weight.scales           = nullptr;
+    shard.weight.high_plane_bytes = 0;
+    return shard;
+}
+
 // FP8 row-scale payload geometry: code = n*k bytes (k per row), scale plane at
 // align_up(code, 256), scale = n*2 bytes (2 per row). No divisor.
 struct Fp8Geometry {
@@ -451,6 +533,27 @@ WeightShard gather_rows_impl(std::span<const std::uint8_t> full_payload,
         return shard_out;
     }
 
+    if (full_weight.layout == QuantLayout::GgufBlocks) {
+        const GgufGeometry full_geo  = GgufGeometry::of(full_weight.qtype, full_weight.n, k);
+        const GgufGeometry shard_geo = GgufGeometry::of(full_weight.qtype, total_n, k);
+        shard_out.payload.assign(static_cast<std::size_t>(shard_geo.payload_bytes), 0);
+        std::size_t row_off = 0;
+        for (const auto& p : parts) {
+            // Whole rows move, so the part's half is one contiguous run of the code plane.
+            const std::int32_t rb = p.row_begin + shard * (p.row_count / 2);
+            const std::int32_t rc = p.row_count / 2;
+            std::memcpy(shard_out.payload.data() + row_off,
+                        full_payload.data() + static_cast<std::size_t>(rb) * full_geo.row_bytes,
+                        static_cast<std::size_t>(rc) * full_geo.row_bytes);
+            row_off += static_cast<std::size_t>(rc) * full_geo.row_bytes;
+        }
+        shard_out.weight.payload       = shard_out.payload.data();
+        shard_out.weight.payload_bytes = shard_out.payload.size();
+        shard_out.weight.qdata         = shard_out.payload.data();
+        shard_out.weight.scales        = nullptr;
+        return shard_out;
+    }
+
     throw std::invalid_argument("weight splitter: unsupported qtype for gather");
 }
 
@@ -464,8 +567,52 @@ WeightShard gather_cols_impl(std::span<const std::uint8_t> full_payload,
     if (shard != 0 && shard != 1) {
         throw std::invalid_argument("weight splitter: gather shard must be 0 or 1");
     }
+    if (full_weight.layout == QuantLayout::GgufBlocks) {
+        const GgufBlockShape block = gguf_block_shape(full_weight.qtype);
+        const std::int32_t n = full_weight.n, k = full_weight.k;
+        std::int32_t total_k = 0;
+        for (const auto& p : parts) {
+            if (p.row_count % 2 != 0 || p.row_begin < 0 || p.row_begin + p.row_count > k) {
+                throw std::invalid_argument("weight splitter: invalid column gather part");
+            }
+            require_gguf_block_columns(full_weight.qtype, p.row_count / 2,
+                                       "GGUF block weight column gather part");
+            total_k += p.row_count / 2;
+        }
+        const GgufGeometry full_geo  = GgufGeometry::of(full_weight.qtype, n, k);
+        const GgufGeometry shard_geo = GgufGeometry::of(full_weight.qtype, n, total_k);
+        WeightShard shard_out;
+        shard_out.weight                  = full_weight;
+        shard_out.weight.k                = total_k;
+        shard_out.weight.shape[1]         = total_k;
+        shard_out.weight.padded_shape[1]  = total_k;
+        shard_out.payload.assign(static_cast<std::size_t>(shard_geo.payload_bytes), 0);
+        std::size_t col_off = 0;
+        for (const auto& p : parts) {
+            const std::int32_t cb = p.row_begin + shard * (p.row_count / 2);
+            const std::int32_t cc = p.row_count / 2;
+            const std::uint64_t full_byte =
+                static_cast<std::uint64_t>(cb / block.elements) * block.bytes;
+            const std::uint64_t part_bytes =
+                static_cast<std::uint64_t>(cc / block.elements) * block.bytes;
+            for (std::int32_t r = 0; r < n; ++r) {
+                std::memcpy(shard_out.payload.data() +
+                                static_cast<std::size_t>(r) * shard_geo.row_bytes + col_off,
+                            full_payload.data() +
+                                static_cast<std::size_t>(r) * full_geo.row_bytes + full_byte,
+                            part_bytes);
+            }
+            col_off += part_bytes;
+        }
+        shard_out.weight.payload       = shard_out.payload.data();
+        shard_out.weight.payload_bytes = shard_out.payload.size();
+        shard_out.weight.qdata         = shard_out.payload.data();
+        shard_out.weight.scales        = nullptr;
+        return shard_out;
+    }
     if (full_weight.qtype != QType::BF16 || full_weight.layout != QuantLayout::Contiguous) {
-        throw std::invalid_argument("weight splitter: column gather requires BF16 Contiguous");
+        throw std::invalid_argument(
+            "weight splitter: column gather requires BF16 Contiguous or GGUF blocks");
     }
     const std::int32_t n = full_weight.n, k = full_weight.k;
     std::int32_t total_k = 0;
@@ -506,6 +653,22 @@ WeightShard gather_cols_impl(std::span<const std::uint8_t> full_payload,
 }
 
 } // namespace
+
+void require_gguf_block_columns(QType format, std::int32_t columns, const char* what) {
+    const GgufBlockShape block = gguf_block_shape(format);
+    if (!is_gguf(format) || block.elements <= 0) {
+        throw std::invalid_argument(std::string("tensor parallel split: ") + (what != nullptr ? what : "") +
+                                    ": a GGUF block weight requires a ggml block format");
+    }
+    if (columns <= 0 || (columns % block.elements) != 0) {
+        throw std::invalid_argument(
+            std::string("tensor parallel split: ") + (what != nullptr ? what : "") +
+            ": a GGUF block weight does not support this tensor-parallel split: " +
+            std::to_string(columns) + " values is not a whole number of " +
+            std::to_string(block.elements) + "-value blocks, and a partial block has no "
+            "representation without requantising");
+    }
+}
 
 WeightShard gather_weight_rows(std::span<const std::uint8_t> full_payload,
                                const Weight& full_weight, std::span<const RowPart> parts,
@@ -551,6 +714,32 @@ std::vector<WeightShard> split_weight(std::span<const std::uint8_t> full_payload
         return {slice_grouped_rows(full_payload, full_weight, 0, full_weight.n / 2),
                 slice_grouped_rows(full_payload, full_weight, full_weight.n / 2,
                                    full_weight.n / 2)};
+    }
+    if (full_weight.layout == QuantLayout::GgufBlocks) {
+        // A GGUF block weight splits along N as one contiguous code-plane range (whole rows), and
+        // along K as whole blocks of every row. The K split is the only one that can be
+        // unrepresentable: a tiled value head is 128 values, which is inside a 256-element i-quant
+        // block, so a head-parallel K split cannot be expressed without requantising and is refused
+        // by slice_gguf_cols.
+        if (kind == WeightSplitKind::ColumnParallel) {
+            if ((full_weight.n % 2) != 0) {
+                throw std::invalid_argument("weight splitter: column split requires even n");
+            }
+            return {slice_gguf_rows(full_payload, full_weight, 0, full_weight.n / 2),
+                    slice_gguf_rows(full_payload, full_weight, full_weight.n / 2,
+                                    full_weight.n / 2)};
+        }
+        if (kind == WeightSplitKind::RowParallel) {
+            if ((full_weight.k % 2) != 0) {
+                throw std::invalid_argument("weight splitter: row split requires even k");
+            }
+            return {slice_gguf_cols(full_payload, full_weight, 0, full_weight.k / 2),
+                    slice_gguf_cols(full_payload, full_weight, full_weight.k / 2,
+                                    full_weight.k / 2)};
+        }
+        throw std::invalid_argument(
+            "tensor parallel split: a GGUF block weight supports only a row split (N) or a column "
+            "split (K); a per-part gather needs the row or column parts to be block aligned");
     }
     if (full_weight.qtype == QType::BF16) {
         if (kind == WeightSplitKind::ColumnParallel) {

@@ -11,6 +11,10 @@ ninfer_add_test(ninfer_tp_device_pair_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tp_device_pair.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_tp_weight_splitter_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tp_weight_splitter.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cpp"
   LIBRARIES ninfer_core)
 

@@ -35,6 +35,13 @@ struct RowPart {
     std::int32_t row_count = 0;
 };
 
+// GGUF block weights are the one quantized form whose pieces must stay whole: a block carries its own
+// codes and scale together, so a piece that begins or ends inside a block has no representation
+// without requantising. Every GGUF split path therefore requires the piece to be a whole number of
+// blocks, and fails here (naming the split in the message) at the planning stage, instead of copying
+// a shard whose represented values would differ from the parent's.
+void require_gguf_block_columns(QType format, std::int32_t columns, const char* what);
+
 // Splits a complete NVFP4, FP8 row-scale, or BF16 weight into two shards.
 //   ColumnParallel: shard0 = rows [0, n/2), shard1 = rows [n/2, n). Requires n % 256 == 0.
 //   RowParallel:    shard0 = cols [0, k/2), shard1 = cols [k/2, k). Requires k % 128 == 0.

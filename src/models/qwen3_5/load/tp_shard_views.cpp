@@ -68,6 +68,20 @@ std::vector<BoundWeight> shard_views(std::span<const PendingWeight> pending,
         for (const auto& part : item.reference.binding.parts) {
             const auto* split = spec.find(part.object);
             const WeightSplitKind kind = split ? split->kind : WeightSplitKind::Replicated;
+            if (kind == WeightSplitKind::RowParallel || kind == WeightSplitKind::GatherCols) {
+                // A weight whose Use gathers its input columns stores them in an order of its own
+                // (a GGUF block checkpoint's tiled value heads). A K split would hand this shard a
+                // block of that stored order while its activation holds only this shard's own heads,
+                // so the two halves would no longer pair up. Refuse it by name instead of computing a
+                // wrong product.
+                for (const auto& use : item.uses) {
+                    if (!use.input_columns) { continue; }
+                    throw std::invalid_argument(
+                        "tensor parallel split: " + item.reference.name +
+                        " gathers its input columns, which a column-parallel TP-2 split cannot "
+                        "represent");
+                }
+            }
             WeightRegion shard_part;
             shard_part.parent = &shard_backing.device_parent(part.object);
             if (kind == WeightSplitKind::Replicated) {
