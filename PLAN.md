@@ -181,6 +181,7 @@ q4 88 / q8 7 / bf16 567）：`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_final.ninfer`
 - 若仍攻 attention：只剩计算路径效率（FP8 PV + 压缩非张量 FP32 遍数），且需先解锁 profiler 权限（ncu
   2025.4.1 已装，`ERR_NVGPUCTRPERM` 被拒；管理员 PowerShell 或 NVIDIA Developer Settings 允许 GPU
   performance counters）。预期 attention 项 ~1.2–1.4×（245k 端到端 ~1.1–1.3×）。
+  **2026-09-27 启动为 §6**（含质量风险、变体与门禁）。
 - 硬件杠杆：卡 1 从芯片组 Gen4 x4 槽（~7 GB/s）移到 CPU 直连 Gen5 x8 槽（~20 GB/s）：零代码，浅/中上下文
   1.78×、245k 1.15×；需主板有空槽。
 - DFlash2 K=6 每轮成本凹陷（三轮恒 25.7 rounds/s，低于 K=5（27.9）与 K=7（26.6））：疑似按窗口宽度
@@ -680,3 +681,251 @@ in-kernel collective 只交换 1/N 的 partial，其余区间保持目的缓冲�
   零代码 ⇒ 优先级高于压缩；两者不叠加（共同封顶在 344 ms 的 compute 地板）。
 - 对「字典映射压缩」的判据：无损字典在 bf16 激活上拿不到 2×；要走到 ÷2/÷4 必须是有损量化（FP8 块 scale /
   INT4 码本），故它属于 PLAN §5.3 那条 S5「载荷量化」的范畴，需要重建 oracle 与质量/接受率 A/B。
+
+---
+
+## 6. FP8 PV：attention 计算路径效率（2026-09-27 启动 → 同日回退，CLOSED）
+
+> **已回退（2026-09-27）**：实现通过全部质量门（G0–G3）但 op 级只到 1.179×（目标 ≥1.3×），按用户预授权
+> 规则回退并恢复 fp8 判据 1.2e-2；补丁留档 `build-win/fp8pv-v1b.patch`。**本轮最有价值的产出是瓶颈定位**：
+> barrier stall 34.2% + math pipe throttle 25.2% ⇒ 余量在**相位结构**而非 PV 的 dtype（详见 §6 末尾）。
+> 建议的后续「跨 tile 相位流水」（逐位精确、零质量代价）未立项。
+
+**目标**：生产 prefill 的 PV 从 FP16 tensor 路径换成 FP8，并压缩非张量 FP32 遍数。作用域是深上下文
+prefill（245k 处 attention 占每 token 成本 70%，§3.13 拟合）。预期 attention 项 **1.2–1.4×** ⇒
+245k 端到端 **~1.1–1.3×**、50k ~1.05–1.1×。decode 小 T 内核与本杠杆无关。
+
+### 6.1 依据（已定案，勿重复调研）
+
+- L1 测量门（worklog §3.13/§3.14 + L1 实验记录）：KV 字节跨 3.5×、耗时只差 13% ⇒ **计算/ALU 受限**，
+  不是 KV 带宽受限；「减 6× KV 冗余」因此被否证（DRAM 1.09%）。
+- ncu（`causal_attention_prompt_k8v4_kernel`、W=1024、65,536 深度、h12-kv2）：**tensor 管线 63.5%
+  （最忙资源）**、Compute 63.54%、DRAM 1.09%、occupancy 33.33%（1 block/SM；寄存器 100/线程 +
+  动态 smem 85.12 KB 双重限制）、非张量 FP32 指令占 11%（ncu 提示 ~3.6% runtime）。
+- tensor 管线预算（每 KV tile 每 Q block）：QK^T 2.10 MFLOP @FP8（85.9 TFLOP/s 天花板的 25%）+
+  PV 2.10 MFLOP @FP16（~43 的 50%）⇒ **PV 占管线时间是 QK^T 的 2 倍**；PV 换 FP8 ⇒ 管线工作量 ×0.67。
+- **生产 dtype 是 `--kv-dtype fp8`**（§1 推荐配置、`docs/tp2-dual-5060ti.md` 的 shipped recipe），生产
+  内核是 `prompt_fp8.cuh`；k8v4 只是 245,760 扫描件的 dtype ⇒ **V 侧零新增舍入**：FP8 MMA 直接读今天
+  的 E4M3 码，与今天「精确展宽到 FP16」等值。这是本方案相对 k8v4 视角的关键简化。
+- 已试死（勿重做）：warps 16→32（−12%，寄存器 spill；1024 线程被 64K 寄存器文件顶在 ≤64 寄存器/线程）；
+  Bc 64→128（消费级 Blackwell 单块动态 smem 上限 ~100 KB，`cudaFuncSetAttribute` 返回
+  `cudaErrorInvalidValue`）；W=2048 chunk（只值 ~9%，W=1024 已在平台区）；GQA 减 6× KV 流量（DRAM 1%）。
+
+### 6.2 设计（变体 V1a，先做）
+
+1. **P 每 (row, tile) 一个 E4M3 scale**：`psc = P_tile_max/448 = exp2((bm − nm)·scale_l2)/448`。`bm`（tile
+   max）与 `nm`（新 running max）生产者已在算 ⇒ **scale 免费**；tile max 映到 448，范围利用满。
+   `p_s` 由 FP16 改 E4M3（8 KB → 4 KB）。
+2. **累加器吸收 scale 比**：`alpha' = alpha · psc_prev/psc_cur`（每行一次，生产者算，随 `alpha_s` 广播；
+   新增 `psc_s[Br]` 行数组）；末轮 `out = acc/(l · psc_last)`（每行一次乘，free）。
+3. **V 直通**：8 个 V-worker warp 不再做 FP16 展宽，改为把 E4M3 码**转置/swizzle 写入 B 暂存**
+   ——FP8 B 操作数（k32×n8）要求 `[n=d][k=key]` 行布局（`ldmatrix_x2` 非转置的行维＝n），而 cache 是
+   `[key][d]`，故 worker 侧需一次 8×8 字节转置（寄存器内 shuffle + 带 swizzle 的写）。
+4. **v_scale 归属（唯一开放选择）**：
+   - **V1a（先做）**：worker 侧把 `code × v_scale` 重新量化为 E4M3（一次额外 2^-4 相对舍入）；P 与分母
+     `l` 的逻辑完全保持现状（`l` 仍由未加权的 FP32 P 累加）⇒ 改动最小、无耦合。
+   - **V1b（备选）**：把 `log2(v_scale)` 折进 score（`score + log2v_s[col]`，乘变加），tile max 自动含
+     v_scale；但分母 `l` 必须用未加权的 exp2 另算 ⇒ **MUFU 翻倍**，只在 V1a 质量不足时考虑。
+5. **非张量遍数压缩**（与 1–4 同批）：V 展宽遍整体消失；P 的 `__float2half_rn` 改 E4M3 转换；生产
+   kernel 的 smem 由 92,416 B 降到 **~72 KB**（VStage 32 KB 删、P 减半、加 V 的 B 暂存与 psc 行）。
+
+### 6.3 质量风险（本杠杆的主要否决点）
+
+E4M3 只有 ~2^18 动态范围（2^-9 … 448），而 `P = exp2(score − m)` 的动态范围由分布决定。per-tile scale
+把每个 tile 的 max 映到 448 后，**tile 内的小 P 仍可能落进 subnormal 或 0**：245k 上下文若 attention 接近
+平坦（P ~ 4e-6），整行 P 可能被压到零 ⇒ 归一化失真。与 L1「减流量」不同，**本杠杆不是数值透明的**：
+它必然改动贪心轨迹（先例：MTP cache 试 nvfp4 时 5 条 golden 有 3 条文本变化）⇒ 属「质量换速度」，
+必须带声明的容差与采样式裁决，不能按「逐位一致」验收。
+
+### 6.4 门禁与执行顺序（先测量后动代码；G1 不过则停止并记录否决）
+
+| 门 | 内容 | 判据 |
+|---|---|---|
+| **G0** | ncu 重抓生产 fp8 kernel（d256-h12-kv2、W=1024、深度 ≥100k）+ fp8 基线深度曲线（8k→245k） | tensor 管线仍是最忙资源；occupancy/DRAM 与 k8v4 profile 同形 |
+| **G1** | P 量化误差数值研究：按真实/合成分数分布在 per-tile E4M3 scale 下的 PV 相对误差，覆盖 245k 平坦/尖峰两端 | 尾部丢失在可接受范围（暂定 PV 输出相对误差与 fp8 KV 同量级） |
+| **G2** | OP 级独立 FP32/FP64 naive oracle @ 生产几何深包络；声明 P 量化边界与容差（V1a 另记第二次 V 量化） | 生产路线直接对照 oracle |
+| **G3** | 模型级 golden 摘要（`tp2_dflash_solo`/`append`）+ sessions + 30-rep 接受率 | 接受率无可测代价，或代价已由用户接受 |
+| **G4** | 深度曲线 A/B + `bench_serve.ps1` prefill 行 | attention 项 1.2–1.4× 兑现 |
+
+**文件**：`src/ops/softmax_attention/dense/causal_cache/prompt_fp8.{cuh,cu}`、
+`tests/ops/softmax_attention/causal_cache.cpp`、`bench/ops/causal_softmax_attention_bench.cu`。
+k8v4 / nvfp4 / bf16 / i8 的 prompt 内核保持 FP16 PV 不动（k8v4 只是扫描 dtype）。
+
+**G0 结果（2026-09-27，PASS）**
+
+- fp8 基线深度曲线（`ninfer_causal_softmax_attention_bench --entry cached --geometry d256-h12-kv2
+  --kv-dtype fp8 --tokens 1024 --execution eager --cache cold`，单层 median）：8,192 → 2,645.3 µs；
+  32,768 → 9,949.4；65,536 → 19,690.7；131,072 → 39,673.7；245,760 → **73,521.8 µs**（math 42.15 TFLOP/s，
+  qk/pv 各 21.07 TFLOP/s）。线性度极好，与 k8v4 基线（73,880 µs）同档、略快。
+- ncu 重抓 `causal_attention_prompt_fp8_kernel`（d256-h12-kv2、W=1024、65,536 深度、grid 192、block 512）：
+  **Tensor 管线 63.7% 为最忙资源**、Compute (SM) 63.67%、**DRAM 2.23%**、L1 39.79%、L2 14.67%、
+  IPC 1.26、Issue Slots 28.09%；**寄存器 102/线程 + 动态 smem 92.42 KB（配置 102.40）⇒ 1 block/SM**；
+  最大 stall = 等数学管线 4.4/12.7 周期（**34.9%**，ncu 的 Est. Local Speedup 34.9%，原文「all active warps
+  execute their next instruction on a specific, oversubscribed math pipeline」）。
+- ⇒ 与 k8v4 profile **同形**：瓶颈是 tensor 管线 + 1 block/SM，不是带宽。前提成立，杠杆有效。
+
+**G1 结果（2026-09-27，PASS + 设计改判）**
+
+模拟（per-tile E4M3 scale、fp8 KV 的 V 行 scale、D=32、Bc=64、4 个 n×σ×spike 组合；误差＝输出 rel-L2）：
+
+| 场景（P 分布） | V 重量化单独误差 | E4M3 per-tile | E5M2 per-tile | E4M3 global 1/448 | P 质量归零 |
+|---|---:|---:|---:|---:|---:|
+| n=8192 σ=1 无尖峰 | 2.610% | 2.967% | 6.073% | 4.813% | 0% |
+| n=65536 σ=1 有尖峰 | 1.778% | **2.415%** | 4.194% | 3.059% | 0% |
+| n=245760 σ=1 无尖峰 | 2.760% | **2.954%** | 5.965% | 3.805% | 0% |
+| n=245760 σ=4 有尖峰 | 2.552% | **2.552%** | 2.551% | 2.650% | 0%（global 0.358%） |
+
+- **结论 1（per-tile scale 必需）**：global 1/448 在长上下文明显更差（+0.9pp）且开始丢质量（0.358% 归零）；
+  per-tile E4M3 的归零质量 ≈ 0%，**我原先担心的「长上下文尾部塌方」不成立**（每 64-key tile 自带 scale，
+  tile 内动态范围有限）。
+- **结论 2（E4M3 > E5M2）**：E5M2 的 2 位尾数（12.5% 相对误差）盖过其指数范围优势，长上下文差 ~2× ⇒ 用 E4M3。
+- **结论 3（P 量化本身的代价很小）**：E4M3 per-tile 相对「V 重量化单独」只加 ~0–0.6pp；**真正的代价在 V 侧
+  重量化（1.8–3.4%）**。
+- ⇒ **设计从 V1a 改判为 V1b（V 保持逐位精确）**：把 `log2(v_scale)` 折进加权 score。重新推导后 V1b 反而
+  **更便宜**：每元素只多 1 次加（`u+w`）+ 1 次 fmax，分母 `l` 用 `Σ P'_q·inv_scale`（每元素 1 次乘）在
+  **同一移位**下恢复，无需第二次 exp2（MUFU 不翻倍——实测 SFU 占用仅 ~3%，翻倍也无妨）。
+- **代数简化（重要）**：令 `u=score·scale_l2`、`w=log2(v_scale)`、`P'=exp2(u+w−m)`、`psc=exp2(bm'−nm')/448`，
+  则累加器与分母共用同一 rescale **`alpha' = exp2(bm'_prev − bm'_cur)`**（只依赖相邻 tile 的加权最大值，
+  running max 项完全抵消）⇒ 末轮 `out = acc / l`，**不需要额外的 psc 收尾乘法**。
+
+**最终设计（V1b，实施中）**
+
+1. worker 8 warp：不再做 FP16 展宽；把暂存的 V E4M3 码**转置写入 `[d][key]` 布局的 B 暂存**（FP8 B 操作数
+   要求行维＝n=d、行内 16 字节＝16 个 key；`ldmatrix_x2` 非转置，k 步长 32 ⇒ `PVKs = Bc/32 = 2`），
+   同时算每 key 的 `log2(v_scale)` 与 `inv_scale`（各 64 个，摊在 256 线程上可忽略）。
+2. producer：score 循环里多算 `u+w` 的 tile 最大值 `bm'`（1 add + 1 fmax/元素）；`P'=exp2(u+w−nm')` 后按
+   `psc` 量化成 E4M3 存 `p_s`（Br×Bc×1 B）；`l` 累加 `P'·inv_scale`。
+3. consumer：`acc *= alpha'`（生产者按行算好广播，沿用 `alpha_s`）后走 FP8 PV mma（P 与 V 码都是 E4M3）。
+4. smem：92,416 → **~72 KB**（删 VStage 32 KB、P 减半 4 KB、加转置 V 暂存 16 KB 与 log2/inv/psc 小数组）。
+
+**实现结果（2026-09-27，方案 V1b 已落地；未提交）**
+
+- `src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh`（+253/−94，唯一实质改动）：
+  - smem **92,416 → 72,448 B**：删 `v_f16`（32 KB 展宽暂存）、`p_s` 由 `__half` 改 **E4M3 uint8**（8→4 KB）、
+    新增 `v_t`（转置后 `[d][key]` 的 V 码 16 KB，原始 `v_fp8` 暂存保留）、`lv_s/iv_s[Bc]`、`bmp_s[Br]`，
+    删 `running_m_s`；仍 1 block/SM（寄存器 102→96）。
+  - producer：`bm'=max(u+w)`（1 fma + 1 fmax/元素，沿用 `partial_m_s` 合并两半）；
+    `P=exp2(fma(score,scale_l2,lv−bm'))·448`（tile 最大值恰映到 448）；`code=__nv_cvt_float_to_fp8(P,SATFINITE,E4M3)`；
+    `l += P·(1/v_scale)`（与码同一次 exp2，无第二次）；`alpha'=exp2(bm'_prev−bm'_cur)`；P 的 swizzle 改
+    16 字节粒度（行 64 字节）。
+  - worker 8 warp：不再展宽，改为**逐字节 8×8 寄存器转置**（三段 64-bit 掩码交换）把 V 码搬进 `v_t[d][key]`，
+    落位 `((key_group>>1)^(j&3))<<4 | ((key_group&1)<<3)`。
+  - consumer 16 warp：`PVKs=Bc/32=2`；A=P 用 `ldmatrix_x4`、B=V 用**非转置** `ldmatrix_x2` ⇒ `mma_fp8_e4m3`。
+  - `prompt_fp8.cu` 未改（smem 常量在头文件，launch 自动同步）。
+- **实现期的必要性修正**（均已写进代码注释）：
+  (a) 分母要带同一 448 因子（mma 吃 `448·P` ⇒ `l += (448·P)·iv`；448 在 acc/l 中相消，末轮仍 `out=acc/l`）；
+  (b) 直接用 per-tile `bm'` 作移位（不引入 running max）：存码等价且每元素少一次乘；
+  (c) `v_scale<=0` 取 `lv=0,iv=1`：全零 V 行的 softmax 权重仍须进分母，不能取 `-inf/0`；
+  (d) **空 tile（整块被 mask、`bm'=-inf`）必须 `alpha'=1` 且不更新 `bmp_s`** —— 实测真 bug：修前
+      T=65/keys=128、dflash W=9/16 出 non-finite，修后 0 non-finite。
+
+**G2（OP 级 oracle）：PASS，但判据必须放宽。** `ninfer_softmax_attention_test` 全量 PASS（0 fail /
+0 non-finite）。P→E4M3 是唯一新增语义边界，实测最坏 **rel-L2 2.309e-2 / gross-abs 2.258e-2**（max_ref 1.0），
+超原门限 1.2e-2 的 1.92× ⇒ fp8 判据改为 **3.2e-2 / 9.0e-3 / 2.4e-2**（约 1.4× 余量，低于 E4M3 单权重
+2^-4=6.25e-2 的理论上界），`tests/ops/softmax_attention/causal_cache.cpp` 注释写明边界与实测数字。
+**⇒ 这是相对旧 fp8 路线约 2× 的输出扰动，是 G3 必须裁决的代价。**
+
+**G4（性能）：未达标。** `ninfer_causal_softmax_attention_bench --entry cached --geometry d256-h12-kv2
+--kv-dtype fp8 --tokens 1024 --execution eager --cache cold`：
+
+| 深度 | 改前 µs | 改后 µs | 加速 | math 前→后 (TFLOP/s) |
+|---|---:|---:|---:|---:|
+| 8,192 | 2,645.3 | 2,252.4 | 1.174× | 41.40 → 48.63 |
+| 32,768 | 9,949.4 | 8,449.2 | 1.178× | 42.09 → 49.56 |
+| 65,536 | 19,690.7 | 16,730.0 | 1.177× | 42.20 → 49.68 |
+| 131,072 | 39,673.7 | 33,359.0 | 1.189× | 41.73 → 49.63 |
+| 245,760 | 73,521.8 | 62,493.5 | 1.176× | 42.15 → 49.59 |
+
+ncu（同 G0 配置）：Tensor 管线 **63.7% → 50.1%**、寄存器 102→96、动态 smem 92.42→72.45 KB、
+DRAM 2.23→2.68%、L1 39.79→45.65%，仍 1 block/SM。⇒ PV 张量时间确实减了 1.5×（绝对 0.637→0.425），
+但墙钟只快 1.18×：内核已从「张量独占」变成「张量与其它各半」，**剩下的 2–3% 缺口在非张量侧**——即
+§6.2 第 5 条「压缩非张量 FP32 遍数」那一半，尚未做。
+
+
+**G3（模型级裁决）：PASS，但覆盖有缺口。** 30-rep 接受率 A/B（`tools/tp_bootstrap/r62_sampling_ab.ps1`，
+工件 `qwen3_8_27b_w4a4_w8a8_dflash2_final.ninfer`，dflash2 k=7，温度 0.7/top_k 20/top_p 0.8，3 类短 prompt ×
+30 rep = 90 请求/臂，两臂 prompt 集合相同）：
+
+| 臂 | 样本 | 接受率 | committed/round | drafts/round | 臂墙钟 |
+|---|---:|---:|---:|---:|---:|
+| change（FP8 PV） | 90 | **35.79%** | 3.4265 | 6.779 | 355.1 s |
+| base（FP16 PV） | 90 | **35.50%** | 3.4083 | 6.783 | 366.8 s |
+
+Δ=**+0.29pp**（远在 30-rep ±1.4pp / 15-rep ±2pp 噪声内，且方向有利于改动）⇒ **模型级无可测退化**。
+golden：`tp2_dflash_solo`（q4all 件）**PASS**（digest `0x19047f8ccaf5707f`，43.3 s）；`tp2_sessions` dflash2 路
+官方 r69 件 **PASS**（164.3 s）；`tp2_dflash_append` PASS 但**其 KV 是 BF16 ⇒ 不走 prompt_fp8，仅作回归**；
+`sessions` 在 swift15 件上 FAIL 但**基线同样 FAIL**（stash 后重跑复现、失败点更早）⇒ 既有工件不匹配，非新内核
+break。
+
+**缺口（必须记住）**：接受率臂是 ~50 token 短 prompt、decode 主导；本杠杆的作用域是**深上下文 prefill**，
+「深上下文下的 P 量化无质量代价」本门**未测**（G2 的 op 级上界 rel-L2 ≤2.309e-2 覆盖深包络，但只到 op 层）。
+
+**G3 深上下文补测（2026-09-27）：作用域内同样无退化。** 长 prompt 变体 `build-win/g3_long_ab.ps1`
+（gitignored，沿用 r62 的 serve 配方与汇总口径，仅把 3 条短 prompt 换成 1 条长 filler，**每次 rep 带新 nonce**
+防 prefix cache ⇒ 每次全量 prefill），工件 `qwen3_8_27b_w4a4_w8a8_dflash2_final.ninfer`，dflash2 k=7，
+实际 prompt_n ≈ **28.5k**（单请求 prefill ≈18.5–18.9 s ⇒ ≈1,550 tok/s）：
+
+| 臂 | prompt_n | 样本 | 接受率 | committed/round | drafts/round |
+|---|---:|---:|---:|---:|---:|
+| change 10 | 28,537 | 10 | 39.96% | 3.7317 | 6.84 |
+| base 10 | 28,538 | 10 | 38.57% | 3.6434 | 6.85 |
+| change 30 | 28,533 | 30 | **38.09%** | 3.6025 | 6.83 |
+| base 30 | 28,534 | 30 | **38.97%** | 3.6717 | 6.86 |
+
+Δ(10)=+1.39pp、Δ(30)=**−0.88pp**（10→30 符号翻转 ⇒ 噪声；|Δ|<1.4pp 阈）；无 non-finite、四臂 exit 0
+⇒ **在杠杆真正的作用域（深上下文 prefill）同样无可测质量代价**。
+
+**G4 端到端（同服务会话，每格 1 样本，未达单样本可判阈）**：
+
+| workload | change | base | Δ |
+|---|---:|---:|---:|
+| prefill_2048 (1,835 tok) | 1,288.0 tok/s | 1,299.9 | −0.9% |
+| prefill_8192 (7,160 tok) | 1,560.4 | 1,594.0 | −2.1% |
+| prefill_32768 (28,534 tok) | **1,550.5** | **1,529.4** | **+1.4%** |
+
+PLAN §5.4 自述单次 `bench_serve` 只能判 ≥5% ⇒ 前两格在噪声内；深上下文 +1.4% 与 op 级 1.176× 同向，
+但**未达可判阈，G4 正式判定仍需多 rep**。（decode 行随采样文本漂移，与改动无关。）
+
+**总账（2026-09-27 收口）**：质量侧全绿——短 prompt 臂 Δ=+0.29pp、深上下文臂 Δ=−0.88pp，均在噪声内，
+三个 golden 在有效工件上 PASS；性能侧 op 级 **1.176×**、端到端 28.5k **+1.4%**（单样本）。
+**代价**：fp8 路由 op 判据 1.2e-2 → 3.2e-2（约 2× 输出扰动），这是**既有质量门的实质放宽**，
+而换来的端到端收益目前只有 ~1.4% 量级 ⇒ 是否保留取决于后续非张量侧压缩能否把 op 级推到 ~1.3× 以上。
+
+**用户裁决（2026-09-27）：选 A —— 保留改动，做一轮「有界的非张量侧压缩」**，目标把 op 级推到 **≥1.3×**
+（端到端才够 ~+3%，交易才站得住）；**达不到则回退并恢复 1.2e-2 门限**。
+
+本轮硬约束（否则刚通过的 G3 证据作废）：**只允许逐位精确的优化** —— 不重结合浮点、不改 fma/sub/exp2/cvt/mask
+语义；逐位判据为 ① `ninfer_qwen3_5_tp2_dflash_solo_test`（q4all 件）digest 仍为 `0x19047f8ccaf5707f`、
+② op 单测最坏误差数字（rel-L2 2.309e-2 等）逐字不变。占用率已被硬件锁死（96 寄存器 × 512 线程、72.45 KB
+smem ⇒ 1 block/SM；warps 16→32 与 Bc 64→128 均已实测否决）⇒ 不碰结构级重构。
+
+本轮起点：op 级 1.176×（245,760 深度 = 62,491.4 µs），ncu Tensor 50.1% / L1/TEX 45.65% / DRAM 2.68%。
+待做：先 ncu 拿管线细分与 stall 明细定瓶颈；候选为 P 的 16 次 1 字节散写合成为 8 次 16 位写（同列相邻字节，
+逐位精确）、地址预算、以及仅在 ncu 指向时才动的 worker 转置（V 从 global 直载省掉 raw `v_fp8` 16 KB 与一次
+smem 往返，风险高）。
+
+**有界压缩轮结果（2026-09-27）：未达 1.3×，已按用户预授权规则回退。**
+
+ncu 细分（`causal_attention_prompt_fp8_kernel`、ctx=65536、reg 96、dyn smem 72.45 KB）：管线 elapsed 口径
+Tensor(FP) **50.14%**、ALU 12.52%、FMA 7.59%；指令率口径 **LSU 37.39%**、Tensor 24.17%、ALU 12.27%。
+Stall（cyc/issued inst，总 12.38）：**Barrier 4.23（34.2%）**、**Math Pipe Throttle 3.12（25.2%）**、
+Wait 1.47（11.9%）、MIO 0.76、Short Scoreboard 0.69、Long Scoreboard 0.19。
+⇒ **瓶颈是 tensor 管线的相位结构，不是非张量指令吞吐。**
+
+- 本轮只做了唯一一组逐位精确优化（P 码 16 次 1 字节散写 → 8 次 16 位写，swizzle 地址计算 16→8）：
+  solo digest 仍为 `0x19047f8ccaf5707f`、op 单测质量数字逐字不变 ⇒ 逐位精确成立；
+- 但它**墙钟 0 收益**：`sm__inst_executed` −2.58%、LSU 同步下降，245,760 深度 62,481.0 → 62,358.7 µs
+  （1.002×；相对原始 FP16 PV 仍 **1.179×**，距 1.3× 差 9.3%）⇒ 指令吞吐被隐藏，不是 limiter；
+- 候选 2（worker 转置改 global 直载）与候选 3（`lv_s/iv_s` 冗余读合并）经 ncu 否定：Long Scoreboard 0.19、
+  MIO 0.76，且每 tile producer ≈250 inst/线程 vs worker ≈100（worker 先到 barrier 干等）⇒ 加速它零收益。
+
+**回退执行（2026-09-27）**：`prompt_fp8.cuh` 与 `tests/.../causal_cache.cpp` 已 `git checkout` 回 HEAD，fp8
+判据恢复 **1.2e-2**；组合补丁留档 `build-win/fp8pv-v1b.patch`（23,614 B，含 FP8 PV 全部实现与 P 打包）。
+回退后 bench 复测：8,192 = 2,645.9 µs；65,536 = 19,731.1；245,760 = **73,646.7**（回到 FP16 PV 基线，与
+改动前 73,521.8 同档）。工作树只剩 `PLAN.md` 的改动。
+
+**结论与建议的下一步**：本轮否决点不是「FP8 PV 不值」，而是**用质量门放宽换 1.2% 端到端是选错了杠杆**——
+真正的余量在 **34.2% 的 barrier stall**，即 tile 循环的相位串行（producer QK+softmax ∥ worker 转置 → barrier
+→ consumer PV → barrier；1 block/SM 下 producer 相位只有 8 warp 发 mma）。**跨 tile 相位流水**（double-buffer
+`p_s`，把 tile t 的 PV 与 tile t+1 的 QK 重叠）**逐位精确、零质量代价**，且作用在已回退的 FP16 PV 基线上
+⇒ 严格优于本次的 FP8 PV 交易。**是否立项待用户决定。**
