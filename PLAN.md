@@ -84,6 +84,53 @@ q4 88 / q8 7 / bf16 567）：`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_final.ninfer`
   16,384 个寄存器 = SM 寄存器文件的 25%，拆 warp 必然撞 128 寄存器/线程墙或 producer 工作集墙 ⇒ 当前
   「8 producer ∥ 8 Vdeq → 16-warp PV」packing 在 1 block/SM 包络下已最优。**CLOSED，不再重开**，除非
   执行包络改变（如 Br=32 把 acc/线程降到 16，或出现 >100 KB 块级 smem 预算）。
+- **TP-2 跨会话稳定块复用：浅召回吞掉真实分歧锚（2026-09-27 修复 + 回归场景）**：故障现象是「新会话系统
+  提示词缓存不生效」。根因链：DSH 每个新会话并行发 title 请求，title 与长会话只共享 thinking 前导（≈41
+  tok），于是长会话被留下一个浅镜像（anchor=33），它成为后续主请求唯一的可召回边界；而 `session_restore`
+  把被召回 entry 的 `tokens` 截断到召回边界、`cached_prompt_tokens_` 随之缩短 ⇒ `shared_prefix` 被压在
+  边界上、`anchor_position > reuse` 永不成立、真实分歧点（系统提示词末尾 ≈9,292）从不写锚 ⇒ 前三个新会话
+  各付一次全量 prefill。修复（`src/runtime/engine/tp2_generation_core.{h,cpp}`）：召回不再截断历史
+  （`frontier` 只管设备 KV 覆盖范围）、新增 `SessionEntry::host_kv_end` 记录 slab 有效范围（浅召回不缩短
+  slab）、`session_capture_shared_state` 允许写仍持有该前缀 slab 的 device-resident entry、锚归属从「被换出的
+  上一个会话」改为「复用扫描比对的 entry」（`anchor_session_`）、store 时丢弃 slab 已覆盖不到的旧镜像。
+  证据：`ninfer_qwen3_5_tp2_sessions_test` 新增「浅镜像召回 → 稳定块末尾锚」场景，`dflash2`/`mtp` 路线在
+  `qwen3_8_27b_w4a4_w8a8_dflash2_final.ninfer` 上全绿——W1 只复用 8（浅镜像）而 `shared=500`，同一次 walk
+  把 492 锚进被召回 entry 自己的 slab（`[tp2-session] anchor entry=0 position=492 resident=1 tokens=636`），
+  W2 复用 492；同场景在修复前 `tokens=8`/`cached=8`、W2 复用 8（A/B 已复现，见 23:45 那次运行）。
+  注：`plain` 路线仍停在 §3.3 既有的「shared system prompt 首采样分叉」，与本次改动无关（修复前后逐字节
+  相同的失败）。
+- **TP-2 跨会话稳定块复用：第二次会话仍慢（prompt 自带块边界锚，2026-09-28 修复 + 服务端复现）**：上一轮的
+  「浅召回锚」只覆盖「第二个之后」——第一个共享稳定块的会话本身就是必须走完块的那次，观察永远晚一步，所以用户
+  日志里三个主请求仍是 `cache 33`、TTFT 6.2s。本轮两处修复：
+  1. **锚归属**（`tp2_generation_core.cpp` 的 `execute_walk`）：不再只认复用扫描比对的 entry，改为扫描所有
+     host-resident entry，选与入站 prompt 共享最深前缀、且 slab 覆盖 `shared - margin`（`host_kv_end` 校验）
+     的那个，排除 `anchor_session_` 自身；浅镜像落在 title entry、深历史在主 entry 时，锚因此落到深 entry 上。
+  2. **块边界由 prompt 自带**：`Frontend::prepare_context_cache` 无条件把 leading instruction block 的 frontier
+     写进新字段 `PreparedContextCache::leading_instruction_frontier`（与 `allow_engine_automatic_shared_prefixes`
+     无关，单卡上下文缓存的 mark 策略不变）；TP-2 core 在 prefill 中把 `frontier - margin` 强制为 chunk 边界并写
+     入新增的 block ring slot（`kReuseBlockCheckpointCount = 1`，与 divergence slot 一样在 `--host-state-slots`
+     之外），记录 `block_anchor_position_/block_anchor_prefill_id_`；会话换出时（`session_store_active`）按
+     position+prefill_id 找到该 checkpoint，把 state（含 DFlash2 draft 镜像）拷进该 entry 的 `host_shared_state`，
+     成为下一次同族会话的可召回边界（`host_shared_end`）。
+  3. 证据：服务端复现（`build-win/apps/ninfer-serve.exe`，`--max-context 65536 --host-state-slots 32`，swift15
+     artifact，`--prefill-chunk 1024`，三个会话各带一个 title 请求）：主请求 1 = 7,037 tok 全量、TTFT 4.4s；主请求 2
+     复用 **6,145/7,039 (87.3%)、TTFT 817ms**（锚点落在 1024 对齐的 chunk 边界上，因此冻结的是「从头走也会得到
+     的状态」，代价是最多一个 chunk 的复用深度）；主请求 3 复用 7,020 (99.8%)、TTFT 172ms（走上一轮 walk 留下的
+     观察式锚）。轨迹：`[tp2-session] anchor entry=2 position=6145`（换出时转移）→
+     `[tp2-reuse] prompt=7039 shared=7028 -> reuse=6145 src=live`。回归：`ninfer_qwen3_5_tp2_sessions_test` 新增「prompt 自带块边界 → 换出转移 → 同族会话复用 ≥90%」场景，`dflash2`/`mtp`
+     全绿，`plain` 仍停在既有的首采样分叉（与本次无关）。
+  4. 运维：用户的 `--max-context 262144` 把显存吃到 `free 0.0 MiB`；本机当前（桌面/浏览器占 GPU）连**旧二进制**
+     同样启动 OOM（把 `--host-state-slots` 降到 31、使 pinned 与旧版一致也照样 OOM），与本改动无关，需要时降到
+     `--max-context 131072` 或释放 GPU 占用。
+  5. **短会话不占名额（2026-09-28，接续修复）**：DSH 每个会话会产生两个 entry（title ~160 tok + main ~10k tok），
+     `--max-private-continuations 3` 实际只留得住约一个会话，于是会话 A 的续写（req#7）`cache 0`。新增
+     `ContextCacheOptions::session_retention_floor_tokens`（引擎默认 0 = 全留）+ 服务端默认 2048 +
+     `--session-retention-floor` 覆盖；`session_publish` 对短于阈值的历史不建/不更新 entry（请求照常服务）。
+     坑：TP-2 归一化在 `model_instance.cpp` 里**重建** `ContextCacheOptions` 白名单字段，新字段当时被丢掉
+     （表现为规则不生效）——已补进该初始化列表。验证（全量重建 + 服务端 A/B）：warmup/title 请求后
+     `entries=0`（不占名额），topic 请求 `reuse=3` 走 ring；req#4 `cache 5,121/5,609`(91.3%)/TTFT 468ms、
+     req#6 `cache 5,590/5,606`(99.7%)/TTFT 126ms。另：本仓库增量依赖扫描不可靠，改 `include/ninfer/types.h`
+     或引擎头后必须 `--clean-first` 全量重建（本轮两次假故障均由此引起）。
 
 ---
 

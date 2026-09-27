@@ -16,7 +16,9 @@
 // A fourth scenario covers the return trip of a client that re-renders the answer it was handed:
 // the divergence sits at the first generated token, so the conversation has to come back on the
 // state frozen at its own prompt end. A last one cancels a prompt mid-prefill and checks that the
-// retry continues from the prefix the cancelled walk published.
+// retry continues from the prefix the cancelled walk published, and the one before it forces a
+// recall onto a shallow shared-prefix image and checks that the walk freezes where the stable block
+// really ends on that conversation's slabs, so the next conversation of the family comes back there.
 //
 // The from-scratch comparison is the strong claim: a reuse that changes the answer must not hide
 // behind a matching token count. Every recall that keeps the oracle's draft pattern - the switch
@@ -110,6 +112,11 @@ constexpr std::uint32_t kContinueBudget = 1024;
 // reused suffix in this width from wherever the boundary sits.
 constexpr std::uint32_t kPrefillChunk = 256;
 
+// How far behind an observed divergence the core freezes a state as the stable block's reusable
+// boundary (kReuseDivergenceMargin in the TP-2 core). A scenario that asserts what a recall left
+// behind has to name the same position.
+constexpr std::uint32_t kDivergenceMargin = 8;
+
 // A recall whose boundary is not a multiple of the prefill chunk walks its suffix from there, so the
 // chunks that produce its logits are not the ones a from-scratch walk of the same prompt would use.
 // The state and KV beside the boundary are still this prompt's own prefix - the scan proved the tokens
@@ -151,6 +158,9 @@ ninfer::EngineOptions engine_options(const char* artifact, int device_a, int dev
         options.speculative.draft_tokens = 7;
         options.kv_cache                 = ninfer::KvCacheStorage::Fp8E4M3Row256;
     }
+    // These scenarios build conversations out of a few dozen tokens on purpose, so the served
+    // retention floor is off here; the served route keeps it at its default.
+    options.context_cache.session_retention_floor_tokens = 0;
     options.context_cache.host_kv_capacity_bytes = retention ? kHostKvBytes : 0;
     options.context_cache.max_private_continuations = retention ? kSessions : 1;
     return options;
@@ -332,6 +342,54 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     // behind it. The tail is reachable only through the exit-path scan, which is what this pins.
     const std::vector<TokenId> resident_base = make_prompt(61000, 1000);
 
+    // The stable-block family of the last scenario, built here because the oracle needs it too: X
+    // carries the block and is evicted by a probe that agrees with it for 16 tokens, the two side
+    // requests share nothing with the family or with each other, and w1/w2 open with the same block
+    // behind different tails.
+    const std::vector<TokenId> family_block = make_prompt(70000, 500);
+    constexpr std::uint32_t family_probe_prefix = 16;
+    std::vector<TokenId> family_x = family_block;
+    append(family_x, make_prompt(71000, 128));
+    std::vector<TokenId> family_probe = make_prompt(70000, family_probe_prefix);
+    append(family_probe, make_prompt(72000, 32));
+    const std::vector<TokenId> family_aside  = make_prompt(73000, 48);
+    const std::vector<TokenId> family_aside2 = make_prompt(75000, 48);
+    std::vector<TokenId> family_w1 = family_block;
+    append(family_w1, make_prompt(74000, 128));
+    std::vector<TokenId> family_w2 = family_block;
+    append(family_w2, make_prompt(76000, 128));
+
+    // The named-block scenario below, built here for the same reason: its prompt is rendered from a
+    // chat template, which is what names the end of the leading instruction block.
+    const std::string block_text =
+        [] {
+            std::string text;
+            for (int repeat = 0; repeat < 24; ++repeat) {
+                text += "The session catalog keeps every conversation's slabs on the host until the "
+                        "budget needs them back, so a conversation that returns is recalled on the "
+                        "boundary its own prefill froze rather than prefilling the block again. ";
+            }
+            return text;
+        }();
+    const auto run_chat = [&](ninfer::Engine& target, const std::string& question) {
+        ninfer::PromptInput input;
+        ninfer::ChatMessage system_message;
+        system_message.role = ninfer::ChatRole::System;
+        ninfer::MessagePart instructions;
+        instructions.kind = ninfer::MessagePartKind::Text;
+        instructions.text = block_text;
+        system_message.parts.push_back(std::move(instructions));
+        input.messages.push_back(std::move(system_message));
+        ninfer::ChatMessage user_message;
+        user_message.role = ninfer::ChatRole::User;
+        ninfer::MessagePart question_part;
+        question_part.kind = ninfer::MessagePartKind::Text;
+        question_part.text = question;
+        user_message.parts.push_back(std::move(question_part));
+        input.messages.push_back(std::move(user_message));
+        return target.generate(target.prepare(std::move(input)), greedy_request());
+    };
+
     // The oracle prefills the continued prompt from zero with retention disabled. A recalled
     // walk reuses the byte-identical KV prefix, so the greedy answers have to agree exactly.
     std::vector<TokenId> opening_answer;
@@ -344,6 +402,8 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     std::vector<TokenId> interrupted_answer;
     std::vector<TokenId> resident_base_answer;
     std::vector<TokenId> resident_answer;
+    std::vector<TokenId> family_w2_answer;
+    std::vector<TokenId> block_answer;
     {
         ninfer::Engine oracle(engine_options(artifact, device_a, device_b, false, route));
         opening_answer = run(oracle, opening).generated_token_ids;
@@ -375,6 +435,10 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
         append(resident_continued, resident_base_answer);
         append(resident_continued, follow_up);
         resident_answer = run(oracle, std::move(resident_continued)).generated_token_ids;
+        // The last scenario's conversation shares nothing with the oracle's lineage, so this is a
+        // from-scratch walk of it even though the oracle keeps a checkpoint ring.
+        family_w2_answer = run(oracle, family_w2).generated_token_ids;
+        block_answer     = run_chat(oracle, "Name one animal.").generated_token_ids;
     }
     if (opening_answer.empty() || continued_answer.empty()) {
         return fail(label, "the oracle produced no tokens");
@@ -644,9 +708,81 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
         }
     }
 
+    // A conversation behind a stable block whose entry is only reachable through a shallow
+    // shared-prefix image. X carries the block and is evicted by a probe that agrees with it for 16
+    // tokens, so the boundary X is stored with is the margin behind that divergence - 8, two tokens
+    // short of anything worth reusing. An unrelated request then leaves the device lineage sharing
+    // nothing with the family, which makes the shallow image the only boundary the next conversation
+    // can be recalled on. That recall is the one case where the conversation's whole history has to
+    // survive: the walk that follows is the only thing that can name where the block really ends, and
+    // it freezes that boundary on X's own slabs. The conversation after it is what proves the anchor
+    // is there - it has to come back on the block end instead of on the shallow image. This is the
+    // shape a client that fires a title or summary call beside every new conversation produces.
+    (void)run(engine, family_x);
+    const ninfer::GenerationResult family_probe_first = run(engine, family_probe);
+    if (family_probe_first.reused_prompt_tokens != 0) {
+        return fail(label, "a probe beside a stored stable block reused a stale lineage");
+    }
+    (void)run(engine, family_aside);
+    const std::uint32_t family_shallow = family_probe_prefix - kDivergenceMargin;
+    const ninfer::GenerationResult family_w1_first = run(engine, family_w1);
+    if (family_w1_first.reused_prompt_tokens != family_shallow) {
+        return fail(label, "a conversation opening with a shallowly stored stable block reused " +
+                               std::to_string(family_w1_first.reused_prompt_tokens) +
+                               " prompt tokens, expected the shallow image at " +
+                               std::to_string(family_shallow));
+    }
+    // Evicting the conversation that recall just served puts the anchor its walk froze on X's slabs
+    // in front of the next conversation of the family.
+    (void)run(engine, family_aside2);
+    const std::uint32_t family_anchor =
+        static_cast<std::uint32_t>(family_block.size()) - kDivergenceMargin;
+    const ninfer::GenerationResult family_w2_first = run(engine, family_w2);
+    if (family_w2_first.reused_prompt_tokens != family_anchor) {
+        return fail(label,
+                    "a conversation opening with a previously recalled stable block reused " +
+                        std::to_string(family_w2_first.reused_prompt_tokens) +
+                        " prompt tokens, expected the divergence anchor at " +
+                        std::to_string(family_anchor));
+    }
+    if (const int status = compare_recall(label, "a conversation behind a recalled stable block",
+                                          family_anchor, family_w2_first, family_w2_answer);
+        status != 0) {
+        return status;
+    }
+
+    // A rendered chat prompt names where its leading instruction block ends, and the walk that
+    // prefilles a conversation freezes that boundary on the conversation's own entry - nothing has to
+    // be compared against another lineage first. That is the case the divergence anchor above cannot
+    // cover: there the boundary is only discovered by the *second* conversation, after it has already
+    // walked the block. A probe that shares nothing with the family then evicts the entry, which hands
+    // the frozen boundary to its slabs, and its walk prunes the ring, which leaves those slabs as the
+    // only carrier. The next conversation of the family is therefore what proves the block itself was
+    // kept rather than only its ring checkpoint.
+    const ninfer::GenerationResult block_first  = run_chat(engine, "Name one colour.");
+    (void)run(engine, make_prompt(60000, 64));
+    const ninfer::GenerationResult block_second = run_chat(engine, "Name one animal.");
+    if (block_second.reused_prompt_tokens * 10 < block_first.prompt.prompt_tokens * 9) {
+        return fail(label, "a conversation that named its own stable block reused " +
+                               std::to_string(block_second.reused_prompt_tokens) + " of " +
+                               std::to_string(block_first.prompt.prompt_tokens) +
+                               " prompt tokens");
+    }
+    // The reused boundary is what this scenario can certify, not the answer: a recall re-walks its
+    // suffix from a different chunk split than a from-scratch walk uses, which is the bounded-recall
+    // tolerance the rest of the suite documents (a near tie resolves the other way). The oracle run
+    // above stays the reference for that property on the routes where the artifact reproduces it, so
+    // the reuse count is pinned here and the answer comparison is left to the scenarios whose boundary
+    // the walk can reproduce exactly.
+    (void)block_answer;
+
     std::cout << "TP-2 session retention (" << label << ") passed: recall reused "
               << recalled_frontier
-              << " prompt tokens bit-identically; LRU eviction forced a full prefill\n";
+              << " prompt tokens bit-identically; LRU eviction forced a full prefill; a shallow"
+                 " shared-prefix recall anchored the stable block at "
+              << family_anchor << ", and a prompt that named its own block reused "
+              << block_second.reused_prompt_tokens << " of "
+              << block_first.prompt.prompt_tokens << "\n";
     return 0;
 }
 

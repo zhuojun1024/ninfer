@@ -833,6 +833,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--host-kv-mib N` | shared Host Main/Backend KV byte capacity in MiB; the backing is pageable, so the OS may evict it | `8192` |
 | `--host-kv-pinned` | pin the Host KV backing for faster transfers; a refused pin falls back to pageable | off |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
+| `--session-retention-floor N` | history below this many tokens is served but never retained, so a one-off short request (a title or summary call) cannot evict a real conversation from the private catalog; `1` retains every conversation | `2048` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
 | `--no-thinking` | disable thinking by default | thinking on |

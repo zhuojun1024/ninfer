@@ -187,6 +187,11 @@ constexpr std::uint32_t kReuseTailCheckpointCount = 8;
 // renders its stable prefix once, and because the ring prunes on a single lineage: a checkpoint past
 // the newest shared prefix is dead for good, so a second slot could never hold a rival prefix.
 constexpr std::uint32_t kReuseDivergenceCheckpointCount = 1;
+// Slots for the stable block's own anchor: the boundary the prompt itself names as the end of its
+// leading instruction block. It needs a slot of its own because the observed divergence owns the one
+// above and both boundaries matter in the same walk - the observed one is where this prompt stopped
+// matching the conversation before it, the block one is where the next conversation of the agent will.
+constexpr std::uint32_t kReuseBlockCheckpointCount = 1;
 // How far before the observed divergence the anchor is placed. A shared prefix is only reusable
 // while every later prompt agrees on every token before it, and the index where two prompts first
 // differ is where the tokenizer stopped emitting the same ids - the token that straddles the stable
@@ -320,10 +325,12 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     // coarser; a zero budget keeps the ring disabled, which is what --no-prefix-reuse selects.
     {
         const std::uint32_t host_slots = options_.context_cache.host_state_slots;
+        session_retention_floor_tokens_ = options_.context_cache.session_retention_floor_tokens;
         if (host_slots != 0) {
             host_checkpoint_tail_slots_ =
                 std::max(1U, std::min(kReuseTailCheckpointCount, host_slots / 2U));
             host_checkpoint_divergence_slots_ = kReuseDivergenceCheckpointCount;
+            host_checkpoint_block_slots_      = kReuseBlockCheckpointCount;
             const std::uint32_t grid_slots =
                 std::max(1U, host_slots - host_checkpoint_tail_slots_);
             const std::uint32_t per_slot = (options_.max_context + grid_slots - 1U) / grid_slots;
@@ -596,7 +603,8 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         // through this shard's own device, but a portable allocation keeps that true if the
         // execution context ever binds the peer first.
         const std::uint32_t slots = options_.context_cache.host_state_slots +
-                                    host_checkpoint_divergence_slots_;
+                                    host_checkpoint_divergence_slots_ +
+                                    host_checkpoint_block_slots_;
 
         shard.host_checkpoint_grid_slots = options_.context_cache.host_state_slots -
                                            host_checkpoint_tail_slots_;
@@ -784,10 +792,10 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
             // each slot on the shard that owns it, which is the second pinned figure.
             std::fprintf(stderr,
                          "[mem] host-checkpoints shard %d slots %zu (grid %zu + tail %u + "
-                         "divergence %u) x %.1f MiB | stride %u tok | pinned %.1f MiB\n",
+                         "divergence %u + block %u) x %.1f MiB | stride %u tok | pinned %.1f MiB\n",
                          shard_index, shard.host_checkpoints.size(),
                          shard.host_checkpoint_grid_slots, host_checkpoint_tail_slots_,
-                         host_checkpoint_divergence_slots_,
+                         host_checkpoint_divergence_slots_, host_checkpoint_block_slots_,
                          static_cast<double>(shard.state_backing.bytes) / 1048576.0,
                          host_checkpoint_stride_,
                          static_cast<double>((shard.state_backing.bytes + dflash_image_bytes) *
@@ -1706,6 +1714,7 @@ bool TP2GenerationCore::session_store_active() {
         entry.device_resident = false;
         entry.host_prompt_end = 0;
         entry.host_shared_end = 0;
+        entry.host_kv_end     = 0;
         return true;
     }
     if (!session_ensure_host_slabs(entry, pages)) { return false; }
@@ -1761,12 +1770,43 @@ bool TP2GenerationCore::session_store_active() {
 
     shard_a_.device.bind_to_current_thread();
     entry.device_resident = false;
+    // The slabs now carry the KV up to the frontier they were filled at, which is the extent every
+    // later capture and recall has to stay inside. A shared-prefix image this shorter extent no
+    // longer reaches - a partial recall whose walk stopped before it - goes with them.
+    entry.host_kv_end = entry.frontier;
+    if (entry.host_shared_end > entry.host_kv_end) { entry.host_shared_end = 0; }
     // The prompt-end boundary is only offered when its target image *and* its draft image exist; a
     // recall that restored one without the other would run the draft against the wrong tokens.
     const bool prompt_end_images =
         entry.host_prompt_state[0] != nullptr && entry.host_prompt_state[1] != nullptr &&
         (shard_a_.dflash_round == nullptr || entry.host_dflash_prompt[0] != nullptr);
     entry.host_prompt_end = prompt_end_images ? entry.prompt_end : 0;
+    // The block boundary this conversation's own prefill froze, while the ring still holds the walk
+    // that wrote it: the slabs just took the KV that sits before the boundary, so pairing the frozen
+    // state with them gives the entry a boundary the next conversation opening with the same block is
+    // recalled on. Everything else the entry carries describes its own history; this describes the
+    // part of it that outlives the conversation.
+    if (block_anchor_position_ != 0 && block_anchor_position_ <= entry.frontier) {
+        const PinnedHostBuffer* frozen[2]   = {nullptr, nullptr};
+        const PinnedHostBuffer* block_draft = nullptr;
+        Shard* const shards[2] = {&shard_a_, &shard_b_};
+        for (std::size_t index = 0; index < 2; ++index) {
+            for (const Shard::HostCheckpoint& checkpoint : shards[index]->host_checkpoints) {
+                if (!checkpoint.valid || checkpoint.position != block_anchor_position_ ||
+                    checkpoint.prefill_id != block_anchor_prefill_id_ ||
+                    checkpoint.buffer == nullptr) {
+                    continue;
+                }
+                frozen[index] = checkpoint.buffer.get();
+                if (index == 0) { block_draft = checkpoint.dflash_buffer.get(); }
+                break;
+            }
+        }
+        if (frozen[0] != nullptr && frozen[1] != nullptr) {
+            session_capture_shared_state(active_session_, block_anchor_position_, false, frozen,
+                                         block_draft);
+        }
+    }
     entry.lru_clock       = ++session_lru_clock_;
     ++session_stores_;
     return true;
@@ -1826,9 +1866,12 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
     }
     shard_a_.device.bind_to_current_thread();
     // A prompt-end recall leaves the entry standing where that prompt ended: the device pools hold
-    // its KV and the state at its end, and the tail the entry had generated past it is gone. A
-    // history longer than the restored frontier would describe KV the pools no longer carry.
-    if (boundary < entry.frontier) { entry.tokens.resize(boundary); }
+    // its KV and the state at its end, and the tail the entry had generated past it is gone from the
+    // device. The history itself stays: `tokens` is the conversation and `frontier` is how far the
+    // device came back, and the prefix scan needs the whole history to find where the next prompt
+    // diverges from this one - that boundary is what the divergence anchor is frozen at, and a
+    // history clipped to the restored frontier hides it behind the recall. The slabs the recall read
+    // still carry the KV this history describes, which is what a capture into the entry pairs with.
     entry.frontier        = boundary;
     entry.device_resident = true;
     entry.lru_clock       = ++session_lru_clock_;
@@ -1841,11 +1884,12 @@ void TP2GenerationCore::session_capture_shared_state(std::size_t index, std::uin
                                                      const PinnedHostBuffer* dflash_frozen) {
     if (index >= sessions_.size() || position == 0) { return; }
     SessionEntry& entry = sessions_[index];
-    // Only a host-resident entry has a slab to pair the state with, and only a position its slab
-    // covers can be recalled: the KV before the frontier is the most there is.
-    if (entry.device_resident || position <= entry.host_shared_end || position > entry.frontier) {
-        return;
-    }
+    // The image is the state of the tokens before 'position' paired with the KV the slabs hold
+    // there, so the slabs have to reach the position and no image at or past it may exist yet. A
+    // device-resident entry is a candidate: a recall that brought it back to a shallower boundary
+    // left its slabs standing at the extent it was evicted with, and that is exactly the anchor's
+    // case - the conversation this prompt diverged from is the one the slabs still carry.
+    if (position <= entry.host_shared_end || position > entry.host_kv_end) { return; }
     Shard* const shards[2] = {&shard_a_, &shard_b_};
     for (std::size_t shard_index = 0; shard_index < 2; ++shard_index) {
         if (entry.host_shared_state[shard_index] == nullptr) { return; }
@@ -1883,14 +1927,19 @@ void TP2GenerationCore::session_capture_shared_state(std::size_t index, std::uin
         }
     }
     entry.host_shared_end = position;
+    if (session_trace_enabled()) {
+        std::fprintf(stderr,
+                     "[tp2-session] anchor entry=%zu position=%u resident=%d tokens=%zu\n", index,
+                     position, entry.device_resident ? 1 : 0, entry.tokens.size());
+    }
 }
 
 void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
     if (session_capacity_ == 0) { return; }
-    // The entry this recall moves into its host slabs is the only conversation that can still be
-    // told where the incoming prompt stopped matching it, and the running prefill is the last walk
-    // that sees the shared state. execute_walk reads this before it advances anything.
-    host_stored_session_ = kNoSession;
+    // The conversation this prompt is compared against is the only one that can still be told where
+    // the two stopped matching, and the running prefill is the last walk that sees the shared state.
+    // execute_walk reads this before it advances anything.
+    anchor_session_ = kNoSession;
     // How deep the resident lineage can start this prompt, mirroring what the reuse scan below
     // finds: the live state at its frontier, a device snapshot, or a host checkpoint. Zero means
     // the prompt shares nothing the device can reuse, and keeping the resident session would leave
@@ -1951,10 +2000,11 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
         std::uint32_t reach = 0;
         RecallState via     = RecallState::Frontier;
         for (std::size_t kind = 0; kind < 3; ++kind) {
-            // The shared-prefix image is capped by the frontier it was evicted at, so the slab
-            // covers every page the recall reads.
+            // The shared-prefix image is capped by the extent the slabs were filled to, so the
+            // recall reads pages the slabs really carry. The other two images are bounded by the
+            // frontier and the prompt end they were taken at, which the slabs cover by construction.
             const std::uint32_t ceiling =
-                kind == 2 ? entry.frontier : std::numeric_limits<std::uint32_t>::max();
+                kind == 2 ? entry.host_kv_end : std::numeric_limits<std::uint32_t>::max();
             if (offered[kind] == 0 || offered[kind] > shared ||
                 offered[kind] >= prompt_tokens.size() || offered[kind] > ceiling) {
                 continue;
@@ -1966,10 +2016,10 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
         }
         if (session_trace_enabled()) {
             std::fprintf(stderr,
-                         "[tp2-session]   entry %zu tokens=%zu frontier=%u prompt_end=%u shared_end=%u "
-                         "shared=%zu reach=%u via=%s resident=%d\n",
-                         index, entry.tokens.size(), entry.frontier, entry.prompt_end,
-                         entry.host_shared_end, shared, reach,
+                         "[tp2-session]   entry %zu tokens=%zu frontier=%u kv_end=%u prompt_end=%u "
+                         "shared_end=%u shared=%zu reach=%u via=%s resident=%d\n",
+                         index, entry.tokens.size(), entry.frontier, entry.host_kv_end,
+                         entry.prompt_end, entry.host_shared_end, shared, reach,
                          reach == 0 ? "none" : kReachName[static_cast<std::size_t>(via)],
                          entry.device_resident ? 1 : 0);
         }
@@ -1983,7 +2033,6 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
     if (best_host != kNoSession && best_frontier > resident_depth) {
         const std::size_t previous = active_session_;
         const bool drop_previous   = previous != kNoSession && !session_store_active();
-        host_stored_session_       = drop_previous ? kNoSession : previous;
         // Restoring before dropping keeps the recalled entry's index valid: nothing has been erased
         // yet, and the drop below only shifts indices the restore is already done with.
         session_restore(sessions_[best_host], best_frontier, best_state);
@@ -1999,6 +2048,13 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
         cached_state_valid_ = true;
         reuse_source_       = ReuseSource::None;
         if (drop_previous) { session_drop(previous); }
+        // The scan below compared this prompt against the recalled entry's own history - the restore
+        // kept it - so the boundary the two diverge at is that entry's to keep, not the one that just
+        // left the device. The recall retires the ring it read from, which takes the outgoing
+        // conversation's block boundary with it: this prompt names its own.
+        anchor_session_          = active_session_;
+        block_anchor_position_   = 0;
+        block_anchor_prefill_id_ = 0;
         if (session_trace_enabled()) {
             std::fprintf(
                 stderr,
@@ -2037,7 +2093,12 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
     // prefix on every turn of a switch.
     const std::size_t previous = active_session_;
     const bool dropped         = previous != kNoSession && !session_store_active();
-    host_stored_session_       = dropped ? kNoSession : previous;
+    // The divergence was measured against the resident entry's history, and the eviction just put
+    // that entry's KV in the slabs, so the state the walk starts from is its state at the same
+    // boundary. A session the host budget could not keep has no slab to pair the anchor with.
+    anchor_session_            = dropped ? kNoSession : previous;
+    block_anchor_position_     = 0;
+    block_anchor_prefill_id_   = 0;
     if (dropped) { session_drop(previous); }
     active_session_   = kNoSession;
     live_state_valid_ = false;
@@ -2054,6 +2115,10 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
 void TP2GenerationCore::session_publish(const std::vector<TokenId>& history,
                                         std::uint32_t frontier) {
     if (session_capacity_ == 0) { return; }
+    // Served and forgotten. Re-prefilling a history this short costs less than the catalog slot it
+    // would hold, and the slot is what a returning conversation needs; a client that fires a one-off
+    // title or summary call beside every new session would otherwise evict the sessions themselves.
+    if (history.size() < session_retention_floor_tokens_) { return; }
     if (active_session_ != kNoSession && sessions_[active_session_].device_resident) {
         SessionEntry& entry = sessions_[active_session_];
         entry.tokens.assign(history.begin(), history.end());
@@ -2526,9 +2591,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // ones, and the ring slot it lands in is only revisited by a later prefill's checkpoint at the
     // same index.
     // Which reserved group of the ring a checkpoint lands in. The grid and the tail anchors rotate
-    // through their own slots; the divergence anchor owns a single slot and is rewritten in place,
-    // so it advances no cursor and neither rotation can evict it.
-    enum class HostRing { Grid, Tail, Divergence };
+    // through their own slots; the divergence anchor and the block anchor own a fixed slot each and
+    // are rewritten in place, so they advance no cursor and neither rotation can evict them.
+    enum class HostRing { Grid, Tail, Divergence, Block };
     auto snapshot_host_checkpoint = [&](Shard& shard, std::uint32_t frontier, HostRing ring) {
         if (shard.host_checkpoints.empty()) { return; }
         ++prefill_host_writes;
@@ -2542,6 +2607,10 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             case HostRing::Divergence:
                 begin = grid + tail;
                 count = host_checkpoint_divergence_slots_;
+                break;
+            case HostRing::Block:
+                begin = grid + tail + host_checkpoint_divergence_slots_;
+                count = host_checkpoint_block_slots_;
                 break;
         }
         if (count == 0 || begin + count > shard.host_checkpoints.size()) { return; }
@@ -2633,23 +2702,69 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         }
         return false;
     };
-    const std::uint32_t anchor_position = shared_prefix > kReuseDivergenceMargin
-                                              ? shared_prefix - kReuseDivergenceMargin
-                                              : shared_prefix;
+    // The anchor does not always belong to the conversation the walk was recalled from. A prompt that
+    // only opens with a stable block is served by the shallowest image still reachable, while the
+    // entry whose history actually carries that block can share far more with it - and it offers no
+    // recall at all, because every boundary it holds sits past the shared prefix. The block's end
+    // still has to be frozen on it: that entry is the one the next conversation of the family is
+    // recalled from, and a ring slot does not survive the evictions a session slab does.
+    std::uint32_t anchor_prefix = static_cast<std::uint32_t>(shared_prefix);
+    for (std::size_t index = 0; index < sessions_.size(); ++index) {
+        const SessionEntry& entry = sessions_[index];
+        if (index == anchor_session_ || entry.device_resident || entry.tokens.empty()) { continue; }
+        if (entry.host_shared_state[0] == nullptr || entry.host_shared_state[1] == nullptr) {
+            continue;
+        }
+        const std::size_t common = std::min(entry.tokens.size(), token_ids.size());
+        std::size_t shared       = 0;
+        while (shared < common && entry.tokens[shared] == token_ids[shared]) { ++shared; }
+        if (shared <= anchor_prefix || shared >= prompt_tokens) { continue; }
+        const std::uint32_t position = shared > kReuseDivergenceMargin
+                                           ? static_cast<std::uint32_t>(shared) - kReuseDivergenceMargin
+                                           : static_cast<std::uint32_t>(shared);
+        if (position <= reuse || position > entry.host_kv_end) { continue; }
+        anchor_prefix   = static_cast<std::uint32_t>(shared);
+        anchor_session_ = index;
+    }
+    const std::uint32_t anchor_position = anchor_prefix > kReuseDivergenceMargin
+                                              ? anchor_prefix - kReuseDivergenceMargin
+                                              : anchor_prefix;
     const bool anchor_divergence = host_checkpoint_stride_ != 0 && anchor_position > reuse &&
                                    anchor_position < prompt_tokens &&
                                    !has_valid_host_checkpoint_at(shard_a_, anchor_position) &&
                                    !has_valid_host_checkpoint_at(shard_b_, anchor_position);
-    // The conversation the recall just moved into its host slabs stopped matching this prompt exactly
-    // where the walk starts. The device state sitting there right now is its state at that boundary
-    // too, so freeze it before the first chunk overwrites it: a later conversation opening with the
-    // same stable block can then be recalled onto the entry's own slab instead of prefilling the
-    // block again. The device pools still hold it because the recall restored it and nothing has run
-    // since.
-    if (host_stored_session_ != kNoSession && reuse != 0 && reuse == shared_prefix) {
+    // The prompt names where its own leading instruction block ends, and this walk is the only one
+    // that can freeze the state there: the block is what every conversation of the same agent
+    // re-renders, but the first conversation that shares it is the one that has to walk it, so an
+    // observation always arrives too late for it. The boundary is kept for this conversation's own
+    // entry (see session_store_active), which is what lets the next one start on the block.
+    const std::uint32_t block_frontier = data.context_cache.leading_instruction_frontier.value_or(0);
+    const std::uint32_t block_target   = block_frontier > kReuseDivergenceMargin
+                                             ? block_frontier - kReuseDivergenceMargin
+                                             : block_frontier;
+    // The anchor sits on this walk's own chunk grid, not a fixed distance behind the boundary: a
+    // boundary that coincides with a chunk end is the state the walk committed there anyway, and a
+    // recall starting on it re-walks the chunks a from-scratch walk of the same prompt would, so the
+    // recalled answer is the oracle's and not merely a plausible one. The margin keeps the anchor
+    // clear of the boundary the divergence may reach back to.
+    std::uint32_t block_position = block_target;
+    if (block_position > reuse) {
+        block_position = reuse + ((block_position - reuse) / prefill_chunk) * prefill_chunk;
+    }
+    const bool block_anchor = host_checkpoint_stride_ != 0 && block_position > reuse &&
+                              block_position < prompt_tokens &&
+                              !has_valid_host_checkpoint_at(shard_a_, block_position) &&
+                              !has_valid_host_checkpoint_at(shard_b_, block_position);
+    // The conversation this prompt was compared against stopped matching it exactly where the walk
+    // starts, so the device state sitting there right now is its state at that boundary too: freeze
+    // it before the first chunk overwrites it. A later conversation opening with the same stable
+    // block can then be recalled onto the owner's own slabs instead of prefilling the block again.
+    // The device pools still hold it because the recall restored it, or because the eviction left
+    // the device lineage standing on it, and nothing has run since.
+    if (anchor_session_ != kNoSession && reuse != 0 && reuse == shared_prefix) {
         // The device draft ring was restored to `reuse` by begin_dflash_state above, which is the
         // boundary the target state is at too, so this captures the two halves together.
-        session_capture_shared_state(host_stored_session_, reuse, true, nullptr, nullptr);
+        session_capture_shared_state(anchor_session_, reuse, true, nullptr, nullptr);
     }
     // Set when the prefill's own sample already ended the request: the first token can be a stop
     // token, or it can spend the whole output budget. Decode then has nothing left to do.
@@ -2712,6 +2827,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         }
         if (anchor_divergence && anchor_position > t0 && anchor_position < t0 + length) {
             length = anchor_position - t0;
+        }
+        // The block boundary is a property of the tokens, not of this walk's chunking, so the chunk
+        // that would step over it ends on it and the state frozen there is exact.
+        if (block_anchor && block_position > t0 && block_position < t0 + length) {
+            length = block_position - t0;
         }
         qwen::execution::Tp2VisionChunk media_chunk;
         const qwen::execution::Tp2VisionChunk* media_ptr = nullptr;
@@ -2782,6 +2902,14 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 snapshot_host_checkpoint(shard_a_, frontier, HostRing::Divergence);
                 snapshot_host_checkpoint(shard_b_, frontier, HostRing::Divergence);
             }
+            if (block_anchor && frontier == block_position) {
+                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Block);
+                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Block);
+                // The id names the walk that wrote it, so the eviction can tell this conversation's
+                // own block state from a later conversation's rewrite of the same slot.
+                block_anchor_position_   = block_position;
+                block_anchor_prefill_id_ = host_checkpoint_live_id_;
+            }
         }
         if (t0 + length == prompt_tokens) {
             // First token: sample from the last chunk's last-column logits.
@@ -2844,12 +2972,13 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         ++prefill_chunks;
         t0 += length;
     }
-    // The divergence anchor is the state of the block the two conversations still agreed on: the one
-    // the recall just moved into its host slabs agrees with this prompt up to the same token, so the
-    // anchor is its state there as well. Copying it into that entry's own image pairs the state with
-    // the KV its slab already holds, and unlike the ring slot it survives the next evictions. It
-    // lands before session_publish, which may erase the entry and shift every later index.
-    if (host_stored_session_ != kNoSession && anchor_divergence) {
+    // The divergence anchor is the state of the block the two histories still agreed on: the entry
+    // whose history the scan compared this prompt against - the recalled one, or the one the switch
+    // moved into its slabs - agrees with it up to the same token, so the anchor is its state there
+    // as well. Copying it into that entry's own image pairs the state with the KV its slabs already
+    // hold, and unlike the ring slot it survives the next evictions. It lands before
+    // session_publish, which may erase the entry and shift every later index.
+    if (anchor_session_ != kNoSession && anchor_divergence) {
         const PinnedHostBuffer* frozen[2]    = {nullptr, nullptr};
         const PinnedHostBuffer* frozen_draft = nullptr;
         bool complete                        = true;
@@ -2876,7 +3005,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 shard->device.bind_to_current_thread();
                 CUDA_CHECK(cudaStreamSynchronize(shard->device.stream));
             }
-            session_capture_shared_state(host_stored_session_, anchor_position, false, frozen,
+            session_capture_shared_state(anchor_session_, anchor_position, false, frozen,
                                          frozen_draft);
         }
     }

@@ -458,6 +458,14 @@ PreparedContextCache prepare_context_cache(
         throw std::invalid_argument("context cache retention hint is invalid");
     }
     out.update_session_index = hints.update_session_index;
+    // Named unconditionally: this is the position where the client's stable block ends, which is what
+    // a route without a context cache needs in order to freeze the block's state where the prompt
+    // that writes it can still reach it.
+    if (leading_boundary && *leading_boundary < message_boundaries.size() &&
+        message_boundaries[*leading_boundary] &&
+        exact_vision_frontier(*message_boundaries[*leading_boundary], vision_items)) {
+        out.leading_instruction_frontier = message_boundaries[*leading_boundary];
+    }
 
     for (const PromptCacheMarker marker : hints.markers) {
         switch (marker.kind) {

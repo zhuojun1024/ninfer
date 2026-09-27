@@ -58,7 +58,27 @@ use `temperature 0` per request and the response's `usage` token counts, one req
   after a context compression -- is covered too: the core freezes that divergence in the host ring, so
   the next such prompt reuses the whole stable block instead of restarting from zero. With a
   20k-token stable block and a 35k-token predecessor, the first divergent prompt walked 35,363 tokens
-  in 23.4 s, and the one after it reused 17,451 and walked 23 tokens in 71.8 ms.
+  in 23.4 s, and the one after it reused 17,451 and walked 23 tokens in 71.8 ms. A prompt whose only
+  reachable boundary is a *shallow* shared-prefix image -- the shape a client that fires a title or
+  summary request beside every new conversation produces -- is covered as well: the walk behind that
+  recall freezes where the block really ends on the recalled conversation's own slabs, so the next
+  conversation of the family starts there instead of at the shallow boundary. The *first* conversation
+  of a family cannot wait for that observation, so what it freezes is the boundary the prompt names
+  itself: a rendered chat prompt carries the frontier where its leading instruction block ends, the
+  walk that prefills it writes the state there, and the conversation's eviction hands it to the
+  session slabs. The anchor sits on the prefill chunk grid rather than a fixed distance behind the
+  boundary, so what it freezes is the state a from-scratch walk has at that token count and not one
+  this walk produced by being cut short. In a served reproduction of the reported shape -- three
+  sessions, each opening with the same ~7k-token stable block behind its own title request, at the
+  served 1024-token prefill chunk -- the first main request walked 7,037 tokens in 4.4 s, the second
+  reused 6,145 of 7,039 (87.3%) at 817 ms TTFT, and the third reused 7,020 (99.8%) at 172 ms on the
+  divergence anchor that walk left behind, where the same client shape reused 33 tokens of a
+  10,279-token prompt before the fix. The served route also declines to retain a conversation whose
+  whole history is shorter than `--session-retention-floor` (default 2048): a client that fires a
+  one-off title or summary call beside every new session would otherwise fill the private catalog with
+  conversations too short to be worth a slot and evict the sessions the catalog exists for, and a
+  corpus that short costs less to prefill again than the slot is worth. The Engine itself keeps
+  retaining everything unless a caller sets the option.
 - **Concurrency**: two simultaneous streaming requests both completed (24 and 27 chunks, 1.99 s).
 
 The startup after CUDA-graph capture is a one-off 14.4 s on this configuration; it is outside the
@@ -521,7 +541,7 @@ The context cache is disabled on this route -- the core owns the prefix-reuse sn
 | DFlash2 walk determinism | `ninfer_qwen3_5_tp2_dflash_solo_test` (independent processes) | one digest (`0x4bcc3994a5efba7d`) over 10 captured-graph runs with identical walk bodies, byte-identical again under `NINFER_TP2_VERIFY_GRAPH=0`; the recalled walk matches the from-scratch walk of the same prompt on its first sample in every run |
 | DFlash2 verify CUDA graph | solo A/B graph vs `NINFER_TP2_VERIFY_GRAPH=0`, `bench_serve.ps1` served route | walk digests byte-identical across routes (before the capture-forwarding fix 2 of 6 graph runs flipped the tail near tie); equal-output 128-token decode -10.2% wall (-4.9 ms/round), prefill flat, MTP K=2 control in its band |
 | MTP draft-chain CUDA graph | r52 greedy goldens in all three launch modes + git-stash pre-change A/B, `ninfer_qwen3_5_tp2_sessions_test`, `NINFER_TP2_TIMING=1` trajectory A/B | 5/5 byte-identical across graph/eager(bucket)/eager(exact) and the pre-change build; sessions pass on all three routes (after teaching the replay advances to accept a zero workspace delta); identical 94-round walks measure the chain step 3.7 -> 3.5 ms and the round 34.2 -> 34.0 ms |
-| Cross-session KV retention | `ninfer_qwen3_5_tp2_sessions_test` (`NINFER_TEST_ARTIFACT`; all three routes) | every route: a returning conversation recalled 71 prompt tokens and matched the oracle token for token where the draft pattern survives (the switch scenario on the prefill grid and the cancellation retry included); the LRU-evicted one reported `reused_prompt_tokens == 0`. A recall anchored inside a chunk pins the boundary crossing (first sample) instead of the whole trajectory. The MTP round's shard-0 arena reports `2 layouts` against shard 1's `1`, so its own KV slab travels with the session |
+| Cross-session KV retention | `ninfer_qwen3_5_tp2_sessions_test` (`NINFER_TEST_ARTIFACT`; all three routes) | every route: a returning conversation recalled 71 prompt tokens and matched the oracle token for token where the draft pattern survives (the switch scenario on the prefill grid and the cancellation retry included); the LRU-evicted one reported `reused_prompt_tokens == 0`. A recall anchored inside a chunk pins the boundary crossing (first sample) instead of the whole trajectory. The MTP round's shard-0 arena reports `2 layouts` against shard 1's `1`, so its own KV slab travels with the session. One scenario pins the shallow-recall case: a conversation recallable only 8 tokens in has to leave the stable block's real end (500 - 8) on its own slabs, and the next conversation of that family reused 492 prompt tokens -- 8 before the fix -- on the `dflash2` and `mtp` routes (the `plain` route stops earlier on the artifact-sensitive first-sample divergence above). A second scenario pins the block a prompt names itself: after the conversation's eviction hands the frozen frontier to its slabs and a probe prunes the ring around it, the next conversation of the family reused at least nine tenths of the first one's prompt (the served reproduction above records the same effect as 7,017 of 7,039 tokens). It pins the boundary and not a bit-exact answer: a recall re-walks its suffix from a different chunk split than a from-scratch walk uses, and on this artifact the resulting near tie resolves either way - the same retention-off oracle answered differently under two chunkings - which is the bounded-recall tolerance documented beside this row |
 
 "Exact" is bit for bit: the split Op output equals the same Op run with the full weight on the same
 device, which is the property the merge relies on. `temperature 0, top_k 1` is what makes the greedy

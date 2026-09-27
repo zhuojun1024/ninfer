@@ -74,6 +74,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] [--host-kv-pinned] "
+"[--session-retention-floor N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
@@ -228,6 +229,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.context_cache.host_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
             context_capacity_explicit = true;
+        } else if (arg == "--session-retention-floor") {
+            options.context_cache.session_retention_floor_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--session-retention-floor"),
+                                      "session-retention-floor"));
         } else if (arg == "--host-kv-mib") {
             const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {

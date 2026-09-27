@@ -123,6 +123,11 @@ struct PreparedContextCache {
     std::optional<PreparedSessionKey> session_key;
     runtime::RetentionClass retention = runtime::RetentionClass::RecentPrivate;
     std::vector<PreparedCacheOpportunity> opportunities;
+    // Frontier (token count) where the leading instruction block ends: the first message that is not
+    // a System/Developer instruction starts there. Every conversation of the same agent re-renders
+    // that block, so the boundary is worth naming even where the surrounding cache policy writes
+    // nothing - a route that keeps no context cache anchors its prefix reuse on it.
+    std::optional<std::uint32_t> leading_instruction_frontier;
     // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
     bool update_session_index = true;
 };

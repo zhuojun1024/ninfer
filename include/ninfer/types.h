@@ -140,6 +140,12 @@ struct ContextCacheOptions {
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
+    // A conversation whose whole committed history is shorter than this is served but not retained.
+    // A corpus this short is cheaper to prefill again than a place in the private catalog is worth,
+    // and a client that fires a one-off short request - a title or summary call beside every real
+    // conversation - otherwise evicts the conversations the catalog exists for. 0 retains
+    // everything, which is what the mechanism tests do.
+    std::uint32_t session_retention_floor_tokens = 0;
     // Host KV backing is pageable by default so the OS can evict it under commit pressure. Pin it
     // only when the faster transfers are worth a permanent lock: a refused pin still falls back to
     // the pageable path instead of failing the arena.

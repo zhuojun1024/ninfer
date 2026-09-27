@@ -214,6 +214,9 @@ private:
     struct SessionEntry {
         // Prompt plus every committed generated token, in order. The device KV at [0, frontier)
         // holds exactly this prefix, which is what lets a returning prompt prefill only its suffix.
+        // The history survives a recall that comes back shallower than it: the frontier says how far
+        // the device returned, while the tokens still say which conversation this is, and the prefix
+        // scan needs the longer of the two to find where the next prompt diverges from this one.
         std::vector<TokenId> tokens;
         std::uint32_t frontier = 0;
         // Token count of the prompt the last completed prefill for this conversation walked. A later
@@ -250,10 +253,15 @@ private:
         // Token count the prompt-end state image corresponds to. Zero means the entry was evicted
         // before its first prompt completed, and only the frontier image can be recalled.
         std::uint32_t host_prompt_end = 0;
-        // Token count the shared-prefix image corresponds to, never deeper than the frontier it was
-        // evicted at. Zero means no other conversation has diverged from this one yet.
+        // Token count the shared-prefix image corresponds to, never deeper than the KV the slabs
+        // hold. Zero means no other conversation has diverged from this one yet.
         std::uint32_t host_shared_end = 0;
-        std::uint64_t lru_clock       = 0;
+        // Token count the host KV slabs carry. A store fills them to the evicted frontier; a recall
+        // restores the device to a boundary that may be shallower without shortening them, so this
+        // is the extent that anything paired with the slabs - a recall, or a shared-prefix capture -
+        // has to stay inside. Zero means no slab holds this entry.
+        std::uint32_t host_kv_end = 0;
+        std::uint64_t lru_clock   = 0;
     };
     static constexpr std::size_t kNoSession = static_cast<std::size_t>(-1);
 
@@ -468,10 +476,13 @@ private:
     std::vector<SessionEntry> sessions_;
     std::size_t active_session_      = kNoSession;
     std::uint64_t session_lru_clock_ = 0;
-    // The entry the last recall moved into its host slabs, while the running prefill is the only
-    // thing that can still name the boundary the two conversations diverged at. kNoSession when the
-    // recall found nothing to store. Every prefill reads it once, before the walk advances the state.
-    std::size_t host_stored_session_ = kNoSession;
+    // The catalog entry whose history the running prefill compares this prompt against, and therefore
+    // the one a divergence state at or before the shared prefix belongs to: after a recall, the entry
+    // that recall restored, whose own history is what the scan reads; after a switch, the session the
+    // switch just moved into its host slabs. kNoSession when the prompt is compared against no
+    // catalog entry, or against one the host budget could not keep. Every prefill reads it once,
+    // before the walk advances the state.
+    std::size_t anchor_session_ = kNoSession;
     // Entries the catalog accepts, resident one included. Zero disables session retention, which
     // is what a zero host KV budget selects.
     std::size_t session_capacity_    = 0;
@@ -497,11 +508,20 @@ private:
     std::uint32_t host_checkpoint_tail_slots_ = 0;
     std::uint64_t host_checkpoint_live_id_    = 0;
     std::uint64_t host_checkpoint_next_id_    = 1;
-    // Slots appended to the end of every shard's ring for the divergence anchor. They sit outside
-    // the configured --host-state-slots budget: the anchor answers a different question than the
-    // position grid, and carving them out of the grid would coarsen the stride that covers the
-    // whole context. They cost pinned host memory only.
+    // Slots appended to the end of every shard's ring for the divergence anchor and for the stable
+    // block's own anchor. They sit outside the configured --host-state-slots budget: the anchors
+    // answer a different question than the position grid, and carving them out of the grid would
+    // coarsen the stride that covers the whole context. They cost pinned host memory only.
     std::uint32_t host_checkpoint_divergence_slots_ = 0;
+    std::uint32_t host_checkpoint_block_slots_      = 0;
+    // The block boundary the last prefill's own prompt named, and the ring id that froze its state.
+    // A conversation keeps it across its turns and hands it to its slabs when it is evicted, so the
+    // next conversation that opens with the same block is recalled on the boundary instead of
+    // prefilling the block again. Zero means the running lineage has none.
+    std::uint32_t block_anchor_position_   = 0;
+    std::uint64_t block_anchor_prefill_id_ = 0;
+    // Committed history below this many tokens is not worth a catalog slot; 0 retains everything.
+    std::uint32_t session_retention_floor_tokens_ = 0;
     // Which memory the prefix scan's winning boundary restores its GDN state from. LiveState means
     // the device state already sits at that boundary - the resident session's frontier restored by
     // a recall, or the tail of a conversation that just decoded - so nothing is copied at all.

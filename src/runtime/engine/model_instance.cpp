@@ -126,9 +126,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         const bool host_kv_pinned            = options.context_cache.host_kv_pinned;
         const std::uint32_t session_capacity =
             options.context_cache.max_private_continuations.value_or(kTp2DefaultSessions);
+        const std::uint32_t retention_floor = options.context_cache.session_retention_floor_tokens;
         options.context_cache = ContextCacheOptions{.enabled        = false,
                                                     .host_state_slots = host_state_slots,
                                                     .host_kv_capacity_bytes = host_kv_capacity,
+                                                    .session_retention_floor_tokens = retention_floor,
                                                     .host_kv_pinned = host_kv_pinned,
                                                     .max_private_continuations = session_capacity};
     }
