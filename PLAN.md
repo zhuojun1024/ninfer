@@ -131,6 +131,14 @@ q4 88 / q8 7 / bf16 567）：`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_final.ninfer`
      `entries=0`（不占名额），topic 请求 `reuse=3` 走 ring；req#4 `cache 5,121/5,609`(91.3%)/TTFT 468ms、
      req#6 `cache 5,590/5,606`(99.7%)/TTFT 126ms。另：本仓库增量依赖扫描不可靠，改 `include/ninfer/types.h`
      或引擎头后必须 `--clean-first` 全量重建（本轮两次假故障均由此引起）。
+  6. **会话 entry 生命周期（2026-09-28，同轮修复）**：第 5 条的阈值规则去掉了每个新会话旁边那条 title entry，
+     而"驻留 entry 原地更新"分支原本依赖它当牺牲品——于是下一条会话直接覆盖上一条会话的 entry，A 的历史被
+     B、C 依次抹掉（服务端复现：`entries=1`、回到 A `reuse=0`）。修三处：① `session_publish` 只在
+     `history` 以上一条 entry 的 tokens 为前缀（同一会话的延伸）时才原地更新，否则新建 entry；② 新增
+     `mark_device_resident` 强制"最多一条 entry 声称驻留"（此前两条同时驻留 → 淘汰扫描只能选到那条刚冻结
+     边界的 entry，引擎测试因此红）；③ `session_capture_shared_state` 成功后刷新 `lru_clock`（写入即使用，
+     刚冻结的边界不会被同轮淘汰）。验证：`dflash2`/`mtp` 全绿；服务端 A→B→C→回到 A 复现 `entries` 0→1→2、
+     回到 A `reuse=5590/5625 (99.4%)`（修复前 `reuse=0` 全量 prefill）。
 
 ---
 

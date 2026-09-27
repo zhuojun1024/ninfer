@@ -1521,8 +1521,9 @@ bool TP2GenerationCore::session_evict_one() {
     }
     if (victim == kNoSession) { return false; }
     if (session_trace_enabled()) {
-        std::fprintf(stderr, "[tp2-session] evict frontier=%u tokens=%zu\n",
-                     sessions_[victim].frontier, sessions_[victim].tokens.size());
+        std::fprintf(stderr, "[tp2-session] evict frontier=%u tokens=%zu clock=%llu\n",
+                     sessions_[victim].frontier, sessions_[victim].tokens.size(),
+                     static_cast<unsigned long long>(sessions_[victim].lru_clock));
     }
     session_drop(victim);
     ++session_evictions_;
@@ -1703,6 +1704,18 @@ bool TP2GenerationCore::session_ensure_host_slabs(SessionEntry& entry, std::uint
     return true;
 }
 
+// At most one entry describes the conversation the device pools hold: a recall restores one and a
+// publish installs one, and every other entry's device state is gone the moment that happens. The
+// eviction scan skips resident entries because their KV never reached the slabs, so a stale flag
+// makes an entry unevictable - and lets the scans believe the device still holds a conversation it
+// has already overwritten.
+template <typename Sessions>
+static void mark_device_resident(Sessions& sessions, std::size_t index) {
+    for (std::size_t other = 0; other < sessions.size(); ++other) {
+        sessions[other].device_resident = other == index;
+    }
+}
+
 bool TP2GenerationCore::session_store_active() {
     if (active_session_ == kNoSession) { return true; }
     SessionEntry& entry = sessions_[active_session_];
@@ -1817,8 +1830,8 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
     const std::uint32_t pages = pages_for_tokens(boundary);
     if (pages == 0) {
         entry.tokens.clear();
-        entry.frontier        = 0;
-        entry.device_resident = true;
+        entry.frontier = 0;
+        mark_device_resident(sessions_, static_cast<std::size_t>(&entry - sessions_.data()));
         return;
     }
     Shard* const shards[2] = {&shard_a_, &shard_b_};
@@ -1872,9 +1885,9 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
     // diverges from this one - that boundary is what the divergence anchor is frozen at, and a
     // history clipped to the restored frontier hides it behind the recall. The slabs the recall read
     // still carry the KV this history describes, which is what a capture into the entry pairs with.
-    entry.frontier        = boundary;
-    entry.device_resident = true;
-    entry.lru_clock       = ++session_lru_clock_;
+    entry.frontier = boundary;
+    mark_device_resident(sessions_, static_cast<std::size_t>(&entry - sessions_.data()));
+    entry.lru_clock = ++session_lru_clock_;
     ++session_recalls_;
 }
 
@@ -1927,6 +1940,10 @@ void TP2GenerationCore::session_capture_shared_state(std::size_t index, std::uin
         }
     }
     entry.host_shared_end = position;
+    // A capture writes this entry: the boundary it now carries is the freshest thing the catalog
+    // holds, and evicting it in the same round would throw that work away before any conversation
+    // could use it. Recency is what the LRU approximates, so the write refreshes it.
+    entry.lru_clock = ++session_lru_clock_;
     if (session_trace_enabled()) {
         std::fprintf(stderr,
                      "[tp2-session] anchor entry=%zu position=%u resident=%d tokens=%zu\n", index,
@@ -2119,7 +2136,16 @@ void TP2GenerationCore::session_publish(const std::vector<TokenId>& history,
     // would hold, and the slot is what a returning conversation needs; a client that fires a one-off
     // title or summary call beside every new session would otherwise evict the sessions themselves.
     if (history.size() < session_retention_floor_tokens_) { return; }
-    if (active_session_ != kNoSession && sessions_[active_session_].device_resident) {
+    // Only the conversation the device still holds may be updated in place. A different one that
+    // reaches this point must get an entry of its own, or it would overwrite the resident history
+    // and leave the conversation that owned it unreachable - which is what a short request beside a
+    // new session used to prevent by taking the resident slot for itself.
+    const bool extends_resident =
+        active_session_ != kNoSession && sessions_[active_session_].device_resident &&
+        history.size() >= sessions_[active_session_].tokens.size() &&
+        std::equal(sessions_[active_session_].tokens.begin(), sessions_[active_session_].tokens.end(),
+                   history.begin());
+    if (extends_resident) {
         SessionEntry& entry = sessions_[active_session_];
         entry.tokens.assign(history.begin(), history.end());
         entry.frontier  = frontier;
@@ -2138,11 +2164,11 @@ void TP2GenerationCore::session_publish(const std::vector<TokenId>& history,
     }
     SessionEntry entry;
     entry.tokens.assign(history.begin(), history.end());
-    entry.frontier        = frontier;
-    entry.device_resident = true;
-    entry.lru_clock       = ++session_lru_clock_;
+    entry.frontier  = frontier;
+    entry.lru_clock = ++session_lru_clock_;
     sessions_.push_back(std::move(entry));
-    active_session_       = sessions_.size() - 1;
+    active_session_ = sessions_.size() - 1;
+    mark_device_resident(sessions_, active_session_);
     cached_prompt_tokens_ = sessions_[active_session_].tokens;
     live_state_valid_     = true;
 }

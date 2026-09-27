@@ -78,7 +78,12 @@ use `temperature 0` per request and the response's `usage` token counts, one req
   one-off title or summary call beside every new session would otherwise fill the private catalog with
   conversations too short to be worth a slot and evict the sessions the catalog exists for, and a
   corpus that short costs less to prefill again than the slot is worth. The Engine itself keeps
-  retaining everything unless a caller sets the option.
+  retaining everything unless a caller sets the option. A conversation also never adopts another
+  one's entry: the catalog keeps one entry per conversation, only the conversation the device pools
+  hold is updated in place, and a recall clears that claim on every other entry - so a displaced
+  conversation keeps its own history on its slabs instead of being overwritten by whoever arrives
+  next. A capture counts as a use for the LRU as well, so a boundary frozen this round is not
+  evicted before the conversation it was frozen for can recall it.
 - **Concurrency**: two simultaneous streaming requests both completed (24 and 27 chunks, 1.99 s).
 
 The startup after CUDA-graph capture is a one-off 14.4 s on this configuration; it is outside the
