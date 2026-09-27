@@ -28,6 +28,7 @@ venv/
 
 # Local workspace and transient runtime output
 /.local/
+/_temp/
 /temp/
 /temp-*/
 /tmp/
