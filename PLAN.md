@@ -687,7 +687,8 @@ in-kernel collective 只交换 1/N 的 partial，其余区间保持目的缓冲�
 ## 6. FP8 PV：attention 计算路径效率（2026-09-27 启动 → 同日回退，CLOSED）
 
 > **已回退（2026-09-27）**：实现通过全部质量门（G0–G3）但 op 级只到 1.179×（目标 ≥1.3×），按用户预授权
-> 规则回退并恢复 fp8 判据 1.2e-2；补丁留档 `build-win/fp8pv-v1b.patch`。**本轮最有价值的产出是瓶颈定位**：
+> 规则回退并恢复 fp8 判据 1.2e-2；补丁与其同处仓库根：`PLAN-fp8pv-v1b.patch`（`git apply`
+> 即可还原整套实现）。**本轮最有价值的产出是瓶颈定位**：
 > barrier stall 34.2% + math pipe throttle 25.2% ⇒ 余量在**相位结构**而非 PV 的 dtype（详见 §6 末尾）。
 > 建议的后续「跨 tile 相位流水」（逐位精确、零质量代价）未立项。
 
@@ -920,7 +921,8 @@ Wait 1.47（11.9%）、MIO 0.76、Short Scoreboard 0.69、Long Scoreboard 0.19�
   MIO 0.76，且每 tile producer ≈250 inst/线程 vs worker ≈100（worker 先到 barrier 干等）⇒ 加速它零收益。
 
 **回退执行（2026-09-27）**：`prompt_fp8.cuh` 与 `tests/.../causal_cache.cpp` 已 `git checkout` 回 HEAD，fp8
-判据恢复 **1.2e-2**；组合补丁留档 `build-win/fp8pv-v1b.patch`（23,614 B，含 FP8 PV 全部实现与 P 打包）。
+判据恢复 **1.2e-2**；组合补丁归档到仓库根 `PLAN-fp8pv-v1b.patch`（23,614 B：FP8 PV 全部实现 + P 打包，
+改 `prompt_fp8.cuh` 与 `causal_cache.cpp` 两个文件；`git apply PLAN-fp8pv-v1b.patch` 已验证可干净套用）。
 回退后 bench 复测：8,192 = 2,645.9 µs；65,536 = 19,731.1；245,760 = **73,646.7**（回到 FP16 PV 基线，与
 改动前 73,521.8 同档）。工作树只剩 `PLAN.md` 的改动。
 
