@@ -7,8 +7,8 @@ record what was tried, what the evidence showed, and where the full record lives
 Historical reference only: current state and remaining work live in `PLAN.md`
 (repository root); product behavior and measurements live in
 [tp2-dual-5060ti.md](tp2-dual-5060ti.md). Worklog line numbers refer to
-[tp2-dual-5060ti-worklog.md](tp2-dual-5060ti-worklog.md) as of 2026-09-25
-(6,499 lines).
+[tp2-dual-5060ti-worklog.md](tp2-dual-5060ti-worklog.md) as of 2026-09-27
+(7,939 lines).
 
 ## Architecture and ownership
 
@@ -41,6 +41,35 @@ Historical reference only: current state and remaining work live in `PLAN.md`
 
 ## Rejected optimizations (measured)
 
+- **FP8 PV (2026-09-27): implemented, passed every quality gate, reverted.** It
+  cleared G0-G3 (short-prompt acceptance Δ=+0.29 pp, deep-context Δ=−0.88 pp, both
+  within the 30-rep noise) but reached only **1.176×** at the op level against the
+  ≥1.3× bar (end-to-end ≈+1.4%, single sample) while widening the fp8 op tolerance
+  1.2e-2 → 3.2e-2 (~2× output perturbation). Per the user's pre-authorization it was
+  rolled back and the 1.2e-2 gate restored; the full implementation sits at the
+  repository root as `PLAN-fp8pv-v1b.patch`. The lasting result is the attribution:
+  **barrier stall 4.23 cyc/inst (34.2%) + math pipe throttle 3.12 (25.2%)** ⇒ the
+  headroom is in the phase structure, not the PV dtype. (worklog 2026-09-27 archive
+  §6; PLAN §2)
+- **Cross-tile phase pipelining (2026-09-27): rejected.** G0 confirmed barrier is
+  still the second stall on the reverted FP16-PV baseline (3.34 cyc/inst, 26.3%; 97%
+  of it after the two block-wide `__syncthreads()`), but both resident-role
+  implementations fell to **0.71–0.80×**: the whole PV accumulator is Br×D = 64×256
+  fp32 = 16,384 registers = 25% of the SM register file, so moving PV to 8 warps
+  doubles acc/thread into the 128-register wall, and a 768-thread variant (24 warps)
+  pushes the producer past its working-set wall. The baseline "8 producer ∥ 8 Vdeq →
+  16-warp PV" packing is optimal in the 1 block/SM envelope. Closed unless the
+  envelope changes (Br=32, or a >100 KB block-level smem budget). (worklog 2026-09-27
+  archive §7; PLAN §2)
+- **Upstream ninfer-all items closed by measurement (2026-09-26).** Per-device
+  `cudaFuncSetAttribute` and the 170-SM hardcoding were fixed (3 sites made
+  runtime-derived; two stayed comments only, because the derived value would change
+  existing 5090 behavior without a 5060 Ti A/B); item 3a disabling RDC was reverted
+  (this tree gained +38 stack-frame functions, opposite to upstream); 5b GDN record
+  staging was ported but is Op-level only (−22~27%, unmeasurable end to end); 5a
+  small-T tensor-core covers only q4/q5 and does not apply to the TP-2 NVFP4/FP8
+  trunks; item 4 (re-quantizing the streamed FP8 tensors to NVFP4/Q4) was dropped by
+  user decision. (worklog 2026-09-27 archive §5; PLAN §2, §3.8)
 - **Prefill AR∥MMA sub-block pipeline (R12 host-side chunk interleave): ~5%
   slower, rolled back.** That implementation, not the lever: a re-implementation
   with per-sub-block events and a dedicated collective stream nets **+11%**
@@ -96,7 +125,7 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   round: declining 22.5 vs keeping 87.1 tok/s with near-identical acceptance ⇒
   the gate, `draft_context_declined`, `reuse_grid` and session-mean pricing
   were removed; a single scan with the deepest boundary wins. (worklog
-  L4251–4279 background; PLAN §2)
+  L4251–4279 background)
 - **DFlash2 TP-2 option (b) (2026-09-22): implemented, then rolled back.** It
   was not the cause of the solo-probe instability; the route went back to
   construction-time rejection until the clamping-round root cause was fixed
@@ -106,7 +135,7 @@ Historical reference only: current state and remaining work live in `PLAN.md`
 
 - **Acceptance-rate verdicts need a 30-rep pool.** The 15-rep inter-arm noise
   floor is ~±2 pp; two "−2 pp cost" verdicts from 15-rep pools were later shown
-  to be noise. (worklog L6200–6206; PLAN §2)
+  to be noise. (worklog L6200–6206)
 - **Greedy cross-arm comparison is invalid.** Draft proposal length changes the
   verify batch shape ⇒ target numerics change ⇒ text drifts (6/7 probe prompts
   differ). Greedy probes are deterministic regression checks only; pooled
@@ -157,10 +186,10 @@ Historical reference only: current state and remaining work live in `PLAN.md`
 - **BF16-add allreduce is bit-safe only for BF16 payloads.** I32/FP32 ids can
   carry signaling-NaN bit patterns; use `DevicePair::sendrecv` for byte-exact
   cross-card exchange. DFlash2's equivalent paths are fixed; the MTP route at
-  `execution/text.cpp:486` is not (verification cost high). (PLAN §2, §3.3)
+  `execution/text.cpp:486` is not (verification cost high). (PLAN §3.3)
 - **Official NVFP4 artifact's lower acceptance rate vs synthetic/self-
   converted:** the difference is in the text weights, not the components.
-  (PLAN §2)
+  (worklog 2026-09-27 archive)
 - **Solo-probe determinism: ~6% flip rate** refutes "byte-identical across
   runs" for the dflash2 solo probe. (worklog L4097)
 - **The sessions plain-route failure is pre-existing** (the r57 baseline
@@ -232,4 +261,5 @@ Historical reference only: current state and remaining work live in `PLAN.md`
 - **Genuinely open items** (tracked in PLAN §3, not settled): bf16 KV + MTP
   first-prefill crash; MTP I32 sNaN risk; MTP3 ≥70 tok/s; perplexity on TP-2;
   trigger source of the low-frequency transport failures; B7 settling
-  (≥24 reps/arm); sessions plain-route failure.
+  (≥24 reps/arm); sessions plain-route failure; upstream 3b/3c and the 5060 Ti
+  SM-count A/B timings (PLAN §3.8).

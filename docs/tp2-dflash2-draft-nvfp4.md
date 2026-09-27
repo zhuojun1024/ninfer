@@ -1,6 +1,6 @@
 # DFlash2 全 draft NVFP4：源码级可行性分析
 
-> 结论性分析记录（2026-09-24），服务于 [PLAN.md](../PLAN.md) §3.7 的剩余杠杆「全 draft NVFP4」。
+> 结论性分析记录（2026-09-24），服务于 [PLAN.md](../PLAN.md) §3.4 的剩余杠杆「全 draft NVFP4」。
 > 方法与证据：消费 op 的 qtype 校验器、weight 绑定/布局实现、转换器方法注册表、真实 r66 artifact
 > 的 conversion 报告，以及本机 `D:/LLM/W4A16/NVFP4/W4A4+W8A8/DFlash2-FP8` 源与
 > `qwen3_8_27b_w4a4_w8a8_dflash2_q4all.ninfer`（现役最好件）。
@@ -9,7 +9,7 @@
 
 **全 draft NVFP4 在源码层「可做」，但不值得做；作为显存杠杆它已被现役 Q4 件击败。**
 
-1. **收益被高估**：相对官方 Q8 draft 全量 NVFP4 省 **−1090.9 MiB（−1.065 GiB）**，与 §3.7 的「约 −0.95 GiB」
+1. **收益被高估**：相对官方 Q8 draft 全量 NVFP4 省 **−1090.9 MiB（−1.065 GiB）**，与 §3.4 的「约 −0.95 GiB」
    同量级；但相对现役 r66 `q4all` 件只剩 **−202.3 MiB**，其中 **−174.3 MiB 来自 codebook**（非 GEMM，
    且与「NVFP4 profile」无关），其余 GEMM 项合计只再省 ~28 MiB。
 2. **逐张量看 NVFP4 比 Q4 更大**：NVFP4 = 0.5625 B/元素，Q4_G64_FP16 = 0.53125 B/元素。draft 的
