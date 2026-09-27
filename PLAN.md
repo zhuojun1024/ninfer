@@ -930,4 +930,141 @@ Wait 1.47（11.9%）、MIO 0.76、Short Scoreboard 0.69、Long Scoreboard 0.19�
 真正的余量在 **34.2% 的 barrier stall**，即 tile 循环的相位串行（producer QK+softmax ∥ worker 转置 → barrier
 → consumer PV → barrier；1 block/SM 下 producer 相位只有 8 warp 发 mma）。**跨 tile 相位流水**（double-buffer
 `p_s`，把 tile t 的 PV 与 tile t+1 的 QK 重叠）**逐位精确、零质量代价**，且作用在已回退的 FP16 PV 基线上
-⇒ 严格优于本次的 FP8 PV 交易。**是否立项待用户决定。**
+⇒ 严格优于本次的 FP8 PV 交易。**已立项（2026-09-27，用户决定，见 §7）。**
+
+---
+
+## 7. 跨 tile 相位流水：吃掉 barrier stall（2026-09-27 立项 → 同日否决，CLOSED）
+
+**目标**：把 `causal_attention_prompt_fp8_kernel` 的 tile 循环从相位串行改成跨 tile 流水，让 tile t 的 PV 与
+tile t+1 的 QK^T/softmax 重叠，直接吃掉 §6 定位到的 barrier stall。**验收口径与 §6 相反：本杠杆不引入任何新的
+数值边界，因此以逐位一致验收（solo digest + op 单测数字逐字不变），不设质量门、不放宽任何判据。**
+
+**基线（2026-09-27，HEAD `d21febf6`，FP8 PV 已回退）**：`ninfer_causal_softmax_attention_bench --entry cached
+--geometry d256-h12-kv2 --kv-dtype fp8 --tokens 1024 --execution eager --cache cold`（warmup 5 / repeat 30，
+单层 median）：8,192 → 2,643.6 µs；32,768 → 9,949.2；65,536 → **19,689.3**；131,072 → 39,553.2；245,760 →
+**73,517.7 µs**（math 42.15 TFLOP/s，qk/pv 各 21.08），与 §6 回退后复测同档。
+
+### 7.1 依据
+
+- §6 最后一轮 ncu（FP8 PV 版，ctx=65,536）：**Barrier 4.23 cyc/inst（34.2%）居首**、Math Pipe Throttle 3.12
+  （25.2%）、Wait 1.47、MIO 0.76、Short Scoreboard 0.69；管线 elapsed 口径 Tensor(FP) 50.14%。
+- 相位结构（`prompt_fp8.cuh:232-415`）：每个 KV tile 是
+  `producer QK^T+softmax（8 warp）∥ worker V 展宽（8 warp）→ __syncthreads → 全 16 warp PV → __syncthreads`；
+  producer 相位只有 8 warp 发 mma，PV 相位又必须等 producer 全部到齐；1 block/SM（96 寄存器 × 512 线程 +
+  动态 smem）⇒ 没有第二个 block 填相位空洞。同文件 :379-413 显示 tile t+1 的 KV `cp.async` 预取**已经**压在
+  tile t 的 PV 上 ⇒ 剩余缺口是 **QK/softmax 与 PV 两个计算相位的串行**，不是预取。
+- **关键不确定点**：§6 的 34.2% 是 FP8 PV 版的数（PV 张量时间减半后才把 barrier 顶到首位）。回退后的 FP16 PV
+  基线是否同样以 barrier 为首要 stall **必须由 G0 重测**——同类 k8v4 profile（worklog §3.13）当时是 math pipe
+  34.4% 居首。这正是 G0 门存在的理由。
+
+### 7.2 门禁与执行顺序（先测后改；G0 不过即否决）
+
+| 门 | 内容 | 判据 |
+|---|---|---|
+| **G0** | 在当前 FP16-PV 基线（fp8 KV、d256-h12-kv2、ctx=65,536）重抓 ncu `--set full`，要 stall 分类 + 管线 elapsed 细分 | barrier 类 stall 居首或次席且 ≥15%（相位串行确实暴露可观时间）⇒ 进 G1；否则**记录否决、不动代码** |
+| **G1** | 逐位精确的跨 tile 相位流水（具体形态由 G0 的 stall 归因决定，受 §7.3 约束） | 不重结合浮点、不改 fma/exp2/cvt/mask 语义与累加顺序；ncu 复测 barrier 显著下降 |
+| **G2** | 逐位判据 | ① `ninfer_qwen3_5_tp2_dflash_solo_test`（`D:\LLM\qwen3_8_27b_w4a4_dflash2_q4all.ninfer`）digest 与**改动前 HEAD 构建**逐位相同；② `ninfer_softmax_attention_test` 全 PASS 且最坏误差数字逐字不变（fp8 判据维持 1.2e-2） |
+| **G3** | 性能 | 深度曲线 8k→245k 相对基线无回退，且 245,760 上有可判提升 |
+
+**文件**：`src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh`（唯一实质改动；`prompt_fp8.cu` 仅当
+launch 常量需同步）、`tests/ops/softmax_attention/causal_cache.cpp`（仅当判据文字需改）。k8v4/nvfp4/bf16/i8 的
+prompt 内核本轮不动。
+
+### 7.3 设计约束（已实测，勿重复）
+
+- **smem 预算硬约束**：当前动态 smem **92,416 B**，opt-in 上限 **101,376 B**（G0 实测；Bc=128 的
+  151,808 B 直接 `cudaErrorInvalidValue`，worklog §3.13）⇒ 只有 **8,960 B** 的增量预算。双缓冲 `v_f16`
+  （32 KB）、`k_fp8`/`v_fp8`（各 16 KB）全都放不下，设计必须先把这些缓冲区变小或换掉，而不是直接翻倍。
+- **寄存器/占用率锁死**：102 寄存器 × 512 线程 + 92.4 KB smem ⇒ 1 block/SM（`regsPerSM = 65,536` ⇒
+  ≤128 寄存器/线程）；warps 16→32 已实测 −12%（spill）。
+- **可动点**：`v_f16`（32 KB，V 展宽暂存）是最大单项，且 §6 已论证 worker 相位每线程 ~100 inst 远早于
+  producer 到 barrier ⇒ 它既占满预算又不是关键路径，是本轮最可能的腾挪来源。
+
+**G0 结果（2026-09-27，PASS + 关键归因）**
+
+- 复跑基线（HEAD `d21febf6`，ctx=65536）：Tensor 63.6%（最忙）、Compute 63.60%、DRAM 2.28%、L1 39.80%、
+  寄存器 102/线程、动态 smem 92.42 KB、1 block/SM、Warp Cycles/Issued Inst **12.71**。
+- stall 分类（cyc/issued-inst，口径同 §6）：**Math Pipe Throttle 4.44（34.9%）**、**Barrier 3.34（26.3%）**、
+  Wait 1.68（13.2%）、Selected 1.00、Short Scoreboard 0.62、Not Selected 0.60、MIO 0.52、Long Scoreboard 0.12、
+  No Instruction 0.16、Branch Resolving 0.14。⇒ **barrier 在回退后的 FP16 PV 基线上仍是第二 stall（26.3%）**，
+  远超 15% 的 G0 门限 ⇒ 相位流水有效，进 G1。
+- **PC 级归因**（`ncu --page source --print-source sass`，1,724,394 个 warp-stall 样本，其中 barrier 452,953）：
+  | barrier 停在哪 | SASS PC（函数内偏移） | 样本 | 占比 |
+  |---|---|---:|---:|
+  | tile 末 `__syncthreads()`（0x5b00）之后 | UMOV（0x5b40，循环回边） | 262,286 | 58% |
+  | producer/worker → PV 的 `__syncthreads()`（0x4bd0）之后 | BRA.U（0x4bf0） | 177,073 | 39% |
+  | producer 内部第一个 `bar.sync 1,256`（0x3760）之后 | LDS（0x3770） | 9,422 | 2.1% |
+  | producer 内部第二个 `bar.sync 1,256`（0x4740）之后 | BRA（0x4750） | 3,933 | 0.9% |
+  ⇒ **97% 的 barrier stall 在两个全块 `__syncthreads()`（相位串行），producer 内部命名屏障只占 3%**。
+  结论：要吃的就是这个相位边界，而不是 softmax 的两个 partial 归约。
+- 说明：ncu 把 `.DEFER_BLOCKING` 的 barrier 等待记在屏障之后的第一条指令上，故上表 PC 均是 `BAR.SYNC` 的后继。
+- 设备参数（`cudaDeviceProp`，sm_120）：`sharedMemPerBlockOptin = 101,376 B`、`sharedMemPerSM = 102,400`、
+  `regsPerSM = 65,536`（512 线程 ⇒ ≤128 寄存器/线程）。当前动态 smem 92,416 ⇒ **余量仅 8,960 B**。
+
+**G1 设计（2026-09-27，按 G0 归因定案）**：把 tile 循环拆成两个**常驻 warp 角色**，一个 `__syncthreads`/tile：
+- **A（warp 0–7，producer）**：QK^T + softmax(t) → `p_s[t&1]`、`alpha_s[t&1]`、`running_m/l`；顺带预取
+  tile t+1 的 K 码与 K scale。
+- **B（warp 8–15，consumer）**：先做 **PV(t−1)**（读 `p_s[(t−1)&1]`、`alpha_s[(t−1)&1]`、`v_f16`），
+  再做 **V 展宽(t)**（`v_fp8(t)`→`v_f16`），顺带预取 tile t+1 的 V 码与 V scale。
+- 收尾：循环后再由 B 做 PV(K−1) 并写输出。
+- **smem 增量为零以外的开销**：`p_s` 8,192→16,384（双缓冲）、`alpha_s` 256→512 ⇒ 92,416→**100,864**
+  （余 512 B）；`k_fp8`/`v_fp8`/`v_f16`/`k_scale_s`/`v_scale_s` **保持单缓冲**——它们的预取分别由
+  消费它的那个组在读完当前 tile 之后发出，靠 cp.async 的异步性跨一个相位隐藏延迟。
+- **逐位精确性论证**：每个输出元素仍由唯一 warp 用同一组操作数（同一 P 片、同一 V 片）按同一顺序
+  （`acc*=alpha` 后 k=0→3 四个 mma）累加，tile 顺序与 `running_m/l` 递推完全不变；唯一变化是
+  **同一份工作换了个 warp 执行**（PV 由 8 warp 各覆盖 16 个 n-tile，而非 16 warp 各覆盖 8 个），
+  以及 softmax 的 partial 归约仍由原 8 个 producer warp 用原 `bar.sync 1,256` 完成
+  ⇒ 不重结合、不改运算语义。
+- **已知风险**：① B 的 `acc[16][4]`=64 个累加寄存器（原 32）可能顶到 `__maxnreg__(120)`；② 5 个命名
+  屏障（A 3 个 + B 2 个）与 1 个 `__syncthreads` 的相位关系必须精确，否则死锁或污染 `v_f16`。
+
+**G1/G3 结果（2026-09-27）：否决。三配置全部比基线慢，lever CLOSED。**
+
+（G1 自身的判据「barrier 显著下降」达成：3.34 → 2.23 cyc/inst；**否决发生在 G3**——三种实现的
+65,536/245,760 全部回退到 0.71–0.80×，且指令数上升，属结构性代价而非调参问题，故停止并记录否决。）
+
+实现（已回退）：`prompt_fp8.cuh` 拆成两个常驻角色 + 每 tile 一个 `__syncthreads`（`p_s`/`alpha_s` 双缓冲，
+smem 92,416 → **100,864 B**，余 512 B）。**正确性无问题**：`ninfer_softmax_attention_test` 全 PASS（fp8 判据
+1.2e-2 不变、0 fail / 0 non-finite）。否决纯粹是性能/结构原因。
+
+| 配置 | 结构 | 65,536 µs | 相对基线 | 245,760 µs | 相对基线 |
+|---|---|---:|---:|---:|---:|
+| 基线（HEAD） | 8 producer ∥ 8 Vdeq → 16-warp PV | **19,689** | 1.00× | **73,518** | 1.00× |
+| V1 | 8 producer + 8 consumer（PV 32→64 acc/线程，512 线程） | 24,527~24,640 | **0.80×** | 92,160~92,219 | **0.80×** |
+| V2 | 24 warp（8 producer + 16 consumer，768 线程，`__maxnreg__(80)`） | 27,836 | **0.71×** | 104,193 | **0.71×** |
+
+**V1 的 ncu 归因**（同 G0 配置，`--set full` + 逐 PC 采样）：
+- **barrier 3.34 → 2.23 cyc/inst（目标确实吃到了）**；但 math pipe throttle 4.44 → **5.24**、
+  long scoreboard 0.12 → **0.77**、short scoreboard 0.62 → 0.88、wait 1.68 → 1.85 ⇒ 总 latency 12.71 → 13.31。
+- **执行指令数 +17.4%**（2,222.6 M → 2,608.9 M）：其中 `LDL` **0 → 40.4 M**（运行时 local 溢出）、
+  IADD +54.8 M、LOP3 +37.3 M、IMAD +31.5 M、IMAD.SHL +29.7 M、BRA +34.8 M、S2R +23.8 M、
+  `BSSY/NOP/BSYNC.RECONVERGENT` 各 +16.2 M（地址重算与分支管理）。`LDSM.16.M88.4`（P 操作数）
+  −6.34 M 是唯一的实质节省。
+
+**根因（结构性，可复现）**：整块 PV 累加器 = Br×D = 64×256 fp32 = **16,384 个寄存器 = SM 寄存器文件的 25%**。
+- V1 把 PV 压到 8 warp（256 线程）⇒ 每线程 acc 32 → **64**；512 线程的硬上限是 128 寄存器/线程
+  （65,536/512）。实测 `__maxnreg__(128)` 时 ptxas 用满 128 **仍溢出**：prologue 把 ~20 个跨循环不变的
+  地址 `STL` 到栈，`run_pv` 每次调用再 `LDL` 取回（静态 48 条 STL/LDL、`REG:128 LOCAL:0` 是 cuobjdump
+  的误报）。
+- V2 把 PV 还原到 16 warp（32 acc/线程），代价是 768 线程 ⇒ 每线程上限 65,536/768 = 85，
+  且寄存器按 8/线程粒度分配 ⇒ `__maxnreg__(84)` 直接 `cudaErrorLaunchOutOfResources`
+  （24×32×88 = 67,584 > 65,536）；降到 80（61,440）后 producer 路径（`score[4][4]` + softmax ≈90 寄存器）
+  被压出更重的溢出 ⇒ 0.71×。
+
+⇒ **「腾出 8 个 warp 去发 QK」在这台机器上无解**：要么 PV 的 acc 翻倍撞 128/线程墙，要么加线程把上限
+压到 ≤80 撞 producer 工作集墙。基线「8 producer ∥ 8 Vdeq → 16-warp PV」正是本机
+「寄存器文件 + 100 KB smem + 1 block/SM」包络下唯一可行的 packing。另外 barrier 降到 2.23 后总 stall
+反而上升说明：**相位串行的一部分是张量管线在相位尾部排空的表现**（math throttle 上升是同一现象的另一面），
+不是可回收的空转。
+
+**回退执行与 G2 复核（2026-09-27）**：`src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh` 已
+`git checkout` 回 HEAD（`git status` 只剩 PLAN.md）；重建后 bench 复测 65,536 = 19,728.6 µs、
+245,760 = 74,132.0 µs（与基线同档，math 42.13 TFLOP/s），`ninfer_softmax_attention_test` 全 PASS
+（exit 0）。**digest 判据**：`tp2_dflash_solo`（q4all 件）= **`0xad284a4b774b1cc3`**，两个独立进程一致、PASS；
+回退后源码与 HEAD 逐字节相同，故该值即基线值（§6 记的 `0x19047f8ccaf5707f` 是 **FP8 PV 版本** 的值——
+§7.2 最初引用它属误记，已改为「与改动前 HEAD 构建逐位相同」；工作树历史值 `0x4bcc3994a5efba7d` 早于
+`6e01537a`/b7d352e8 两个前端改动，三者互不矛盾）。
+
+工作树只剩 `PLAN.md`。**本节 CLOSED，不再重开**——除非执行包络本身改变（例如 Br=32 把 acc/线程降到 16，
+或出现 >100 KB 的块级 smem 预算让 `v_f16` 也能双缓冲）。
