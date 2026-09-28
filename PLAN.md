@@ -140,6 +140,25 @@ q4 88 / q8 7 / bf16 567）：`D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_final.ninfer`
      刚冻结的边界不会被同轮淘汰）。验证：`dflash2`/`mtp` 全绿；服务端 A→B→C→回到 A 复现 `entries` 0→1→2、
      回到 A `reuse=5590/5625 (99.4%)`（修复前 `reuse=0` 全量 prefill）。
 
+- **Vision 聚合上限 32,768 → 131,072 merged tokens（2026-09-28，用户要求）**：现象是用户 1080p 截图会话在
+  「历史已有 16 张 + 本轮新增 8 张 = 24 张」时被 `HTTP 400 media_budget_exceeded: vision budget exceeded` 拒绝。
+  根因：整请求聚合上界 `kMaximumPromptVisionTokens`（`src/models/qwen3_5/frontend/prepared_prompt.h`）为
+  32,768 merged token（= 131,072 raw patch = 33.5 MP 对齐像素），而客户端每轮把整个会话历史重发、历史里的图片每轮
+  重新计入 ⇒ 实际等价于「每会话 1080p 最多 16 张 / 720p 最多 37 张」，且超限后该会话后续请求全部 400。
+  改动只抬聚合上界（单项 ceiling 16,384 与编码 workspace 规划不变 ⇒ **设备显存占用不变**）：
+  `kMaximumPromptVisionTokens = 131'072` 并把注释写明它只决定「保留 patch 预算 / 媒体 live 下限 / 准入检查」；
+  同步 `docs/maintainer/qwen3_5-model.md`（524,288 raw patch / 131,072 merged token）、`docs/serving.md`
+  （新 envelope + `--media-live-mib` 需 ≥ 12,288 B/merged token = 1.5 GiB，默认 2048 满足）、
+  `tests/test_request_log.cpp` 的 fixture。证据：`--clean-first` 全量重建（769 步）后
+  `ninfer_request_log_test` / `ninfer_qwen3_5_frontend_test` / `ninfer_public_api_test` 通过；
+  `ninfer_qwen3_5_vision_workspace_test` 在本机 16 GB 卡 `cudaMalloc` OOM（worklog 已记「本机不适用」，且其断言
+  只涉单项上界，与本次改动无关）；端到端（`build-win/apps/ninfer-serve.exe`，1920×1080 图 = **2,040** merged
+  token/张）：24 张 → HTTP 200（prompt 49,022）、64 张 → HTTP 200（prompt 130,702）、65 张 → HTTP 400
+  `media_budget_exceeded`（"vision raw patches exceed processor budget"）⇒ 边界精确落在 131,072。
+  代价：host 侧媒体 live 下限 384 MiB → 1.5 GiB、单请求最坏保留 1.5 GiB BF16 patch（2 GiB live 预算里 media cache
+  由 ~1 GiB 缩到 ~512 MiB）；KV/上下文仍由 `--max-context` 决定。已部署 `C:\ninfer\ninfer-serve.exe`
+  （SHA256 `29D8758E548E581B4BAF38EDD6C56E5451F43CDC3E2F1615EA6DF4523708F2C1`，与 `build-win` 产物一致）。
+
 ---
 
 ## 3. 待处理任务

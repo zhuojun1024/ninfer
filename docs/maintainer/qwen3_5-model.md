@@ -293,7 +293,7 @@ width 4608, and computes `fc2(GELU_exact(fc1(merged) + bias)) + bias`, producing
 Those columns replace matching placeholder embeddings. Vision has no autoregressive state.
 
 Frontend admission uses aggregate media bytes, pixels, patch/token budgets and Engine context
-capacity. The aggregate limit is 131,072 raw patches / 32,768 merged tokens; a single tower item
+capacity. The aggregate limit is 524,288 raw patches / 131,072 merged tokens; a single tower item
 uses at most 16,384 merged tokens, additionally bounded by context. Program executes items
 sequentially and reuses their output handoff after scattering the previous item.
 

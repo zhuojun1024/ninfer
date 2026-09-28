@@ -350,8 +350,10 @@ OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
 media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
-has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore
-`min(--max-context, 32768)`. One media item is further bounded by `--vision-item-tokens`, which is
+has a 131,072 merged-token envelope (524,288 raw patches); the effective Vision limit is therefore
+`min(--max-context, 131072)`. The envelope also sets the media live-byte floor: Vision needs at
+least 12,288 bytes of `--media-live-mib` per merged token (1.5 GiB at the full envelope). One media
+item is further bounded by `--vision-item-tokens`, which is
 also the pixel budget its resize targets. There is no fixed image/video item-count limit: item count
 is admitted through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory
 budgets.
