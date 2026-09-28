@@ -855,6 +855,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
         checked_token_count(result.token_ids.size()));
+    result.message_boundaries = std::move(message_boundaries);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -934,6 +935,17 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
 std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
     return impl_->tokenizer->encode(text);
+}
+
+std::string Frontend::decode_tokens(std::span<const TokenId> token_ids,
+                                    bool skip_special_tokens) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    std::vector<int> ids;
+    ids.reserve(token_ids.size());
+    for (const TokenId token : token_ids) { ids.push_back(static_cast<int>(token)); }
+    fi::DecodeOptions options;
+    options.skip_special_tokens = skip_special_tokens;
+    return impl_->tokenizer->decode(ids, options);
 }
 
 PromptCapabilities Frontend::prompt_capabilities() const noexcept {

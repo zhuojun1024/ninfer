@@ -1,5 +1,7 @@
 #include "runtime/engine/tp2_generation_core.h"
 
+#include "runtime/engine/turn_replay.h"
+
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/cyclic_kv_cache.h"
@@ -283,6 +285,36 @@ struct ArCaptureGuard {
     tp::DevicePair& pair;
     ~ArCaptureGuard() { pair.end_capture(); }
 };
+
+
+// Prefix-reuse trace helper: a divergence is a byte-level disagreement, so the diagnostic has to
+// show the bytes either side of it with the whitespace that separates two renderings made visible.
+void print_escaped_bytes(std::string_view text, std::size_t from, std::size_t length) {
+    constexpr std::size_t kMaximumBytes = 160;
+    for (std::size_t index = from, printed = 0;
+         index < text.size() && printed < length && printed < kMaximumBytes; ++index, ++printed) {
+        const auto byte = static_cast<unsigned char>(text[index]);
+        switch (byte) {
+            case '\n': std::fputs("\\n", stderr); break;
+            case '\r': std::fputs("\\r", stderr); break;
+            case '\t': std::fputs("\\t", stderr); break;
+            case '"': std::fputs("\\\"", stderr); break;
+            case '\\': std::fputs("\\\\", stderr); break;
+            default:
+                if (byte < 0x20U || byte == 0x7fU) { std::fprintf(stderr, "\\x%02x", byte); }
+                else { std::fputc(static_cast<char>(byte), stderr); }
+                break;
+        }
+    }
+}
+
+void print_reuse_span(const char* label, const TP2GenerationCore& core,
+                      std::span<const TokenId> tokens) {
+    const std::string text = core.frontend().decode_tokens(tokens);
+    std::fprintf(stderr, " %s[%zu]=\"", label, tokens.size());
+    print_escaped_bytes(text, 0, text.size());
+    std::fputs("\"", stderr);
+}
 
 } // namespace
 
@@ -2186,6 +2218,132 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     }
 }
 
+TP2GenerationCore::TurnAdoption
+TP2GenerationCore::adopt_generated_turn(models::qwen3_5::PreparedPromptData& data,
+                                        std::uint32_t prompt_tokens, bool trace) const {
+    TurnAdoption adoption;
+    adoption.prompt_tokens = prompt_tokens;
+    if (cached_prompt_tokens_.empty()) { return adoption; }
+    // Where the client's rendering and this lineage's history part. Taken before anything is
+    // replaced: it is both the reuse decision the scan would have made and, for the trace, the only
+    // measurement of a re-rendered answer that survives the adoption itself.
+    const std::size_t common = std::min(cached_prompt_tokens_.size(), data.token_ids.size());
+    std::size_t shared        = 0;
+    while (shared < common && cached_prompt_tokens_[shared] == data.token_ids[shared]) { ++shared; }
+    adoption.divergence = shared;
+    // A multimodal request is left alone: its token array carries vision runs whose positions a
+    // replacement would have to keep, and a media turn never comes back as pure text.
+    if (data.has_media()) { return adoption; }
+    // Where the answer this lineage generated begins. The slot-0 snapshot is the boundary the cached
+    // lineage's last prefill ended on, which is exactly the position the answer starts at, and it
+    // survives the catalog letting the conversation go. The session field is chunk-start bookkeeping,
+    // so it is only the fallback for a walk that left no snapshot of its own.
+    std::size_t turn_begin = cached_boundaries_[0];
+    if (turn_begin == 0 && active_session_ != kNoSession) {
+        turn_begin = sessions_[active_session_].prompt_end;
+    }
+    const std::size_t turn_end = cached_prompt_tokens_.size();
+    // The whole history in front of the turn has to match, or this is a different history and not a
+    // replay of the answer this lineage wrote. An empty ring means no completed prefill is in reach.
+    if (turn_begin == 0 || turn_end <= turn_begin || data.token_ids.size() <= turn_begin ||
+        shared < turn_begin) {
+        return adoption;
+    }
+    // The replay ends where the message after the turn begins. A prompt without that boundary - an
+    // encoded token stream, or a turn the template folds into a neighbouring message - cannot be
+    // compared here and keeps today's behaviour.
+    std::size_t replay_end = 0;
+    for (const auto& boundary : data.message_boundaries) {
+        if (boundary.has_value() && *boundary > turn_begin) {
+            replay_end = *boundary;
+            break;
+        }
+    }
+    if (replay_end <= turn_begin || replay_end > data.token_ids.size()) { return adoption; }
+    const std::span<const TokenId> generated_span =
+        std::span<const TokenId>(cached_prompt_tokens_)
+            .subspan(turn_begin, turn_end - turn_begin);
+    const std::span<const TokenId> replayed_span =
+        std::span<const TokenId>(data.token_ids).subspan(turn_begin, replay_end - turn_begin);
+    const std::string generated = frontend().decode_tokens(generated_span, true);
+    const std::string replayed  = frontend().decode_tokens(replayed_span, true);
+    const bool same_turn        = same_rendered_turn(generated, replayed);
+    if (trace) {
+        // The case that decides the whole reuse story: the prompt matched past the previous prompt
+        // end and then stopped, because the client re-rendered the turn this lineage generated.
+        // Where the bytes part decides whether the turn is the same one, so print both sides.
+        std::fprintf(stderr,
+                     "[tp2-diverge] prompt=%u cached=%zu prev_prompt=%zu shared=%zu in_turn=%zu "
+                     "to_turn_end=%zu replay=%zu same_turn=%d",
+                     prompt_tokens, cached_prompt_tokens_.size(), turn_begin, shared,
+                     shared > turn_begin ? shared - turn_begin : 0, turn_end - shared,
+                     replayed_span.size(), same_turn ? 1 : 0);
+        // Where the two texts part, in bytes: the prefixes below are capped, and a divergence deep
+        // inside a long turn is invisible in them.
+        std::size_t difference = 0;
+        const std::size_t common = std::min(generated.size(), replayed.size());
+        while (difference < common && generated[difference] == replayed[difference]) { ++difference; }
+        std::fprintf(stderr, " diff_at=%zu", difference);
+        print_reuse_span("generated", *this, generated_span);
+        print_reuse_span("replayed", *this, replayed_span);
+        const std::size_t window = difference > 24 ? difference - 24 : 0;
+        std::fputs(" around_generated=\"", stderr);
+        print_escaped_bytes(generated, window, 48);
+        std::fputs("\" around_replayed=\"", stderr);
+        print_escaped_bytes(replayed, window, 48);
+        std::fputs("\"", stderr);
+        std::fprintf(stderr, "\n");
+    }
+    if (!same_turn) { return adoption; }
+    // An exact replay needs nothing replaced: the scan below already reads this lineage's tokens.
+    if (generated_span.size() == replayed_span.size() &&
+        std::equal(generated_span.begin(), generated_span.end(), replayed_span.begin())) {
+        return adoption;
+    }
+    // Same turn, so the tokens this lineage owns are the ones its KV holds; replacing the replay
+    // with them lets the prefix scan below take the deepest boundary of this lineage - normally its
+    // own frontier - instead of re-prefilling the whole answer. The replacement is allowed to be a
+    // few tokens longer than the replay, so it still has to fit the context the request was
+    // admitted against. token_types and positions stay as prepared because only the media route
+    // fills them, and that route never reaches this point.
+    if (data.token_ids.size() - replayed_span.size() + generated_span.size() >
+        options_.max_context) {
+        return adoption;
+    }
+    std::vector<TokenId> spliced;
+    spliced.reserve(data.token_ids.size() - (replay_end - turn_begin) + (turn_end - turn_begin));
+    spliced.insert(spliced.end(), data.token_ids.begin(),
+                   data.token_ids.begin() + static_cast<std::ptrdiff_t>(turn_begin));
+    spliced.insert(spliced.end(),
+                   cached_prompt_tokens_.begin() + static_cast<std::ptrdiff_t>(turn_begin),
+                   cached_prompt_tokens_.end());
+    spliced.insert(spliced.end(),
+                   data.token_ids.begin() + static_cast<std::ptrdiff_t>(replay_end),
+                   data.token_ids.end());
+    data.token_ids = std::move(spliced);
+    adoption.adopted       = true;
+    adoption.prompt_tokens = static_cast<std::uint32_t>(data.token_ids.size());
+    return adoption;
+}
+
+PrefixReusePath TP2GenerationCore::reuse_path(std::uint32_t reuse,
+                                              std::uint32_t block_frontier) const noexcept {
+    if (reuse == 0) { return PrefixReusePath::Root; }
+    if (block_frontier != 0 && reuse == block_frontier) {
+        return PrefixReusePath::SharedStablePrefix;
+    }
+    if (active_session_ != kNoSession) {
+        const SessionEntry& entry = sessions_[active_session_];
+        if (reuse == entry.frontier) { return PrefixReusePath::PrivateEndpoint; }
+        // The boundary in front of the answer this lineage generated. A client that re-rendered that
+        // answer cannot extend it and re-prefills from the generation opener instead.
+        if (reuse == entry.prompt_end) { return PrefixReusePath::PrivateResponseReplay; }
+    }
+    // Everything else is a retention boundary: a grid or tail anchor this core wrote, or a state
+    // another conversation was seen to diverge at.
+    return PrefixReusePath::PrivateLongAnchor;
+}
+
 GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* sink,
                                                  const CancellationView& cancellation) {
     const bool streaming = request.consumer_mode == OutputConsumerMode::Streaming;
@@ -2197,7 +2355,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // conversation its MTP rounds; the request-level flag stays a property of the session, not of the
     // prompt.
     const bool media = data.has_media();
-    const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(token_ids.size());
+    // The walk's own prompt length. adopt_generated_turn below may replace the client's rendering
+    // of the last turn with the tokens this lineage generated, which changes the count.
+    std::uint32_t prompt_tokens = static_cast<std::uint32_t>(token_ids.size());
     const std::int32_t vocab =
         qwen::execution::dimension(shard_a_.model->config().text.vocab_size);
     const std::int32_t hidden =
@@ -2244,6 +2404,13 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         const char* env = std::getenv("NINFER_TP2_TIMING");
         return env != nullptr && env[0] == '1';
     }();
+    // Prefix-reuse trace. It shows what the boundaries offered, what the prompt actually matched,
+    // and - when a client re-rendered the answer it was handed - the bytes either side of the
+    // divergence, which is what decides whether the two describe the same turn.
+    const bool reuse_trace = [] {
+        const char* env = std::getenv("NINFER_TP2_REUSE_TRACE");
+        return env != nullptr && env[0] == '1';
+    }();
     std::uint32_t prefill_chunks      = 0;
     std::uint64_t prefill_host_writes = 0;
     Clock::time_point scan_done       = start;
@@ -2254,6 +2421,24 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // to another conversation makes the resident session swap out here, so by the time the scan
     // below compares against cached_prompt_tokens_ the pools already hold the conversation this
     // prompt continues. A prompt that continues the resident conversation is left untouched.
+    // A client that re-renders the answer it was handed does not have to pay for it: when the
+    // replay describes the same turn, the tokens this lineage generated are the ones its KV holds,
+    // and the scan below then takes the boundary this lineage actually reached instead of the
+    // prompt end. See adopt_generated_turn.
+    //
+    // This runs before the recall on purpose. The recall decides whether the conversation is still
+    // this prompt's lineage from how far the two agree, and a replayed answer is exactly the case
+    // where the client's rendering agrees only up to a re-tokenised token deep inside it: comparing
+    // the tokens the walk will really forward keeps a conversation whose answer came back as text
+    // resident, instead of retiring it over a divergence the adoption is about to remove. When
+    // nothing is adopted the tokens are untouched and the recall sees exactly what it always did.
+    const TurnAdoption adoption = adopt_generated_turn(data, prompt_tokens, reuse_trace);
+    if (adoption.adopted) {
+        prompt_tokens                 = adoption.prompt_tokens;
+        request.summary.prompt_tokens = prompt_tokens;
+        result.prompt.prompt_tokens   = prompt_tokens;
+    }
+
     session_recall(token_ids);
 
     // Prompt-prefix reuse. The KV pages hold the K/V of every position the last completed prefill
@@ -2262,13 +2447,6 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // route gets this from the context cache; TP-2 runs with that cache disabled, so the core keeps
     // the boundaries it already owns. The deepest boundary at or before the shared prefix wins; the
     // final prompt token is always forwarded, because its logits drive the first sample.
-    // NINFER_TP2_REUSE_TRACE=1 prints what the boundaries offered and what the prompt actually
-    // matched. It is the difference between a client that resends its history verbatim and one that
-    // re-renders it, which decides whether a boundary past the previous prompt can ever be used.
-    const bool reuse_trace = [] {
-        const char* env = std::getenv("NINFER_TP2_REUSE_TRACE");
-        return env != nullptr && env[0] == '1';
-    }();
     std::uint32_t reuse       = 0;
     std::size_t reuse_slot    = 0;
     std::size_t shared_prefix = 0;
@@ -2300,8 +2478,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // tolerance a bounded recall has always had, and why a recall owes a from-scratch walk its
         // boundary crossing rather than its whole trajectory. Rounding down to the prefill grid
         // instead would re-prefill up to a whole chunk on every turn of a conversation that continues
-        // in place - the common agent case - because decode publishes no grid boundary past its own
-        // prompt, so the deepest aligned candidate sits behind the entire generated answer.
+        // in place - the common agent case. Decode writes the position grid too (see the decode loop),
+        // so a boundary now exists inside the answer this lineage generated as well; what no boundary
+        // inside it can offer is a restart *after* a replay that does not describe this turn.
         //
         // The masked draft stays live on such a boundary as well. Its ring belongs to the walk that
         // froze it, so it proposes the block that walk would have proposed; the draft only proposes,
@@ -2341,10 +2520,14 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                              : reuse_source_ == ReuseSource::LiveState    ? "live"
                              : reuse_source_ == ReuseSource::DeviceSnapshot ? "device"
                                                                             : "none";
+        const std::uint32_t previous_prompt =
+            active_session_ != kNoSession ? sessions_[active_session_].prompt_end : 0;
         std::fprintf(stderr,
-                     "[tp2-reuse] prompt=%u cached=%zu shared=%zu prefill_end=%u rewind=%u "
-                     "host=%zu/%zu stride=%u -> reuse=%u slot=%zu src=%s\n",
+                     "[tp2-reuse] prompt=%u cached=%zu shared=%zu replay_split=%zu adopted=%d "
+                     "prev_prompt=%u prefill_end=%u rewind=%u host=%zu/%zu stride=%u -> reuse=%u "
+                     "slot=%zu src=%s\n",
                      prompt_tokens, cached_prompt_tokens_.size(), shared_prefix,
+                     adoption.divergence, adoption.adopted ? 1 : 0, previous_prompt,
                      cached_boundaries_[0], cached_boundaries_[1], valid_checkpoints,
                      shard_a_.host_checkpoints.size(), host_checkpoint_stride_, reuse, reuse_slot,
                      source);
@@ -2495,6 +2678,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         sink->start(GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
     }
     result.reused_prompt_tokens   = reuse;
+    result.prefix_reuse_path =
+        reuse_path(reuse, data.context_cache.leading_instruction_frontier.value_or(0));
 
     // Sampling config, device-resident, for ops::sample.
     ops::SamplingConfig sampling_config = make_sampling_config(request.sampling);
@@ -3645,6 +3830,27 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         ++timing.rounds;
         timing.round_ms +=
             std::chrono::duration<double, std::milli>(Clock::now() - round_start).count();
+
+        // Decode advances the frontier, and a later turn that re-renders the answer it was handed
+        // stops matching inside this generated span. Prefill leaves no boundary here, so without
+        // these writes the deepest checkpoint behind a replayed answer sits at the prompt end and
+        // the whole answer is re-prefilled. Write the position grid the prefill writes, at the
+        // frontier this round actually committed - the same count the final publish names - so the
+        // loss a replay cannot avoid is bounded by one stride instead of by the answer. The draft
+        // image has to describe the frontier the checkpoint names, so hand it the pending window
+        // first; the final boundary is skipped because the device snapshot and the live state both
+        // already hold it.
+        if (host_checkpoint_stride_ != 0 && !finished) {
+            const std::uint32_t committed_frontier =
+                prompt_tokens + static_cast<std::uint32_t>(request.generated.size()) - 1U;
+            if (committed_frontier >= next_host_checkpoint) {
+                flush_dflash_context(committed_frontier);
+                snapshot_host_checkpoint(shard_a_, committed_frontier, HostRing::Grid);
+                snapshot_host_checkpoint(shard_b_, committed_frontier, HostRing::Grid);
+                next_host_checkpoint =
+                    (committed_frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
+            }
+        }
     }
 
     // Publish the finished conversation: the pools hold prompt plus committed output and the live
@@ -3665,6 +3871,17 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // remainder first. A finished round already did this itself.
         flush_dflash_context(frontier);
         session_publish(history, frontier);
+    }
+    // Only now are the checkpoints decode wrote usable, on the same terms as the prefill's: their
+    // state is one this walk committed and their KV prefix is one it wrote. A walk that threw
+    // before this point leaves them invalid, so a torn round can never be recalled.
+    {
+        Shard* const shards[2] = {&shard_a_, &shard_b_};
+        for (Shard* shard : shards) {
+            for (auto& checkpoint : shard->host_checkpoints) {
+                if (checkpoint.prefill_id == host_checkpoint_live_id_) { checkpoint.valid = true; }
+            }
+        }
     }
     result.generated_token_ids = std::move(request.generated);
     result.tool_calls          = request.output.take_tool_calls();

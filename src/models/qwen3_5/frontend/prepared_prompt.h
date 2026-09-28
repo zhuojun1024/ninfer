@@ -155,6 +155,10 @@ struct PrepareStats {
 
 struct PreparedPromptData {
     std::vector<TokenId> token_ids;
+    // Token frontier after serializing the first n input messages: entry n is the end of message
+    // n - 1, and a missing value means the template has no independent boundary there. A prefix
+    // scan uses them to locate the span one message occupies without re-rendering the prompt.
+    std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
     std::int32_t rope_delta = 0;

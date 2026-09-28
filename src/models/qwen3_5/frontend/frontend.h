@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -79,6 +80,12 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+    // Exact text of a committed token span. Prefix reuse compares two renderings of the same turn
+    // as bytes - the template's separators and the whitespace the template trims are not visible in
+    // a token id - and the turn separator is itself a special token, so specials stay in unless the
+    // caller asks for them to be dropped.
+    [[nodiscard]] std::string decode_tokens(std::span<const TokenId> token_ids,
+                                            bool skip_special_tokens = false) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession

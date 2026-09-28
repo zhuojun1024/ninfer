@@ -121,6 +121,18 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   decode vs saved prefill), recomputing is the rational choice. The only lever
   for token-exact reuse is a continuation protocol carrying token ids
   (unscheduled). (worklog L5408–5413, L5457)
+
+  *Byte-exactness withdrawn; the generated span is adopted instead.* The
+  template's `|trim` removes the leading whitespace of the model's reasoning
+  (worklog L5389–5391), so a replayed turn parts from the resident history at
+  its first token while describing the same turn. When the two renderings agree
+  - same trimmed reasoning, same trimmed content, byte-identical tool-call
+  region - the walk replaces the replay with the tokens this lineage generated
+  and reaches its frontier again; a replay that describes a different turn keeps
+  the old fall-back, and decode now writes the checkpoint grid so that fall-back
+  costs at most one stride. `turn_replay.h` owns the guard,
+  `adopt_generated_turn` the replacement, and `NINFER_TP2_REUSE_TRACE=1`
+  reports `adopted=` and the divergence bytes per request.
 - **"Unaligned reuse must decline the masked draft": premise overturned.** Same
   round: declining 22.5 vs keeping 87.1 tok/s with near-identical acceptance ⇒
   the gate, `draft_context_declined`, `reuse_grid` and session-mean pricing
