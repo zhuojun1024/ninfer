@@ -154,7 +154,7 @@ int run(const Options& options) {
     auto resource_plan = program->seal_identity(*request_plan, prompt, {});
     if (!resource_plan) { throw std::runtime_error("benchmark root resources were not sealed"); }
     const auto reserved =
-        program->start_resource_transaction(std::move(*resource_plan), std::move(prompt), {});
+        program->start_resource_transaction(std::move(*resource_plan), prompt, {});
     if (reserved != ninfer::runtime::ContextTransactionReserveStatus::Reserved) {
         throw std::runtime_error("benchmark root materialization was not reserved");
     }
