@@ -39,7 +39,10 @@ VisionControlPlan plan_vision_control(const PreparedPromptData& prompt,
         throw std::invalid_argument("Vision control geometry must be positive");
     }
     if (prompt.token_ids.size() != prompt.token_types.size()) {
-        throw std::invalid_argument("vision control token types must cover the prompt");
+        throw std::invalid_argument(
+            "vision control token types must cover the prompt: " +
+            std::to_string(prompt.token_ids.size()) + " tokens carry " +
+            std::to_string(prompt.token_types.size()) + " types");
     }
     VisionControlPlan plan{.spatial_merge_size = merge, .position_grid_side = position_side};
     plan.items.reserve(prompt.vision_items.size());
