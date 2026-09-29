@@ -24,7 +24,12 @@ cards in a TP-2 pair (`--devices 0,1`), artifact `qwen3_8_27b_nvfp4.ninfer` (23.
 pwsh -File tools/win_port/build.ps1 -Configure        # configure and build (Release, sm_120a)
 pwsh -File tools/win_port/build.ps1                  # incremental build
 pwsh -File tools/win_port/build.ps1 -Configure -Apps 0   # core libraries only
+pwsh -File tools/win_port/build.ps1 -Configure -Tests 1 -Benchmarks 1   # add the suite and benchmarks
 ```
+
+`-Apps`, `-Tests`, and `-Benchmarks` set `NINFER_BUILD_APPS`, `BUILD_TESTING`, and
+`NINFER_BUILD_BENCHMARKS` on every `-Configure` run, so a plain `-Configure` turns the suite and the
+benchmarks **off**. Pass the switches for the configuration you want; the three are additive.
 
 Products land in `build-win/apps/{ninfer,ninfer-serve,ninfer-perplexity}.exe`. `build.ps1` imports the
 `vcvars64` environment into the PowerShell session (see `tools/win_port/vcvars.ps1`), so no cmd wrapper

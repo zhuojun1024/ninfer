@@ -3,6 +3,7 @@
 #   pwsh -File tools/win_port/build.ps1                            # incremental build
 #   pwsh -File tools/win_port/build.ps1 -Configure                 # configure first, then build
 #   pwsh -File tools/win_port/build.ps1 -Configure -Apps 0         # core only (no CLI/server)
+#   pwsh -File tools/win_port/build.ps1 -Configure -Tests 1 -Benchmarks 1   # suite and benchmarks
 #   pwsh -File tools/win_port/build.ps1 -SkipProbe                 # skip the pipe preflight
 #
 # The ffmpeg and libcurl prefixes are required by the media paths; docs/windows.md explains how to
@@ -25,6 +26,7 @@ param(
     [switch] $Configure,
     [int] $Apps = 1,
     [int] $Tests = 0,
+    [int] $Benchmarks = 0,
     [int] $Jobs = 12,
     [int] $TimeoutSec = 2700,
     [switch] $SkipProbe,
@@ -118,14 +120,16 @@ if ($servers.Count -ne 0) {
 }
 
 if ($Configure) {
-    $appsFlag  = if ($Apps -ne 0) { "ON" } else { "OFF" }
-    $testsFlag = if ($Tests -ne 0) { "ON" } else { "OFF" }
+    $appsFlag       = if ($Apps -ne 0) { "ON" } else { "OFF" }
+    $testsFlag      = if ($Tests -ne 0) { "ON" } else { "OFF" }
+    $benchmarksFlag = if ($Benchmarks -ne 0) { "ON" } else { "OFF" }
     $arguments = @(
         "-S", $SourceDir, "-B", $BuildDir, "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_CUDA_ARCHITECTURES=120a",
         "-DNINFER_BUILD_APPS=$appsFlag",
         "-DBUILD_TESTING=$testsFlag",
+        "-DNINFER_BUILD_BENCHMARKS=$benchmarksFlag",
         "-DNINFER_FFMPEG_ROOT=$FfmpegRoot"
     )
     if (($Apps -ne 0) -or ($Tests -ne 0)) {
