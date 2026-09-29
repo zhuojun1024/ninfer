@@ -12,6 +12,7 @@
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/program/runtime_types.h"
 #include "models/qwen3_5/state/decoder_state.h"
@@ -226,6 +227,16 @@ private:
         std::uint32_t prompt_end = 0;
         // True while this entry's KV and GDN state are the ones in the device pools.
         bool device_resident = false;
+        // The conversation the client named for this entry, when it named one. Naming a session is
+        // how a client says it will come back, so a named entry outranks an anonymous continuation
+        // when the catalog has to shed one. Only the newest entry of a conversation carries its
+        // session: publishing a later turn demotes the entry that held it, exactly as the single-GPU
+        // context cache re-binds its session index.
+        std::optional<models::qwen3_5::PreparedSessionKey> session;
+        // Eviction order between the non-resident entries. Mirrors the single-GPU context cache's
+        // private_retention_weight: a named live session (16) outranks an anonymous continuation
+        // (4), which outranks a disposable one (1).
+        std::uint32_t retention_weight = 4;
         // Host copies, one KV slab per shard (shard B carries no MTP slab) and two GDN state images
         // per shard: the state the evicted frontier sat on, and the state the last completed prefill
         // froze at this conversation's own prompt end. A client that re-renders the answer it was
@@ -469,13 +480,25 @@ private:
     void session_drop(std::size_t index);
     // Gives entry host KV slabs of at least 'pages' pages per shard, reusing larger existing ones.
     [[nodiscard]] bool session_ensure_host_slabs(SessionEntry& entry, std::uint32_t pages);
-    // Evicts the least recently used non-resident entry; false when only the resident one remains.
+    // Evicts the non-resident entry with the lowest retention weight, breaking ties by least recent
+    // use, so a client-named session outlives the anonymous continuations around it; false when only
+    // the resident one remains.
     bool session_evict_one();
+    // Records the conversation and the retention class a request's cache hints assign to an entry,
+    // demoting whichever entry held the same session before it: only the newest entry of a
+    // conversation keeps the session weight, because that is the one the next turn extends.
+    void bind_entry_session(SessionEntry& entry,
+                            const models::qwen3_5::PreparedContextCache& cache_hints);
+    // Drops a session binding from every entry that still holds it, leaving them anonymous
+    // continuations.
+    void demote_session_owners(const models::qwen3_5::PreparedSessionKey& key);
+    [[nodiscard]] static std::uint32_t private_retention_weight(RetentionClass retention) noexcept;
     // Publishes a walk's full history as the resident catalog entry. `frontier` is how far the
     // device KV and GDN state actually reach: the sampled token that ends the prompt is not
     // forwarded until the first decode round, so a finished response's frontier is one token short
     // of its history.
-    void session_publish(const std::vector<TokenId>& history, std::uint32_t frontier);
+    void session_publish(const std::vector<TokenId>& history, std::uint32_t frontier,
+                         const models::qwen3_5::PreparedContextCache& cache_hints);
     // The in-kernel transport gives up on its deadline instead of waiting forever (see DevicePair),
     // so a stalled rendezvous no longer freezes the process: it surfaces here as a round whose data
     // is a local partial sum rather than an allreduce result. Fails the request with the retryable

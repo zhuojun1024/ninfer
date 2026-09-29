@@ -1541,21 +1541,60 @@ void TP2GenerationCore::session_drop(std::size_t index) {
     }
 }
 
+std::uint32_t TP2GenerationCore::private_retention_weight(RetentionClass retention) noexcept {
+    // The single-GPU context cache's weights, so both routes shed the same conversation first.
+    switch (retention) {
+    case RetentionClass::SharedStable: return 0;
+    case RetentionClass::Disposable: return 1;
+    case RetentionClass::RecentPrivate: return 4;
+    case RetentionClass::LiveSession: return 16;
+    }
+    return 0;
+}
+
+void TP2GenerationCore::demote_session_owners(
+    const models::qwen3_5::PreparedSessionKey& key) {
+    for (SessionEntry& entry : sessions_) {
+        if (!entry.session || !(*entry.session == key)) { continue; }
+        entry.session.reset();
+        entry.retention_weight = private_retention_weight(RetentionClass::RecentPrivate);
+    }
+}
+
+void TP2GenerationCore::bind_entry_session(
+    SessionEntry& entry, const models::qwen3_5::PreparedContextCache& cache_hints) {
+    if (!cache_hints.session_key) {
+        // An unnamed request makes the entry anonymous: the client never said it would return.
+        entry.session.reset();
+    } else {
+        // Only the newest entry of a conversation is its session owner, because that is the entry
+        // the next turn extends; the previous one becomes an ordinary continuation.
+        if (cache_hints.update_session_index) { demote_session_owners(*cache_hints.session_key); }
+        entry.session = *cache_hints.session_key;
+    }
+    entry.retention_weight = private_retention_weight(cache_hints.retention);
+}
+
 bool TP2GenerationCore::session_evict_one() {
-    std::size_t victim     = kNoSession;
-    std::uint64_t oldest   = 0;
+    // Lowest retention weight first, least recently used within a weight. A conversation the client
+    // named is retained against the anonymous ones around it, which is what keeps a long agent
+    // session reusable while one-off writes keep taking the device pools.
+    std::size_t victim = kNoSession;
     for (std::size_t index = 0; index < sessions_.size(); ++index) {
         if (sessions_[index].device_resident) { continue; }
-        if (victim == kNoSession || sessions_[index].lru_clock < oldest) {
+        if (victim == kNoSession ||
+            sessions_[index].retention_weight < sessions_[victim].retention_weight ||
+            (sessions_[index].retention_weight == sessions_[victim].retention_weight &&
+             sessions_[index].lru_clock < sessions_[victim].lru_clock)) {
             victim = index;
-            oldest = sessions_[index].lru_clock;
         }
     }
     if (victim == kNoSession) { return false; }
     if (session_trace_enabled()) {
-        std::fprintf(stderr, "[tp2-session] evict frontier=%u tokens=%zu clock=%llu\n",
+        std::fprintf(stderr, "[tp2-session] evict frontier=%u tokens=%zu clock=%llu weight=%u\n",
                      sessions_[victim].frontier, sessions_[victim].tokens.size(),
-                     static_cast<unsigned long long>(sessions_[victim].lru_clock));
+                     static_cast<unsigned long long>(sessions_[victim].lru_clock),
+                     sessions_[victim].retention_weight);
     }
     session_drop(victim);
     ++session_evictions_;
@@ -2141,14 +2180,41 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
     // holds - so the scan below keeps whatever they cover instead of re-prefilling the whole system
     // prefix on every turn of a switch.
     const std::size_t previous = active_session_;
-    const bool dropped         = previous != kNoSession && !session_store_active();
+    bool stored                = previous == kNoSession || session_store_active();
+    if (!stored) {
+        // The host budget could not take the outgoing conversation. Shed the entries the retention
+        // weights rank lowest and try again: the resident entry is never a candidate, so this only
+        // trades conversations the catalog considers weaker for the one the prefill is about to
+        // replace. Without it the outgoing conversation was dropped the first time its slabs did
+        // not fit, and its next turn re-prefilled a whole history it had already paid for.
+        while (session_evict_one()) {
+            if (session_store_active()) {
+                stored = true;
+                break;
+            }
+        }
+    }
+    // session_drop keeps active_session_ on the same entry across an eviction, so the resident
+    // index is re-read here instead of trusting the copy taken before the loop: a victim the loop
+    // erased from in front of it shifts every later index.
+    const std::size_t resident = active_session_;
+    if (!stored) {
+        // Only the resident is left, so its own KV is what the host budget cannot hold and no
+        // eviction can ever make room. The conversation goes - the prefill below overwrites the
+        // device pools - but it is reported rather than dropped silently.
+        std::fprintf(stderr,
+                     "[tp2-session] drop frontier=%u tokens=%zu weight=%u: the resident session "
+                     "alone exceeds the host session budget\n",
+                     sessions_[resident].frontier, sessions_[resident].tokens.size(),
+                     sessions_[resident].retention_weight);
+    }
     // The divergence was measured against the resident entry's history, and the eviction just put
     // that entry's KV in the slabs, so the state the walk starts from is its state at the same
     // boundary. A session the host budget could not keep has no slab to pair the anchor with.
-    anchor_session_            = dropped ? kNoSession : previous;
+    anchor_session_            = stored ? resident : kNoSession;
     block_anchor_position_     = 0;
     block_anchor_prefill_id_   = 0;
-    if (dropped) { session_drop(previous); }
+    if (!stored) { session_drop(resident); }
     active_session_   = kNoSession;
     live_state_valid_ = false;
     reuse_source_     = ReuseSource::None;
@@ -2157,12 +2223,13 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
         std::fprintf(stderr,
                      "[tp2-session] switch active_shared=%zu resident_depth=%u stored=%d "
                      "entries=%zu\n",
-                     active_shared, resident_depth, dropped ? 0 : 1, sessions_.size());
+                     active_shared, resident_depth, stored ? 1 : 0, sessions_.size());
     }
 }
 
-void TP2GenerationCore::session_publish(const std::vector<TokenId>& history,
-                                        std::uint32_t frontier) {
+void TP2GenerationCore::session_publish(
+    const std::vector<TokenId>& history, std::uint32_t frontier,
+    const models::qwen3_5::PreparedContextCache& cache_hints) {
     if (session_capacity_ == 0) { return; }
     // Served and forgotten. Re-prefilling a history this short costs less than the catalog slot it
     // would hold, and the slot is what a returning conversation needs; a client that fires a one-off
@@ -2182,6 +2249,7 @@ void TP2GenerationCore::session_publish(const std::vector<TokenId>& history,
         entry.tokens.assign(history.begin(), history.end());
         entry.frontier  = frontier;
         entry.lru_clock = ++session_lru_clock_;
+        bind_entry_session(entry, cache_hints);
         // The reuse scan compares against the resident history, so it has to carry the generated
         // tail too: that is what lets a continued turn start at the committed frontier instead of
         // replaying the previous answer.
@@ -2198,6 +2266,7 @@ void TP2GenerationCore::session_publish(const std::vector<TokenId>& history,
     entry.tokens.assign(history.begin(), history.end());
     entry.frontier  = frontier;
     entry.lru_clock = ++session_lru_clock_;
+    bind_entry_session(entry, cache_hints);
     sessions_.push_back(std::move(entry));
     active_session_ = sessions_.size() - 1;
     mark_device_resident(sessions_, active_session_);
@@ -3003,7 +3072,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 session_publish(
                     std::vector<TokenId>(token_ids.begin(),
                                          token_ids.begin() + static_cast<std::ptrdiff_t>(t0)),
-                    t0);
+                    t0, data.context_cache);
                 if (active_session_ != kNoSession) { sessions_[active_session_].prompt_end = t0; }
             }
             (void)request.output.preview_terminal(FinishReason::Cancelled);
@@ -3249,7 +3318,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // The pools now hold exactly this prompt and the live GDN state sits at its end, so the
     // resident catalog entry describes what the walk just wrote. A conversation that had no entry
     // yet gets one here, before decode extends its history.
-    session_publish(token_ids, prompt_tokens);
+    session_publish(token_ids, prompt_tokens, data.context_cache);
     // The entry now describes the prompt the device pools were built from, which is what a later
     // request compares against to tell a later turn of this conversation from a switch away.
     if (active_session_ != kNoSession) { sessions_[active_session_].prompt_end = prompt_tokens; }
@@ -3870,7 +3939,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // entry names exactly the target frontier, and its draft image has to reach it, so commit the
         // remainder first. A finished round already did this itself.
         flush_dflash_context(frontier);
-        session_publish(history, frontier);
+        session_publish(history, frontier, data.context_cache);
     }
     // Only now are the checkpoints decode wrote usable, on the same terms as the prefill's: their
     // state is one this walk committed and their KV prefix is one it wrote. A walk that threw
