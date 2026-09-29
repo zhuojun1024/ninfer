@@ -2318,6 +2318,17 @@ TP2GenerationCore::adopt_generated_turn(models::qwen3_5::PreparedPromptData& dat
         shared < turn_begin) {
         return adoption;
     }
+    // An adoption only pays while it deepens the prefix the scan can reach. It charges for that in
+    // the client's coordinates: the walk runs the tokens this lineage generated in place of the
+    // replayed ones, so the prompt stops agreeing with the client's own rendering at the divergence,
+    // and every later turn of the conversation is measured from there. When the client's rendering
+    // already agrees with the whole history this entry recorded, the live frontier sits inside that
+    // agreement and the scan takes it with no replacement at all: the splice could only trade
+    // positions the client will keep reproducing for ones it never will. A tool-calling conversation
+    // hits that exactly - the template closes the turn with framing the raw sampled tokens do not
+    // carry - and the replacement shortened its prompt behind the answer it had already paid for, so
+    // every following turn matched only up to the divergence and restarted on a host checkpoint.
+    if (shared + 1 >= turn_end) { return adoption; }
     // The replay ends where the message after the turn begins. A prompt without that boundary - an
     // encoded token stream, or a turn the template folds into a neighbouring message - cannot be
     // compared here and keeps today's behaviour.
