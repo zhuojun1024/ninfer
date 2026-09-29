@@ -412,3 +412,34 @@ TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，
 
 `ninfer_resource_manager_test`（candidate-stratified reuse closure）与 `ninfer_serve_options_test`（server reasoning-effort default）在本分支上**基线即失败**：将本轮全部改动 `git stash` 后重建并运行，二者输出完全相同的失败信息。前者正是单卡 context cache 驱逐/复用闭包选择的问题，可作为单卡侧独立缺陷线索。
 
+### 4.9 TP-2 每隔一轮复用塌陷：adoption 的坐标位移（已修复）
+
+**现象（生产日志 `C:\ninfer\serve-win.log`，两个 anthropic 会话来回切两次）**：31 个请求全部成功、无 0 命中，但同一会话增长期**严格交替**：`private endpoint`（98-100%）↔ `long anchor`（83-93%），浅的那轮多 prefill 4,000–9,500 token。
+
+**复现（用导出会话的真实 systemPrompt + 30 个工具重建，`_temp/20260929-1955_tool_replay.mjs`）**
+
+| 轮次 | 修复前 cache | 修复后 cache |
+|---|---|---|
+| 1 | 0（全量） | 0（全量） |
+| 2 | 51,917 | 51,852 |
+| 3 | **51,200** | **51,969** |
+| 4 | 52,151 | 52,109 |
+| 5 | **51,910** | **52,212** |
+| 6 | 52,381 | 52,386 |
+
+**根因（trace 证据：`shared`、`replay_split`、`adopted`、`prev_prompt`）**
+
+隔轮出现 `adopted=1`：`adopt_generated_turn` 把「客户端重渲染的同一个 turn」替换成本 lineage 生成的 token。当客户端渲染**已经覆盖 entry 的全部历史**（`shared == cached`）时，这次替换**不会加深任何可复用边界** —— 扫描的上限就是 `shared`，而最深边界（frontier = `turn_end - 1`）本来就在 `shared` 之内。它唯一的效果是把 prompt 缩短、让 entry 的坐标整体前移。
+
+于是下一轮客户端按自己的坐标重发，公共前缀只能到 `replay_split`（例：52,152，比上一轮记录的 `prompt_end` 52,177 更浅）→ `resident_continues` 判定失败 → 走 `switch`（把会话 D2H 到 host、`live_state_valid_=false`）→ 从更浅的 host checkpoint 重新 prefill。**`switch` 只是症状，不是病因。**
+
+**修复**：`adopt_generated_turn` 只在替换能加深可达前缀时才做 —— `if (shared + 1 >= turn_end) { return adoption; }`。分歧落在回答内部（`shared < turn_end - 1`）时照旧替换，此时它确实把可达前缀从 `shared` 推进到 `turn_end`。
+
+**实测**：trace 全程 `continue`、`adopted=0`、每轮 `src=live`（直接命中 frontier），`shared == cached`（entry 保存的就是客户端自己的 token，不再被位移）。
+
+**被否决的替代方案（记录以免重走）**：把续会判定阈值从 `prompt_end` 换成「客户端渲染一致点」（`adoption.divergence`，每轮都已计算）。实测它确实让每轮都走 `continue`，但**复用深度一点没变**（浅轮仍是 51,200 / 51,906，因为扫描上限仍是 `shared`），并且引入隐患：首轮 entry 的 `divergence` 可能只有 1，判定退化成「任何 prompt 都算续会」，于是另一个会话到来时**不会**把 resident 存到 host；而 entry 一旦失去 resident 又没有 host 副本（`host_kv_end=0`、`frontier>0`），`session_recall` 仍会把它的 frontier 当候选，`session_restore` 会解引用空的 `host_kv`。已回滚。
+
+**已知残留**：当分歧确实落在回答内部（长回答场景，adoption 有真实收益）时，替换仍会让 entry 坐标前移，下一轮匹配被 cap 在分歧点；而分歧点通常**没有 snapshot**（walk 从不经过它，它位于回答内部），于是下一轮只能落到它之前最近的 checkpoint。这是「本轮多复用一段、下一轮少一段」的权衡，是否净收益需要长回答实测才能定；若要消除，需要让 walk 在 splice 分歧点留下 checkpoint（或把续会判定与匹配整体搬到客户端坐标），属独立设计。
+
+**证据与测试**：`_temp/20260929-*_replay_*.out.txt`（对照重放）、`C:\ninfer\serve-guard.err.log`（trace）、`build-win/adopt_guard.log`（构建）；`ninfer_turn_replay_test` 通过。**测试空缺**：`ninfer_qwen3_5_tp2_sessions_test` 走裸 token 路径（不产生 `message_boundaries`），`adopt_generated_turn` 在该测试下从不触发 —— adoption 路径目前没有自动化覆盖。
+
