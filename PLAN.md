@@ -443,3 +443,30 @@ TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，
 
 **证据与测试**：`_temp/20260929-*_replay_*.out.txt`（对照重放）、`C:\ninfer\serve-guard.err.log`（trace）、`build-win/adopt_guard.log`（构建）；`ninfer_turn_replay_test` 通过。**测试空缺**：`ninfer_qwen3_5_tp2_sessions_test` 走裸 token 路径（不产生 `message_boundaries`），`adopt_generated_turn` 在该测试下从不触发 —— adoption 路径目前没有自动化覆盖。
 
+### 4.10 会话缓存崩溃：未存 host 副本的 entry 仍被当作 recall 候选（已修复）
+
+**发现**：用导出会话做双会话交错重放时（两个会话**开场消息完全相同**，正是当时 Claude Code 里的用法），服务在第三个请求（A 的第二轮）**直接崩溃**——进程消失、无任何输出。
+
+**触发链（trace 完整记录）**
+
+1. A1 全量 prefill，发布 entry 0（device-resident，从未写 host）。
+2. B1 的 prompt 与 A1 **逐字节相同** → `active_shared == prompt_end` → 走 `continue`（正确：复用同一段 KV）→ 但生成尾部与 A 不同 → `session_publish` 命中「非 extends_resident」分支 → 新建 entry 1 并 `mark_device_resident(entry1)` → **entry 0 变成非 resident，却没有任何 host 副本**（trace：`entry 0 ... kv_end=0 ... resident=0`）。
+3. A2 到来时 recall 循环仍把 entry 0 的 `frontier=51805` 当候选（`reach=51805 via=frontier`）→ `session_restore` 按 `pages_for_tokens(51805)` 去 `host_kv_arena_->view(*entry.host_kv[i])` → **解引用空 slab** → 崩溃。
+
+**根因**：recall 循环只对 `host_shared_end`（kind 2）做了「不超过 slab 实际填充范围」的封顶，`frontier`（kind 0）与 `host_prompt_end`（kind 1）用的是 `UINT32_MAX`。正常路径下 store 会把 `host_kv_end` 同步成 `frontier`，所以看不出问题；一旦 entry 在**未 store**的情况下失去 device residency，这个不变式就破了（`session_publish` 新建 entry 时只做 `mark_device_resident`，不会为被顶掉的 entry 存副本）。
+
+**修复**：三个候选统一按 `entry.host_kv_end` 封顶。store 时 `host_kv_end == frontier`、另外两个镜像本就在其之内，所以对合法 entry 行为完全不变；对未存副本的 entry，三个候选全为 0 → 自动跳过。
+
+**实测**（同一双会话探针，4 轮 × 2 会话交错）
+
+| | A1 | B1 | A2 | B2 | A3 | B3 | A4 | B4 |
+|---|---|---|---|---|---|---|---|---|
+| 修复前 | 0 | 51,200 | **崩溃** | — | — | — | — | — |
+| 修复后 | 0 | 51,200 | 51,728 | 51,720 | 51,925 | 51,967 | 52,041 | 52,096 |
+
+8/8 请求成功，命中率 99.0–99.9%；trace 显示 A2 的 recall 循环对两个未存副本的 entry 都给出 `reach=0 via=none`，于是不再召回，改由 resident 续会（`reuse=51728 src=device`）。
+
+**未做**：未存副本的 entry 现在只是「惰性」——`reach` 恒为 0，直到被权重/LRU 逐出。它已无害，主动 drop 还需判断它是否为 anchor 等，故保持最小改动。
+
+**测试空缺**：该崩溃与 adoption 一样只有实机重放能覆盖（裸 token 路径不产生 `message_boundaries`，也不会构造同开场消息的双会话）。
+
