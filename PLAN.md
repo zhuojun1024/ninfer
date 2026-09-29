@@ -281,6 +281,8 @@ TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，
 
 ### 3.8 上游 ninfer-all 移植剩余项
 
+- **上游 `origin/master` `e31bc99b`（2026-09-26）/ `dev` `a012e2bc`（2026-09-28）性能项（2026-09-29 源码评估）：无 TP-2 合并价值**——linear 统一+sliced-K、nvfp4 W4A4 TMA、q4/q5 dispatch 均无收益（decode weight-stream bandwidth-bound；主 GEMM 半几何走 MMA 不走 TMA；主线 NVFP4 非 q4/q5）；Jinja chat 模板已合并（含本地增强）。定案与 commit id 见 [tp2-decisions.md](docs/tp2-decisions.md) 的 "Upstream merge-value assessments"；上游未越过 `e31bc99b` 触及主干前不重评估。
+
 - **3b attention gate 折进 reduce epilogue**（上游 `77c9cc39`）：暂缓——每层少一次 launch ≈0.08 ms，
   占 38.2 ms round 的 0.2%，收益低于风险。
 - **3c INT8 系 attention scale 走 shared memory**（上游 `a941c9f4`）：暂缓——生产走 `--kv-dtype fp8`；

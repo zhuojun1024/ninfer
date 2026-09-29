@@ -28,13 +28,13 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   (worklog L3757–3762; PLAN §3.4)
 - **`--spec dflash` (v1) is rejected at construction time** — product decision;
   DFlash2 and MTP are the only supported draft backends. (worklog L3717)
-- **The `--chat-template` whitelist is intentional.** The frontend is not a
-  generic Jinja interpreter: each semantic has a hand-written C++ renderer, and
-  only the two artifact template semantics are accepted (thinking-toggle
-  `e84f32a2…`, reasoning-effort `c3cf9e34…`). A third template in a model dir
-  is rejected because its rendering semantics (tool-call XML/JSON, effort
-  aliases, …) are unimplemented; adding one is a separate feature. (worklog
-  L2554–2565)
+- **`--chat-template` is now a generic Jinja interpreter (this entry is
+  superseded).** As of the first-tier cherry-pick (`b9219f3f` import llama-jinja
+  + `98dada0e` execute custom jinja, 2026-09-21) the frontend compiles and runs
+  arbitrary Jinja via the in-tree `third_party/llama-jinja` runtime, and
+  `--chat-template FILE` loads a custom template (verified in source
+  2026-09-29). The earlier "hand-written renderer + sha256 whitelist" state
+  (worklog L2554–2565) is obsolete.
 - **Vision: single-image cap 8,192 tokens**, static shard split (MTP→shard 0,
   vision→shard 1); images above the cap are rejected at request time with a
   pointer to the `[mem] vision` ledger. (worklog L2456)
@@ -105,6 +105,34 @@ Historical reference only: current state and remaining work live in `PLAN.md`
 - **Device-plane divergence anchor (+73.4 MiB/card): abandoned.** Saves only
   ~9.9 ms per session; in real chat the reachability guard usually holds and
   the device path is taken. (worklog L1976–1984)
+
+## Upstream merge-value assessments
+
+- **Upstream `origin/master` through `e31bc99b` (2026-09-26) and `origin/dev`
+  through `a012e2bc` (2026-09-28): assessed 2026-09-29, no TP-2 merge value.**
+  Checked the perf candidates against the settled bottleneck - decode is
+  weight-stream bandwidth-bound (GEMV 75-90%, lm_head ~439 GB/s ≈ 5060 Ti peak;
+  36 SM, worklog L7360):
+  - *Linear unification + sliced-K MMA* (09-26 batch `229c1832`…`ecbc3357`): no
+    gain. Sliced-K does not cut weight traffic on a bandwidth-bound GEMM; the
+    NVFP4 trunk is W4A4 while upstream's sliced-K targets the A16 route
+    (upstream deleted W4A4); TP-2 half-geometry halves N (column-parallel) or K
+    (row-parallel), shrinking the split-K space.
+  - *nvfp4 W4A4 TMA tweaks* (`1d8587bc`/`05507ab0`/`5f5fccab`): already
+    cherry-picked (second tier) but no TP-2 gain - every main GEMM is a
+    half-geometry shape that runs the MMA route, never TMA (all 5 half shapes
+    lack `nvfp4_a4_tma_route`; only the 5 full-geometry shapes have it).
+  - *q4/q5 dispatch tuning* (`d3c125ed`/`beedffa0`/`bb844c43`/`a9a0d10a`/
+    `b39de4d5`/`9e163eee`/`5b4303c0`/`594930e7`): not on the trunk (mainline is
+    NVFP4; q4/q5 only in the DFlash2 draft path, also bandwidth-bound). Already
+    "not scheduled" (worklog L4357).
+  - *Custom Jinja chat templates* (`98dada0e` + `b9219f3f`): a feature, not a
+    perf lever - already merged (first tier) with local extensions;
+    `--chat-template FILE` runs via the in-tree `third_party/llama-jinja`
+    runtime. Nothing to merge.
+  Real levers remain those in worklog/PLAN (allreduce, AR∥MMA overlap N=4, CUDA
+  graph, card-2 Gen5 slot). Re-assess only if `origin/master` moves past
+  `e31bc99b` in a way that touches the trunk. (source-verified 2026-09-29)
 
 ## Withdrawn approaches (falsified by real traffic)
 
