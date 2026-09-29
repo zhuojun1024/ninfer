@@ -2088,11 +2088,15 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
         std::uint32_t reach = 0;
         RecallState via     = RecallState::Frontier;
         for (std::size_t kind = 0; kind < 3; ++kind) {
-            // The shared-prefix image is capped by the extent the slabs were filled to, so the
-            // recall reads pages the slabs really carry. The other two images are bounded by the
-            // frontier and the prompt end they were taken at, which the slabs cover by construction.
-            const std::uint32_t ceiling =
-                kind == 2 ? entry.host_kv_end : std::numeric_limits<std::uint32_t>::max();
+            // Every image is capped by the extent the slabs were actually filled to, so a recall
+            // only reads pages this entry really carries. At a store the frontier is that extent,
+            // and the prompt-end and shared images are taken at or behind it, so no image needs a
+            // wider bound. An entry the device no longer holds *and* that was never stored - the
+            // shape of publishing a conversation whose opening prompt the resident one already
+            // answered, once the two generated tails part - carries no slabs at all: its frontier
+            // still names the boundary it reached on the device, and offering it here restored pages
+            // that do not exist.
+            const std::uint32_t ceiling = entry.host_kv_end;
             if (offered[kind] == 0 || offered[kind] > shared ||
                 offered[kind] >= prompt_tokens.size() || offered[kind] > ceiling) {
                 continue;
