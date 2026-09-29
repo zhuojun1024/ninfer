@@ -786,6 +786,141 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     return 0;
 }
 
+// A conversation whose opening prompt the resident one had already answered. The second prompt
+// reproduces the whole opening, so the resident lineage still serves it and only the generated tails
+// part; publishing it gives the second conversation an entry of its own while the first one stops
+// being the device lineage without anything having copied it out. Its own next turn reproduces its
+// opening and its answer, so the entry that still names that history is the one the recall reaches
+// for - and that entry has no host slabs to restore from.
+int check_unaligned_dialogue(const char* artifact, int device_a, int device_b, Route route) {
+    const std::string label = std::string("unaligned dialogue (") + route_name(route) + ")";
+    const std::vector<TokenId> opening   = make_prompt(11000, 64);
+    const std::vector<TokenId> follow_up = make_prompt(4000, 16);
+
+    // These cards hold one model at a time, so the conversation's own walk runs first and the oracle
+    // for the same prompt follows it, each in its own scope.
+    std::vector<TokenId> continued;
+    ninfer::GenerationResult got;
+    {
+        ninfer::Engine engine(engine_options(artifact, device_a, device_b, true, route));
+        const ninfer::GenerationResult first = run(engine, opening);
+        if (first.generated_token_ids.empty()) {
+            return fail(label, "the opening turn generated nothing");
+        }
+        std::vector<TokenId> other = opening;
+        append(other, make_prompt(22000, 8));
+        const ninfer::GenerationResult second = run(engine, other);
+        if (second.generated_token_ids.empty()) {
+            return fail(label, "the second conversation generated nothing");
+        }
+        continued = opening;
+        append(continued, first.generated_token_ids);
+        append(continued, follow_up);
+        got = run(engine, continued);
+    }
+    ninfer::GenerationResult expected;
+    {
+        ninfer::Engine oracle(engine_options(artifact, device_a, device_b, false, route));
+        expected = run(oracle, continued);
+    }
+    // The entry that names this history stopped being the device lineage without anything copying it
+    // out, so the walk starts from whatever the device really holds. Its answer still has to be the
+    // oracle's: the boundary it restarts from carries a state the scan proved is this prompt's own
+    // prefix, and a recall that read the slabs of an entry that never wrote one does not.
+    if (const int status = compare_recall(label, "a conversation whose entry kept no host slabs",
+                                          got.reused_prompt_tokens, got,
+                                          expected.generated_token_ids);
+        status != 0) {
+        return status;
+    }
+    std::cout << "TP-2 unaligned dialogue (" << label << ") passed: a conversation whose entry kept"
+                 " no host slabs reused "
+              << got.reused_prompt_tokens << " prompt tokens and matched the oracle\n";
+    return 0;
+}
+
+// A client that hands back the answer it was given. The turn after a re-rendered answer has to stand
+// on the prompt the previous turn was built from: a conversation that spends a prompt and then
+// restarts behind it pays again for tokens it already holds, which is the shape every turn of an
+// agent conversation produces.
+//
+// What this does not pin is the decision inside the adoption. A turn the template renders exactly as
+// it was sampled replays token for token, and the separation between the two is what decides whether
+// anything is replaced at all; the case where a replacement would shorten the prompt needs the
+// template's own framing around a turn whose bytes it owns, and that case is left to the served
+// replay recorded in PLAN.md 4.9.
+int check_replayed_answer_keeps_prompt_end(const char* artifact, int device_a, int device_b,
+                                           Route route) {
+    const std::string label = std::string("replayed answer (") + route_name(route) + ")";
+    ninfer::Engine engine(engine_options(artifact, device_a, device_b, true, route));
+
+    ninfer::RequestOptions request            = greedy_request();
+    request.execution.requested_output_tokens = 24;
+    // The model's own stop token ends the answer the way the template would render it ending, which is
+    // what lets the client's replay reach the tail of the history this lineage recorded.
+    request.stop.include_model_defaults = true;
+
+    auto ask = [](const char* text) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        ninfer::MessagePart part;
+        part.kind = ninfer::MessagePartKind::Text;
+        part.text = text;
+        message.parts.push_back(std::move(part));
+        return message;
+    };
+    auto answer = [](const std::string& text) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::Assistant;
+        ninfer::MessagePart part;
+        part.kind = ninfer::MessagePartKind::Text;
+        part.text = text;
+        message.parts.push_back(std::move(part));
+        return message;
+    };
+    auto prepare = [&engine](const std::vector<ninfer::ChatMessage>& messages) {
+        ninfer::PromptInput input;
+        // A turn the template renders exactly as it was sampled replays token for token, and the
+        // separation between the two is what decides whether anything is replaced at all. This
+        // scenario keeps the answer to its content so that the replay is that exact one, and pins what
+        // the conversation keeps afterwards rather than the decision inside the adoption.
+        input.options.enable_thinking = false;
+        input.messages                = messages;
+        return engine.prepare(std::move(input));
+    };
+
+    std::vector<ninfer::ChatMessage> history;
+    history.push_back(ask("Name the three primary colours in one short sentence."));
+    const ninfer::GenerationResult first = engine.generate(prepare(history), request);
+    if (first.content.empty()) {
+        return fail(label, "the first turn published no answer to replay");
+    }
+    history.push_back(answer(first.content));
+    history.push_back(ask("Now name the three secondary colours the same way."));
+    const ninfer::GenerationResult second = engine.generate(prepare(history), request);
+    if (second.content.empty()) {
+        return fail(label, "the replayed turn published no answer");
+    }
+    history.push_back(answer(second.content));
+    history.push_back(ask("Which of the six is closest to grey?"));
+    const ninfer::GenerationResult third = engine.generate(prepare(history), request);
+
+    // The prompt the device pools were built from on the replayed turn is what the next turn has to
+    // stand on. A replacement that shortened it leaves the client reproducing tokens the entry no
+    // longer holds, and the scan then stops at the replacement instead of at that prompt end.
+    if (third.reused_prompt_tokens < second.prompt.prompt_tokens) {
+        return fail(label, "the turn after a replayed answer reused " +
+                               std::to_string(third.reused_prompt_tokens) + " of the " +
+                               std::to_string(second.prompt.prompt_tokens) +
+                               " prompt tokens it had just paid for");
+    }
+    std::cout << "TP-2 replayed answer (" << label << ") passed: the turn after a re-rendered answer"
+                 " reused "
+              << third.reused_prompt_tokens << " of " << second.prompt.prompt_tokens
+              << " prompt tokens\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -822,6 +957,16 @@ int main() {
         for (const Route route : routes) {
             if (const int status = check_first_token_published(artifact, devices.first,
                                                                devices.second, route);
+                status != 0) {
+                return status;
+            }
+            if (const int status =
+                    check_unaligned_dialogue(artifact, devices.first, devices.second, route);
+                status != 0) {
+                return status;
+            }
+            if (const int status = check_replayed_answer_keeps_prompt_end(
+                    artifact, devices.first, devices.second, route);
                 status != 0) {
                 return status;
             }
