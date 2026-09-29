@@ -764,6 +764,37 @@ int test_stream() {
     failures += check(provisional["message"]["usage"]["input_tokens"] == 25 &&
                           provisional["message"]["usage"]["cache_read_input_tokens"].is_null(),
                       "pre-admission stream error prefix fabricated cache usage");
+
+    // A replayed generated turn the Engine splices into the context moves the prompt count away
+    // from the prepare-time value. The stream adopts the Engine count instead of rejecting the
+    // request, so its start usage and its terminal usage describe the same prompt.
+    AnthropicMessagesStream spliced_stream(identity, 100);
+    std::vector<std::string> spliced{spliced_stream.start(ninfer::GenerationStart{
+        .prompt               = ninfer::PromptSummary{.prompt_tokens = 103},
+        .reused_prompt_tokens = 60,
+    })};
+    for (std::string& value : spliced_stream.reasoning_delta("thought")) {
+        spliced.push_back(std::move(value));
+    }
+    for (std::string& value : spliced_stream.content_delta("answer")) {
+        spliced.push_back(std::move(value));
+    }
+    GenerationOutcome spliced_outcome = sample_outcome();
+    spliced_outcome.prompt_tokens     = 103;
+    for (std::string& value : spliced_stream.finish(spliced_outcome)) {
+        spliced.push_back(std::move(value));
+    }
+    const Json spliced_start = parse_event(spliced.front());
+    Json spliced_terminal;
+    for (const std::string& value : spliced) {
+        const Json parsed = parse_event(value);
+        if (parsed.at("type") == "message_delta") { spliced_terminal = parsed.at("usage"); }
+    }
+    failures += check(spliced_start["message"]["usage"]["input_tokens"] == 43 &&
+                          spliced_start["message"]["usage"]["cache_read_input_tokens"] == 60 &&
+                          spliced_terminal["input_tokens"] == 43 &&
+                          spliced_terminal["cache_read_input_tokens"] == 60,
+                      "Anthropic stream did not adopt the Engine prompt count after a splice");
     return failures;
 }
 

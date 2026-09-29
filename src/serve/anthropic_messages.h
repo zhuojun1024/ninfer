@@ -54,8 +54,10 @@ class AnthropicMessagesStream {
 public:
     AnthropicMessagesStream(AnthropicResponseIdentity identity, int input_tokens);
 
-    // The Engine start event is exact for normal streams. The no-argument form is reserved for an
-    // error raised before admission, so an Anthropic error event still has a valid stream prefix.
+    // The Engine start event carries the prompt the Engine actually runs, which can differ from
+    // the prepare-time count when it splices a replayed generated turn into the context; the stream
+    // adopts that count. The no-argument form is reserved for an error raised before admission, so
+    // an Anthropic error event still has a valid stream prefix.
     std::string start();
     std::string start(const ninfer::GenerationStart& generation);
 

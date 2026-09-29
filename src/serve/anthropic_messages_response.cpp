@@ -223,9 +223,13 @@ AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity ident
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
 std::string AnthropicMessagesStream::start(const ninfer::GenerationStart& generation) {
-    if (generation.prompt.prompt_tokens != static_cast<std::uint32_t>(input_tokens_)) {
-        throw std::logic_error("Anthropic stream prompt count differs from Engine start");
-    }
+    // The Engine may splice a generated turn the client handed back into the prompt when it
+    // recognizes it as the answer it produced, which moves the prompt count away from the value
+    // preparation counted. The Engine count is what actually runs, so adopt it: this stream then
+    // reports one prompt in its start usage and its final usage, and the strict count match that
+    // used to reject the request (and, through the Engine's failure path, discard the whole
+    // conversation's reusable state) is gone.
+    input_tokens_ = static_cast<int>(generation.prompt.prompt_tokens);
     return start_with_cache(static_cast<int>(generation.reused_prompt_tokens));
 }
 
