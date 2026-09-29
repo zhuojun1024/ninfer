@@ -294,3 +294,121 @@ TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，
 - **发射期无条件 `cudaFuncSetAttribute` 收敛**：`context_kv_materialize/materialize.cu`、
   `linear/gguf/ggml_bridge_mmq.cuh`、`linear/nvfp4/nvfp4_w4a4_tma.cu` 等仍在每次发射调用 driver；
   正确但值得在有计时证据时一并收敛。
+---
+
+## 4. Round 54：TP-2 会话缓存四项改进（实施计划）
+
+> 来源：anthropic 0 命中诊断（stream-500 → session_invalidate_active 链条）+ 单卡 vs TP-2 缓存机制对比分析（上游 4201b5d2）。
+> 基线分支：feat/windows-native-port @ 92d7ab57（运行服务器 C:\ninfer\ninfer-serve.exe 同源；本地 master 仅 1102 行早期 TP-2，勿用）。
+> 状态：**计划已整理，未实施。** ④ 可最先独立落地（生产痛点）。
+
+### 4.1 环境约束
+
+- 工作分支 feat/windows-native-port；实施前 git checkout 该分支。
+- 双 5060 Ti 被生产服务器（:3456）占用 → 集成测试需停服时间窗（先与用户确认）：测试二进制占 :3456 → 探针 → 恢复。
+- 探针脚本 _temp/ 时间戳前缀，成功即删。
+
+### 4.2 ④ count-tolerant anthropic stream 编码器（最小，独立）
+
+目标：adoption splice 改 prompt count 不再 500，会话状态不再被摧毁。
+- src/serve/anthropic_messages_response.cpp L225-230：start(generation) 删 throw，改 input_tokens_ = generation.prompt.prompt_tokens;（streaming_start_usage 的 input - reused 算术自动正确）。
+- 审计最终 usage（L91/L352 message_delta 用 outcome.*）：start 与 final chunk 一致（均引擎 count）。
+- 审计 openai_chat_response.cpp L287-295 prompt_progress 同类 throw：return_progress_ 默认关 → 记录为已知限制，改动量小则同样宽容化。
+- 范围外（记录）：serve 渲染失败不销毁引擎状态的更深层修复。
+- 测试：1620 场景探针（divergent echo stream → 200 + cache_read = splice 后 reuse；随后 non-stream 命中自己的边界）；message_start 与 message_delta usage.input_tokens 一致。
+
+### 4.3 ① session_key + 保留权重（引擎层地基）
+
+目标：TP-2 catalog entry 携带 session key 与保留类；驱逐按权重。
+- src/runtime/engine/tp2_generation_core.cpp：
+  1. SessionEntry + std::optional<CacheSessionKey> session + 权重（有 key=LiveSession 16，无=RecentPrivate 4；常量与通用 cache private_retention_weight 对齐）。
+  2. session_recall：匹配保持纯 token 扫描；命中后按 incoming hints 更新绑定。
+  3. session_publish：从 data.context_cache().session_key 取 key（plumbing 已存在）；同 key 他处已绑定 → 重绑定 + 旧 entry 降 4（对齐通用 cache publish_session/demote_replaced_session 的 publication_order 规则）。
+  4. session_evict_one()：权重感知 LRU（先逐最低权重最老；全 16 时逐最老）。
+- serve 层无改动（openai-responses 已传 key；anthropic 合成 key 为独立后续项）。
+- 测试：单元（驱逐顺序 16 vs 4 / 同权最老 / 全 16 最老）；集成（openai A 2 轮 + 压力 B..G，A 存活且下一轮命中）；回归（anthropic 全 4 行为不变）。
+
+### 4.4 ② 容量感知准入（消除静默 drop）
+
+目标：host KV 不足时显式拒绝（503 + Retry-After），而非静默丢弃会话。
+- session_store_active()（L1751）：D2H 前 feasibility 检查。
+- 切换路径（drop_previous）：失败先经 ① 权重驱逐腾 slab 重试；仍失败 → 新异常 ContextCapacityUnavailable 从 submit()/execute_walk 抛出——incoming 拒绝，**当前 resident entry 不销毁**（关键不变式）。
+- generation_service：捕获 → HTTP 503 + Retry-After: 1，标签 "context capacity temporarily unavailable"。
+- 启动容量核对：session_capacity_ > host 满尺寸会话数 + 1 → operational log WARNING。
+- 不加新 flag。协议契约变化 → schema 测试 + docs/serving.md 同步。
+- 测试：N（>host 容量）大会话后第 N+1 并发切换 → 503（非静默）；空闲可逐后恢复；拒绝不销毁 resident（日志验证）。
+
+### 4.5 ③ 共享前缀 entry（两阶段）
+
+目标：多会话共享稳定前缀（系统提示+工具）缓存一次并受保护。
+- 阶段 A（仅保留保护，先做）：
+  1. SharedPrefixEntry：token 前缀（digest key）+ refcount + host slabs 双 shard 副本；refcount>0 不可逐，==0 按最老可逐。
+  2. session_publish 检测：与现有 entry 共享 >= --shared-prefix-floor（新 flag，默认 4096，0=禁用）→ 分歧边界建/更新共享 entry，refcount += 1。
+  3. 驱逐释放引用；refcount → 0 后可逐。
+  4. recall 不变（各 entry 自身 slab 物化）；共享 entry 兼作新会话 recall anchor。
+- 阶段 B（存储去重，可选）：entry 只存 suffix KV；recall = 共享前缀 H2D + suffix H2D；grid 覆盖 suffix；snapshot 在分歧点。仅当多 agent 部署证明 A 不够。
+- 测试（A）：两会话同 30k 系统+工具 → 1 共享 entry；驱逐压力后第三同系统会话可站共享边界；refcount 生命周期。
+
+### 4.6 顺序与依赖
+
+④（独立，serve-only）→ ①（引擎地基）→ ②（依赖 ① 权重驱逐）→ ③A（依赖 ①②）。
+
+### 4.7 风险
+
+- ② 改 serve 错误面 → 协议契约更新（schema 测试 + 文档）。
+- ① 重绑定语义必须与通用 cache publish_session 一致，保持跨模式行为一致。
+- ③A publish 增加有界 token 比较（catalog 规模内，可忽略）。
+- TP-2 文件本地独有（上游无 TP-2）→ 无上游合并冲突；serve 层文件上游在演进 → 实施前对 serve 层做 rebase 检查。
+
+### 4.8 进度与实测结果
+
+- [x] **④ stream 编码器宽容化** —— 已实施（`anthropic_messages_response.{h,cpp}`）+ 单测用例（`test_anthropic_schema.cpp`）+ 实机 A/B。
+- [x] **① session key + 保留权重** —— 已实施（`tp2_generation_core.{h,cpp}`：SessionEntry.session/retention_weight、bind_entry_session/demote_session_owners、权重感知 session_evict_one）。
+- [x] **② 容量感知准入** —— 已实施，但**未采用计划中的 503 拒绝**，见下。
+- [ ] **③A 共享前缀 entry（仅保留保护）** —— 未实施（设计见 4.5；规模较大，见下）。
+- [ ] ③B 存储去重（可选）—— 未实施。
+
+#### ④ 实机 A/B（决定性复现）
+
+确定性触发：模板渲染时 trim `reasoning_content` 但不 trim 正文，而 `same_rendered_turn` 两侧都 trim；因此**给回显的 assistant 正文加尾部空白**即让同一轮在引擎看来等价、但 token 化与生成字节不同 → 触发 `adopt_generated_turn` 拼接 → prompt count 变化。
+
+| 轮次 | 旧二进制（C:\ninfer\ninfer-serve.exe.bak-20260929-1722） | 新二进制 |
+|---|---|---|
+| turn 1 | 200, cache 0 | 200, cache 8375 |
+| turn 2（splice） | **SSE error: "Anthropic stream prompt count differs from Engine start"** | 200, cache 8441（99.7%） |
+| turn 3 | 200, **cache 0**（entry 被 500 摧毁 → 全量重 prefill） | 200, cache 8375 |
+
+即：生产 0 命中循环的根因链条被完整复现，且修复后消失。单测 `ninfer_anthropic_schema_test` 通过（含新增 splice 用例）。
+
+#### ① 实机验证（命名会话 vs 匿名压力）
+
+12 个匿名 anthropic 会话（无 session key，权重 4）+ 1 个命名 openai-responses 会话（store:true，权重 16，clock=1）填满 catalog（9 槽）：
+
+- 驱逐轨迹 4 次全部 `weight=4`；clock=1 的命名会话从未被选中（权重生效的直接证据）。
+- 命名会话 turn2 召回 `cached=8460/8485 = 99.7%`（在压力之后仍存活并可深召回）。
+
+#### ② 实机验证（`--host-kv-mib 2048`，1024 MiB/shard）
+
+- catalog 自限到 host 实际可容纳的 7 个条目（而非目录上限 9）。
+- 13 个请求全部 200；驱逐全部 `weight=4`；**零** `[tp2-session] drop ... alone exceeds the host session budget`。
+- 命名会话仍 99.7% 命中。
+
+#### ② 与计划的偏差（需记录）
+
+计划原定：store 失败 → 权重驱逐重试 → 仍失败则抛 `RequestError(Unavailable)` → 503。实施中发现：**驱逐循环会把所有可驱逐条目清空**；循环结束后仍失败 ⇔ 只有 resident 自己剩下 ⇔ 它自身就超出 host 预算（如 `--host-kv-mib` 小于单会话容量）。此时拒绝会造成**每次切换都 503 的永久性故障**（因为没有任何切换能成功、也就没有任何条目会被逐出）。因此改为：
+
+1. store 失败 → 按权重驱逐并重试（覆盖真正常见的"host 被弱会话占满"场景，这是静默 drop 的主因）；
+2. 仍失败（resident 自身超预算）→ 保持原有 drop，但**无条件打印** `[tp2-session] drop ...` 到 stderr（进入服务端运维日志），不再静默。
+
+另修正一处实施中发现的索引缺陷：`session_evict_one()` 在循环中擦除条目会移动 vector，捕获的 `previous` 索引会失准；改为循环后重读 `active_session_`（`session_drop` 会维护它）。
+
+#### ③A 未实施的原因
+
+- 现状已有**部分覆盖**：TP-2 的 per-entry divergence image（`host_shared_state`/`host_shared_end`）已提供跨会话共享前缀的 recall anchor，实测轨迹中可见 `reach=8448 via=shared`；③A 的增量价值是"会话全部被逐出后共享前缀仍存活"（会话无关的共享条目）。
+- 该增量需要新的存储与召回分支（共享条目及其 host slabs、分歧点快照、以共享条目为源的 recall 分支、引用计数生命周期），属较大改动；在 ④①② 已修复生产 0 命中与静默 drop 之后，单独排期更稳妥（避免半成品特性进入正在服务的引擎）。
+- 建议下一步：先按 4.5 阶段 A 实现"会话无关的共享前缀 checkpoint 池"，复用现有 host checkpoint 的 restore-then-prefill 路径，而不是复制 SessionEntry 的整套 host 状态。
+
+#### 既有失败（与本轮改动无关，已归因）
+
+`ninfer_resource_manager_test`（candidate-stratified reuse closure）与 `ninfer_serve_options_test`（server reasoning-effort default）在本分支上**基线即失败**：将本轮全部改动 `git stash` 后重建并运行，二者输出完全相同的失败信息。前者正是单卡 context cache 驱逐/复用闭包选择的问题，可作为单卡侧独立缺陷线索。
+
