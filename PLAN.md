@@ -441,7 +441,7 @@ TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，
 
 **已知残留**：当分歧确实落在回答内部（长回答场景，adoption 有真实收益）时，替换仍会让 entry 坐标前移，下一轮匹配被 cap 在分歧点；而分歧点通常**没有 snapshot**（walk 从不经过它，它位于回答内部），于是下一轮只能落到它之前最近的 checkpoint。这是「本轮多复用一段、下一轮少一段」的权衡，是否净收益需要长回答实测才能定；若要消除，需要让 walk 在 splice 分歧点留下 checkpoint（或把续会判定与匹配整体搬到客户端坐标），属独立设计。
 
-**证据与测试**：`_temp/20260929-*_replay_*.out.txt`（对照重放）、`C:\ninfer\serve-guard.err.log`（trace）、`build-win/adopt_guard.log`（构建）；`ninfer_turn_replay_test` 通过。**测试空缺**：`ninfer_qwen3_5_tp2_sessions_test` 走裸 token 路径（不产生 `message_boundaries`），`adopt_generated_turn` 在该测试下从不触发 —— adoption 路径目前没有自动化覆盖。
+**证据与测试**：`_temp/20260929-*_replay_*.out.txt`（对照重放）、`C:\ninfer\serve-guard.err.log`（trace）、`build-win/adopt_guard.log`（构建）；`ninfer_turn_replay_test` 通过。**测试覆盖（本轮补齐，部分）**：`tests/models/qwen3_5/test_tp2_sessions.cpp` 新增 `check_replayed_answer_keeps_prompt_end`，用 `engine.prepare(PromptInput)` 走前端渲染路径（产生 `message_boundaries`），断言「重放答案之后的那一轮仍复用上一轮整段 prompt」（实测 `reused 70 of 58`）。**但它不能隔离本节的守卫**：把守卫删掉该测试同样通过——文本答案下客户端回显与 entry 逐 token 精确一致，走的是 adoption 的「exact replay」提前返回，守卫根本没参与；要触发守卫需要模板自有的框定空白（生产里的工具调用轮），该测试路径构造不出，故守卫的回归保护仍依赖实机重放。
 
 ### 4.10 会话缓存崩溃：未存 host 副本的 entry 仍被当作 recall 候选（已修复）
 
@@ -468,5 +468,5 @@ TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，
 
 **未做**：未存副本的 entry 现在只是「惰性」——`reach` 恒为 0，直到被权重/LRU 逐出。它已无害，主动 drop 还需判断它是否为 anchor 等，故保持最小改动。
 
-**测试空缺**：该崩溃与 adoption 一样只有实机重放能覆盖（裸 token 路径不产生 `message_boundaries`，也不会构造同开场消息的双会话）。
+**测试覆盖（本轮补齐）**：`tests/models/qwen3_5/test_tp2_sessions.cpp` 新增 `check_unaligned_dialogue`，用裸 token 路径构造「同开场 prompt、不同续写」的双会话（第一个 entry 失去 resident 且无 host 副本），再让第一个会话回来。**反向验证**：把 recall 封顶改回 `UINT32_MAX` 后，该测试以 `0xC0000005`（访问违例）终止——正是本节的崩溃；封顶在位时通过并与 oracle 一致。
 
