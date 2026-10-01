@@ -6224,21 +6224,39 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 timing.record(1, shard_a_.device.stream);
 
                 qwen::DFlashDecodeState& frame = round.frame();
-                Tensor window_logits = frame.target_logits.view({vocab, width});
-                Tensor window_hidden = frame.target_hidden.view({hidden, width});
+                // The frame is sized for the whole lane capacity, but this arm drives exactly one
+                // lane, so every capacity-sized tensor is trimmed to lane 0 before use: the ops
+                // below derive their batch from the tensor shape, and the flattened window views
+                // must agree with the frame's element count. The batched arm trims to its live
+                // lane count the same way.
+                Tensor frame_anchors           = frame.anchors.slice(0, 0, 1);
+                Tensor frame_drafts            = frame.draft_tokens.slice(1, 0, 1);
+                Tensor frame_frontiers         = frame.execution_frontiers.slice(0, 0, 1);
+                Tensor frame_extents           = frame.proposal_extents.slice(0, 0, 1);
+                Tensor frame_verify_ids        = frame.verify_ids.slice(1, 0, 1);
+                Tensor frame_verify_positions  = frame.verify_positions.slice(1, 0, 1);
+                Tensor frame_target_argmax     = frame.target_argmax.slice(1, 0, 1);
+                Tensor frame_candidate_ids     = frame.candidate_ids.slice(2, 0, 1);
+                Tensor frame_proposal_q        = frame.proposal_q.slice(2, 0, 1);
+                Tensor frame_licensed          = frame.licensed_tokens.slice(1, 0, 1);
+                Tensor frame_licensed_counts   = frame.licensed_counts.slice(0, 0, 1);
+                Tensor frame_accepted          = frame.accepted_drafts.slice(0, 0, 1);
+                Tensor window_logits3d         = frame.target_logits.slice(2, 0, 1);
+                Tensor window_logits           = window_logits3d.view({vocab, width});
+                Tensor window_hidden =
+                    frame.target_hidden.slice(2, 0, 1).view({hidden, width});
                 ops::speculative_prepare_verify_inputs(
-                    frame.anchors, frame.draft_tokens, frame.execution_frontiers,
-                    frame.proposal_extents, frame.verify_ids, frame.verify_positions,
-                    shard_a_.device.stream);
+                    frame_anchors, frame_drafts, frame_frontiers, frame_extents, frame_verify_ids,
+                    frame_verify_positions, shard_a_.device.stream);
                 // The window is assembled in the same pinned buffer the MTP verify uses, so the
                 // eager forward reads the verified ids/positions directly.
                 auto* window_ids       = static_cast<std::int32_t*>(verify_window_host_->data());
                 auto* window_positions = window_ids + width;
                 shard_a_.device.bind_to_current_thread();
-                CUDA_CHECK(cudaMemcpyAsync(window_ids, frame.verify_ids.data,
+                CUDA_CHECK(cudaMemcpyAsync(window_ids, frame_verify_ids.data,
                                            sizeof(std::int32_t) * static_cast<std::size_t>(width),
                                            cudaMemcpyDeviceToHost, shard_a_.device.stream));
-                CUDA_CHECK(cudaMemcpyAsync(window_positions, frame.verify_positions.data,
+                CUDA_CHECK(cudaMemcpyAsync(window_positions, frame_verify_positions.data,
                                            sizeof(std::int32_t) * static_cast<std::size_t>(width),
                                            cudaMemcpyDeviceToHost, shard_a_.device.stream));
                 // The window is produced on the device, so unlike the MTP path (whose host builds
@@ -6310,23 +6328,23 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                                               shard_a_.device.stream);
                     }
                 }
-                ops::argmax(window_logits, frame.target_argmax, public_tokens,
+                ops::argmax(window_logits, frame_target_argmax, public_tokens,
                             shard_a_.device.stream);
                 // DFlash2 acceptance is the sparse 16-candidate rejection sampler, not MTP's greedy
                 // matcher: the draft distribution is the selector's proposal q.
                 ops::speculative_accept_sparse_drafts(
-                    frame.target_argmax, window_logits, frame.draft_tokens, frame.candidate_ids,
-                    frame.proposal_q, frame.proposal_extents, frame.execution_frontiers,
-                    frame.anchors, frame.licensed_tokens, frame.licensed_counts,
-                    frame.accepted_drafts, public_tokens, sampling_a,
-                    ops::SpeculativeAcceptExecutionEnvelope{false}, ws_a, shard_a_.device.stream);
+                    frame_target_argmax, window_logits3d, frame_drafts, frame_candidate_ids,
+                    frame_proposal_q, frame_extents, frame_frontiers, frame_anchors,
+                    frame_licensed, frame_licensed_counts, frame_accepted, public_tokens,
+                    sampling_a, ops::SpeculativeAcceptExecutionEnvelope{false}, ws_a,
+                    shard_a_.device.stream);
                 timing.record(3, shard_a_.device.stream);
                 std::vector<TokenId> licensed_host(static_cast<std::size_t>(width), 0);
                 std::int32_t licensed_count = 0;
-                CUDA_CHECK(cudaMemcpyAsync(licensed_host.data(), frame.licensed_tokens.data,
+                CUDA_CHECK(cudaMemcpyAsync(licensed_host.data(), frame_licensed.data,
                                            sizeof(TokenId) * static_cast<std::size_t>(width),
                                            cudaMemcpyDeviceToHost, shard_a_.device.stream));
-                CUDA_CHECK(cudaMemcpyAsync(&licensed_count, frame.licensed_counts.data,
+                CUDA_CHECK(cudaMemcpyAsync(&licensed_count, frame_licensed_counts.data,
                                            sizeof(std::int32_t), cudaMemcpyDeviceToHost,
                                            shard_a_.device.stream));
                 timing.record(4, shard_a_.device.stream);
