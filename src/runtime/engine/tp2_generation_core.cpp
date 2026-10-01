@@ -832,12 +832,16 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     const std::size_t state_bytes = state_builder.finish(256);
     shard.device.bind_to_current_thread();
     // Live linear-attention pool (two buffers), one prefix-reuse snapshot per slot, and the MTP
-    // round scratch (~77 MiB per plane). `state_bytes` already covers `lanes` slots, so the
-    // per-lane cost is `(2 + kReuseSnapshotCount) * (state_bytes / lanes)`.
-    shard.state_arena   = std::make_unique<DeviceArena>((2 + kReuseSnapshotCount) * state_bytes);
+    // round scratch. `state_bytes` already covers `lanes` slots, so the per-lane cost is
+    // `state_planes * (state_bytes / lanes)`. The host checkpoint ring serves the prompt end and every
+    // rewind boundary when it exists, so those planes are not carved at all and slot 0 stays empty;
+    // without the ring the store path needs the prompt-end plane and every plane is carved.
+    const std::size_t first_state_plane = host_checkpoint_stride_ != 0 ? 1U : 0U;
+    const std::size_t state_planes      = 1U + shard.state_snapshots.size() - first_state_plane;
+    shard.state_arena   = std::make_unique<DeviceArena>(state_planes * state_bytes);
     shard.state_backing = shard.state_arena->alloc_bytes(state_bytes, 256);
-    for (auto& snapshot : shard.state_snapshots) {
-        snapshot = shard.state_arena->alloc_bytes(state_bytes, 256);
+    for (std::size_t slot = first_state_plane; slot < shard.state_snapshots.size(); ++slot) {
+        shard.state_snapshots[slot] = shard.state_arena->alloc_bytes(state_bytes, 256);
     }
     CUDA_CHECK(cudaMemset(shard.state_backing.data, 0, state_bytes));
     shard.state = std::make_unique<LinearAttentionStatePool>(shard.state_backing, state_layout);
@@ -848,7 +852,10 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         // execution context ever binds the peer first. A slot holds one compact single-lane image
         // and belongs to the lane whose slice of the ring it is, so the pinned footprint is the
         // lanes=1 budget whatever the lane count (docs/PLAN-tp2-concurrency.md 12.6).
-        const std::uint32_t slots = lanes_ * host_checkpoint_slots_per_lane_;
+        // One lane's slice per lane, plus the prompt-end slot appended after all of them: those images
+        // are written once per completed prefill and never rotate, so they belong to no lane's slice
+        // (see snapshot_host_checkpoint).
+        const std::uint32_t slots = lanes_ * host_checkpoint_slots_per_lane_ + lanes_;
 
         shard.host_checkpoint_grid_slots = host_checkpoint_grid_slots_;
         shard.host_checkpoints.reserve(slots);
@@ -865,6 +872,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     std::size_t record_bytes        = 0;
     std::size_t round_bytes         = 0;
     std::size_t dflash_image_bytes  = 0;
+    std::size_t dflash_planes       = 0;
     if (mtp_enabled_ || dflash2_enabled_) {
         // ReplaySSM records for one verify window wide, one physical row per lane, per-shard GDN
         // geometry.
@@ -1017,18 +1025,26 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         // boundary, allocated here because only the round knows the ring's image size; the state
         // arena itself holds no draft slot (see Shard::dflash_snapshots). Each boundary carries one
         // compact ring image per lane, so a snapshot is lanes_ images and a lane addresses its own
-        // slice - the same shape as the target state image beside it.
+        // slice - the same shape as the target state image beside it. The host ring serves the same
+        // boundaries as it does for the target state, so the planes it serves are not carved; at one
+        // reuse boundary that leaves no draft plane at all.
         const std::size_t dflash_lane_image = shard.dflash_round->lane_context_image_bytes();
         const std::size_t dflash_image = static_cast<std::size_t>(lanes_) * dflash_lane_image;
         dflash_image_bytes             = dflash_lane_image;
         shard.device.bind_to_current_thread();
-        shard.dflash_snapshot_arena =
-            std::make_unique<DeviceArena>(kReuseSnapshotCount * dflash_image);
-        for (auto& snapshot : shard.dflash_snapshots) {
-            snapshot = shard.dflash_snapshot_arena->alloc_bytes(dflash_image, 256);
+        const std::size_t first_dflash_plane = host_checkpoint_stride_ != 0 ? 1U : 0U;
+        dflash_planes = shard.dflash_snapshots.size() - first_dflash_plane;
+        if (dflash_planes != 0) {
+            shard.dflash_snapshot_arena =
+                std::make_unique<DeviceArena>(dflash_planes * dflash_image);
+            for (std::size_t slot = first_dflash_plane; slot < shard.dflash_snapshots.size();
+                 ++slot) {
+                shard.dflash_snapshots[slot] =
+                    shard.dflash_snapshot_arena->alloc_bytes(dflash_image, 256);
+            }
+            CUDA_CHECK(cudaMemset(shard.dflash_snapshot_arena->base(), 0,
+                                  shard.dflash_snapshot_arena->capacity()));
         }
-        CUDA_CHECK(cudaMemset(shard.dflash_snapshot_arena->base(), 0,
-                              shard.dflash_snapshot_arena->capacity()));
         // The checkpoint ring pairs each target state image with the draft ring at the same
         // frontier. The ring is only allocated once the round exists, which is why it is a second
         // pass over a ring sized above.
@@ -1048,10 +1064,9 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                      "free %.1f of %.1f MiB\n",
                      shard_index, capacity, lanes_, resident_bytes,
                      static_cast<double>(kv_bytes) / 1048576.0,
-                     static_cast<double>((2 + kReuseSnapshotCount) * state_bytes) / 1048576.0,
+                     static_cast<double>(state_planes * state_bytes) / 1048576.0,
                      static_cast<double>(record_bytes) / 1048576.0,
-                     static_cast<double>(kReuseSnapshotCount * lanes_ * dflash_image_bytes) /
-                         1048576.0,
+                     static_cast<double>(dflash_planes * lanes_ * dflash_image_bytes) / 1048576.0,
                      static_cast<double>(round_bytes) / 1048576.0,
                      static_cast<unsigned>(kWorkspaceBytes >> 20),
                      static_cast<double>(vision_bytes) / 1048576.0,
@@ -1064,10 +1079,11 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
             // which is the second pinned figure.
             std::fprintf(stderr,
                          "[mem] host-checkpoints shard %d slots %zu (grid %zu + tail %u + "
-                         "divergence %u + block %u) x %.1f MiB | stride %u tok | pinned %.1f MiB\n",
+                         "divergence %u + block %u + prompt-end %u) x %.1f MiB | stride %u tok | "
+                         "pinned %.1f MiB\n",
                          shard_index, shard.host_checkpoints.size(),
                          shard.host_checkpoint_grid_slots, host_checkpoint_tail_slots_,
-                         host_checkpoint_divergence_slots_, host_checkpoint_block_slots_,
+                         host_checkpoint_divergence_slots_, host_checkpoint_block_slots_, lanes_,
                          static_cast<double>(shard.lane_state_geometry.image_bytes) / 1048576.0,
                          host_checkpoint_stride_,
                          static_cast<double>((shard.lane_state_geometry.image_bytes +
@@ -1984,8 +2000,10 @@ void TP2GenerationCore::load_dflash_image(Shard& shard, const PinnedHostBuffer& 
 void TP2GenerationCore::snapshot_dflash_state(Shard& shard, std::size_t slot,
                                               std::uint32_t lane) {
     if (shard.dflash_round == nullptr) { return; }
-    if (slot >= shard.dflash_snapshots.size() ||
-        shard.dflash_snapshots[slot].data == nullptr) {
+    if (slot >= shard.dflash_snapshots.size() || shard.dflash_snapshots[slot].data == nullptr) {
+        // Slot 0's draft image is served by the host checkpoint ring when that ring exists (the
+        // PromptEnd slot), so there is no device plane to fill and nothing to report.
+        if (slot == 0 && host_checkpoint_stride_ != 0) { return; }
         throw std::logic_error("draft context snapshot slot is unavailable");
     }
     const std::size_t lane_bytes = shard.dflash_round->lane_context_image_bytes();
@@ -2370,6 +2388,9 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
             take(sessions_[lane_state.active_session].frontier, 0, ReuseSource::LiveState);
         }
         for (std::uint32_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
+            // A slot the host ring serves has no device plane; the same boundary is offered below
+            // through its checkpoint instead.
+            if (shard_a_.state_snapshots[slot].data == nullptr) { continue; }
             take(lane_state.cached_boundaries[slot], slot, ReuseSource::DeviceSnapshot);
         }
         for (std::uint32_t slot = 0; slot < shard_a_.host_checkpoints.size(); ++slot) {
@@ -2487,9 +2508,8 @@ void TP2GenerationCore::publish_lane_prefill(
     std::span<const MediaSpan> media,
     const models::qwen3_5::PreparedContextCache& cache_hints) {
     RetentionState& lane_state = retention(lane);
-    // Publish this lane's lineage. The device snapshot planes are shared by every lane, but only
-    // this lane's slice of plane 0 is written - at this lane's own prefill end - and the host ring
-    // and the catalog entry are this lane's own too.
+    // Publish this lane's lineage. The prompt-end boundary is this lane's own: it becomes a
+    // checkpoint in the ring's prompt-end slot, and the catalog entry is this lane's own too.
     lane_state.cached_prompt_tokens.assign(tokens.begin(), tokens.end());
     lane_state.cached_media.assign(media.begin(), media.end());
     lane_state.cached_boundaries.fill(0);
@@ -2498,20 +2518,20 @@ void TP2GenerationCore::publish_lane_prefill(
     if (lane_state.active_session != kNoSession) {
         sessions_[lane_state.active_session].prompt_end = prompt_tokens;
     }
+    // The prefill end is a boundary like any other, so it is published into the ring's prompt-end
+    // slot: that is where a store reads the prompt-end image and where a returning turn stands
+    // without a device plane. It is written before the sweep below, which is what makes it usable.
+    snapshot_host_checkpoint(shard_a_, prompt_tokens, HostRing::PromptEnd, lane);
+    snapshot_host_checkpoint(shard_b_, prompt_tokens, HostRing::PromptEnd, lane);
     // Only now are this prefill's checkpoints usable: their state is one the prefill reached and
     // their KV prefix is one it wrote.
+    publish_lane_checkpoints(lane);
+    // A configuration without the ring keeps the device plane that carries the same image; with the
+    // ring it is not carved and the checkpoint above is the only copy. execute_walk writes the whole
+    // plane at its own prefill end; a batched lane writes only its own slice, which is all a
+    // per-lane boundary needs, and the slice stays valid until this lane prefills again.
     for (Shard* shard : {&shard_a_, &shard_b_}) {
-        for (auto& checkpoint : shard->host_checkpoints) {
-            if (checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id) {
-                checkpoint.valid[lane] = true;
-            }
-        }
-    }
-    // Plane 0 carries this lane's prefill-end state, the boundary a store reads for the prompt-end
-    // image and the one a returning turn can stand on without the host ring. execute_walk writes
-    // the whole plane at its own prefill end; a batched lane writes only its own slice, which is
-    // all a per-lane boundary needs, and the slice stays valid until this lane prefills again.
-    for (Shard* shard : {&shard_a_, &shard_b_}) {
+        if (shard->state_snapshots[0].data == nullptr) { continue; }
         shard->device.bind_to_current_thread();
         // See snapshot_lane_state in execute_walk: the device-to-device branch copies into its
         // first device pointer, so the plane is the destination and the pool is the source.
@@ -2519,8 +2539,9 @@ void TP2GenerationCore::publish_lane_prefill(
                         static_cast<std::int32_t>(lane), shard->state_backing.data,
                         cudaMemcpyDeviceToDevice, shard->device.stream);
     }
-    // The masked draft's ring is part of that same boundary: a lane that later accepts plane 0 has
-    // to get its draft context back too, or the skipped prefix would leave a hole in the ring.
+    // The masked draft's ring is part of that same boundary, and it rides the checkpoint above when
+    // the ring exists: a lane that later accepts this boundary has to get its draft context back
+    // too, or the skipped prefix would leave a hole in the ring.
     if (shard_a_.dflash_round != nullptr) { snapshot_dflash_state(shard_a_, 0, lane); }
     lane_state.cached_boundaries[0] = prompt_tokens;
 }
@@ -3087,8 +3108,8 @@ void TP2GenerationCore::execute_plain_batch(
             if (host_checkpoint_stride_ != 0) {
                 // One checkpoint per stride, tagged with the frontier this chunk actually reached, so
                 // a chunk width that does not divide the stride cannot mislabel a state; plus the
-                // dense tail window. The prompt end is skipped either way: the state there is the one
-                // the lane publishes as its frontier.
+                // dense tail window. The prompt end is skipped either way: the lane publishes it as
+                // its frontier into the ring's own prompt-end slot.
                 const std::uint32_t frontier = t0 + length;
                 if (frontier >= next_host_checkpoint) {
                     snapshot_host_checkpoint(shard_a_, frontier, HostRing::Grid, lane_id);
@@ -3782,8 +3803,8 @@ void TP2GenerationCore::execute_spec_batch(
             if (host_checkpoint_stride_ != 0) {
                 // One checkpoint per stride, tagged with the frontier this chunk actually reached, so
                 // a chunk width that does not divide the stride cannot mislabel a state; plus the
-                // dense tail window. The prompt end is skipped either way: the state there is the one
-                // the lane publishes as its frontier.
+                // dense tail window. The prompt end is skipped either way: the lane publishes it as
+                // its frontier into the ring's own prompt-end slot.
                 const std::uint32_t frontier = t0 + length;
                 if (frontier >= next_host_checkpoint) {
                     snapshot_host_checkpoint(shard_a_, frontier, HostRing::Grid, lane_id);
@@ -5059,6 +5080,12 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
     }
     if (!session_ensure_host_slabs(entry, pages)) { return false; }
     Shard* const shards[2] = {&shard_a_, &shard_b_};
+    // The prompt-end image the store publishes, per shard: the ring's PromptEnd checkpoint when the
+    // ring exists, otherwise the device plane. The two are mutually exclusive - a plane the ring
+    // serves is not carved - and the copies differ in direction, so the source is picked here and
+    // consumed after the synchronize below.
+    const Shard::HostCheckpoint* prompt_end_checkpoints[2] = {nullptr, nullptr};
+    bool prompt_end_captured                              = true;
     for (std::size_t index = 0; index < 2; ++index) {
         Shard& shard = *shards[index];
         shard.device.bind_to_current_thread();
@@ -5072,32 +5099,51 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
                         static_cast<std::byte*>(entry.host_state[index]->data()) +
                             static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
                         cudaMemcpyDeviceToHost, shard.device.stream);
-        // Snapshot slot 0 is the state the last completed prefill froze at this conversation's own
-        // prompt end. A client that re-renders the answer it was handed sends a next prompt that
-        // contains that whole prompt and then diverges inside the generated tail, so this image is
-        // the one its return trip can stand on.
-        if (entry.host_prompt_state[index] != nullptr) {
-            copy_lane_state(shard.lane_state_geometry, shard.state_snapshots[0].data,
-                            static_cast<std::int32_t>(lane),
-                            static_cast<std::byte*>(entry.host_prompt_state[index]->data()) +
-                                static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
-                            cudaMemcpyDeviceToHost, shard.device.stream);
+        // The state the last completed prefill froze at this conversation's own prompt end. A client
+        // that re-renders the answer it was handed sends a next prompt that contains that whole
+        // prompt and then diverges inside the generated tail, so this image is the one its return
+        // trip can stand on. The prefill published it as a checkpoint at that frontier and tagged it
+        // with this lane's live prefill id, which is what tells this conversation's own image from a
+        // later rewrite of the same slot.
+        for (const Shard::HostCheckpoint& checkpoint : shard.host_checkpoints) {
+            if (checkpoint.valid[lane] && checkpoint.position[lane] == entry.prompt_end &&
+                checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id) {
+                prompt_end_checkpoints[index] = &checkpoint;
+                break;
+            }
+        }
+        if (entry.host_prompt_state[index] != nullptr &&
+            prompt_end_checkpoints[index] == nullptr) {
+            if (shard.state_snapshots[0].data != nullptr) {
+                copy_lane_state(shard.lane_state_geometry, shard.state_snapshots[0].data,
+                                static_cast<std::int32_t>(lane),
+                                static_cast<std::byte*>(entry.host_prompt_state[index]->data()) +
+                                    static_cast<std::size_t>(lane) *
+                                        shard.lane_state_geometry.image_bytes,
+                                cudaMemcpyDeviceToHost, shard.device.stream);
+            } else {
+                prompt_end_captured = false;
+            }
         }
         // The masked draft's context rides every target image without an extent of its own: the
-        // evicted frontier is the live ring, and the prompt-end image is the device snapshot slot 0
-        // the GDN copy above just read. Both are the flat ring image, so the device snapshot is a
-        // plain D2H.
+        // evicted frontier is the live ring, and the prompt-end image is the checkpoint above (or the
+        // device plane the GDN copy just read when there is no ring). Both are the flat ring image,
+        // so either source is one copy.
         if (shard.dflash_round != nullptr) {
             const std::size_t draft_lane_bytes = shard.dflash_round->lane_context_image_bytes();
             store_dflash_image(shard, *entry.host_dflash[index], lane);
             if (entry.host_dflash_prompt[index] != nullptr &&
-                shard.dflash_snapshots[0].data != nullptr) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    static_cast<std::byte*>(entry.host_dflash_prompt[index]->data()) +
-                        static_cast<std::size_t>(lane) * draft_lane_bytes,
-                    static_cast<const std::byte*>(shard.dflash_snapshots[0].data) +
-                        static_cast<std::size_t>(lane) * draft_lane_bytes, draft_lane_bytes,
-                    cudaMemcpyDeviceToHost, shard.device.stream));
+                prompt_end_checkpoints[index] == nullptr) {
+                if (shard.dflash_snapshots[0].data != nullptr) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        static_cast<std::byte*>(entry.host_dflash_prompt[index]->data()) +
+                            static_cast<std::size_t>(lane) * draft_lane_bytes,
+                        static_cast<const std::byte*>(shard.dflash_snapshots[0].data) +
+                            static_cast<std::size_t>(lane) * draft_lane_bytes, draft_lane_bytes,
+                        cudaMemcpyDeviceToHost, shard.device.stream));
+                } else {
+                    prompt_end_captured = false;
+                }
             }
         }
     }
@@ -5117,6 +5163,31 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
         shards[index]->device.bind_to_current_thread();
         CUDA_CHECK(cudaStreamSynchronize(shards[index]->device.stream));
     }
+    // The prompt-end image is a host checkpoint when the ring exists, and the D2H that filled it rode
+    // the shard stream, so the synchronize above is what orders these host-to-host moves after it.
+    // Without the ring the device plane already supplied the image.
+    for (std::size_t index = 0; index < 2; ++index) {
+        const Shard::HostCheckpoint* checkpoint = prompt_end_checkpoints[index];
+        if (checkpoint == nullptr) { continue; }
+        Shard& shard = *shards[index];
+        const std::size_t image_bytes = shard.lane_state_geometry.image_bytes;
+        if (entry.host_prompt_state[index] != nullptr) {
+            std::memcpy(static_cast<std::byte*>(entry.host_prompt_state[index]->data()) +
+                            static_cast<std::size_t>(lane) * image_bytes,
+                        checkpoint->buffer->data(), image_bytes);
+        }
+        // Both sides are flat ring images, one compact image per lane: the checkpoint's draft buffer
+        // is one and so is the session slab, so the lane's slice is a straight offset.
+        if (shard.dflash_round != nullptr && entry.host_dflash_prompt[index] != nullptr &&
+            checkpoint->dflash_buffer != nullptr) {
+            const std::size_t draft_lane_bytes = shard.dflash_round->lane_context_image_bytes();
+            std::memcpy(static_cast<std::byte*>(entry.host_dflash_prompt[index]->data()) +
+                            static_cast<std::size_t>(lane) * draft_lane_bytes,
+                        static_cast<const std::byte*>(checkpoint->dflash_buffer->data()) +
+                            static_cast<std::size_t>(lane) * draft_lane_bytes,
+                        draft_lane_bytes);
+        }
+    }
 
     shard_a_.device.bind_to_current_thread();
     entry.device_lane = -1;
@@ -5130,7 +5201,7 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
     const bool prompt_end_images =
         entry.host_prompt_state[0] != nullptr && entry.host_prompt_state[1] != nullptr &&
         (shard_a_.dflash_round == nullptr || entry.host_dflash_prompt[0] != nullptr);
-    entry.host_prompt_end = prompt_end_images ? entry.prompt_end : 0;
+    entry.host_prompt_end = (prompt_end_images && prompt_end_captured) ? entry.prompt_end : 0;
     // The block boundary this conversation's own prefill froze, while the ring still holds the walk
     // that wrote it: the slabs just took the KV that sits before the boundary, so pairing the frozen
     // state with them gives the entry a boundary the next conversation opening with the same block is
@@ -5741,6 +5812,7 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     const std::size_t tail = host_checkpoint_tail_slots_;
     std::size_t begin      = 0;
     std::size_t count      = grid;
+    bool appended          = false;
     switch (ring) {
         case HostRing::Grid: break;
         case HostRing::Tail: begin = grid; count = tail; break;
@@ -5752,10 +5824,23 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
             begin = grid + tail + host_checkpoint_divergence_slots_;
             count = host_checkpoint_block_slots_;
             break;
+        case HostRing::PromptEnd:
+            // The prompt end is written once per completed prefill and never rotates, so it gets one
+            // slot per lane appended after every lane's slice instead of a place in the grid. A place
+            // in the grid would have to be carved out of the position stride, and the ring layout is
+            // only per_lane wide when the configured slot budget is large enough (see the ring sizing
+            // in build_shard), so a fixed offset inside a slice can alias a neighbour's slot.
+            begin    = static_cast<std::size_t>(lanes_) * host_checkpoint_slots_per_lane_ +
+                       static_cast<std::size_t>(lane);
+            count    = 1;
+            appended = true;
+            break;
     }
-    // Each lane owns its own slice of the ring, laid out exactly like the whole ring at lanes=1, so a
-    // write never evicts another lane's checkpoints.
-    begin += static_cast<std::size_t>(lane) * host_checkpoint_slots_per_lane_;
+    if (!appended) {
+        // Each lane owns its own slice of the ring, laid out exactly like the whole ring at lanes=1,
+        // so a write never evicts another lane's checkpoints.
+        begin += static_cast<std::size_t>(lane) * host_checkpoint_slots_per_lane_;
+    }
     if (count == 0 || begin + count > shard.host_checkpoints.size()) { return; }
     const std::size_t index = ring == HostRing::Tail   ? shard.host_checkpoint_tail_next[lane]
                               : ring == HostRing::Grid ? shard.host_checkpoint_next[lane]
@@ -5770,9 +5855,9 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     checkpoint.position[lane]   = frontier;
     checkpoint.prefill_id[lane] = retention(lane).host_checkpoint_live_id;
     // The slot belongs to this lane, so its buffer *is* the lane's compact state image: the lane
-    // is expressed by the slot index (begin + lane * slots_per_lane), never by a byte offset into
-    // the slot. The slot is sized for exactly one such image, so a mismatch here would mean the
-    // ring partition and the state geometry disagree and the copy would run off the allocation.
+    // is expressed by the slot index this ring's layout gives it, never by a byte offset into the
+    // slot. The slot is sized for exactly one such image, so a mismatch here would mean the ring
+    // partition and the state geometry disagree and the copy would run off the allocation.
     if (checkpoint.buffer->size() < shard.lane_state_geometry.image_bytes) {
         throw std::logic_error(
             "TP-2 host checkpoint slot is smaller than one compact lane state image");
@@ -5796,6 +5881,15 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
         shard.host_checkpoint_tail_next[lane] = (index + 1) % count;
     } else if (ring == HostRing::Grid) {
         shard.host_checkpoint_next[lane] = (index + 1) % count;
+    }
+}
+
+void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane) {
+    const std::uint64_t live_id = retention(lane).host_checkpoint_live_id;
+    for (Shard* shard : {&shard_a_, &shard_b_}) {
+        for (auto& checkpoint : shard->host_checkpoints) {
+            if (checkpoint.prefill_id[lane] == live_id) { checkpoint.valid[lane] = true; }
+        }
     }
 }
 
@@ -6027,6 +6121,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             take(sessions_[lane_state.active_session].frontier, 0, ReuseSource::LiveState);
         }
         for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
+            // A slot the host ring serves has no device plane; the same boundary is offered below
+            // through its checkpoint instead.
+            if (shard_a_.state_snapshots[slot].data == nullptr) { continue; }
             take(lane_state.cached_boundaries[slot], slot, ReuseSource::DeviceSnapshot);
         }
         for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
@@ -6275,6 +6372,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // deeper than the boundary it advertises (P2.3 Stage 2). The round scratch keeps the whole
     // plane: the fold restores it wholesale on the shard's own stream.
     auto snapshot_lane_state = [&](Shard& shard, std::size_t slot) {
+        // A slot the host checkpoint ring serves is not carved, so there is no plane to freeze here:
+        // the prompt-end checkpoint written at publish is that image (see publish_lane_prefill).
+        if (shard.state_snapshots[slot].data == nullptr) { return; }
         shard.device.bind_to_current_thread();
         // The device-to-device branch of copy_lane_state copies *into* its first device pointer, so
         // the plane is the destination and the live pool is the source. Passing them the other way
@@ -6473,6 +6573,13 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 // no-op; it is here so the invariant is stated once: nothing is published with an
                 // uncommitted draft window.
                 flush_dflash_context(t0);
+                // The truncated prompt end is a boundary like a completed one, so it goes into the
+                // ring's prompt-end slot and the sweep makes it usable: that is what lets the retry of
+                // the same prompt stand on it. It is written after the flush so the checkpoint's draft
+                // frontier names the same position.
+                snapshot_host_checkpoint(shard_a_, t0, HostRing::PromptEnd, lane);
+                snapshot_host_checkpoint(shard_b_, t0, HostRing::PromptEnd, lane);
+                publish_lane_checkpoints(lane);
                 session_publish(
                     std::vector<TokenId>(token_ids.begin(),
                                          token_ids.begin() + static_cast<std::ptrdiff_t>(t0)),
@@ -6567,8 +6674,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         if (host_checkpoint_stride_ != 0) {
             // One checkpoint per stride, tagged with the frontier this chunk actually reached, so a
             // chunk width that does not divide the stride cannot mislabel a state; plus the dense
-            // tail window. The end of the prompt is skipped either way: the device snapshot below
-            // holds that same state already.
+            // tail window. The end of the prompt is skipped either way: the prompt-end checkpoint
+            // the publish below writes holds that same state already.
             const std::uint32_t frontier = t0 + length;
             const bool on_grid           = frontier >= next_host_checkpoint;
             const bool in_tail           = frontier != prompt_tokens &&
@@ -6706,8 +6813,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         vision_session->retire_handoff();
     }
 
-    // Freeze the GDN state at every boundary this request can offer the next one. Slot 0 is the
-    // prefill end the walk just reached; the rewind slots were captured at their chunk boundaries.
+    // Freeze the GDN state at every boundary this request can offer the next one. The prompt end is
+    // the prefill end the walk just reached; the rewind slots were captured at their chunk
+    // boundaries.
     // A slot is published only when this prefill actually reached its boundary, so a request that
     // fails mid-prefill leaves the previous request's boundaries and snapshots intact.
     snapshot_lane_state(shard_a_, 0);
@@ -6725,6 +6833,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         lane_state.cached_boundaries[slot] = snapshot_at[slot];
     }
     lane_state.cached_state_valid = true;
+    // The prompt end is a boundary like any other: it goes into the ring's prompt-end slot, which is
+    // where a store reads the prompt-end image and where a returning turn stands when the
+    // configuration keeps no device plane.
+    snapshot_host_checkpoint(shard_a_, prompt_tokens, HostRing::PromptEnd, lane);
+    snapshot_host_checkpoint(shard_b_, prompt_tokens, HostRing::PromptEnd, lane);
     // The pools now hold exactly this prompt and the live GDN state sits at its end, so the
     // resident catalog entry describes what the walk just wrote. A conversation that had no entry
     // yet gets one here, before decode extends its history.
@@ -6734,16 +6847,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     if (lane_state.active_session != kNoSession) { sessions_[lane_state.active_session].prompt_end = prompt_tokens; }
     // Only now are this prefill's checkpoints usable: their state is one the walk reached and their
     // KV prefix is one the walk wrote.
-    {
-        Shard* const shards[2] = {&shard_a_, &shard_b_};
-        for (Shard* shard : shards) {
-            for (auto& checkpoint : shard->host_checkpoints) {
-                if (checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id) {
-                    checkpoint.valid[lane] = true;
-                }
-            }
-        }
-    }
+    publish_lane_checkpoints(lane);
 
     if (prefill_trace) {
         const auto millis = [](Clock::time_point from, Clock::time_point to) {
@@ -7327,8 +7431,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // frontier this round actually committed - the same count the final publish names - so the
         // loss a replay cannot avoid is bounded by one stride instead of by the answer. The draft
         // image has to describe the frontier the checkpoint names, so hand it the pending window
-        // first; the final boundary is skipped because the device snapshot and the live state both
-        // already hold it.
+        // first; the final boundary is skipped because the prompt-end checkpoint and the live state
+        // both already hold it.
         if (host_checkpoint_stride_ != 0 && !finished) {
             const std::uint32_t committed_frontier =
                 prompt_tokens + static_cast<std::uint32_t>(request.generated.size()) - 1U;

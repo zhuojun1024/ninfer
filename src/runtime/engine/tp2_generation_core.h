@@ -52,15 +52,18 @@ namespace ninfer::runtime {
 // independently and the two agree exactly.
 class TP2GenerationCore {
 public:
-    // Prefix-reuse device state snapshots per shard: slot 0 is the prefill end. Chat templates render
-    // the previous assistant turn and the generation tail differently, so two consecutive prompts
-    // share everything up to a point a little before the earlier prompt's end, and the boundary that
-    // covers that gap sits one chunk behind the prefill end. That rewind is not worth a device plane:
-    // every slot costs another whole-pool state image per shard (73.4 MiB per lane), and the
-    // host checkpoint ring already holds the same states in pinned host memory, so a prompt that
-    // diverges inside the previous prompt restarts from there through a host copy instead. Slot 0
-    // stays because the session slabs read the prompt-end image out of it (see session_store_active),
-    // which makes this count the floor: one boundary plane, not two.
+    // Prefix-reuse device state snapshots per shard. Slot 0 is the prefill end and slots 1 ..
+    // kReuseSnapshotCount - 1 are rewind boundaries; the extra slot at kRoundScratchSlot is the MTP
+    // round scratch, which is not a reuse boundary. Every plane costs another whole-pool state image
+    // per shard (73.4 MiB per lane), and the host checkpoint ring holds the same states in pinned
+    // host memory, so a boundary the ring can serve does not also get a device plane: with the ring
+    // enabled (--host-state-slots, on by default) the reuse boundaries are not carved at all and only
+    // the round scratch stays on the device. Chat templates render the previous assistant turn and
+    // the generation tail differently, so two consecutive prompts share everything up to a point a
+    // little before the earlier prompt's end; the dense host tail ring covers that rewind, which is
+    // why this count is the floor rather than a choice. A configuration without the ring
+    // (--no-prefix-reuse, --host-state-slots 0) keeps every plane, because it has nowhere else to put
+    // the prompt-end image the session slabs read (see session_store_active).
     static constexpr std::size_t kReuseSnapshotCount = 1;
     // Extra state slot (beyond the reuse snapshots) holding the pre-verify state of the current MTP
     // round: RecordForReplay advances the live state by the whole window, so the fold must replay the
@@ -145,8 +148,10 @@ private:
     // Which reserved group of the host checkpoint ring a write lands in. The grid and the tail
     // anchors rotate through their own slots; the divergence anchor and the block anchor own a fixed
     // slot each and are rewritten in place, so they advance no cursor and neither rotation can evict
-    // them.
-    enum class HostRing { Grid, Tail, Divergence, Block };
+    // them. The prompt-end slot is the prefill end of the lane that owns it: it is written once per
+    // completed prefill and lives outside every lane's grid, so it is the one ring slot the reuse
+    // boundaries can be read from without a device plane.
+    enum class HostRing { Grid, Tail, Divergence, Block, PromptEnd };
 
     struct Shard {
         DeviceContext device;
@@ -165,7 +170,8 @@ private:
         // device snapshot), computed once the pool exists.
         LaneStateGeometry lane_state_geometry;
         // GDN state at reuse boundaries of the last completed prefill (see kReuseSnapshot* in the
-        // implementation), used to skip a shared prompt prefix on the next request.
+        // implementation), used to skip a shared prompt prefix on the next request. A plane the host
+        // checkpoint ring serves is left empty instead of carved.
         std::array<DeviceSpan, kReuseSnapshotCount + 1> state_snapshots{};
         // Prefix-reuse checkpoints in pinned host memory, one ring per shard. They carry the state
         // of the frontier they were taken at, so a prompt whose shared prefix ends *inside* the
@@ -174,8 +180,9 @@ private:
         // (--host-state-slots) and costs no device memory.
         //
         // A slot holds one compact single-lane image and belongs to the lane whose slice of the ring
-        // it is, so the pinned budget is the lanes=1 budget whatever the lane count. The per-frontier
-        // fields are indexed by lane to keep a stale claim from a re-partitioned ring readable.
+        // it is, so the pinned budget is the lanes=1 budget whatever the lane count; the prompt-end
+        // slots are appended after every lane's slice, one per lane. The per-frontier fields are
+        // indexed by lane to keep a stale claim from a re-partitioned ring readable.
         struct HostCheckpoint {
             std::unique_ptr<PinnedHostBuffer> buffer;
             // The masked draft's context at the same frontier, on the shard that owns the draft
@@ -196,7 +203,7 @@ private:
         // Within a lane's slice the ring is split in two: [0, grid_slots) holds the position grid,
         // which keeps the whole context covered and is never evicted by the tail anchors;
         // [grid_slots, size) holds the tail anchors, refreshed every prefill, which land within one
-        // chunk of a prompt end.
+        // chunk of a prompt end. Past every lane's slice sits the prompt-end slot that lane owns.
         std::vector<HostCheckpoint> host_checkpoints;
         std::size_t host_checkpoint_grid_slots = 0;
         // One round-robin cursor per lane: a lane's coverage belongs to its own conversation, so a
@@ -275,7 +282,8 @@ private:
         // The draft context at the reuse boundaries the GDN snapshots freeze: slot 0 is the prefill
         // end (the round-scratch slot is not paired - the verify never advances the draft ring). The
         // draft cannot be recomputed from the target state, so a boundary that cannot restore these
-        // bytes cannot be offered for reuse.
+        // bytes cannot be offered for reuse. Like the target state, a plane the host ring serves is
+        // left empty instead of carved.
         std::array<DeviceSpan, kReuseSnapshotCount> dflash_snapshots{};
         std::unique_ptr<DeviceArena> dflash_snapshot_arena;
     };
@@ -521,8 +529,9 @@ private:
     // The masked draft's context image, on the shard that owns the draft; a no-op on shard 1 and on
     // every backend other than DFlash2. The device slot pairs with state_snapshots[slot] and the
     // host image with a checkpoint or session slab, so the two are always copied and restored
-    // together with the target state at the same absolute frontier. Every image carries one compact
-    // ring image per lane and the lane index selects the slice, exactly like the target state image.
+    // together with the target state at the same absolute frontier; a boundary the host ring serves
+    // has no device slot at all. Every image carries one compact ring image per lane and the lane
+    // index selects the slice, exactly like the target state image.
     void store_dflash_image(Shard& shard, PinnedHostBuffer& image, std::uint32_t lane);
     void load_dflash_image(Shard& shard, const PinnedHostBuffer& image, std::uint32_t lane);
     void snapshot_dflash_state(Shard& shard, std::size_t slot, std::uint32_t lane);
@@ -743,9 +752,14 @@ private:
     [[nodiscard]] static LaneStateGeometry make_lane_state_geometry(const Shard& shard);
     // Copies the GDN state this lane's device slot holds right now into the ring slot the group
     // owns, tagged with the frontier it captures. A prefill writes these at its chunk boundaries and
-    // the sweep that follows a completed prefill is what makes them usable.
+    // the sweep that follows a completed prefill is what makes them usable; the prompt-end group is
+    // written once by the publish of a completed (or cancelled) prefill instead.
     void snapshot_host_checkpoint(Shard& shard, std::uint32_t frontier, HostRing ring,
                                   std::uint32_t lane);
+    // Makes every checkpoint the lane's current prefill wrote usable. Only a completed prefill (or a
+    // cancelled walk that published its truncation) calls this, because the sweep is what turns a
+    // written slot into a boundary the next request can restore.
+    void publish_lane_checkpoints(std::uint32_t lane);
     // Copies one lane's image between a whole-pool device buffer and its compact pinned image, or
     // between two whole-pool device buffers. `other` is the compact pinned image for a host copy
     // and the source pool for a device-to-device one.
@@ -964,10 +978,11 @@ private:
     std::uint64_t host_checkpoint_next_id_    = 1;
     // Host-ring writes of the request being served, reported by the NINFER_TP2_TIMING trace.
     std::uint64_t prefill_host_writes_        = 0;
-    // Slots appended to the end of every shard's ring for the divergence anchor and for the stable
-    // block's own anchor. They sit outside the configured --host-state-slots budget: the anchors
-    // answer a different question than the position grid, and carving them out of the grid would
-    // coarsen the stride that covers the whole context. They cost pinned host memory only.
+    // Slots appended to the end of every shard's ring for the divergence anchor, the stable block's
+    // own anchor and one prompt-end image per lane. They sit outside the configured
+    // --host-state-slots budget: the anchors answer a different question than the position grid, and
+    // carving them out of the grid would coarsen the stride that covers the whole context. They cost
+    // pinned host memory only.
     std::uint32_t host_checkpoint_divergence_slots_ = 0;
     std::uint32_t host_checkpoint_block_slots_      = 0;
     // Committed history below this many tokens is not worth a catalog slot; 0 retains everything.
