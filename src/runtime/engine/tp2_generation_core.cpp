@@ -341,7 +341,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         dflash_drafts_ = std::clamp<std::uint32_t>(options.speculative.draft_tokens, 1U,
                                                    qwen::kDFlashDecodeMaximumDrafts);
     }
-    // The plain, MTP and DFlash2 rounds all carry a batch (PLAN-tp2-concurrency.md P2.1c/P2.1b);
+    // The plain, MTP and DFlash2 rounds all carry a batch (docs/PLAN-tp2-concurrency.md P2.1c/P2.1b);
     // only `--spec dflash` has no TP-2 context layout, so a multi-lane run on that route would
     // silently feed every lane through row 0. Collapse it and report. The plain route keeps its
     // lanes.
@@ -354,7 +354,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         std::fprintf(stderr,
                      "[tp2-lane] --max-concurrency %u collapses to 1 lane on the speculative "
                      "route (only the MTP and DFlash2 rounds are batched; see "
-                     "PLAN-tp2-concurrency.md)\n",
+                     "docs/PLAN-tp2-concurrency.md)\n",
                      lanes_);
         lanes_ = 1U;
     }
@@ -377,7 +377,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     {
         const std::uint32_t host_slots = options_.context_cache.host_state_slots;
         session_retention_floor_tokens_ = options_.context_cache.session_retention_floor_tokens;
-        // PLAN-tp2-concurrency.md 12.6: a checkpoint is one compact single-lane state image, and
+        // docs/PLAN-tp2-concurrency.md 12.6: a checkpoint is one compact single-lane state image, and
         // each lane owns its own slice of the ring, so the pinned budget is the lanes=1 budget
         // whatever the lane count. The batch executors recall into their own lane (Stage 1d), so
         // the ring is live at every lane count.
@@ -419,7 +419,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         // DFlash2 takes part: a session slab holds the draft ring beside the target KV and GDN
         // state, so a recall restores the whole conversation rather than only its target half.
         // A session image carries the same per-lane state, so the catalog splits its slabs by lane
-        // (PLAN-tp2-concurrency.md 12.6).
+        // (docs/PLAN-tp2-concurrency.md 12.6).
         if (host_kv_bytes / 2 != 0 && sessions > 1) {
             host_kv_shard_bytes_ = host_kv_bytes / 2;
             session_capacity_    = sessions;
@@ -694,7 +694,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     // planned for. `kTp2GenerationMaxConcurrency` (include/ninfer/tp2_capacity.h) pins this to
     // one today, so the layouts below stay byte-for-byte the single-request ones; raising that
     // gate additionally requires the batch execution path and per-lane KV/GDN publication, not
-    // just this width. P1.2 of PLAN-tp2-concurrency.md.
+    // just this width. P1.2 of docs/PLAN-tp2-concurrency.md.
     const std::int32_t lanes = static_cast<std::int32_t>(lanes_);
 
     // Per-shard config: the mixer head counts are halved (each shard owns half the attention/GDN
@@ -785,7 +785,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         // through this shard's own device, but a portable allocation keeps that true if the
         // execution context ever binds the peer first. A slot holds one compact single-lane image
         // and belongs to the lane whose slice of the ring it is, so the pinned footprint is the
-        // lanes=1 budget whatever the lane count (PLAN-tp2-concurrency.md 12.6).
+        // lanes=1 budget whatever the lane count (docs/PLAN-tp2-concurrency.md 12.6).
         const std::uint32_t slots = lanes_ * host_checkpoint_slots_per_lane_;
 
         shard.host_checkpoint_grid_slots = host_checkpoint_grid_slots_;
@@ -2008,7 +2008,7 @@ GenerationResult TP2GenerationCore::Submission::wait(OutputSink* sink,
 }
 
 // ---------------------------------------------------------------------------------------------
-// Multi-lane admission (PLAN-tp2-concurrency.md P1.4)
+// Multi-lane admission (docs/PLAN-tp2-concurrency.md P1.4)
 // ---------------------------------------------------------------------------------------------
 
 // A submission to the multi-lane route never touches the device itself. It appends itself to the
@@ -2172,7 +2172,7 @@ GenerationResult TP2GenerationCore::execute_lane(PendingRequest& pending, std::u
 }
 
 // ---------------------------------------------------------------------------------------------
-// Batched-lane prefix retention (PLAN-tp2-concurrency.md P2.3)
+// Batched-lane prefix retention (docs/PLAN-tp2-concurrency.md P2.3)
 // ---------------------------------------------------------------------------------------------
 //
 // A batched lane owns one KV row, one GDN state slot and one slice of every retention buffer, so
@@ -2439,7 +2439,7 @@ void TP2GenerationCore::invalidate_lane_prefill(std::uint32_t lane) {
     session_invalidate_active(lane);
 }
 // ---------------------------------------------------------------------------------------------
-// Batched plain walk (PLAN-tp2-concurrency.md P1.4c)
+// Batched plain walk (docs/PLAN-tp2-concurrency.md P1.4c)
 // ---------------------------------------------------------------------------------------------
 //
 // One round of this walk runs a single batched decode window for every lane still live. That shared

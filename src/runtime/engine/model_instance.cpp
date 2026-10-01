@@ -107,7 +107,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         if (options.max_concurrency == 1U && requested_concurrency > 1U) {
             std::fprintf(stderr,
                          "[tp2-lane] --max-concurrency %u collapses to 1 lane on the %s route "
-                         "(see PLAN-tp2-concurrency.md)\n",
+                         "(see docs/PLAN-tp2-concurrency.md)\n",
                          requested_concurrency, product::speculative_backend_name(
                                                     options.speculative.backend));
         }

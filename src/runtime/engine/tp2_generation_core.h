@@ -372,7 +372,7 @@ private:
     [[nodiscard]] GenerationResult execute_walk(Request& request, OutputSink* sink,
                                                 const CancellationView& cancellation);
 
-    // Multi-lane admission (PLAN-tp2-concurrency.md P1.4). Only reachable when lanes_ > 1, which the
+    // Multi-lane admission (docs/PLAN-tp2-concurrency.md P1.4). Only reachable when lanes_ > 1, which the
     // constructor keeps for every backend but DFlash v1 (that one collapses to one lane). A submission
     // never touches the device itself: it appends a PendingRequest to the FIFO and then either waits
     // for the batch that picks it up, or - when no driver is active - becomes the driver and forms
@@ -823,7 +823,7 @@ private:
     // a recall, or the tail of a conversation that just decoded - so nothing is copied at all.
     enum class ReuseSource : std::uint8_t { None, DeviceSnapshot, HostCheckpoint, LiveState };
 
-    // Per-lane retention state (PLAN-tp2-concurrency.md P2.3). The single-lane walk drives slot 0;
+    // Per-lane retention state (docs/PLAN-tp2-concurrency.md P2.3). The single-lane walk drives slot 0;
     // the batched executors drive one slot per active lane. Everything a lane needs in order to know
     // what prefix it may reuse lives here, because a lane's device state is its own slot in the
     // shared pools and two lanes must never share a cached lineage.
@@ -900,7 +900,7 @@ private:
     // Host checkpoint ring: the token stride between checkpoints (0 disables the ring, which is
     // what a zero host state-image budget selects), and the next id to hand out. Which checkpoints
     // are usable is decided per request by Shard::HostCheckpoint::valid, not by the id.
-    // Decode width this core was provisioned for (PLAN-tp2-concurrency.md P1.2).
+    // Decode width this core was provisioned for (docs/PLAN-tp2-concurrency.md P1.2).
     std::uint32_t lanes_                      = 1;
     std::uint32_t host_checkpoint_stride_     = 0;
     std::uint32_t host_checkpoint_tail_slots_ = 0;
@@ -908,7 +908,7 @@ private:
     std::uint32_t host_checkpoint_grid_slots_ = 0;
     // Each lane owns this many ring slots, and a slot holds one compact single-lane state image, so
     // the pinned footprint is the lanes=1 budget whatever the lane count
-    // (PLAN-tp2-concurrency.md 12.6).
+    // (docs/PLAN-tp2-concurrency.md 12.6).
     std::uint32_t host_checkpoint_slots_per_lane_ = 0;
     std::uint64_t host_checkpoint_next_id_    = 1;
     // Host-ring writes of the request being served, reported by the NINFER_TP2_TIMING trace.
