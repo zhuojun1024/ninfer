@@ -709,3 +709,34 @@ void forward_tp2_decode_window_batch(TextContext& peer, tp::DevicePair& pair,
   `plain-pair-ring` 的 lane 1 host 恢复路径（本次修复点）仍正常：`[tp2-reuse] lane=1 prompt=2848 cached=2805 shared=2783 replay_split=2783 adopted=0 prefill_end=2805 host=5/34 stride=16384 -> reuse=2560 slot=29 src=host`（slot=29 属 lane 1 的 `[17,34)` 区间）；其答案 `B3: cache_n=2560 prompt_ms=483.3 pred_ms=340.1 n=13 | The invariant is preserved because every writer names the sa` 与 lane 0 的 `A3: cache_n=2560 prompt_ms=243.0 pred_ms=580.3 n=13 | The invariant is preserved because every writer names the sa` 一致，与修复前逐字相同；`plain-pair`/`mtp-pair`/`dflash2-pair` 的 `src=device` 复用与 `mtp-pair`/`dflash2-pair` 的 `reuse=512 slot=8 src=host` 也全部复现。
 - `tp2_sessions` plain 路线（`NINFER_TEST_ARTIFACT=D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer`，`NINFER_TEST_ROUTE=plain`，`_temp/p26_sessions_plain.log`，job pwsh-487）：`unaligned dialogue` 与 `replayed answer`（`reused 70 of 58 prompt tokens`）passed，随后停在**与 HEAD 逐字相同**的既有失败 `FAIL (plain): a conversation behind a shared system prompt diverged from the oracle on its first sample: got [2752 13 198 197 197 92 198 197] expected [467 419 538 13 198 197 197 92]`（`EXIT=1`）⇒ 单 lane（`slot_count() == 1`）路径下新增几何护栏通过且行为不变。
 - 说明：修复只去掉越界偏移、不改变读写的内容语义（writer 与 reader 原本用同一个偏移），故功能行为不变；新增护栏使「ring 分区与 state 几何不一致」在任何 lane 上立即失败而不是静默越界。
+
+### 12.12 审查修复计划的落地（A/B/C 项）与 MTP 多卡 warmup 的 peer arena 泄漏修复（2026-10-01）
+
+逐项施工记录与验证见 `docs/PLAN-tp2-concurrency-review-remediation.md` §11；本节只记结论与对本文档有影响的部分。
+
+#### 落地范围
+- **P0.1＝A2**：批组建/trace/调度全部移入 `drive_lane_queue` 的 `try`，异常走 D4 收窄路径而不是逃出驱动线程。
+- **P0.2＝C2**：多 lane 批次改由核心自持的驱动线程运行（`lane_driver_`，构造时启动、`stop_lane_driver()` 析构停止），`wait_lanes` 只入队并等待自己的 `complete`；`publish_lane` 每 lane 完成即发布 ⇒ 长请求不再扣住同批的短请求（探针：短请求 `done` 从整批等待降到 316–1858 ms，无 499）。
+- **P1.1＝A3**：`build_shard` 增加启动断言（`lane_context_window() + (mtp_enabled_ ? mtp_drafts_ : 0) < per_lane * kPagedKVPageSize`），把「未发布页 = 未初始化 block-table 项」的关系钉死在启动期；`build_shard` 调用点下移到 lane 预算计算之后。
+- **P1.2＝A4+A5**：删 `model_instance.cpp` 的「collapses to 1 lane」死 fprintf（`--spec dflash` 在归一化末尾直接被拒，无路线静默丢 lane）；删 `tp2_generation_core.cpp` 不可达的 `refusal = "route"` 分支。
+- **P1.3＝B2+B5**：`docs/serving.md` 与 `src/serve/serve_options.h:79-83` 的 TP-2 容量口径改为 `tp2_generation_concurrency(max_concurrency)`（1–4 活跃 lane）+ `max_pending_requests` 排队。
+- **P2.1＝C3/A1**：带 tools 的请求不再退化为串行 —— 每 lane 一个 `ToolCallConstraint`，按 lane 的列块（`[width*l, width*(l+1))`）掩码该轮 logits，prefill 首 token 同样掩码；`drive_lane_queue` 的 grammar 拒绝分支删除。
+- **P2.2＝C1**：轮边界动态接纳（`try_pop_lane_queue` + `admit_lane`），空出的 slot 立刻接住批运行期间到达的请求；staging 全部按 `lanes_` 预留。
+- **P3.1＝B3**：MTP 草稿链的图/host profile/AR channel 只在 `lanes_ == 1` 构建，多 lane 启动日志显示 `mtp chain: n/a`。
+- **P3.2＝B6 / P3.3＝B1 / P3.4＝B4**：`build.ps1` 条件化说明、HTTP 线程池容量不变式注释、整轮失败爆炸半径注释，`docs/serving.md` 同步。
+
+#### 新发现并修复：`TextContext::proposal_argmax` 的 peer arena 泄漏（P0.3）
+- 现象：`--spec mtp --max-concurrency 4` 启动 warmup 报 `TP-2 batched verify CUDA Graph replay found a different workspace layout`（`tp2_generation_core.cpp:1551-1553`）；`--max-concurrency 1` 正常，DFlash2 多 lane 正常。
+- 根因：`src/models/qwen3_5/execution/text.cpp:822` 的 `proposal_argmax` 只对本地 arena 取 scope（`:823`），而拆分 proposal head 的分支在 **peer 的 arena** 上分配（`:867`/`:876`/`:878` 以及 `:877` 的 `project` scratch）且 peer 侧无 scope ⇒ 每次调用把 peer 的 bump pointer 抬高约 403,456 B 永不回收。多 lane 路线每轮跑 `max_extent` 个 MTP 链步，`max_extent` 随轮预算变化（warmup 捕获轮 2、重放轮 0）⇒ verify 图捕获的 `arena_begin[1]` 无法复现。
+- 归属：既有缺陷（`text.cpp` 最后一次改动是已提交的 `6a17bb2c`）；同文件其他 peer 分配点（`:494`/`:932`/`:1050`/`:2137`/`:2814`）都有 `auto peer_scope = peer.work_.scope();`，只有 `:858` 漏了。
+- 修复：`:858` 之后补 `auto peer_scope = peer.work_.scope();`（含注释 +5 行）。
+- 与本文档 `:500` 记录的 P2.2c 属同类（链步内的分配让 verify 调用点的 `used()` 漂移），P2.2c 只处理了本地侧（把 `positions` 提到循环外），peer 侧漏了。
+
+#### 验证（2026-10-01）
+- `ninja -C build-win` exit 0（`_temp/fix_build2.log`，`NINFER_TP2_LAYOUT_TRACE` 临时插桩已全部删除）。
+- 门禁（`_temp/fix_gate.log`）：`test.ps1 -Filter 'tp2|tp_device|engine_options|serve_options'` **11/11 通过**，72.51 s（五个 artifact 用例照旧 Skip）。
+- `tp2_forward --artifact …` exit 0（`_temp/fix_forward.log`）；`tp2_load --artifact …` exit 0（`_temp/fix_load.log`）。
+- `tp2_sessions`（`_temp/fix_sessions.log`）与基线 `_temp/p22_sessions.log` 的 `passed/FAIL` 行 **Compare-Object 完全一致**（仍停在既有的 shared-system-prompt 失败）。
+- MTP C=4 `--draft-tokens 2` 双卡冒烟：warmup 通过（`listening on http://127.0.0.1:8099`），两条并发 `/v1/responses`（带 tools 的短请求 + 1729 token 长请求）均 HTTP 200，带 tools 的返回合法 `function_call`；逐步 trace 显示 shard B 水位在链步间恒定（修复前 `81920 → 444416 → 847872`，修复后恒为 `81920`）。
+- MTP C=1 双卡冒烟：启动日志 `mtp chain: graph`、`rendezvous id channels reserved: 24`、HTTP 200 ⇒ P3.1 未破坏单 lane 路线。
+- 上述 P0/P1/P2.1/P2.2/P3 与本次 peer scope 修复均**未提交**，在 work tree（仓库约定：仅在用户要求时提交）。
