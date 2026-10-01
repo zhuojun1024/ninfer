@@ -3,6 +3,7 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer {
 namespace {
@@ -27,6 +28,15 @@ std::array<std::int32_t, 4> normalize_shape(std::initializer_list<std::int32_t> 
         out[i++] = dim;
     }
     return out;
+}
+
+std::string shape_to_string(const std::int32_t* shape) {
+    std::string text = "[";
+    for (int i = 0; i < 4; ++i) {
+        if (i != 0) { text += ','; }
+        text += std::to_string(shape[i]);
+    }
+    return text + "]";
 }
 
 std::int64_t shape_numel(const std::int32_t (&shape)[4]) {
@@ -101,7 +111,9 @@ Tensor Tensor::view(std::initializer_list<std::int32_t> shape) const {
 
     const auto normalized = normalize_shape(shape);
     if (shape_numel(normalized) != numel()) {
-        throw std::invalid_argument("view element count mismatch");
+        throw std::invalid_argument("view element count mismatch: tensor " + shape_to_string(ne) +
+                                    " (numel " + std::to_string(numel()) + ") cannot become " +
+                                    shape_to_string(normalized.data()));
     }
 
     return Tensor(data, dtype, shape);
