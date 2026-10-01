@@ -52,15 +52,16 @@ namespace ninfer::runtime {
 // independently and the two agree exactly.
 class TP2GenerationCore {
 public:
-    // Prefix-reuse device state snapshots per shard: slot 0 is the prefill end, the others are
-    // rewinds behind it. Chat templates render the previous assistant turn and the generation tail
-    // differently, so two consecutive prompts share everything up to a point a little before the
-    // earlier prompt's end. One rewind behind the prefill end covers that gap; every extra slot is
-    // another 73 MiB of resident state per shard, which this context ceiling cannot spare. A prompt
-    // that diverges *deeper* inside the previous prompt - a client that re-renders a shorter
-    // history at a turn boundary - is served by the host checkpoint ring instead, which holds the
-    // same states in pinned host memory and therefore costs no device memory.
-    static constexpr std::size_t kReuseSnapshotCount = 2;
+    // Prefix-reuse device state snapshots per shard: slot 0 is the prefill end. Chat templates render
+    // the previous assistant turn and the generation tail differently, so two consecutive prompts
+    // share everything up to a point a little before the earlier prompt's end, and the boundary that
+    // covers that gap sits one chunk behind the prefill end. That rewind is not worth a device plane:
+    // every slot costs another whole-pool state image per shard (73.4 MiB per lane), and the
+    // host checkpoint ring already holds the same states in pinned host memory, so a prompt that
+    // diverges inside the previous prompt restarts from there through a host copy instead. Slot 0
+    // stays because the session slabs read the prompt-end image out of it (see session_store_active),
+    // which makes this count the floor: one boundary plane, not two.
+    static constexpr std::size_t kReuseSnapshotCount = 1;
     // Extra state slot (beyond the reuse snapshots) holding the pre-verify state of the current MTP
     // round: RecordForReplay advances the live state by the whole window, so the fold must replay the
     // committed columns from this snapshot instead of stacking on an already advanced state.
@@ -272,9 +273,9 @@ private:
         // and builds none of this.
         std::unique_ptr<models::qwen3_5::execution::DFlash2Round> dflash_round;
         // The draft context at the reuse boundaries the GDN snapshots freeze: slot 0 is the prefill
-        // end and slot 1 the rewind behind it (the round-scratch slot 2 is not paired - the verify
-        // never advances the draft ring). The draft cannot be recomputed from the target state, so a
-        // boundary that cannot restore these bytes cannot be offered for reuse.
+        // end (the round-scratch slot is not paired - the verify never advances the draft ring). The
+        // draft cannot be recomputed from the target state, so a boundary that cannot restore these
+        // bytes cannot be offered for reuse.
         std::array<DeviceSpan, kReuseSnapshotCount> dflash_snapshots{};
         std::unique_ptr<DeviceArena> dflash_snapshot_arena;
     };

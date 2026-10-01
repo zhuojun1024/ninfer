@@ -299,6 +299,59 @@
 1. `--max-context` 的**服务端默认值是 8192**（`src/serve/serve_options.h:32`）。第一轮脚本把 `--max-context` 从公共参数里拿掉后，C=4 `--lane-context 32768` 的服务器启动即退（exit 1），stderr 首行 `ninfer-serve: --lane-context must be 0 or at most --max-context`。所以「策略绑定」分支的验收必须显式给 `--max-context 131072`。
 2. **prompt 超过 `--max-context` 时，前端准备阶段先拒绝**（`src/models/qwen3_5/frontend/frontend.cpp:846`、`src/models/qwen3_5/frontend/processor.cpp:935-940` 与 `:1066-1071`），因此核心的**池子绑定分支只在 `(pool_tokens − margin, max_context]` 这个窄带内可达**（带宽 = `margin − (pool_tokens − max_context)`：dflash2 `margin=1`、页对齐余量 0 时正好 1 token；MTP `--draft-tokens 15` 时最多 17 token），实际是防御性分支。对操作员真正有用的是前端那条，本次也给它补了 token 数；由于前端 tokenizer 以 `max_context + 1` 为上限（`encode_rendered_chat(..., impl_->max_context + 1U)`、`EncodeOptions{.max_tokens = encode_limit}`），计数只能给下界，报文因此写 `prompt at least 16385 tokens`。
 
+### 9.6 `kReuseSnapshotCount` 2→1：设备端只留 prefill 末态边界（未提交，m01730）
+
+**动机**：`state_arena = std::make_unique<DeviceArena>((2 + kReuseSnapshotCount) * state_bytes)`（`src/runtime/engine/tp2_generation_core.cpp:836-837`）与 `dflash_snapshot_arena = std::make_unique<DeviceArena>(kReuseSnapshotCount * dflash_image)`（`:1026`）说明每 shard 常驻 `kReuseSnapshotCount + 2` 份整平面 state（live + 各复用边界 + round scratch）与 `kReuseSnapshotCount` 份草稿环。C=4 相对 C=1 的 2168 MiB 里 1334 MiB 是这批快照的账（2 份 state 边界 1174.5 + 1 份草稿环 160），只有约 834 MiB 是多并发本身。
+
+**为什么 1 是下限**：`kRoundScratchSlot = kReuseSnapshotCount`（`src/runtime/engine/tp2_generation_core.h:68`），而 `publish_lane_prefill` 用 `state_snapshots[0]` 存 prefill 末态（`tp2_generation_core.cpp:2514-2525`），slot 0 同时是会话 slab 里 prompt 末态镜像的唯一来源（`session_store_active` → `entry.host_prompt_state`/`entry.host_dflash_prompt`，`:5079-5100`）。再降 0 会让 round scratch 与 prefill 末态抢同一个平面，所以本次只砍 rewind 槽（slot 1..count-1）。
+
+**改动点**（一行常量 + 5 处边界口径）
+
+| 位置 | 改动 |
+|---|---|
+| `src/runtime/engine/tp2_generation_core.h:55-64` | `kReuseSnapshotCount = 2` → `1`，注释改成「rewind 不值一个设备平面：每槽每 shard 又是一份整平面 state，主机 checkpoint 环已持有同一批状态，slot 0 因会话 slab 读 prompt 末态镜像而保留，故 1 是下限」 |
+| `src/runtime/engine/tp2_generation_core.h:274-277` | `dflash_snapshots` 注释去掉「slot 1 是它后面的 rewind」 |
+| `src/runtime/engine/tp2_generation_core.cpp:1016` | 草稿环 arena 注释 "the two reuse boundaries" → "the reuse boundaries" |
+| `src/runtime/engine/tp2_generation_core.cpp:6045-6050`、`:6063` | `[tp2-reuse]` 跟踪里 `cached_boundaries[1]` 的越界读改成循环取最深的 rewind 槽（`rewind_boundary`） |
+| `src/runtime/engine/tp2_generation_core.cpp:6465-6470` | 取消路径 `cached_boundaries[1] = 0` 的越界写改成循环清零 |
+
+**语义后果**
+- rewind 槽的所有循环本来就是 `for (slot = 1; slot < kReuseSnapshotCount; ++slot)`（`:6048`、`:6340`、`:6468`、`:6500`、`:6559`），count=1 时全部空转：既没有设备端 rewind 平面，也没有 `snapshot_at[1]` 对 prefill chunk 的夹紧（`:6500-6503`）。
+- **C=4 上这份平面是死分配**：`release_lane_kv`（`:2664`）在 `lanes_ > 1` 时每个请求终态都被调用，会清 `cached_boundaries` 与 `cached_state_valid`，因此 `scan_lane_reuse`（`:2331-2400`）的整个边界扫描从第二轮起就不进入（trace `src=none`）。C=4 的跨轮复用走 `session_recall`/`session_restore` 主机 slab，与本次改动无关。
+- **C=1 才是唯一语义变化点**（`release_lane_kv` 对 `lanes_ <= 1U` 早退）：落在「上一轮 prompt 末尾一个 chunk 之内、但不等于末态」的复用请求，改由主机 checkpoint 环的 tail 子环给边界（`[mem] host-checkpoints shard N slots 34 (grid 24 + tail 8 + divergence 1 + block 1) x 73.4 MiB | stride 8192 tok`，tail 覆盖末尾 8192 token）。**复用深度不变，只是恢复源从设备快照（D2D）变成 H2D**（73.4 MiB state + 40 MiB 草稿/lane）。
+
+**验收**（`tools/win_port/build.ps1` BUILD_EXIT=0，增量 29–30 s；门禁 `tools/win_port/test.ps1 -Filter 'tp2|tp_device|engine_options|serve_options'` 11/11，71.48 s）
+
+显存（同一 binary 与参数，只差 `--max-concurrency` 与常量；count=1 日志 `_temp/cnt1_c1.err`/`_temp/cnt1_c4.err`，基线 `_temp/s2_c1.err`/`_temp/s2_c4.err`）：
+
+| 项目 MiB | count=2 基线 | count=1 | 差 |
+|---|---|---|---|
+| C=4 shard 0 `state` | 1174.5 | 880.9 | −293.6 |
+| C=4 shard 0 `draft-snap` | 320.0 | 160.0 | −160.0 |
+| C=4 shard 0 `free` | 726.0 | 1180.0 | +454.0 |
+| C=4 shard 1 `state` | 1174.5 | 880.9 | −293.6 |
+| C=4 shard 1 `free` | 1424.0 | 1718.0 | +294.0 |
+| **C=4 两卡合计** | — | — | **+748** |
+| C=1 shard 0 `state`/`draft-snap`/`free` | 293.6/80.0/1996.0 | 220.2/40.0/2108.0 | +112 |
+| C=1 shard 1 `state`/`free` | 293.6/2322.0 | 220.2/2394.0 | +72 |
+| **C=1 两卡合计** | — | — | **+184** |
+
+⇒ **C=1→C=4 的增量从 2168 MiB 降到 1420 MiB**（DFlash2 round 行同步缩小：C=1 `ring 40.0 | context 90.3 | frame 3.4 | proposal 3.3` → C=4 `ring 160.0 | context 211.2 | frame 12.1 | proposal 4.0`）。
+
+行为（复用深度不变，A/B 同一探针 `_temp/cnt1_rewind.mjs`）：
+
+| 场景 | count=2 | count=1 |
+|---|---|---|
+| C=1 rewind 带（R2 = FILLER×285 + 另一条尾句，5431 tok / shared 5418） | `cached=5120`（707 ms），trace `reuse=5120 slot=1 src=device` | `cached=5120`（648 ms），trace `reuse=5120 slot=28 src=host`（`host=5/34 stride=8192`） |
+| C=4 双轮 recall（`_temp/s1_diag.mjs` 探针） | `cached=5749`（511 ms） | `cached=5749`（470 ms） |
+
+双卡 artifact 链（`_temp/run_cnt1_artifact.ps1`）：`tp2_forward_test` exit 0（`duplicated-lane control: lane_gap=0 solo_gap=2.03125 batch_lane0_gap=0 argmax_mismatches=0`；两 lane verify `max_logit_diff=2.03125 argmax_mismatches=1 near_tie_flips=1`，与基线逐字相同）；`tp2_load_test` exit 0；`tp2_sessions_test` 完整日志里只有一条 FAIL——plain divergence 用例，输出与 HEAD 基线逐字节相同（`docs/tp2-dual-5060ti-worklog.md:6549-6554`）⇒ 无回归（本次 sessions 运行是 plain 路线，dflash2 用例未跑）。
+
+**未覆盖**
+- rewind 复用的恢复从 D2D 变 H2D，本次只证明复用深度与端到端延迟同档，未做 PCIe 带宽级分项计时。
+- vision prompt 的 chunk 夹紧语义与纯文本不同（`:6490-6503` 的 vision cap 与 snapshot clamp 顺序），未构造 vision 复用用例。
+- 回退方式：常量改回 2 并重建（数组尺寸与槽循环自动跟随）。
+
 ---
 
 ## 10. 未决问题与已知限制
@@ -307,4 +360,5 @@
 - ~~`docs/maintainer/engine-architecture.md:41` 的 TP-2 例外说明~~（**已做**，m01348 第 3 项）：见 `docs/maintainer/engine-architecture.md:45-51`。
 - 碎片化的量化（不同请求尺寸序列下可容纳的最大请求）尚未测量。
 - **已知代价（S1 引入）**：每个请求终态都会走 `retire_lane_session` → `session_store_active`，把该 lane 的 frontier KV + state 镜像 D2H 到 host slab（满上下文时约 73.4 MiB/shard），下一轮复用再经 `session_recall` → `session_restore` 拷回新页。这是「页可立即易主」的直接后果，多轮会话的吞吐代价待量化（R4）。
-- **仍未验证**：单卡 `--devices 0` 半项（TP-2 artifact 是双 shard 布局，不适用）；碎片化的量化（不同请求尺寸序列下可容纳的最大请求）；R4 的多轮会话吞吐代价。
+- **已知代价（count=1，未提交，m01730）**：设备端不再保留 rewind 边界（`kReuseSnapshotCount = 1`），C=1 落在「上一轮 prompt 末 chunk 内」的复用改由主机 checkpoint 环的 tail 子环提供边界，恢复走 H2D（73.4 + 40 MiB/lane）；复用深度实测不变。C=4 不受影响（该平面本就是死分配）。回退：`src/runtime/engine/tp2_generation_core.h:64` 常量改回 2。详见 §9.6。
+- **仍未验证**：单卡 `--devices 0` 半项（TP-2 artifact 是双 shard 布局，不适用）；碎片化的量化（不同请求尺寸序列下可容纳的最大请求）；R4 的多轮会话吞吐代价；vision prompt 的 rewind 复用用例。

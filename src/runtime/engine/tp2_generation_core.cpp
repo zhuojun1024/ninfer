@@ -1013,7 +1013,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                      static_cast<double>(shard.dflash_round->context_bytes()) / 1048576.0,
                      static_cast<double>(shard.dflash_round->frame_bytes()) / 1048576.0,
                      static_cast<double>(proposal_bytes) / 1048576.0);
-        // The draft context at the two reuse boundaries the GDN snapshots freeze. It is one ring per
+        // The draft context at the reuse boundaries the GDN snapshots freeze. It is one ring per
         // boundary, allocated here because only the round knows the ring's image size; the state
         // arena itself holds no draft slot (see Shard::dflash_snapshots). Each boundary carries one
         // compact ring image per lane, so a snapshot is lanes_ images and a lane addresses its own
@@ -6042,6 +6042,12 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         for (const auto& checkpoint : shard_a_.host_checkpoints) {
             valid_checkpoints += checkpoint.valid[lane] ? 1U : 0U;
         }
+        // The deepest rewind slot this lane still carries. A configuration that keeps no rewind slot
+        // reports zero instead of reading past the boundary array.
+        std::uint32_t rewind_boundary = 0;
+        for (std::size_t slot = 1; slot < kReuseSnapshotCount; ++slot) {
+            rewind_boundary = std::max(rewind_boundary, lane_state.cached_boundaries[slot]);
+        }
         const char* source = lane_state.reuse_source == ReuseSource::HostCheckpoint ? "host"
                              : lane_state.reuse_source == ReuseSource::LiveState    ? "live"
                              : lane_state.reuse_source == ReuseSource::DeviceSnapshot ? "device"
@@ -6054,7 +6060,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                      "slot=%zu src=%s\n",
                      prompt_tokens, lane_state.cached_prompt_tokens.size(), shared_prefix,
                      adoption.divergence, adoption.adopted ? 1 : 0, previous_prompt,
-                     lane_state.cached_boundaries[0], lane_state.cached_boundaries[1], valid_checkpoints,
+                     lane_state.cached_boundaries[0], rewind_boundary, valid_checkpoints,
                      shard_a_.host_checkpoints.size(), host_checkpoint_stride_, reuse, reuse_slot,
                      source);
     }
@@ -6457,7 +6463,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 snapshot_dflash_state(shard_a_, 0, lane);
                 snapshot_dflash_state(shard_b_, 0, lane);
                 lane_state.cached_boundaries[0] = t0;
-                lane_state.cached_boundaries[1] = 0;
+                // A cancelled walk reached no rewind boundary, so every rewind slot this lane still
+                // carried is dropped: the slot above is where the walk stopped.
+                for (std::size_t slot = 1; slot < kReuseSnapshotCount; ++slot) {
+                    lane_state.cached_boundaries[slot] = 0;
+                }
                 lane_state.cached_state_valid   = true;
                 // A prefill chunk commits its own draft window inside the forward, so this is a
                 // no-op; it is here so the invariant is stated once: nothing is published with an
