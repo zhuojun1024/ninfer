@@ -32,6 +32,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace ninfer {
@@ -374,10 +375,10 @@ private:
 
     // Multi-lane admission (docs/PLAN-tp2-concurrency.md P1.4). Only reachable when lanes_ > 1, which the
     // constructor keeps for every backend but DFlash v1 (that one collapses to one lane). A submission
-    // never touches the device itself: it appends a PendingRequest to the FIFO and then either waits
-    // for the batch that picks it up, or - when no driver is active - becomes the driver and forms
-    // batches of at most lanes_ from the queue head. The driver holds `execution_mutex_`, so
-    // "exactly one thread drives the devices" survives the split, and admission order is FIFO.
+    // never touches the device itself: it appends a PendingRequest to the FIFO and waits for the
+    // core's own driver thread to retire it. The driver forms batches of at most lanes_ from the
+    // queue head and holds `execution_mutex_` while it runs them, so "exactly one thread drives the
+    // devices" survives the split and admission order is FIFO.
     struct PendingRequest {
         std::unique_ptr<Request> request;
         OutputSink* sink = nullptr;
@@ -388,18 +389,28 @@ private:
     };
     [[nodiscard]] GenerationResult wait_lanes(std::unique_ptr<Request> request, OutputSink* sink,
                                               const CancellationView& cancellation);
+    // P0.2: retire one member the moment its own lane finishes instead of publishing the whole batch
+    // at once. Called by the batch executors' finalize, by the serial lane walk, and as a safety net
+    // by the driver. It is the only place `complete` is set for a request that ran.
+    void publish_lane(PendingRequest& pending);
     void drive_lane_queue();
-    [[nodiscard]] GenerationResult execute_lane(PendingRequest& pending, std::uint32_t lane);
+    // The driver thread's lifetime: started by the constructor when lanes_ > 1, stopped and joined by
+    // the destructor, which fails whatever is still queued so no submitter waits forever.
+    void stop_lane_driver();
+    // P2.2: take one request that arrived while a batch was running, or null when the queue is empty.
+    // The executors call this while the driver holds `execution_mutex_`, which is the order
+    // execution_mutex_ -> lane_queue_mutex_ the rest of the core keeps.
+    std::shared_ptr<PendingRequest> try_pop_lane_queue();
     // P1.4c: one shared decode round for the whole batch, which is the only path that turns
     // concurrency into throughput. Prefill stays serial per lane, each on its own KV row and GDN
-    // slot; only the decode rounds are shared. Reachable only for a plain, unconstrained, text-only
-    // group, and the constructor keeps lanes_ > 1 to the plain route already.
-    void execute_plain_batch(const std::vector<std::shared_ptr<PendingRequest>>& batch);
+    // slot; only the decode rounds are shared. Every admitted member is batched, including one that
+    // carries a tool grammar (P2.1) or media (P2.4).
+    void execute_plain_batch(std::vector<std::shared_ptr<PendingRequest>>& batch);
     // P2.1c: the same shared-round shape as execute_plain_batch, but each round runs one masked-draft
     // proposal over the whole batch and one batched target verify, then accepts and folds per lane.
     // Reachable only for a DFlash2 group with no tool grammar and no media; the plain route keeps the
     // function above, and MTP keeps the serial walk (its draft chain is still single-row).
-    void execute_spec_batch(const std::vector<std::shared_ptr<PendingRequest>>& batch);
+    void execute_spec_batch(std::vector<std::shared_ptr<PendingRequest>>& batch);
 
     // The turn this lineage generated, adopted when the client's rendering of it is the same turn.
     // The template trims the reasoning and the content and writes its own separators between them,
@@ -438,6 +449,8 @@ private:
     // token short of it. A batched MTP route also runs its draft chain a few columns past the
     // longest lane's position, so it keeps that write tail inside the lane's own pages too (P2.1b).
     // The single-lane route keeps advertising `options_.max_context` unchanged.
+    // build_shard asserts that this window plus the route's write tail still fits the pages
+    // published to the lane's execution row.
     [[nodiscard]] std::uint32_t lane_context_window() const noexcept {
         if (lanes_ == 1U) { return options_.max_context; }
         const std::uint32_t margin = mtp_enabled_ ? mtp_drafts_ + 2U : 1U;
@@ -946,7 +959,10 @@ private:
     std::deque<std::shared_ptr<PendingRequest>> lane_queue_;
     std::mutex lane_queue_mutex_;
     std::condition_variable lane_queue_cv_;
-    bool lane_driver_active_ = false;
+    // P0.2: the driver is a thread the core owns, not the submitter that found the queue idle.
+    // `lane_driver_stop_` is set once, by the destructor, which then joins the thread.
+    std::thread lane_driver_;
+    bool lane_driver_stop_ = false;
     std::uint32_t lane_token_capacity_ = 0;
     // The lane the batch member currently driving is bound to. It only reaches the non-batch windows,
     // which take it as an argument; the driver holds `execution_mutex_`, so there is exactly one

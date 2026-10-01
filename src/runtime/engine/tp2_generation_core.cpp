@@ -430,13 +430,14 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
                      session_capacity_ == 0 ? "disabled" : "enabled");
     }
 
-    build_shard(shard_a_, 0);
-    build_shard(shard_b_, 1);
     // The KV pool is one physical allocation split statically across the lanes, so a lane owns
     // `per_lane` pages and the context ceiling a request may be admitted against is that lane's
     // share of the pool, not the whole of it. The last lane takes the page remainder, so this is
     // the guaranteed minimum. Single-lane keeps reading options_.max_context directly: the page
     // rounding above must not widen the ceiling it has always advertised.
+    //
+    // This runs before `build_shard` because build_shard asserts that the split it publishes and
+    // the window this derives are the same budget (lane_context_window()).
     if (lanes_ > 1) {
         const std::uint32_t pages_per_lane = pages_for_tokens(options_.max_context) / lanes_;
         lane_token_capacity_ = pages_per_lane * static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -446,6 +447,9 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         batch_lane_host_ = std::make_unique<PinnedHostBuffer>(
             5 * static_cast<std::size_t>(lanes_) * sizeof(std::int32_t), true);
     }
+
+    build_shard(shard_a_, 0);
+    build_shard(shard_b_, 1);
     if (session_capacity_ != 0) {
         // Report the budget in the unit an operator sizes against: full-context conversations per
         // shard. The MTP layer's own slab is not counted, so shard 0 holds slightly fewer.
@@ -551,7 +555,11 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
             }
         }
     }
-    if (mtp_enabled_) {
+    // The draft chain is replayed only by the single-lane serial walk (execute_walk ->
+    // mtp_propose_window). The multi-lane route runs its MTP steps through the batched entry points,
+    // so building these profiles and reserving their rendezvous channels there is dead weight
+    // (P3.1). The same gate keeps the startup log from advertising a chain the run never uses.
+    if (mtp_enabled_ && lanes_ == 1U) {
         // The draft chain is the same kind of object as the verify window: one captured sequence per
         // envelope bucket whose only per-round inputs are the anchor token and its position scalars.
         // They reach it through this pinned [anchor, position, position+1, drafts(K)] buffer, which
@@ -651,14 +659,16 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
                      verify_batch_mode_ == StepLaunchMode::Graph        ? "graph"
                      : verify_batch_mode_ == StepLaunchMode::EagerBucket ? "eager(bucket)"
                                                                         : "eager(exact)",
-                     mtp_chain_mode_ == StepLaunchMode::Graph        ? "graph"
+                     (!mtp_enabled_ || lanes_ > 1U)                   ? "n/a"
+                     : mtp_chain_mode_ == StepLaunchMode::Graph        ? "graph"
                      : mtp_chain_mode_ == StepLaunchMode::EagerBucket ? "eager(bucket)"
                                                                      : "eager(exact)");
     }
 
     // The rendezvous id space is one channel per captured graph, and the bucket sets above are the
-    // complete set of graphs that can ever be captured (single- and multi-lane verify windows, MTP
-    // draft chain, single- and multi-lane plain decode steps). Reserve them all: the multi-lane
+    // complete set of graphs that can ever be captured (single- and multi-lane verify windows, the
+    // single-lane MTP draft chain, single- and multi-lane plain decode steps). Reserve them all: the
+    // multi-lane
     // families alone are one graph per (bucket, lane count), far past the fixed 16 default, and a
     // bucket that cannot get a channel fails every later request that needs it.
     pair_.reserve_ar_channels(verify_graphs_.size() + verify_batch_graphs_.size() +
@@ -676,12 +686,35 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
                              .media_preprocess_threads = options.media_preprocess_threads,
                              .vision_item_tokens       = options.vision_item_tokens}));
     load_seconds_ = std::chrono::duration<double>(Clock::now() - load_start).count();
+    // P0.2: the multi-lane route runs its batches on a core-owned driver thread, never on the
+    // submitter's. A submitter that drove its own batch would have to run it to the end before it
+    // could return, which is exactly what withheld a finished response behind a slower peer.
+    if (lanes_ > 1U) { lane_driver_ = std::thread([this] { drive_lane_queue(); }); }
 }
 
 TP2GenerationCore::~TP2GenerationCore() {
+    stop_lane_driver();
     // The catalog's host KV slabs are suballocations of the host arenas, so the entries have to be
     // released before the arenas they were taken from.
     sessions_.clear();
+}
+
+void TP2GenerationCore::stop_lane_driver() {
+    if (!lane_driver_.joinable()) { return; }
+    {
+        std::unique_lock<std::mutex> queue(lane_queue_mutex_);
+        lane_driver_stop_ = true;
+        // Whoever is still queued will never be picked up: this is the last moment anything can
+        // publish a result for it, so fail it here instead of leaving its submitter waiting.
+        for (auto& pending : lane_queue_) {
+            pending->failure = std::make_exception_ptr(RequestError(
+                RequestErrorKind::Unavailable, "TP-2 driver stopped before this request ran"));
+            pending->complete = true;
+        }
+        lane_queue_.clear();
+        lane_queue_cv_.notify_all();
+    }
+    lane_driver_.join();
 }
 
 void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
@@ -1028,6 +1061,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     // the last lane takes the remainder so every page is assigned exactly once. Phase 1 has no
     // backfill and no preemption, so a lane can never need another lane's pages; the cost is that
     // each lane's context is divided by the lane count (--kv-capacity is the machine total).
+    // The admitted window is bound to this split: see the assertion below and lane_context_window().
     {
         auto& pool   = shard.decoder->text_kv.page_pool();
         auto& tables = shard.decoder->text_kv.execution_tables();
@@ -1037,6 +1071,21 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
             throw std::logic_error(
                 "TP-2 KV budget cannot give every lane a page; lower --max-concurrency or raise "
                 "--max-context");
+        }
+        // Each execution row is published over only `count` pages while its logical capacity is the
+        // whole context, and the device arena is not zeroed: a request admitted past the published
+        // range would read an uninitialized block-table entry and write another lane's physical
+        // pages. Nothing else checks that relation (A3 of
+        // docs/PLAN-tp2-concurrency-review-remediation.md), so pin it here and fail at startup
+        // rather than on the first over-long request. See lane_context_window().
+        if (lanes_ > 1U) {
+            const std::uint32_t lane_pages_tokens =
+                per_lane * static_cast<std::uint32_t>(kPagedKVPageSize);
+            const std::uint32_t write_tail = mtp_enabled_ ? mtp_drafts_ : 0U;
+            if (lane_context_window() + write_tail >= lane_pages_tokens) {
+                throw std::logic_error(
+                    "TP-2 lane context window exceeds the pages published to its execution row");
+            }
         }
         shard.device.bind_to_current_thread();
         shard.kv_lane_pages.resize(static_cast<std::size_t>(lanes));
@@ -1800,6 +1849,11 @@ std::vector<TokenId> TP2GenerationCore::mtp_propose_window(Shard& shard, Tensor&
                                                            std::int32_t anchor,
                                                            std::uint32_t position,
                                                            DeviceArena& ws) {
+    // The chain exists only on the single-lane MTP route (P3.1); the multi-lane route never calls
+    // this, and a future caller that does gets a diagnostic instead of a null dereference.
+    if (mtp_chain_host_ == nullptr) {
+        throw std::logic_error("TP-2 MTP chain is only built for the single-lane MTP route");
+    }
     // Every per-round input reaches the chain through this pinned buffer: [anchor(1), position(1),
     // position+1(1), drafts(K)]. The capture re-reads it through memcpy nodes on every replay and
     // the chain publishes its drafts back into the trailing slots.
@@ -1995,8 +2049,8 @@ GenerationResult TP2GenerationCore::Submission::wait(OutputSink* sink,
             "GenerationHandle wait sink does not match its submitted consumer mode");
     }
     // The multi-lane route owns its own admission: the request joins the core's FIFO instead of
-    // taking the device here, and whichever thread drives the batch that picks it up holds
-    // `execution_mutex_` for the whole batch. The single-lane route keeps the direct hand-off.
+    // taking the device here, and the core's driver thread holds `execution_mutex_` while it runs
+    // the batch that picks it up. The single-lane route keeps the direct hand-off.
     if (owner_->lanes_ > 1) {
         return owner_->wait_lanes(std::move(request_), sink, cancellation);
     }
@@ -2007,16 +2061,35 @@ GenerationResult TP2GenerationCore::Submission::wait(OutputSink* sink,
     return owner_->execute(*request_, sink, cancellation);
 }
 
+namespace {
+
+// Env-gated lane trace: the same switch the driver's batch line reads, so one env var turns the
+// whole per-lane story on. It lives here, above the driver, because drive_lane_queue prints the
+// batch line this switch gates.
+bool lane_trace_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("NINFER_TP2_LANE_TRACE");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------------------------
 // Multi-lane admission (docs/PLAN-tp2-concurrency.md P1.4)
 // ---------------------------------------------------------------------------------------------
 
 // A submission to the multi-lane route never touches the device itself. It appends itself to the
-// FIFO and then either becomes the driver - the one thread allowed past `execution_mutex_` - or
-// waits for the batch that picks it up. The driver forms batches of at most `lanes_` from the
-// queue head, so admission is FIFO and no lane is ever handed a request younger than one still
-// waiting. A request cancelled while queued is not skipped: it enters the walk, whose first
-// cancellation check returns a Cancelled result with the proper preview state.
+// FIFO and waits for the core's own driver thread to retire it. The driver forms batches of at most
+// `lanes_` from the queue head, so admission is FIFO and no lane is ever handed a request younger
+// than one still waiting. A request cancelled while queued is not skipped: it enters the walk, whose
+// first cancellation check returns a Cancelled result with the proper preview state.
+//
+// P0.2: the submitter is never the driver, and each member is retired the moment its own lane
+// finishes (publish_lane). Together those rules stop a finished request from waiting behind a batch
+// it does not depend on, which is what used to hold a 773 ms walk for four minutes until the client
+// disconnected first (HTTP 499).
 GenerationResult TP2GenerationCore::wait_lanes(std::unique_ptr<Request> request, OutputSink* sink,
                                                const CancellationView& cancellation) {
     auto pending          = std::make_shared<PendingRequest>();
@@ -2024,105 +2097,101 @@ GenerationResult TP2GenerationCore::wait_lanes(std::unique_ptr<Request> request,
     pending->sink         = sink;
     pending->cancellation = cancellation;
     const std::shared_ptr<PendingRequest> mine = pending;
-    bool drives = false;
     {
         std::unique_lock<std::mutex> queue(lane_queue_mutex_);
         lane_queue_.push_back(std::move(pending));
-        // Wake the driver's batch-formation window: this enqueue is exactly the arrival it is
+        // Wake the driver thread's batch-formation window: this enqueue is exactly the arrival it is
         // waiting for before it commits to a batch.
         lane_queue_cv_.notify_all();
-        if (lane_driver_active_) {
-            lane_queue_cv_.wait(queue, [&] { return mine->complete; });
-        } else {
-            // The thread that found no driver drives. It covers every waiter behind it, including
-            // whatever arrives while it runs: those requests join batches it has not formed yet.
-            lane_driver_active_ = true;
-            drives              = true;
-        }
-    }
-    if (drives) {
-        // The driver is the only thread past this lock for as long as it drives, which is the
-        // invariant the single-lane route states by holding it inside execute().
-        std::unique_lock<std::mutex> device(execution_mutex_);
-        drive_lane_queue();
+        // P0.2: the submitter never drives. It waits for its own member only, so a request whose
+        // lane finishes early returns immediately even while the rest of its batch keeps decoding.
+        lane_queue_cv_.wait(queue, [&] { return mine->complete; });
     }
     if (mine->failure != nullptr) { std::rethrow_exception(mine->failure); }
     return std::move(mine->result);
 }
 
-// How long a driver that found the queue short of the batch size waits for peers to arrive. A
-// submission becomes the driver the instant it enqueues, so without this window a burst of requests
-// that are already inside submit() would still run one at a time: each would drain its own batch
-// before the next one landed. The window only delays a batch that is not yet full, and the batch it
-// delays would have run for hundreds of milliseconds anyway.
+// How long the driver thread waits for peers to arrive once it has found the queue non-empty. A
+// submission only wakes the driver, so without this window a burst of requests that are already
+// inside submit() would still run one at a time: each would drain its own batch before the next one
+// landed. The window only delays a batch that is not yet full, and the batch it delays would have
+// run for hundreds of milliseconds anyway.
 constexpr std::chrono::microseconds kBatchFormationWindow{3000};
 
-// The driver loop. Each pass takes the oldest lanes_ requests, runs them, publishes their results
-// and immediately looks for work that arrived in the meantime, so the queue drains while its owner
-// is still inside this call.
+// Retire one member. The result and any streamed preview are already in place when this is called,
+// so setting `complete` under the queue lock and waking the waiters is the whole hand-off.
+void TP2GenerationCore::publish_lane(PendingRequest& pending) {
+    // Read the count before `complete` is visible: the submitter owns the result from the moment it
+    // wakes, and this thread must not touch it afterwards.
+    const std::size_t tokens = pending.result.generated_token_ids.size();
+    std::size_t queued       = 0;
+    {
+        std::unique_lock<std::mutex> queue(lane_queue_mutex_);
+        pending.complete = true;
+        queued           = lane_queue_.size();
+        lane_queue_cv_.notify_all();
+    }
+    static const bool lane_trace = [] {
+        const char* env = std::getenv("NINFER_TP2_LANE_TRACE");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (lane_trace) {
+        std::fprintf(stderr, "[tp2-lane] publish tokens=%zu queued=%zu\n", tokens, queued);
+    }
+}
+
+// The driver thread's loop. Each pass takes the oldest lanes_ requests, runs them on the devices,
+// and immediately looks for work that arrived in the meantime. A member is retired by its own
+// lane's finalize, so the end of the batch never gates a member's response.
 void TP2GenerationCore::drive_lane_queue() {
     for (;;) {
         std::vector<std::shared_ptr<PendingRequest>> batch;
-        batch.reserve(lanes_);
         {
             std::unique_lock<std::mutex> queue(lane_queue_mutex_);
-            if (lane_queue_.size() < lanes_) {
-                lane_queue_cv_.wait_for(queue, kBatchFormationWindow,
-                                        [&] { return lane_queue_.size() >= lanes_; });
+            if (lane_queue_.empty()) {
+                // Idle: sleep until a submission arrives rather than polling the queue.
+                lane_queue_cv_.wait(queue,
+                                    [&] { return lane_driver_stop_ || !lane_queue_.empty(); });
+                if (lane_queue_.empty()) { return; } // the destructor asked the driver to stop
+                // Give the rest of the burst that is already inside submit() the same window the
+                // leader-driver used to give it, so it lands in this batch.
+                lane_queue_cv_.wait_for(queue, kBatchFormationWindow);
             }
+            batch.reserve(lanes_);
             while (batch.size() < lanes_ && !lane_queue_.empty()) {
                 batch.push_back(std::move(lane_queue_.front()));
                 lane_queue_.pop_front();
             }
-            if (batch.empty()) {
-                lane_driver_active_ = false;
-                lane_queue_cv_.notify_all();
-                return;
-            }
         }
-        // Reachable batched shapes at lanes_ > 1: the plain route, MTP and DFlash2. Only the
-        // legacy DFlash backend collapses to one lane in the constructor.
+        if (batch.empty()) {
+            if (lane_driver_stop_) { return; }
+            continue;
+        }
+        // Reachable batched shapes on this route: the plain route, MTP and DFlash2. --spec dflash
+        // is rejected at construction, so there is no route refusal left to test: every batch that
+        // reaches this loop is batchable.
         // A multimodal member no longer forces the serial lane walk (P2.4): the batch prefills one
         // lane at a time, so that lane's Vision session runs on the single startup arena exactly as
-        // the serial walk's does. A tool-call grammar still refuses, because the constraint is a
-        // mask over one decode round's logits and the batched step carries no per-lane mask.
-        bool batchable         = lanes_ > 1;
-        const char* refusal    = batchable ? nullptr : "route";
-        if (batchable) {
-            for (const auto& member : batch) {
-                const auto& data = qwen::PreparedPromptAccess::view(member->request->prompt);
-                if (data.tool_call_output != nullptr) {
-                    batchable = false;
-                    refusal   = "grammar";
-                    break;
-                }
-            }
-        }
-        static const bool lane_trace = [] {
-            const char* env = std::getenv("NINFER_TP2_LANE_TRACE");
-            return env != nullptr && env[0] == '1';
-        }();
-        if (lane_trace) {
-            std::fprintf(stderr, "[tp2-lane] batch=%zu capacity=%u path=%s%s\n", batch.size(),
-                         static_cast<unsigned>(lanes_), batchable ? "batched" : "serial",
-                         refusal != nullptr ? refusal : "");
-        }
+        // the serial walk's does.
+        // P2.1: a tool-call grammar no longer refuses the batch either. Each executor keeps one
+        // constraint per lane and masks that lane's own columns of the round's logits, so a request
+        // carrying tools takes the same batched route as one that does not.
+        // P0.1: batch formation is inside the try. Reading a member's prepared prompt can throw (an
+        // empty prompt is an invalid_argument), and with the driver on its own thread that exception
+        // would otherwise escape the loop and abort the process. Here it fails this batch whole,
+        // which is what the D4 whole-batch failure rule already means.
+        std::unique_lock<std::mutex> device(execution_mutex_);
         try {
-            if (batchable) {
-                // Writes every member's result in place. Both speculative routes drive their own
-                // batched proposal/verify/accept round; the plain route decodes one token per lane.
-                if (dflash2_enabled_ || mtp_enabled_) {
-                    execute_spec_batch(batch);
-                } else {
-                    execute_plain_batch(batch);
-                }
+            if (lane_trace_enabled()) {
+                std::fprintf(stderr, "[tp2-lane] batch=%zu capacity=%u path=batched\n", batch.size(),
+                             static_cast<unsigned>(lanes_));
+            }
+            // Writes every member's result in place. Both speculative routes drive their own batched
+            // proposal/verify/accept round; the plain route decodes one token per lane.
+            if (dflash2_enabled_ || mtp_enabled_) {
+                execute_spec_batch(batch);
             } else {
-                // P1.4a runs one lane of the batch at a time; the state machine and admission are
-                // already the shape the batched round needs.
-                for (std::size_t lane = 0; lane < batch.size(); ++lane) {
-                    batch[lane]->result =
-                        execute_lane(*batch[lane], static_cast<std::uint32_t>(lane));
-                }
+                execute_plain_batch(batch);
             }
         } catch (...) {
             // D4: the batch commits or fails whole. A lane that already finished its own walk is
@@ -2140,35 +2209,28 @@ void TP2GenerationCore::drive_lane_queue() {
             } catch (...) {
                 std::fprintf(stderr, "[tp2-lane] batch of %zu failed: unknown error\n", batch.size());
             }
-            // A failed batch leaves every lane's device state where the catalog cannot name it.
+            // A failed batch leaves every lane's device state where the catalog cannot name it. The
+            // blast radius is therefore the whole lane set, not the lane that raised: a round is one
+            // collective, so a mid-round failure (an allreduce stall above all) can desync a lane that
+            // never raised, and the KV/GDN images of the others were written by a partially executed
+            // round. Discarding every lane's recall claim and host checkpoints costs a re-prefill;
+            // guessing which lanes are still sound would cost correctness (P3.4/B4, docs/serving.md).
             session_invalidate_all();
-            for (auto& member : batch) { member->failure = failure; }
-        }
-        {
+            // D4 narrowed by P0.2: a member whose lane already retired keeps the result it published
+            // - that lane committed, and its submitter may already be gone - so only the members
+            // still running take the failure. Writing `failure` under the queue lock before `complete`
+            // is set is what lets a submitter observe both without a race.
             std::unique_lock<std::mutex> queue(lane_queue_mutex_);
-            for (auto& member : batch) { member->complete = true; }
-            lane_queue_cv_.notify_all();
-            if (lane_queue_.empty()) {
-                lane_driver_active_ = false;
-                lane_queue_cv_.notify_all();
-                return;
+            for (auto& member : batch) {
+                if (!member->complete) { member->failure = failure; }
             }
         }
+        // Safety net: an executor that abandoned a lane before its own finalize still has to wake
+        // that member's submitter, or the request would wait for a result nobody will publish.
+        for (auto& member : batch) {
+            if (!member->complete) { publish_lane(*member); }
+        }
     }
-}
-
-// Bind the lane's own execution resources, then run the walk. The paged-KV execution row reaches
-// the non-batch windows through `active_lane_`, and the GDN slot below is both the state this lane's
-// walk starts from and the one it updates in place. That state is zeroed by the walk itself, so a
-// lane never inherits the recurrence of whatever ran on it before.
-GenerationResult TP2GenerationCore::execute_lane(PendingRequest& pending, std::uint32_t lane) {
-    Shard* const shards[2] = {&shard_a_, &shard_b_};
-    active_lane_           = static_cast<std::int32_t>(lane);
-    for (Shard* shard : shards) {
-        shard->device.bind_to_current_thread();
-        shard->context->set_linear_state_slots(active_lane_, active_lane_);
-    }
-    return execute(*pending.request, pending.sink, pending.cancellation);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2438,6 +2500,49 @@ void TP2GenerationCore::invalidate_lane_prefill(std::uint32_t lane) {
     lane_state.live_state_valid = false;
     session_invalidate_active(lane);
 }
+
+namespace {
+
+// P2.1: one lane's tool-call grammar inside a batched round. The serial walk keeps a single
+// constraint for its single lane; a batch keeps one per admitted lane, each fed from its own lane's
+// published text, so a round can mix grammar-constrained and unconstrained lanes.
+struct LaneGrammar {
+    std::shared_ptr<qwen::frontend::ToolCallConstraint> constraint;
+    std::size_t fed = 0;
+};
+
+// Feeds a lane's newly published text to its constraint, the way the serial walk's
+// constraint_advance() does.
+void grammar_advance(LaneGrammar& grammar, const TP2GenerationCore::Request& request) {
+    if (grammar.constraint == nullptr) {
+        return;
+    }
+    const std::string_view raw = request.output.raw_content_text();
+    if (raw.size() > grammar.fed) {
+        grammar.constraint->feed(raw.substr(grammar.fed));
+        grammar.fed = raw.size();
+    }
+}
+
+// True while this lane's tokens must obey its declared-name grammar: the request carries a tool
+// contract and the lane is not inside a reasoning block (the serial walk's constraint_live()).
+bool grammar_live(const LaneGrammar& grammar, const TP2GenerationCore::Request& request) {
+    return grammar.constraint != nullptr && !request.output.in_reasoning();
+}
+
+}  // namespace
+
+// P2.2: one request that arrived while a batch was running. The caller holds `execution_mutex_`
+// (the driver takes it around every executor), so the lock order execution_mutex_ ->
+// lane_queue_mutex_ holds; the queue itself is only ever touched under its own lock.
+std::shared_ptr<TP2GenerationCore::PendingRequest> TP2GenerationCore::try_pop_lane_queue() {
+    std::unique_lock<std::mutex> queue(lane_queue_mutex_);
+    if (lane_queue_.empty()) { return nullptr; }
+    std::shared_ptr<PendingRequest> pending = std::move(lane_queue_.front());
+    lane_queue_.pop_front();
+    return pending;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Batched plain walk (docs/PLAN-tp2-concurrency.md P1.4c)
 // ---------------------------------------------------------------------------------------------
@@ -2446,13 +2551,13 @@ void TP2GenerationCore::invalidate_lane_prefill(std::uint32_t lane) {
 // forward is where the throughput comes from: a single-lane step is weight-stream bound, so two
 // lanes cost one weight pass instead of two.
 //
-// Reachability: the driver routes a batch here only on the plain route, and only when no member
-// carries a tool grammar or media; the speculative routes run execute_spec_batch instead. Anything
-// else keeps the serial P1.4a walk in execute_lane.
+// Reachability: the driver routes a batch here on the plain route only; the speculative routes run
+// execute_spec_batch instead. Every admitted member is batched, including one that carries a tool
+// grammar (P2.1 masks each lane's own columns) or media.
 //
 // Invariants this function owns:
 //  - Lane "slot" is both the KV execution row and the GDN state slot that lane owns, exactly as
-//    execute_lane binds them. A batched lane is structurally a single-lane plain request whose
+//    the serial walk binds them. A batched lane is structurally a single-lane plain request whose
 //    prefix reuse is scanned on that lane alone: prefill from the accepted boundary, first-token
 //    sample, then one token per shared round.
 //  - Retention is per lane (P2.3). Each lane scans its own lineage, restores its own GDN slot and
@@ -2463,7 +2568,7 @@ void TP2GenerationCore::invalidate_lane_prefill(std::uint32_t lane) {
 //  - The arena watermark below is fixed by the constructor's lane count rather than by this batch
 //    (P2.2b), so the captured batch decode step finds the same layout on every replay.
 void TP2GenerationCore::execute_plain_batch(
-    const std::vector<std::shared_ptr<PendingRequest>>& batch) {
+    std::vector<std::shared_ptr<PendingRequest>>& batch) {
     DeviceArena& ws_a = *shard_a_.workspace;
     DeviceArena& ws_b = *shard_b_.workspace;
     auto& ctx_a       = *shard_a_.context;
@@ -2508,9 +2613,11 @@ void TP2GenerationCore::execute_plain_batch(
         Clock::time_point begin;
         Clock::time_point first_token;
     };
-    const std::size_t lane_capacity = batch.size();
+    // P2.2: the lane arrays cover the whole lane capacity rather than the batch that happened to
+    // arrive, because a lane that retires frees its slot for a request still waiting in the queue.
+    const std::size_t lane_capacity = lanes_;
     std::vector<LaneState> lanes(lane_capacity);
-    for (std::size_t index = 0; index < lane_capacity; ++index) {
+    for (std::size_t index = 0; index < batch.size(); ++index) {
         lanes[index].pending     = batch[index].get();
         lanes[index].slot        = static_cast<std::uint32_t>(index);
         lanes[index].begin       = Clock::now();
@@ -2521,15 +2628,29 @@ void TP2GenerationCore::execute_plain_batch(
     auto lifetime_a = ws_a.scope();
     auto lifetime_b = ws_b.scope();
 
+    // Filled by admit_lane for every lane it admits, including the ones that arrive later.
     std::vector<ops::SamplingConfig> configs(lane_capacity);
-    for (std::size_t index = 0; index < lane_capacity; ++index) {
-        configs[index] = make_sampling_config(batch[index]->request->sampling);
-    }
+
+    // P2.1: one declared-name grammar per lane, built from that lane's own prompt contract before any
+    // round runs, plus the mask staging the rounds reuse. A lane without a tool contract keeps a null
+    // constraint and is never masked. The logits domain is the packed embedding row count, which the
+    // artifact contract allows to be wider than the tokenizer public domain the constraint table
+    // covers; build_mask() excludes the rows in between.
+    const std::size_t logits_domain = static_cast<std::size_t>(vocab);
+    // Built by admit_lane, one lane at a time, so a lane admitted mid-batch gets its own constraint.
+    std::vector<LaneGrammar> grammar(lane_capacity);
+    bool any_grammar = false;
+    std::vector<std::uint8_t> tool_mask_one(static_cast<std::size_t>(vocab), std::uint8_t{1});
+    std::vector<std::uint8_t> tool_mask_host(static_cast<std::size_t>(vocab) * lane_capacity,
+                                             std::uint8_t{1});
+
     // A request with a configured penalty accumulates its committed tokens in device memory, one
     // slice per lane so the shared sample reads per-lane counts. The array is sized for the widest
     // batch this route can form rather than for this batch: the round watermark, and with it every
     // captured batch graph, has to be the same for every request. A request with no configured
     // penalty simply never reads its slice, and only the live span is cleared.
+    // admit_lane points each admitted lane's config at its own slice of this array.
+    std::int32_t* counts_base = nullptr;
     {
         Tensor counts = ws_a.alloc(
             DType::I32, {static_cast<std::int32_t>(public_tokens * static_cast<std::int32_t>(lanes_))});
@@ -2538,15 +2659,7 @@ void TP2GenerationCore::execute_plain_batch(
             counts.data, 0,
             sizeof(std::int32_t) * static_cast<std::size_t>(public_tokens) * lane_capacity,
             shard_a_.device.stream));
-        auto* base = static_cast<std::int32_t*>(counts.data);
-        for (std::size_t index = 0; index < lane_capacity; ++index) {
-            if (configs[index].presence_penalty == 0.0F &&
-                configs[index].frequency_penalty == 0.0F) {
-                continue;
-            }
-            configs[index].token_counts =
-                base + static_cast<std::size_t>(index) * static_cast<std::size_t>(public_tokens);
-        }
+        counts_base = static_cast<std::int32_t*>(counts.data);
     }
 
     // Device copy of the per-lane sampler configs. Staging this once lets the prefill samples read
@@ -2628,6 +2741,9 @@ void TP2GenerationCore::execute_plain_batch(
             lane.result.timings.total_seconds = total;
         }
         lane.pending->result = std::move(lane.result);
+        // P0.2: retire the member here rather than at the end of the batch. This lane is done, and
+        // its submitter must be free to return while the other lanes keep running.
+        publish_lane(*lane.pending);
     };
 
     // Each lane's GDN slot is brought to its own starting state in the loop below: a lane that
@@ -2639,8 +2755,49 @@ void TP2GenerationCore::execute_plain_batch(
     // resource is the workspace arena, and the chunk scopes below hand it back between lanes.
     std::vector<std::size_t> active;
     active.reserve(lane_capacity);
-    for (std::size_t index = 0; index < lane_capacity; ++index) {
-        LaneState& lane  = lanes[index];
+
+    // P2.2: one lane's whole setup as a callable unit, so a slot a retired lane leaves free can take
+    // the next queued request at any round boundary. The caller appends the member to `batch` before
+    // this runs, so a throw here still reaches the driver's failure propagation and its publish
+    // safety net. Returns true when the lane is left decoding.
+    auto admit_lane = [&](std::size_t index, PendingRequest& pending) -> bool {
+        LaneState& lane = lanes[index];
+        lane             = LaneState{};
+        lane.pending     = &pending;
+        lane.slot        = static_cast<std::uint32_t>(index);
+        lane.begin       = Clock::now();
+        lane.first_token = lane.begin;
+        // This lane's own sampler config and grammar, built here because a lane may be admitted long
+        // after the batch was formed. The device copy of the configs is refreshed entry by entry.
+        configs[index] = make_sampling_config(pending.request->sampling);
+        if (configs[index].presence_penalty != 0.0F || configs[index].frequency_penalty != 0.0F) {
+            configs[index].token_counts =
+                counts_base +
+                static_cast<std::size_t>(index) * static_cast<std::size_t>(public_tokens);
+        }
+        grammar[index] = LaneGrammar{};
+        {
+            const auto& lane_data = qwen::PreparedPromptAccess::view(pending.request->prompt);
+            if (lane_data.tool_call_output != nullptr) {
+                grammar[index].constraint =
+                    frontend_->make_tool_call_constraint(lane_data.tool_call_output);
+                if (grammar[index].constraint != nullptr) {
+                    if (grammar[index].constraint->vocab_size() > logits_domain) {
+                        throw std::logic_error(
+                            "TP-2 tool-call constraint vocabulary " +
+                            std::to_string(grammar[index].constraint->vocab_size()) +
+                            " exceeds the logits domain " + std::to_string(logits_domain));
+                    }
+                    any_grammar = true;
+                }
+            }
+        }
+        shard_a_.device.bind_to_current_thread();
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::uint8_t*>(configs_dev.data) +
+                static_cast<std::size_t>(index) * sizeof(ops::SamplingConfig),
+            &configs[index], sizeof(ops::SamplingConfig), cudaMemcpyHostToDevice,
+            shard_a_.device.stream));
         Request& request = *lane.pending->request;
         // The batch column is also the KV execution row and the GDN state slot this lane owns, which
         // is the lane index every session_* and retention helper takes (P2.3).
@@ -2765,6 +2922,21 @@ void TP2GenerationCore::execute_plain_batch(
                 ops::set_i32_scalar(logical_pos_lane,
                                     static_cast<std::int32_t>(lane.prompt_tokens),
                                     shard_a_.device.stream);
+                // P2.1: the serial walk masks the first token at the same site. The grammar starts in
+                // its free-text position, so build_mask() normally reports the empty prefix as
+                // unconstrained; keeping the site makes the batched route behave like the serial one
+                // if a constrained first position is ever introduced.
+                if (grammar_live(grammar[index], request)) {
+                    grammar_advance(grammar[index], request);
+                    if (grammar[index].constraint->build_mask(logits_domain, tool_mask_one)) {
+                        Tensor tool_mask_first = ws_a.alloc(DType::U8, {vocab, 1});
+                        shard_a_.device.bind_to_current_thread();
+                        CUDA_CHECK(cudaMemcpyAsync(tool_mask_first.data, tool_mask_one.data(),
+                                                   tool_mask_one.size(), cudaMemcpyHostToDevice,
+                                                   shard_a_.device.stream));
+                        ops::apply_token_mask(logits_a, tool_mask_first, shard_a_.device.stream);
+                    }
+                }
                 Tensor sampled_a = ws_a.alloc(DType::I32, {1});
                 ops::sample(logits_a, sampled_a, public_tokens,
                             static_cast<const ops::SamplingConfig*>(configs_dev.data) + lane.slot,
@@ -2822,7 +2994,7 @@ void TP2GenerationCore::execute_plain_batch(
             lane.result.finish_reason = FinishReason::Cancelled;
             publish_preview(lane, false);
             finalize(lane);
-            continue;
+            return false;
         }
         computed_prefill_tokens_ += lane.prompt_tokens - reuse;
         publish_lane_prefill(lane_id, lane.prompt_tokens, tokens, prompt_media, data.context_cache);
@@ -2830,9 +3002,13 @@ void TP2GenerationCore::execute_plain_batch(
         lane.finished = first_token_finish != FinishReason::None;
         if (lane.finished) {
             finalize(lane);
-        } else {
-            active.push_back(index);
+            return false;
         }
+        return true;
+    };
+
+    for (std::size_t index = 0; index < batch.size(); ++index) {
+        if (admit_lane(index, *batch[index])) { active.push_back(index); }
     }
 
     // Round watermark. Prefill's chunk scopes have handed the arena back, so the decode rounds
@@ -2840,7 +3016,7 @@ void TP2GenerationCore::execute_plain_batch(
     shard_a_.round_base = ws_a.used();
     shard_b_.round_base = ws_b.used();
 
-    while (!active.empty()) {
+    for (;;) {
         // Retire the lanes that asked to stop before this round is formed. A cancelled or
         // budget-exhausted lane publishes its terminal preview and leaves; the remaining lanes keep
         // decoding, so one lane's limit does not stall the others.
@@ -2866,6 +3042,27 @@ void TP2GenerationCore::execute_plain_batch(
             live.push_back(index);
         }
         active.swap(live);
+
+        // P2.2: every slot this round left free takes the next request that arrived while the batch
+        // was running, so a short request no longer waits for the long one beside it to finish.
+        while (active.size() < lane_capacity) {
+            std::shared_ptr<PendingRequest> next = try_pop_lane_queue();
+            if (next == nullptr) { break; }
+            std::size_t index = lane_capacity;
+            for (std::size_t candidate = 0; candidate < lane_capacity; ++candidate) {
+                if (std::find(active.begin(), active.end(), candidate) == active.end()) {
+                    index = candidate;
+                    break;
+                }
+            }
+            if (index == lane_capacity) { break; }
+            batch.push_back(next);
+            if (lane_trace_enabled()) {
+                std::fprintf(stderr, "[tp2-lane] admit slot=%zu live=%zu\n", index,
+                             active.size() + 1);
+            }
+            if (admit_lane(index, *next)) { active.push_back(index); }
+        }
         if (active.empty()) { break; }
 
         const std::int32_t columns = static_cast<std::int32_t>(active.size());
@@ -2905,6 +3102,42 @@ void TP2GenerationCore::execute_plain_batch(
         const ops::CausalAttentionExecutionEnvelope envelope{1, max_position + 1};
         run_plain_decode_step_batch(host_tokens, host_positions, host_kv_rows, host_slots, columns,
                                     envelope, logits);
+        // P2.1: mask each live lane's own column with that lane's own declared-name grammar, after
+        // the decode forward that produced the logits and before the sample reads them. Column c of
+        // the round's logits belongs to lane active[c], so block c is that lane's mask.
+        if (any_grammar) {
+            std::fill(tool_mask_host.begin(), tool_mask_host.end(), std::uint8_t{1});
+            std::int32_t masked_columns = 0;
+            for (std::int32_t column = 0; column < columns; ++column) {
+                const std::size_t lane_index = active[static_cast<std::size_t>(column)];
+                LaneGrammar& lane_grammar    = grammar[lane_index];
+                const Request& lane_request  = *lanes[lane_index].pending->request;
+                if (!grammar_live(lane_grammar, lane_request)) {
+                    continue;
+                }
+                grammar_advance(lane_grammar, lane_request);
+                if (lane_grammar.constraint->build_mask(logits_domain, tool_mask_one)) {
+                    const std::size_t base =
+                        static_cast<std::size_t>(column) * static_cast<std::size_t>(vocab);
+                    std::copy(tool_mask_one.begin(), tool_mask_one.end(),
+                              tool_mask_host.begin() + static_cast<std::ptrdiff_t>(base));
+                    ++masked_columns;
+                }
+            }
+            if (masked_columns > 0) {
+                Tensor tool_mask_dev = ws_a.alloc(DType::U8, {vocab, columns});
+                shard_a_.device.bind_to_current_thread();
+                CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_host.data(),
+                                           sizeof(std::uint8_t) * static_cast<std::size_t>(vocab) *
+                                               static_cast<std::size_t>(columns),
+                                           cudaMemcpyHostToDevice, shard_a_.device.stream));
+                ops::apply_token_mask(logits, tool_mask_dev, shard_a_.device.stream);
+                if (lane_trace_enabled()) {
+                    std::fprintf(stderr, "[tp2-lane] grammar masked %d of %d columns\n",
+                                 static_cast<int>(masked_columns), static_cast<int>(columns));
+                }
+            }
+        }
         Tensor sampled = ws_a.alloc(DType::I32, {columns});
         shard_a_.device.bind_to_current_thread();
         ops::sample(logits, sampled, public_tokens,
@@ -2967,13 +3200,13 @@ void TP2GenerationCore::execute_plain_batch(
 // the row index, so rows compact cleanly when a lane retires. Every frame tensor is sliced to
 // columns along its outermost (batch) dimension, which stays contiguous.
 //
-// Grammar-constrained members never reach here: drive_lane_queue refuses them on the batched path,
-// and a masked verify window has no per-lane logit mask.
+// Grammar-constrained members reach here too: P2.1 masks each lane's own columns of the verify
+// window before the argmax that reads it.
 //
 // A round costs every lane the slowest lane's proposal plus verify, so a retired lane frees a row
 // but not time. Continuous batching is out of scope for P2.1c.
 void TP2GenerationCore::execute_spec_batch(
-    const std::vector<std::shared_ptr<PendingRequest>>& batch) {
+    std::vector<std::shared_ptr<PendingRequest>>& batch) {
     DeviceArena& ws_a = *shard_a_.workspace;
     DeviceArena& ws_b = *shard_b_.workspace;
     auto& ctx_a       = *shard_a_.context;
@@ -3021,9 +3254,11 @@ void TP2GenerationCore::execute_spec_batch(
         Clock::time_point first_token;
     };
 
-    const std::size_t lane_capacity = batch.size();
+    // P2.2: the lane arrays cover the whole lane capacity rather than the batch that happened to
+    // arrive, because a lane that retires frees its slot for a request still waiting in the queue.
+    const std::size_t lane_capacity = lanes_;
     std::vector<LaneState> lanes(lane_capacity);
-    for (std::size_t index = 0; index < lane_capacity; ++index) {
+    for (std::size_t index = 0; index < batch.size(); ++index) {
         lanes[index].pending     = batch[index].get();
         lanes[index].slot        = static_cast<std::uint32_t>(index);
         lanes[index].begin       = Clock::now();
@@ -3032,14 +3267,26 @@ void TP2GenerationCore::execute_spec_batch(
     auto lifetime_a = ws_a.scope();
     auto lifetime_b = ws_b.scope();
 
+    // Filled by admit_lane for every lane it admits, including the ones that arrive later.
     std::vector<ops::SamplingConfig> configs(lane_capacity);
-    for (std::size_t index = 0; index < lane_capacity; ++index) {
-        configs[index] = make_sampling_config(batch[index]->request->sampling);
-    }
+
+    // P2.1: the same per-lane grammar and mask staging the plain batch keeps, sized for a
+    // speculative window (width columns per lane) instead of one column per lane.
+    const std::size_t logits_domain = static_cast<std::size_t>(vocab);
+    // Built by admit_lane, one lane at a time, so a lane admitted mid-batch gets its own constraint.
+    std::vector<LaneGrammar> grammar(lane_capacity);
+    bool any_grammar = false;
+    std::vector<std::uint8_t> tool_mask_one(static_cast<std::size_t>(vocab), std::uint8_t{1});
+    std::vector<std::uint8_t> tool_mask_host(
+        static_cast<std::size_t>(vocab) * static_cast<std::size_t>(width) * lanes_,
+        std::uint8_t{1});
+
     // Same reservation rule as the plain batch: the penalty counts cover the widest batch this
     // route can form, so the round watermark -- and with it every captured verify graph -- is the
     // same for every request. A request with no configured penalty never reads its slice, and only
     // the live span is cleared.
+    // admit_lane points each admitted lane's config at its own slice of this array.
+    std::int32_t* counts_base = nullptr;
     {
         Tensor counts = ws_a.alloc(
             DType::I32, {static_cast<std::int32_t>(public_tokens * static_cast<std::int32_t>(lanes_))});
@@ -3048,15 +3295,7 @@ void TP2GenerationCore::execute_spec_batch(
             counts.data, 0,
             sizeof(std::int32_t) * static_cast<std::size_t>(public_tokens) * lane_capacity,
             shard_a_.device.stream));
-        auto* base = static_cast<std::int32_t*>(counts.data);
-        for (std::size_t index = 0; index < lane_capacity; ++index) {
-            if (configs[index].presence_penalty == 0.0F &&
-                configs[index].frequency_penalty == 0.0F) {
-                continue;
-            }
-            configs[index].token_counts =
-                base + static_cast<std::size_t>(index) * static_cast<std::size_t>(public_tokens);
-        }
+        counts_base = static_cast<std::int32_t*>(counts.data);
     }
     // The prefill-tail samples read their own lane's entry through this staging copy, so it carries
     // the same whole-lane-count reservation as the counts array.
@@ -3070,7 +3309,7 @@ void TP2GenerationCore::execute_spec_batch(
     // the per-lane KV row and state slot vectors the window binds. This is the core member, not a
     // round local: a captured verify window reads the whole staging block through memcpy nodes, so
     // its address is baked into every graph and each section is strided by the startup lane count.
-    const std::size_t window_span = static_cast<std::size_t>(width) * lane_capacity;
+    const std::size_t window_span = static_cast<std::size_t>(width) * lanes_;
     const std::size_t id_span     = static_cast<std::size_t>(width) * lanes_;
     std::int32_t* spec_ids       = batch_window_base();
     std::int32_t* spec_positions = spec_ids + id_span;
@@ -3080,15 +3319,15 @@ void TP2GenerationCore::execute_spec_batch(
 
     // Licensed prefixes come back through a second pinned allocation, together with the fold and
     // retirement vectors computed from them.
-    PinnedHostBuffer accept_host((window_span + 6 * lane_capacity) * sizeof(std::int32_t), true);
+    PinnedHostBuffer accept_host((window_span + 6 * lanes_) * sizeof(std::int32_t), true);
     auto* accept_base             = static_cast<std::int32_t*>(accept_host.data());
     std::int32_t* licensed        = accept_base;
     std::int32_t* licensed_counts = licensed + window_span;
-    std::int32_t* fold_slots      = licensed_counts + lane_capacity;
-    std::int32_t* fold_columns    = fold_slots + lane_capacity;
-    std::int32_t* tail_slots      = fold_columns + lane_capacity;
-    std::int32_t* tail_starts     = tail_slots + lane_capacity;
-    std::int32_t* tail_ends       = tail_starts + lane_capacity;
+    std::int32_t* fold_slots      = licensed_counts + lanes_;
+    std::int32_t* fold_columns    = fold_slots + lanes_;
+    std::int32_t* tail_slots      = fold_columns + lanes_;
+    std::int32_t* tail_starts     = tail_slots + lanes_;
+    std::int32_t* tail_ends       = tail_starts + lanes_;
 
     // The frontier each lane's pending draft features were staged at is retention(slot)'s own
     // dflash_context_frontier (P2.3 Stage 2), the same member the single-lane walk keeps and the host
@@ -3152,6 +3391,9 @@ void TP2GenerationCore::execute_spec_batch(
             lane.result.timings.total_seconds = total;
         }
         lane.pending->result = std::move(lane.result);
+        // P0.2: retire the member here rather than at the end of the batch. This lane is done, and
+        // its submitter must be free to return while the other lanes keep running.
+        publish_lane(*lane.pending);
     };
 
     // Each lane's GDN slot is brought to its own starting state in the loop below: a lane that
@@ -3163,8 +3405,49 @@ void TP2GenerationCore::execute_spec_batch(
     // draft-ring slot, so every lane's ring is primed before the first shared proposal.
     std::vector<std::size_t> active;
     active.reserve(lane_capacity);
-    for (std::size_t index = 0; index < lane_capacity; ++index) {
+
+    // P2.2: one lane's whole setup as a callable unit, so a slot a retired lane leaves free can take
+    // the next queued request at any round boundary. The caller appends the member to `batch` before
+    // this runs, so a throw here still reaches the driver's failure propagation and its publish
+    // safety net. Returns true when the lane is left decoding.
+    auto admit_lane = [&](std::size_t index, PendingRequest& pending) -> bool {
         LaneState& lane  = lanes[index];
+        lane             = LaneState{};
+        lane.pending     = &pending;
+        lane.slot        = static_cast<std::uint32_t>(index);
+        lane.begin       = Clock::now();
+        lane.first_token = lane.begin;
+        // This lane's own sampler config and grammar, built here because a lane may be admitted long
+        // after the batch was formed. The device copy of the configs is refreshed entry by entry.
+        configs[index] = make_sampling_config(pending.request->sampling);
+        if (configs[index].presence_penalty != 0.0F || configs[index].frequency_penalty != 0.0F) {
+            configs[index].token_counts =
+                counts_base +
+                static_cast<std::size_t>(index) * static_cast<std::size_t>(public_tokens);
+        }
+        grammar[index] = LaneGrammar{};
+        {
+            const auto& lane_data = qwen::PreparedPromptAccess::view(pending.request->prompt);
+            if (lane_data.tool_call_output != nullptr) {
+                grammar[index].constraint =
+                    frontend_->make_tool_call_constraint(lane_data.tool_call_output);
+                if (grammar[index].constraint != nullptr) {
+                    if (grammar[index].constraint->vocab_size() > logits_domain) {
+                        throw std::logic_error(
+                            "TP-2 tool-call constraint vocabulary " +
+                            std::to_string(grammar[index].constraint->vocab_size()) +
+                            " exceeds the logits domain " + std::to_string(logits_domain));
+                    }
+                    any_grammar = true;
+                }
+            }
+        }
+        shard_a_.device.bind_to_current_thread();
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::uint8_t*>(configs_dev.data) +
+                static_cast<std::size_t>(index) * sizeof(ops::SamplingConfig),
+            &configs[index], sizeof(ops::SamplingConfig), cudaMemcpyHostToDevice,
+            shard_a_.device.stream));
         Request& request = *lane.pending->request;
         // The batch column is also the KV execution row and the GDN state slot this lane owns, which
         // is the lane index every session_* and retention helper takes (P2.3).
@@ -3301,6 +3584,19 @@ void TP2GenerationCore::execute_spec_batch(
                 shard_a_.device.bind_to_current_thread();
                 ops::set_i32_scalar(logical_pos_lane, static_cast<std::int32_t>(lane.prompt_tokens),
                                     shard_a_.device.stream);
+                // P2.1: the same first-token mask the serial walk applies, on this lane's own
+                // grammar.
+                if (grammar_live(grammar[index], request)) {
+                    grammar_advance(grammar[index], request);
+                    if (grammar[index].constraint->build_mask(logits_domain, tool_mask_one)) {
+                        Tensor tool_mask_first = ws_a.alloc(DType::U8, {vocab, 1});
+                        shard_a_.device.bind_to_current_thread();
+                        CUDA_CHECK(cudaMemcpyAsync(tool_mask_first.data, tool_mask_one.data(),
+                                                   tool_mask_one.size(), cudaMemcpyHostToDevice,
+                                                   shard_a_.device.stream));
+                        ops::apply_token_mask(logits_a, tool_mask_first, shard_a_.device.stream);
+                    }
+                }
                 Tensor sampled_a = ws_a.alloc(DType::I32, {1});
                 ops::sample(logits_a, sampled_a, public_tokens,
                             static_cast<const ops::SamplingConfig*>(configs_dev.data) + lane.slot,
@@ -3364,7 +3660,7 @@ void TP2GenerationCore::execute_spec_batch(
             lane.result.finish_reason = FinishReason::Cancelled;
             publish_preview(lane, false);
             finalize(lane);
-            continue;
+            return false;
         }
         computed_prefill_tokens_ += lane.prompt_tokens - reuse;
         publish_lane_prefill(lane_id, lane.prompt_tokens, tokens, prompt_media, data.context_cache);
@@ -3372,9 +3668,13 @@ void TP2GenerationCore::execute_spec_batch(
         lane.finished   = first_token_finish != FinishReason::None;
         if (lane.finished) {
             finalize(lane);
-        } else {
-            active.push_back(index);
+            return false;
         }
+        return true;
+    };
+
+    for (std::size_t index = 0; index < batch.size(); ++index) {
+        if (admit_lane(index, *batch[index])) { active.push_back(index); }
     }
 
     shard_a_.round_base = ws_a.used();
@@ -3400,12 +3700,13 @@ void TP2GenerationCore::execute_spec_batch(
     std::vector<std::int32_t> append_starts(lane_capacity, 0);
     std::vector<std::int32_t> append_ends(lane_capacity, 0);
     // MTP round staging (P2.1b): the packed per-frame-row vectors, the per-step cache positions and
-    // the per-lane hidden selectors.
-    std::vector<std::int32_t> mtp_pack(7 * lane_capacity, 0);
-    std::vector<std::int32_t> mtp_step_host(lane_capacity, 0);
-    std::vector<std::int32_t> mtp_selectors_h(lane_capacity, 0);
+    // the per-lane hidden selectors. The reservation is the whole lane count: a lane admitted
+    // mid-batch must find its own entry even when the round it joins has fewer columns than that.
+    std::vector<std::int32_t> mtp_pack(7 * lanes_, 0);
+    std::vector<std::int32_t> mtp_step_host(lanes_, 0);
+    std::vector<std::int32_t> mtp_selectors_h(lanes_, 0);
 
-    while (!active.empty()) {
+    for (;;) {
         // Retirement scan: a lane that ran out of budget or was cancelled leaves the batch before
         // the round is shaped, so every frame row in this round belongs to a live lane.
         {
@@ -3431,8 +3732,29 @@ void TP2GenerationCore::execute_spec_batch(
                 live.push_back(index);
             }
             active.swap(live);
-            if (active.empty()) { break; }
         }
+
+        // P2.2: every slot this round left free takes the next request that arrived while the batch
+        // was running, so a short request no longer waits for the long one beside it to finish.
+        while (active.size() < lane_capacity) {
+            std::shared_ptr<PendingRequest> next = try_pop_lane_queue();
+            if (next == nullptr) { break; }
+            std::size_t index = lane_capacity;
+            for (std::size_t candidate = 0; candidate < lane_capacity; ++candidate) {
+                if (std::find(active.begin(), active.end(), candidate) == active.end()) {
+                    index = candidate;
+                    break;
+                }
+            }
+            if (index == lane_capacity) { break; }
+            batch.push_back(next);
+            if (lane_trace_enabled()) {
+                std::fprintf(stderr, "[tp2-lane] admit slot=%zu live=%zu\n", index,
+                             active.size() + 1);
+            }
+            if (admit_lane(index, *next)) { active.push_back(index); }
+        }
+        if (active.empty()) { break; }
 
         const std::int32_t columns = static_cast<std::int32_t>(active.size());
         // The live speculative route owns the draft count and the context ceiling: every lane holds a
@@ -3646,6 +3968,55 @@ void TP2GenerationCore::execute_spec_batch(
                                     window_logits2d, window_hidden2d, nullptr, spec_valid);
             timing.record(2, shard_a_.device.stream);
 
+            // P2.1: the declared-name mask has to follow the verify forward that produces the logits
+            // and precede the argmax that reads them. Window column t of lane l (the round's column
+            // index) owns the mask block at t + width * l, matching the window's own layout.
+            if (any_grammar) {
+                std::fill(tool_mask_host.begin(), tool_mask_host.end(), std::uint8_t{1});
+                std::int32_t masked_columns = 0;
+                for (std::int32_t column = 0; column < columns; ++column) {
+                    const std::size_t lane_index = active[static_cast<std::size_t>(column)];
+                    LaneGrammar& lane_grammar    = grammar[lane_index];
+                    const Request& lane_request  = *lanes[lane_index].pending->request;
+                    if (!grammar_live(lane_grammar, lane_request)) {
+                        continue;
+                    }
+                    grammar_advance(lane_grammar, lane_request);
+                    std::string drafted_prefix;
+                    for (std::int32_t t = 0; t < width; ++t) {
+                        if (lane_grammar.constraint->build_mask_after(drafted_prefix, logits_domain,
+                                                                      tool_mask_one)) {
+                            const std::size_t base =
+                                (static_cast<std::size_t>(t) + static_cast<std::size_t>(width) *
+                                                                  static_cast<std::size_t>(column)) *
+                                static_cast<std::size_t>(vocab);
+                            std::copy(tool_mask_one.begin(), tool_mask_one.end(),
+                                      tool_mask_host.begin() + static_cast<std::ptrdiff_t>(base));
+                            ++masked_columns;
+                        }
+                        if (t + 1 < width) {
+                            const std::size_t next =
+                                static_cast<std::size_t>(t + 1) + static_cast<std::size_t>(width) *
+                                                                     static_cast<std::size_t>(column);
+                            drafted_prefix.append(lane_grammar.constraint->piece(
+                                static_cast<std::size_t>(spec_ids[next])));
+                        }
+                    }
+                }
+                if (masked_columns > 0) {
+                    Tensor tool_mask_dev =
+                        ws_a.alloc(DType::U8, {vocab, static_cast<std::int32_t>(window_live)});
+                    shard_a_.device.bind_to_current_thread();
+                    CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_host.data(), window_live,
+                                               cudaMemcpyHostToDevice, shard_a_.device.stream));
+                    ops::apply_token_mask(window_logits2d, tool_mask_dev, shard_a_.device.stream);
+                    if (lane_trace_enabled()) {
+                        std::fprintf(stderr, "[tp2-lane] grammar masked %d window columns of %d lanes\n",
+                                     static_cast<int>(masked_columns), static_cast<int>(columns));
+                    }
+                }
+            }
+
             Tensor mtp_target          = ws_a.alloc(DType::I32, {width, columns});
             Tensor mtp_target_flat     = mtp_target.view({width * columns});
             Tensor mtp_licensed        = ws_a.alloc(DType::I32, {width, columns});
@@ -3782,6 +4153,56 @@ void TP2GenerationCore::execute_spec_batch(
                                 static_cast<std::int32_t>(max_position), window_logits,
                                 window_hidden, &verify_sink, spec_valid);
         timing.record(2, shard_a_.device.stream);
+
+        // P2.1: the same declared-name mask the serial DFlash2 window applies, per lane. It has to
+        // follow the verify forward that produces the logits (the forward would overwrite it) and
+        // precede the argmax that reads them. Window column t of lane l (the round's column index)
+        // owns the mask block at t + width * l, matching the window's own layout.
+        if (any_grammar) {
+            std::fill(tool_mask_host.begin(), tool_mask_host.end(), std::uint8_t{1});
+            std::int32_t masked_columns = 0;
+            for (std::int32_t column = 0; column < columns; ++column) {
+                const std::size_t lane_index = active[static_cast<std::size_t>(column)];
+                LaneGrammar& lane_grammar    = grammar[lane_index];
+                const Request& lane_request  = *lanes[lane_index].pending->request;
+                if (!grammar_live(lane_grammar, lane_request)) {
+                    continue;
+                }
+                grammar_advance(lane_grammar, lane_request);
+                std::string drafted_prefix;
+                for (std::int32_t t = 0; t < width; ++t) {
+                    if (lane_grammar.constraint->build_mask_after(drafted_prefix, logits_domain,
+                                                                  tool_mask_one)) {
+                        const std::size_t base =
+                            (static_cast<std::size_t>(t) + static_cast<std::size_t>(width) *
+                                                              static_cast<std::size_t>(column)) *
+                            static_cast<std::size_t>(vocab);
+                        std::copy(tool_mask_one.begin(), tool_mask_one.end(),
+                                  tool_mask_host.begin() + static_cast<std::ptrdiff_t>(base));
+                        ++masked_columns;
+                    }
+                    if (t + 1 < width) {
+                        const std::size_t next =
+                            static_cast<std::size_t>(t + 1) + static_cast<std::size_t>(width) *
+                                                                 static_cast<std::size_t>(column);
+                        drafted_prefix.append(lane_grammar.constraint->piece(
+                            static_cast<std::size_t>(spec_ids[next])));
+                    }
+                }
+            }
+            if (masked_columns > 0) {
+                Tensor tool_mask_dev =
+                    ws_a.alloc(DType::U8, {vocab, static_cast<std::int32_t>(window_live)});
+                shard_a_.device.bind_to_current_thread();
+                CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_host.data(), window_live,
+                                           cudaMemcpyHostToDevice, shard_a_.device.stream));
+                ops::apply_token_mask(window_logits, tool_mask_dev, shard_a_.device.stream);
+                if (lane_trace_enabled()) {
+                    std::fprintf(stderr, "[tp2-lane] grammar masked %d window columns of %d lanes\n",
+                                 static_cast<int>(masked_columns), static_cast<int>(columns));
+                }
+            }
+        }
 
         ops::argmax(window_logits, target_argmax_flat, public_tokens, shard_a_.device.stream);
         ops::speculative_accept_sparse_drafts(
