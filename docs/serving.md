@@ -413,10 +413,13 @@ released. A request-level preparation gate derived from the live limit prevents 
 builds from deadlocking the memory account.
 
 An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
-the prepared token count and configured context ceiling. A media preprocessing resource rejection
-returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
-body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
-resource errors.
+the prepared token count (a lower bound when tokenization stopped at the ceiling) and the
+configured context ceiling. On the TP-2 multi-lane route the ceiling is the lane's admission
+ceiling - the whole shared KV pool by default, or `--lane-context` when set - and the message
+names which of the two bound it together with the pool arithmetic. A media preprocessing
+resource rejection returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is
+reserved for a raw request body that exceeds `--max-request-mib` before JSON parsing; it is not
+used for model-context or media resource errors.
 
 ## OpenAI prompt caching
 

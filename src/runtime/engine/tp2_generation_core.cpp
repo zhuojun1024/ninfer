@@ -2015,8 +2015,29 @@ TP2GenerationCore::Submission TP2GenerationCore::submit(
     // A prompt longer than the admission ceiling can never fit the pool, so reject it before the
     // subtraction below wraps it into a capacity that looks infinite.
     if (lanes_ > 1 && summary.prompt_tokens > context_window) {
-        throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           "prompt exceeds this lane's context capacity");
+        // Carry the arithmetic in the message: the caller has to know whether the per-lane policy
+        // or the pool itself is the binding constraint before deciding what to change.
+        const std::uint32_t pool_pages = pages_for_tokens(options_.max_context);
+        const std::uint32_t pool_tokens =
+            pool_pages * static_cast<std::uint32_t>(kPagedKVPageSize);
+        const bool policy_bound =
+            options_.lane_context != 0U && context_window == options_.lane_context;
+        char message[512];
+        if (policy_bound) {
+            std::snprintf(message, sizeof(message),
+                          "prompt exceeds this lane's context capacity: prompt %u tokens > lane "
+                          "ceiling %u tokens (--lane-context %u); raise --lane-context to widen it",
+                          summary.prompt_tokens, context_window, options_.lane_context);
+        } else {
+            std::snprintf(message, sizeof(message),
+                          "prompt exceeds this lane's context capacity: prompt %u tokens > lane "
+                          "ceiling %u tokens (KV pool %u pages x %u tokens = %u tokens minus a "
+                          "%u-token write margin, --lane-context 0 = whole pool); raise "
+                          "--max-context to widen it",
+                          summary.prompt_tokens, context_window, pool_pages,
+                          static_cast<unsigned>(kPagedKVPageSize), pool_tokens, lane_kv_margin());
+        }
+        throw RequestError(RequestErrorKind::ContextLengthExceeded, message);
     }
     const std::uint32_t capacity_output =
         context_window - summary.prompt_tokens + static_cast<std::uint32_t>(1);
@@ -2025,6 +2046,15 @@ TP2GenerationCore::Submission TP2GenerationCore::submit(
     const FinishReason limit_reason =
         options.execution.requested_output_tokens <= capacity_output ? FinishReason::OutputLimit
                                                                      : FinishReason::ContextCapacity;
+    if (limit_reason == FinishReason::ContextCapacity) {
+        // The ceiling, not the client, shortened this answer. Say so once per request so a
+        // truncated completion is not read as a model or client failure.
+        std::fprintf(stderr,
+                     "[tp2-capacity] prompt %u + requested output %u exceeds the %u-token lane "
+                     "context ceiling; the output budget is clamped to %u\n",
+                     summary.prompt_tokens, options.execution.requested_output_tokens,
+                     context_window, effective);
+    }
     try {
         output.validate_generation_capacity(effective);
     } catch (const std::invalid_argument& error) {

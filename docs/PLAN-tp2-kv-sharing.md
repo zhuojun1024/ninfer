@@ -161,7 +161,7 @@
 
 ## 9. 施工记录
 
-### 9.1 S1：共享池动态预留/释放（已落盘，未提交；`HEAD=94e6cc64` 工作树）
+### 9.1 S1：共享池动态预留/释放（已提交 `d0931a2d`；基线 `HEAD=94e6cc64`）
 
 **改动**
 - 头文件：`Shard` 增 `mtp_lane_pages`；删 `lane_token_capacity_` → `lane_context_limit_`；`lane_context_window()` 拆成 `lane_admission_limit()`（`lanes_==1 ? options_.max_context : lane_context_limit_`）+ `lane_kv_margin()`（MTP 时 `mtp_drafts_+2`，否则 1）+ `lane_kv_write_tail()` + `lane_kv_window(pages)`；新增 5 个声明。
@@ -178,7 +178,7 @@
 - 退役时先 `session_store_active` 再释放，跨请求复用改走 host slab（下一轮 `session_recall` → `session_restore` 拷回新页）；`active_session = kNoSession` 让该 host 条目重新成为候选（`:5120` 只在 `index == active_session` 时跳过）。
 - 接纳上限 = 整池 - margin ⇒ 只要 `prompt + effective <= lane_context_limit_` 就必然能在一张空池里放下，「池子不足」只可能是等别的 lane 退役，不会死锁。
 
-### 9.2 S1 验证记录（2026-10-01/02，`HEAD=94e6cc64` 工作树）
+### 9.2 S1 验证记录（2026-10-01/02，基线 `HEAD=94e6cc64`；随 `d0931a2d` 提交）
 
 **门禁（全部通过）**
 
@@ -238,7 +238,7 @@
 
 ---
 
-### 9.3 S3：镜像清理与口径复核（已落盘，未提交）
+### 9.3 S3：镜像清理与口径复核（已提交 `d0931a2d`）
 
 - 删除死字段 `Shard::mtp_page_handles`：它只在单 lane 启动块被 `clear`/`reserve`/`push_back` 填充，全仓无任何读取点——host checkpoint 导出读的是 `mtp_lane_handles[lane]`（`src/runtime/engine/tp2_generation_core.cpp:5059` 与 `:5163`），而 `mtp_lane_handles[0]` 已经持有同一批 handle。头文件里「`mtp_pages` 与 `mtp_page_handles` 是单 lane 路线 pin 住、host checkpoint 导出用的整池列表」的注释随之改成只提 `mtp_pages`（保活整池 lease）与按 lane 索引的四件套（`mtp_lane_pages`/`mtp_lane_handles`/`mtp_rows`/`mtp_views`）。
 - host checkpoint 口径复核（双卡 `--spec mtp --max-concurrency 4` 启动日志）：`[mem] host checkpoint ring 32 slots x 73.4 MiB/lane/shard`、`[mem] host-checkpoints shard 0 slots 32 (grid 3 + tail 3 + divergence 1 + block 1) x 73.4 MiB | stride 43776 tok | pinned 2349.0 MiB`（32 × 73.4 = 2349 ✓），与 S1 之前一致——S1 只改变「什么时候拍镜像」，不改变每 lane 的槽位几何。
@@ -246,7 +246,7 @@
 
 ---
 
-### 9.4 S2：`--lane-context` 上限旋钮（已落盘，未提交）
+### 9.4 S2：`--lane-context` 上限旋钮（已提交 `d0931a2d`）
 
 **语义**：`0`（默认）= 整池，S1 行为逐字节不变；`>0` = 一个 lane 最多能接纳多少 token（对齐 llama.cpp `--kv-unified-per-slot`），用来按策略收窄「先到的大请求独占整池」；`--max-concurrency 1` 路线忽略它（单 lane 本来就独占上下文）并在启动日志明说。
 
@@ -273,10 +273,38 @@
 
 ---
 
+### 9.5 操作面补充：400 报文算术、容量告警、架构文档例外说明（已落盘）
+
+**背景**：S1 把「每个 lane 固定 1/lanes 上下文」换成共享池后，操作员拿到 400 时无法从报文判断是「策略上限」还是「池子本身」，长 prompt 撞顶导致输出被截断也没有任何日志。本节补上这三处（用户 m01348 批准）。
+
+- **400 报文带算术**（`src/runtime/engine/tp2_generation_core.cpp:2017-2043`）：`submit` 的 `context_length_exceeded` 分两支——
+  - 策略绑定（`--lane-context` 就是上限）：`prompt exceeds this lane's context capacity: prompt 39340 tokens > lane ceiling 32768 tokens (--lane-context 32768); raise --lane-context to widen it`
+  - 池子绑定（默认整池，**示例报文**；该分支只在 `(pool_tokens − margin, max_context]` 窄带内可达，见发现 2，故未做端到端实测）：`… prompt 17200 tokens > lane ceiling 16383 tokens (KV pool 256 pages x 64 tokens = 16384 tokens minus a 1-token write margin, --lane-context 0 = whole pool); raise --max-context to widen it`
+- **前端准备阶段的 400 也带 token 数**（`src/models/qwen3_5/frontend/frontend.cpp:256-263` 的助手新增 `prompt_tokens`/`prompt_count_is_capped` 参数，调用点 `:849`（`encoded.input_ids.size()`，cap 命中 ⇒ `at least`）与 `:922`（`token_ids.size()`，精确值）；`src/models/qwen3_5/frontend/processor.cpp:935-940`、`:1066-1071` 同样补 `prompt at least N tokens`）：`prepared prompt exceeds Engine max_context 16384: prompt at least 16385 tokens`。这是 prompt 超 `--max-context` 时操作员唯一能看到的报文（见下文发现 2），tokenizer 上限使其只能给下界，故写 `at least`。
+- **容量告警**（同文件 `:2044-2055`）：`limit_reason == FinishReason::ContextCapacity`（上限而非客户端决定了输出预算）时打印一行 `[tp2-capacity] prompt %u + requested output %u exceeds the %u-token lane context ceiling; the output budget is clamped to %u`；未截断的请求不打印。
+- **架构文档例外说明**（`docs/maintainer/engine-architecture.md:45-51` 新增一段）：写明 TP-2 多 lane 是「同一份 paged KV 池 + 接纳时预留 prompt+预算+写入余量 + 池子不足留队首 + 唯一 400 是 prompt 超上限 + `--lane-context` 收窄 + 不抢占」的具体形态，并指出公平性由操作员的策略保证而不是调度器。
+- **文档同步**：`docs/serving.md:415-417` 的 400 段落补一句 TP-2 口径（上限是 lane 的接纳上限：默认整池，`--lane-context` 可收窄，报文说明是哪一支在约束）；`docs/PLAN-tp2-concurrency.md:287` 的护栏条目注明报文后来改为带算术的两支。
+
+**验收**：`ninja -C build-win` exit 0；门禁 11/11；双卡冒烟（`_temp/run_s2c_verify.ps1`、`_temp/run_s2d_verify.ps1`）——
+
+| 场景 | 期望 | 实测（2026-10-02） |
+|---|---|---|
+| C=4 `--max-context 131072 --lane-context 32768`，prompt 39340 + 16 | 400，策略绑定报文 | HTTP 400（72 ms）：`prompt exceeds this lane's context capacity: prompt 39340 tokens > lane ceiling 32768 tokens (--lane-context 32768); raise --lane-context to widen it` |
+| C=4 `--max-context 131072 --lane-context 32768`，prompt 19010 + 32768 | 200，且 `[tp2-capacity]` 一行 | HTTP 200 completed（14.5 s），`[tp2-capacity] prompt 19010 + requested output 32768 exceeds the 32768-token lane context ceiling; the output budget is clamped to 13759`（= 32768 − 19010 + 1） |
+| C=4 `--max-context 16384`（默认整池），prompt 长于 16384 | 400，报文给出 prompt 下界 | HTTP 400（38 ms）：`prepared prompt exceeds Engine max_context 16384: prompt at least 16385 tokens` |
+| C=1 `--max-context 16384`，prompt 9510 + 16384 | 200，告警按单 lane 上限打印 | HTTP 200，`[tp2-capacity] prompt 9510 + requested output 16384 exceeds the 16384-token lane context ceiling; the output budget is clamped to 6875`（= 16384 − 9510 + 1） |
+
+**验证中发现并回填的两件事**：
+
+1. `--max-context` 的**服务端默认值是 8192**（`src/serve/serve_options.h:32`）。第一轮脚本把 `--max-context` 从公共参数里拿掉后，C=4 `--lane-context 32768` 的服务器启动即退（exit 1），stderr 首行 `ninfer-serve: --lane-context must be 0 or at most --max-context`。所以「策略绑定」分支的验收必须显式给 `--max-context 131072`。
+2. **prompt 超过 `--max-context` 时，前端准备阶段先拒绝**（`src/models/qwen3_5/frontend/frontend.cpp:846`、`src/models/qwen3_5/frontend/processor.cpp:935-940` 与 `:1066-1071`），因此核心的**池子绑定分支只在 `(pool_tokens − margin, max_context]` 这个窄带内可达**（带宽 = `margin − (pool_tokens − max_context)`：dflash2 `margin=1`、页对齐余量 0 时正好 1 token；MTP `--draft-tokens 15` 时最多 17 token），实际是防御性分支。对操作员真正有用的是前端那条，本次也给它补了 token 数；由于前端 tokenizer 以 `max_context + 1` 为上限（`encode_rendered_chat(..., impl_->max_context + 1U)`、`EncodeOptions{.max_tokens = encode_limit}`），计数只能给下界，报文因此写 `prompt at least 16385 tokens`。
+
+---
+
 ## 10. 未决问题与已知限制
 - ~~`--lane-context` 的默认值~~（已定，m01348）：默认 `0` = 整池，即 S1 的「先到的大请求可以独占整池」；需要按策略收窄时由操作员显式给值。不再改默认。
-- 400 报文是否带上「lane 容量 + `max-context/lanes` 算术」与 `prompt + max_output` 超预算告警：评估时已列出，等用户点头。
-- `docs/maintainer/engine-architecture.md:41` 的「不把共享 KV 容量平均切分给 lane」在 TP-2 语境下需要例外说明：等用户点头。
+- ~~400 报文带 lane 容量算术 + `prompt + max_output` 超预算告警~~（**已做**，m01348 第 3 项）：见 §9.5；核心报文分「策略绑定 / 池子绑定」两支，前端准备阶段报文补 `prompt (at least) N tokens`，输出预算被上限夹紧时打印 `[tp2-capacity]`。
+- ~~`docs/maintainer/engine-architecture.md:41` 的 TP-2 例外说明~~（**已做**，m01348 第 3 项）：见 `docs/maintainer/engine-architecture.md:45-51`。
 - 碎片化的量化（不同请求尺寸序列下可容纳的最大请求）尚未测量。
 - **已知代价（S1 引入）**：每个请求终态都会走 `retire_lane_session` → `session_store_active`，把该 lane 的 frontier KV + state 镜像 D2H 到 host slab（满上下文时约 73.4 MiB/shard），下一轮复用再经 `session_recall` → `session_restore` 拷回新页。这是「页可立即易主」的直接后果，多轮会话的吞吐代价待量化（R4）。
 - **仍未验证**：单卡 `--devices 0` 半项（TP-2 artifact 是双 shard 布局，不适用）；碎片化的量化（不同请求尺寸序列下可容纳的最大请求）；R4 的多轮会话吞吐代价。

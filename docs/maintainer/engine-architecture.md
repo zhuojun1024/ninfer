@@ -42,6 +42,13 @@ checkpoint 或 cache replica，也不进入 Scheduler/ResourceManager。Generati
 证明其完整执行资源已经得到保障后才会进入 Active；进入 Active 后，它不会因为另一个请求或
 inactive cache 的保留而丢失完成能力。
 
+TP-2 多 lane 路线（`--devices a,b`，lane 数 = `min(--max-concurrency, 4)`）是这条合同的具体形态：
+所有 lane 共享同一份 paged KV 池，请求在接纳时按「prompt + 输出预算 + 该路线的写入余量」预留页数，
+退役时归还；池子当前放不下时请求留在 lane 队列的队首等待，而不是失败、也不会抢占已经运行的请求
+（唯一的 `context_length_exceeded` 是 prompt 本身超过整池接纳上限）。`--lane-context` 可以把单个
+lane 的上限收窄到池子以下（默认 `0` = 整池）。因此「先到的大请求独占整池」是被允许的行为，
+公平性由操作员的 `--lane-context` 策略保证，而不是由调度器保证。
+
 本文不覆盖多 GPU placement、active request preemption、priority/QoS、跨 Engine context store
 或大规模 continuous batching。这些工作负载需要重新定义 admission 与公平性合同，不能直接从当前
 小并发模型外推。

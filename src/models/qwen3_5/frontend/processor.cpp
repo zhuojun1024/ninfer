@@ -935,7 +935,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         if (preliminary_tokens > maximum_prompt_tokens) {
             throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
                                  "prepared prompt exceeds Engine max_context " +
-                                     std::to_string(maximum_prompt_tokens));
+                                     std::to_string(maximum_prompt_tokens) + ": prompt at least " +
+                                     std::to_string(preliminary_tokens) + " tokens");
         }
     }
     MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
@@ -1065,7 +1066,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     if (encoded.input_ids.size() > maximum_prompt_tokens) {
         throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
                              "prepared prompt exceeds Engine max_context " +
-                                 std::to_string(maximum_prompt_tokens));
+                                 std::to_string(maximum_prompt_tokens) + ": prompt at least " +
+                                 std::to_string(encoded.input_ids.size()) + " tokens");
     }
     output.starts_in_reasoning         = rendered.starts_in_reasoning;
     output.input_ids                   = std::move(encoded.input_ids);
