@@ -62,6 +62,9 @@ void validate_options(const EngineOptions& options) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
+    if (options.lane_context > options.max_context) {
+        throw std::invalid_argument("Engine lane_context must be 0 or at most max_context");
+    }
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
     }
@@ -103,6 +106,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         const std::uint32_t requested_concurrency = options.max_concurrency;
         options.max_concurrency =
             tp2_generation_concurrency(requested_concurrency, options.speculative.backend);
+        // `--lane-context` is a TP-2 policy knob: a ceiling wider than the logical context is
+        // rejected rather than silently clamped, so the operator's number and the ceiling the core
+        // advertises never disagree. 0 keeps the whole-pool ceiling (S1 of the kv-sharing plan).
+        if (options.lane_context > options.max_context) {
+            throw std::invalid_argument("TP-2 lane_context must be 0 or at most max_context");
+        }
         // The TP-2 core reads the prefill chunk itself. Clamp the request to the range its
         // cross-device allreduce staging buffer and its per-chunk activation peak can carry
         // (0 selects the default width).

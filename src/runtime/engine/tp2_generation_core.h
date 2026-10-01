@@ -210,20 +210,24 @@ private:
         std::size_t round_base = 0;
         models::qwen3_5::RoundState io;
         std::unique_ptr<models::qwen3_5::execution::TextContext> context;
-        // One KV execution row per lane (P1.2c). lanes == 1 reproduces the original single row.
-        // Every row covers its own disjoint physical page group, published once at startup and
-        // reused in place across requests. Cross-session retention is per lane as well (P2.3), so
-        // the export and import paths address this lane's own handle list.
+        // One KV execution row per lane (P1.2c). lanes == 1 reproduces the original single row,
+        // which covers the whole pool and is published once at startup. On a multi-lane route the
+        // pool is shared and handed out per request, so a lane's row is (re)published with the pages
+        // of whichever request currently holds that lane (S1 of docs/PLAN-tp2-kv-sharing.md).
+        // Cross-session retention is per lane as well (P2.3), so the export and import paths address
+        // this lane's own handle list.
         std::vector<std::vector<DeviceKVPageLease>> kv_lane_pages;
         std::vector<std::vector<DeviceKVPageHandle>> kv_lane_handles;
         std::vector<KVExecutionRowLease> kv_rows;
         // MTP layer KV (shard 0 only, when --spec mtp): its own page list and one execution row per
-        // lane, split the same way as the text cache (P2.1b). `mtp_page_handles` stays the flat
-        // physical page list a host checkpoint exports; `mtp_lane_handles`/`mtp_rows`/`mtp_views` are
-        // indexed by lane. The MTP layer's extra page groups are dead capacity - the single-GPU
-        // route never publishes them either - so only the `logical` slice is mapped.
+        // lane, shared and published per request exactly like the text cache (P2.1b). `mtp_pages`
+        // keeps the whole-pool leases alive on the single-lane route, where they are pinned for the
+        // process; `mtp_lane_pages`/`mtp_lane_handles`/`mtp_rows`/`mtp_views` are indexed by lane and
+        // are what the per-request reservation and the host checkpoint read. The MTP layer's extra
+        // page groups are dead capacity - the single-GPU route never publishes them either - so only
+        // the `logical` slice is mapped.
         std::vector<DeviceKVPageLease> mtp_pages;
-        std::vector<DeviceKVPageHandle> mtp_page_handles;
+        std::vector<std::vector<DeviceKVPageLease>> mtp_lane_pages;
         std::vector<std::vector<DeviceKVPageHandle>> mtp_lane_handles;
         std::vector<KVExecutionRowLease> mtp_rows;
         std::vector<models::qwen3_5::PagedKVCacheView> mtp_views;
@@ -401,6 +405,28 @@ private:
     // The executors call this while the driver holds `execution_mutex_`, which is the order
     // execution_mutex_ -> lane_queue_mutex_ the rest of the core keeps.
     std::shared_ptr<PendingRequest> try_pop_lane_queue();
+    // S1 (docs/PLAN-tp2-kv-sharing.md): the shared-pool allocation path. A multi-lane request
+    // reserves exactly the pages its own prompt plus output budget need, on both shards and on
+    // shard 0's MTP cache when that route is live, and publishes them into its lane's execution row.
+    // The reservation is all-or-nothing and happens before the request is admitted, so a pool that
+    // cannot cover the request right now leaves nothing behind and the caller puts the request back
+    // at the head of the queue.
+    [[nodiscard]] bool reserve_lane_kv(std::uint32_t lane, std::uint32_t need_tokens);
+    void release_lane_kv(std::uint32_t lane) noexcept;
+    // Copy the lane's resident session into its host slabs before the pages go back, so a
+    // conversation keeps its reuse across the retirement. Called by the executors' finalize.
+    void retire_lane_session(std::uint32_t lane);
+    // Put a request the admission could not serve back at the head of the FIFO queue, so it keeps
+    // its place ahead of the requests that arrived after it.
+    void requeue_lane_front(std::shared_ptr<PendingRequest> pending);
+    // Prompt tokens plus the output budget the request was admitted with: the positions its own KV
+    // pages have to cover.
+    [[nodiscard]] std::uint32_t lane_need_tokens(const PendingRequest& pending) const noexcept;
+    // The pages a request with this many positions needs: those positions plus the route's write
+    // margin, rounded up to the page grid. reserve_lane_kv() reserves this and the executors derive
+    // the lane's window from the same expression, so the window can never disagree with the pages
+    // that were actually reserved for it.
+    [[nodiscard]] std::uint32_t lane_kv_pages(std::uint32_t need_tokens) const noexcept;
     // P1.4c: one shared decode round for the whole batch, which is the only path that turns
     // concurrency into throughput. Prefill stays serial per lane, each on its own KV row and GDN
     // slot; only the decode rounds are shared. Every admitted member is batched, including one that
@@ -443,18 +469,29 @@ private:
     // by what the cross-device all-reduce staging buffer carries in one payload (see the definition).
     [[nodiscard]] std::uint32_t prefill_chunk_width(const models::qwen3_5::TextConfig& config) const;
 
-    // The context ceiling a lane may actually write at. `lane_token_capacity_` is the KV budget a
-    // lane owns after the static page split, but a lane that reached that position would write on
-    // the next lane's first page (and the last lane past the pool), so the admitted window stops one
-    // token short of it. A batched MTP route also runs its draft chain a few columns past the
-    // longest lane's position, so it keeps that write tail inside the lane's own pages too (P2.1b).
-    // The single-lane route keeps advertising `options_.max_context` unchanged.
-    // build_shard asserts that this window plus the route's write tail still fits the pages
-    // published to the lane's execution row.
-    [[nodiscard]] std::uint32_t lane_context_window() const noexcept {
-        if (lanes_ == 1U) { return options_.max_context; }
-        const std::uint32_t margin = mtp_enabled_ ? mtp_drafts_ + 2U : 1U;
-        return lane_token_capacity_ > margin ? lane_token_capacity_ - margin : 1U;
+    // The context ceiling a request may be admitted against on a multi-lane route. The pool is
+    // shared rather than partitioned, so this is a policy bound - the whole pool by default, or the
+    // `--lane-context` ceiling when one is configured (S2) - clamped to the pool minus the route's
+    // write margin. The clamp is what makes the executors' wait-for-pages path safe: a request
+    // admitted at this ceiling always fits an empty pool, so it can only be waiting for another lane
+    // to retire. The single-lane route keeps advertising `options_.max_context` unchanged.
+    [[nodiscard]] std::uint32_t lane_admission_limit() const noexcept {
+        return lanes_ == 1U ? options_.max_context : lane_context_limit_;
+    }
+    // Tokens past the admitted window that a round may still write inside the lane's own pages: the
+    // batched MTP route runs its draft chain that far past the longest lane's position (P2.1b).
+    [[nodiscard]] std::uint32_t lane_kv_margin() const noexcept {
+        return mtp_enabled_ ? mtp_drafts_ + 2U : 1U;
+    }
+    [[nodiscard]] std::uint32_t lane_kv_write_tail() const noexcept {
+        return mtp_enabled_ ? mtp_drafts_ : 0U;
+    }
+    // The context window a lane gets out of the pages it reserved: the page rounding hands it up to
+    // 63 extra tokens, but the route's write tail has to stay inside the same pages.
+    [[nodiscard]] std::uint32_t lane_kv_window(std::uint32_t pages) const noexcept {
+        const std::uint32_t page_tokens = pages * static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t margin      = lane_kv_margin();
+        return page_tokens > margin ? page_tokens - margin : 0U;
     }
 
     // MTP prefill priming on shard 0: runs the MTP layer over one prefill chunk, appending its own
@@ -953,9 +990,9 @@ private:
     bool dflash2_enabled_         = false;
     std::uint32_t dflash_drafts_  = 0;
 
-    // Multi-lane admission state (P1.4). `lane_token_capacity_` is the KV budget every lane owns
-    // after the static page split, which is the context ceiling submit() must clamp against once
-    // lanes_ > 1: the pool is shared, so no lane may be offered the whole options_.max_context.
+    // Multi-lane admission state (P1.4, S1). `lane_context_limit_` is the context ceiling submit()
+    // clamps against once lanes_ > 1: the KV pool is shared and handed out per request, so this is a
+    // policy bound (the whole pool by default, `--lane-context` in S2) rather than a partition.
     std::deque<std::shared_ptr<PendingRequest>> lane_queue_;
     std::mutex lane_queue_mutex_;
     std::condition_variable lane_queue_cv_;
@@ -963,7 +1000,7 @@ private:
     // `lane_driver_stop_` is set once, by the destructor, which then joins the thread.
     std::thread lane_driver_;
     bool lane_driver_stop_ = false;
-    std::uint32_t lane_token_capacity_ = 0;
+    std::uint32_t lane_context_limit_ = 0;
     // The lane the batch member currently driving is bound to. It only reaches the non-batch windows,
     // which take it as an argument; the driver holds `execution_mutex_`, so there is exactly one
     // writer and one reader at a time. It stays 0 on the single-lane route.

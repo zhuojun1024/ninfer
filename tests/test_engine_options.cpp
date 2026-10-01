@@ -104,6 +104,26 @@ int main() {
                           "TP-2 route enabled a disabled prefill overlap");
     }
 
+    {
+        // `--lane-context` is the TP-2 multi-lane admission ceiling. Normalization keeps the
+        // operator's number and rejects a ceiling wider than the logical context.
+        ninfer::EngineOptions options = generation_options();
+        options.device_b              = 1;
+        options.max_context           = 131072;
+        options.max_concurrency       = 4;
+        options.lane_context          = 32768;
+        const ninfer::EngineOptions resolved = ninfer::runtime::normalize_engine_options(options);
+        failures += check(resolved.lane_context == 32768,
+                          "TP-2 route dropped the configured lane context ceiling");
+
+        options.lane_context = 262144;
+        bool rejected        = false;
+        try {
+            (void)ninfer::runtime::normalize_engine_options(options);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "TP-2 lane_context above max_context was accepted");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " engine option checks failed\n";
         return 1;

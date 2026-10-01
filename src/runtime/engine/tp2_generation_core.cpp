@@ -430,22 +430,51 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
                      session_capacity_ == 0 ? "disabled" : "enabled");
     }
 
-    // The KV pool is one physical allocation split statically across the lanes, so a lane owns
-    // `per_lane` pages and the context ceiling a request may be admitted against is that lane's
-    // share of the pool, not the whole of it. The last lane takes the page remainder, so this is
-    // the guaranteed minimum. Single-lane keeps reading options_.max_context directly: the page
-    // rounding above must not widen the ceiling it has always advertised.
+    // The text KV pool is one physical allocation shared by every lane. A multi-lane route hands it
+    // out dynamically: a request reserves exactly the pages its own prompt plus output budget need
+    // when it is admitted and returns them when it retires, so a lane that runs alone may use the
+    // whole pool instead of a fixed 1/lanes slice (docs/PLAN-tp2-kv-sharing.md). The admission
+    // ceiling is a policy value clamped to the pool minus the route's write margin; the clamp
+    // guarantees that a request admitted at this ceiling always finds its pages, which is what keeps
+    // the executors' requeue path from waiting forever.
     //
-    // This runs before `build_shard` because build_shard asserts that the split it publishes and
-    // the window this derives are the same budget (lane_context_window()).
+    // Single-lane keeps reading options_.max_context directly: the page rounding above must not
+    // widen the ceiling it has always advertised.
     if (lanes_ > 1) {
-        const std::uint32_t pages_per_lane = pages_for_tokens(options_.max_context) / lanes_;
-        lane_token_capacity_ = pages_per_lane * static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t pool_tokens =
+            pages_for_tokens(options_.max_context) * static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t margin = lane_kv_margin();
+        if (pool_tokens <= margin) {
+            throw std::logic_error("TP-2 KV pool is too small for the route's write margin");
+        }
+        lane_context_limit_ = pool_tokens - margin;
+        // `--lane-context` is the operator's ceiling for one lane (llama.cpp's
+        // --kv-unified-per-slot): a smaller value caps what one lane may reserve, so four large
+        // requests can still run four-up instead of the first one taking the whole pool. A larger
+        // value is clamped to the pool ceiling above, which is the only value that cannot
+        // deadlock.
+        if (options_.lane_context != 0U) {
+            if (options_.lane_context < lane_context_limit_) {
+                lane_context_limit_ = options_.lane_context;
+            }
+            std::fprintf(stderr,
+                         "[mem] TP-2 lane admission ceiling %u tokens (--lane-context %u)\n",
+                         lane_context_limit_, options_.lane_context);
+        }
         // The batched executors stage their per-lane operands here, one section per operand with
         // the lane index as the stride. A captured batch step reads these addresses through memcpy
         // nodes, so the buffer may not move between rounds (P2.2b).
         batch_lane_host_ = std::make_unique<PinnedHostBuffer>(
             5 * static_cast<std::size_t>(lanes_) * sizeof(std::int32_t), true);
+    }
+
+    if (lanes_ == 1U && options_.lane_context != 0U) {
+        // The single lane owns the whole context by construction, so a ceiling here would only
+        // shorten the one request the route can run. Say so instead of applying it silently.
+        std::fprintf(stderr,
+                     "[mem] --lane-context %u is ignored at --max-concurrency 1: the single "
+                     "lane owns the whole context\n",
+                     options_.lane_context);
     }
 
     build_shard(shard_a_, 0);
@@ -1051,127 +1080,97 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     // The execution context is constructed at the end of this function: the MTP layer needs its KV
     // execution view, which only exists after the page list above is materialized.
 
-    // Materialize the full KV page list once at startup. The pool is a fixed physical allocation
-    // reused in place across requests, so pinning the page leases and the execution rows here
-    // means each request only re-zeros the GDN state; there is no per-request reserve/allocate
-    // churn (which would leak the pool's capacity after the first request). The block-table
-    // mapping is identical every request, so publishing once suffices.
+    // Materialize the KV pages at startup. The pool is one fixed physical allocation; on the
+    // single-lane route the whole of it is pinned here and reused in place across requests, so a
+    // request only re-zeros the GDN state and the block-table mapping never changes.
     //
-    // The pages are split statically: lane l owns [l*per_lane, (l+1)*per_lane) of the pool, and
-    // the last lane takes the remainder so every page is assigned exactly once. Phase 1 has no
-    // backfill and no preemption, so a lane can never need another lane's pages; the cost is that
-    // each lane's context is divided by the lane count (--kv-capacity is the machine total).
-    // The admitted window is bound to this split: see the assertion below and lane_context_window().
+    // On a multi-lane route the pool is shared and handed out per request instead: this block only
+    // acquires one execution row per lane, and reserve_lane_kv() republishes a lane's row with the
+    // pages of whichever request currently holds that lane (S1 of docs/PLAN-tp2-kv-sharing.md).
+    // Every page is then owned by exactly one live request, so a lane can never reach another
+    // request's pages, and the admitted window is bound to the pages that request reserved.
     {
         auto& pool   = shard.decoder->text_kv.page_pool();
         auto& tables = shard.decoder->text_kv.execution_tables();
-        const std::uint32_t pages    = pages_for_tokens(capacity);
-        const std::uint32_t per_lane = pages / static_cast<std::uint32_t>(lanes);
-        if (per_lane == 0) {
-            throw std::logic_error(
-                "TP-2 KV budget cannot give every lane a page; lower --max-concurrency or raise "
-                "--max-context");
-        }
-        // Each execution row is published over only `count` pages while its logical capacity is the
-        // whole context, and the device arena is not zeroed: a request admitted past the published
-        // range would read an uninitialized block-table entry and write another lane's physical
-        // pages. Nothing else checks that relation (A3 of
-        // docs/PLAN-tp2-concurrency-review-remediation.md), so pin it here and fail at startup
-        // rather than on the first over-long request. See lane_context_window().
-        if (lanes_ > 1U) {
-            const std::uint32_t lane_pages_tokens =
-                per_lane * static_cast<std::uint32_t>(kPagedKVPageSize);
-            const std::uint32_t write_tail = mtp_enabled_ ? mtp_drafts_ : 0U;
-            if (lane_context_window() + write_tail >= lane_pages_tokens) {
-                throw std::logic_error(
-                    "TP-2 lane context window exceeds the pages published to its execution row");
-            }
-        }
+        const std::uint32_t pages = pages_for_tokens(capacity);
         shard.device.bind_to_current_thread();
         shard.kv_lane_pages.resize(static_cast<std::size_t>(lanes));
         shard.kv_lane_handles.resize(static_cast<std::size_t>(lanes));
         shard.kv_rows.clear();
         shard.kv_rows.reserve(static_cast<std::size_t>(lanes));
-        std::uint32_t assigned = 0;
-        for (std::int32_t lane = 0; lane < lanes; ++lane) {
-            const auto index  = static_cast<std::size_t>(lane);
-            auto&      leases = shard.kv_lane_pages[index];
-            auto&      handles = shard.kv_lane_handles[index];
-            const std::uint32_t count = (lane + 1 == lanes) ? (pages - assigned) : per_lane;
-            auto reserved = pool.reserve(count);
+        if (lanes_ == 1U) {
+            auto& leases  = shard.kv_lane_pages[0];
+            auto& handles = shard.kv_lane_handles[0];
+            auto reserved = pool.reserve(pages);
             if (!reserved.has_value()) {
                 throw std::logic_error("TP-2 KV page reservation failed");
             }
             DeviceKVPageReservation reservation = std::move(*reserved);
             leases.clear();
-            leases.reserve(count);
-            pool.materialize(reservation, count, leases);
+            leases.reserve(pages);
+            pool.materialize(reservation, pages, leases);
             handles.clear();
             handles.reserve(leases.size());
             for (const auto& lease : leases) { handles.push_back(lease.handle()); }
-            shard.kv_rows.push_back(tables.acquire(lane));
+            shard.kv_rows.push_back(tables.acquire(0));
             tables.publish(shard.kv_rows.back().handle(), 0, handles, shard.device.stream);
-            assigned += count;
-        }
-        if (lanes > 1) {
+        } else {
+            // Each row is published per request; the invariant the static split used to pin here (A3
+            // of docs/PLAN-tp2-concurrency-review-remediation.md) is checked in reserve_lane_kv()
+            // against the pages that request actually reserved.
+            for (std::int32_t lane = 0; lane < lanes; ++lane) {
+                shard.kv_rows.push_back(tables.acquire(lane));
+            }
             std::fprintf(stderr,
-                         "[mem] shard %d KV pages %u over %d lanes = %u pages (%u tokens) per "
-                         "lane\n",
-                         shard_index, pages, lanes, per_lane, per_lane * 64U);
+                         "[mem] shard %d KV pool %u pages (%u tokens) shared by %d lanes\n",
+                         shard_index, pages,
+                         pages * static_cast<std::uint32_t>(kPagedKVPageSize), lanes);
         }
     }
 
-    // The MTP layer's own attention context. Same fixed-page treatment as the text cache: one
-    // physical page list split across the lanes, one execution row per lane, each published once
-    // (P2.1b). Only the `logical` slice is mapped; the layer's extra page groups are dead capacity
-    // exactly as on the single-GPU route, so they are materialized but never published.
+    // The MTP layer's own attention context. On the single-lane route it gets the same fixed-page
+    // treatment as the text cache: one physical page list pinned for the process, one execution row,
+    // published once (P2.1b). A multi-lane route shares it too and republishes the lane's row per
+    // request exactly like the text cache (S1). Only the `logical` slice is ever mapped; the layer's
+    // extra page groups are dead capacity exactly as on the single-GPU route.
     if (mtp_shard) {
         auto* cache = shard.decoder->mtp_cache();
         if (cache == nullptr) { throw std::logic_error("TP-2 MTP KV cache was not planned"); }
         auto& pool   = cache->page_pool();
         auto& tables = cache->execution_tables();
         const std::uint32_t logical_pages = pages_for_tokens(capacity);
-        const std::uint32_t per_lane      = logical_pages / lanes;
-        if (per_lane == 0U) {
-            throw std::logic_error("TP-2 MTP KV budget cannot give every lane a page; lower "
-                                   "--max-concurrency or raise --max-context");
-        }
         shard.device.bind_to_current_thread();
-        auto reserved = pool.reserve(mtp_physical_pages);
-        if (!reserved.has_value()) {
-            throw std::logic_error("TP-2 MTP KV page reservation failed");
-        }
-        DeviceKVPageReservation reservation = std::move(*reserved);
-        shard.mtp_pages.reserve(mtp_physical_pages);
-        pool.materialize(reservation, mtp_physical_pages, shard.mtp_pages);
-        shard.mtp_page_handles.clear();
-        shard.mtp_page_handles.reserve(logical_pages);
-        for (std::uint32_t i = 0; i < logical_pages; ++i) {
-            shard.mtp_page_handles.push_back(shard.mtp_pages[i].handle());
-        }
+        shard.mtp_lane_pages.resize(static_cast<std::size_t>(lanes));
         shard.mtp_lane_handles.assign(lanes, {});
         shard.mtp_rows.clear();
         shard.mtp_rows.reserve(lanes);
         shard.mtp_views.clear();
         shard.mtp_views.reserve(lanes);
-        std::uint32_t assigned = 0;
-        for (std::uint32_t lane = 0; lane < lanes; ++lane) {
-            const std::uint32_t count = lane + 1U == lanes ? logical_pages - assigned : per_lane;
-            auto& handles             = shard.mtp_lane_handles[lane];
-            handles.reserve(count);
-            for (std::uint32_t i = 0; i < count; ++i) {
-                handles.push_back(shard.mtp_pages[assigned + i].handle());
+        if (lanes_ == 1U) {
+            auto reserved = pool.reserve(mtp_physical_pages);
+            if (!reserved.has_value()) {
+                throw std::logic_error("TP-2 MTP KV page reservation failed");
             }
-            assigned += count;
-            KVExecutionRowLease row = tables.acquire(static_cast<std::int32_t>(lane));
+            DeviceKVPageReservation reservation = std::move(*reserved);
+            shard.mtp_pages.reserve(mtp_physical_pages);
+            pool.materialize(reservation, mtp_physical_pages, shard.mtp_pages);
+            auto& handles = shard.mtp_lane_handles[0];
+            handles.reserve(logical_pages);
+            for (std::uint32_t i = 0; i < logical_pages; ++i) {
+                handles.push_back(shard.mtp_pages[i].handle());
+            }
+            KVExecutionRowLease row = tables.acquire(0);
             tables.publish(row.handle(), 0, handles, shard.device.stream);
             shard.mtp_views.push_back(cache->execution_view(row));
             shard.mtp_rows.push_back(std::move(row));
-        }
-        if (lanes > 1U) {
-            std::fprintf(stderr,
-                         "[mem] shard %d MTP KV pages %u over %u lanes = %u pages per lane\n",
-                         shard_index, logical_pages, lanes, per_lane);
+        } else {
+            for (std::int32_t lane = 0; lane < lanes; ++lane) {
+                KVExecutionRowLease row = tables.acquire(lane);
+                shard.mtp_views.push_back(cache->execution_view(row));
+                shard.mtp_rows.push_back(std::move(row));
+            }
+            std::fprintf(stderr, "[mem] shard %d MTP KV pool %u pages shared by %u lanes\n",
+                         shard_index, logical_pages, lanes);
         }
     }
 
@@ -2008,12 +2007,12 @@ TP2GenerationCore::Submission TP2GenerationCore::submit(
     GenerationObservationOptions, std::chrono::steady_clock::time_point) {
     auto output = frontend_->make_output_session(prompt, options.stop, options.output,
                                                  options.execution.thinking);
-    // Multi-lane (P1.4): every lane owns a fixed slice of the shared KV pool, so the context
-    // ceiling is that slice - one token short of its page boundary, and on the MTP route one draft
-    // chain short of the tail that chain writes past the current position (P2.1b). Single-lane keeps
-    // the advertised options_.max_context, which the page-rounded per-lane figure would only widen.
-    const std::uint32_t context_window = lane_context_window();
-    // A lane can only ever hold its own slice of the shared pool, so reject an overflow before the
+    // Multi-lane (P1.4, S1): the KV pool is shared and handed out per request, so the ceiling here
+    // is the admission policy - `--lane-context` when configured, the whole pool otherwise - already
+    // clamped by the route's write margin, which is what lets the executors' requeue path terminate.
+    // Single-lane keeps the advertised options_.max_context.
+    const std::uint32_t context_window = lane_admission_limit();
+    // A prompt longer than the admission ceiling can never fit the pool, so reject it before the
     // subtraction below wraps it into a capacity that looks infinite.
     if (lanes_ > 1 && summary.prompt_tokens > context_window) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
@@ -2216,6 +2215,12 @@ void TP2GenerationCore::drive_lane_queue() {
             // round. Discarding every lane's recall claim and host checkpoints costs a re-prefill;
             // guessing which lanes are still sound would cost correctness (P3.4/B4, docs/serving.md).
             session_invalidate_all();
+            // S1: a round that threw can leave a lane's pages reserved with no request owning them.
+            // They go back to the shared pool here, so a failed batch does not cost the pool the
+            // capacity of every lane it touched.
+            for (std::int32_t lane = 0; lane < lanes_; ++lane) {
+                release_lane_kv(static_cast<std::uint32_t>(lane));
+            }
             // D4 narrowed by P0.2: a member whose lane already retired keeps the result it published
             // - that lane committed, and its submitter may already be gone - so only the members
             // still running take the failure. Writing `failure` under the queue lock before `complete`
@@ -2543,6 +2548,146 @@ std::shared_ptr<TP2GenerationCore::PendingRequest> TP2GenerationCore::try_pop_la
     return pending;
 }
 
+// S1 (docs/PLAN-tp2-kv-sharing.md): one request's share of the shared KV pool. The request gets
+// exactly the pages its own prompt plus output budget need - rounded up to the page grid, plus the
+// route's write margin - on both shards and, when the MTP layer is live, on shard 0's own cache.
+// The reservation is all-or-nothing and happens before the request is admitted, so a pool that
+// cannot cover it right now leaves nothing behind and the caller puts the request back at the head
+// of the queue. The admission ceiling already excludes the margin, so a request that fits the policy
+// always fits an empty pool: the wait is always for another lane to retire, never a deadlock.
+std::uint32_t TP2GenerationCore::lane_kv_pages(std::uint32_t need_tokens) const noexcept {
+    return pages_for_tokens(need_tokens + lane_kv_margin());
+}
+
+bool TP2GenerationCore::reserve_lane_kv(std::uint32_t lane, std::uint32_t need_tokens) {
+    if (lanes_ <= 1U) { return true; }
+    const auto index = static_cast<std::size_t>(lane);
+    // A round that threw can leave a lane's pages leased with no request owning them. Take them back
+    // before asking for the new request's share, so a failed batch cannot starve the pool.
+    shard_a_.kv_lane_pages[index].clear();
+    shard_a_.kv_lane_handles[index].clear();
+    shard_b_.kv_lane_pages[index].clear();
+    shard_b_.kv_lane_handles[index].clear();
+    if (mtp_enabled_) {
+        shard_a_.mtp_lane_pages[index].clear();
+        shard_a_.mtp_lane_handles[index].clear();
+    }
+    const std::uint32_t pages       = lane_kv_pages(need_tokens);
+    const std::uint32_t page_tokens = pages * static_cast<std::uint32_t>(kPagedKVPageSize);
+    // The static split pinned this once at startup; the pages belong to one request now, so the same
+    // invariant is checked where they are handed out (A3 of the review remediation plan).
+    if (lane_kv_window(pages) + lane_kv_write_tail() >= page_tokens) {
+        throw std::logic_error("TP-2 lane context window exceeds the pages reserved for it");
+    }
+    Shard* shards[2] = {&shard_a_, &shard_b_};
+    // Reserve on every pool first: a pool that cannot cover the request releases what the others
+    // already reserved through the reservation destructors, so nothing is half-admitted.
+    std::optional<DeviceKVPageReservation> text[2];
+    for (std::size_t s = 0; s < 2; ++s) {
+        text[s] = shards[s]->decoder->text_kv.page_pool().reserve(pages);
+        if (!text[s].has_value()) { return false; }
+    }
+    std::optional<DeviceKVPageReservation> mtp;
+    if (mtp_enabled_) {
+        mtp = shard_a_.decoder->mtp_cache()->page_pool().reserve(pages);
+        if (!mtp.has_value()) { return false; }
+    }
+    for (std::size_t s = 0; s < 2; ++s) {
+        Shard& shard   = *shards[s];
+        auto&  pool    = shard.decoder->text_kv.page_pool();
+        auto&  leases  = shard.kv_lane_pages[index];
+        auto&  handles = shard.kv_lane_handles[index];
+        leases.clear();
+        leases.reserve(pages);
+        pool.materialize(*text[s], pages, leases);
+        handles.clear();
+        handles.reserve(leases.size());
+        for (const DeviceKVPageLease& lease : leases) { handles.push_back(lease.handle()); }
+        // The lane's row is republished over this request's own pages. Nothing has to be cleared
+        // first: the window above never reaches past them, and the device arena is not zeroed, so a
+        // block-table entry the route cannot reach is never read.
+        shard.decoder->text_kv.execution_tables().publish(shard.kv_rows[index].handle(), 0, handles,
+                                                          shard.device.stream);
+    }
+    if (mtp.has_value()) {
+        Shard& shard   = shard_a_;
+        auto*  cache   = shard.decoder->mtp_cache();
+        auto&  pool    = cache->page_pool();
+        auto&  leases  = shard.mtp_lane_pages[index];
+        auto&  handles = shard.mtp_lane_handles[index];
+        leases.clear();
+        leases.reserve(pages);
+        pool.materialize(*mtp, pages, leases);
+        handles.clear();
+        handles.reserve(leases.size());
+        for (const DeviceKVPageLease& lease : leases) { handles.push_back(lease.handle()); }
+        cache->execution_tables().publish(shard.mtp_rows[index].handle(), 0, handles,
+                                          shard.device.stream);
+    }
+    return true;
+}
+
+// The inverse of reserve_lane_kv: hand the lane's pages back to the shared pool and drop every claim
+// that its device KV still describes a conversation. The pages may be handed to another lane the
+// moment they are free, so retention state that still named them would make the next request
+// admitted onto this lane skip its prefill and read somebody else's tokens.
+void TP2GenerationCore::release_lane_kv(std::uint32_t lane) noexcept {
+    if (lanes_ <= 1U) { return; }
+    const auto index = static_cast<std::size_t>(lane);
+    Shard* shards[2] = {&shard_a_, &shard_b_};
+    for (Shard* shard : shards) {
+        if (index < shard->kv_lane_pages.size()) { shard->kv_lane_pages[index].clear(); }
+        if (index < shard->kv_lane_handles.size()) { shard->kv_lane_handles[index].clear(); }
+    }
+    if (index < shard_a_.mtp_lane_pages.size()) { shard_a_.mtp_lane_pages[index].clear(); }
+    if (index < shard_a_.mtp_lane_handles.size()) { shard_a_.mtp_lane_handles[index].clear(); }
+    RetentionState& lane_state = retention(lane);
+    lane_state.cached_prompt_tokens.clear();
+    lane_state.cached_media.clear();
+    lane_state.cached_boundaries.fill(0);
+    lane_state.cached_state_valid      = false;
+    lane_state.live_state_valid        = false;
+    lane_state.reuse_source            = ReuseSource::None;
+    lane_state.anchor_session          = kNoSession;
+    lane_state.block_anchor_position   = 0;
+    lane_state.block_anchor_prefill_id = 0;
+    invalidate_host_checkpoints(lane);
+    for (SessionEntry& entry : sessions_) {
+        if (entry.device_lane == static_cast<std::int32_t>(lane)) { entry.device_lane = -1; }
+    }
+    // The entry itself stays in the catalog: retire_lane_session() has already copied it into its
+    // host slabs when the budget allowed, and a host-resident entry is a recall candidate again.
+    lane_state.active_session = kNoSession;
+}
+
+// A lane's pages are about to go back to the shared pool, so the conversation its device KV holds
+// has to survive somewhere else or the next request admitted onto this lane would extend a prefix
+// that is no longer there. Copy it into its host slabs while the pages are still mapped; a
+// conversation the host budget cannot keep simply loses the newest part of its reuse, exactly as a
+// recall that cannot store the outgoing session does.
+void TP2GenerationCore::retire_lane_session(std::uint32_t lane) {
+    if (lanes_ <= 1U || session_capacity_ == 0) { return; }
+    if (retention(lane).active_session == kNoSession) { return; }
+    if (session_store_active(lane)) { return; }
+    while (session_evict_one()) {
+        if (session_store_active(lane)) { return; }
+    }
+}
+
+// The admission could not serve this request right now, so it keeps the place it had in the FIFO
+// order instead of losing it to the requests that arrived after it. The driver holds
+// `execution_mutex_` around every executor, which is the order execution_mutex_ -> lane_queue_mutex_.
+void TP2GenerationCore::requeue_lane_front(std::shared_ptr<PendingRequest> pending) {
+    std::unique_lock<std::mutex> queue(lane_queue_mutex_);
+    lane_queue_.push_front(std::move(pending));
+}
+
+// The positions one request's own pages have to cover: its prompt plus the output budget it was
+// admitted with (`budget.remaining()` is that budget at admission and only shrinks afterwards).
+std::uint32_t TP2GenerationCore::lane_need_tokens(const PendingRequest& pending) const noexcept {
+    return pending.request->summary.prompt_tokens + pending.request->budget.remaining();
+}
+
 // ---------------------------------------------------------------------------------------------
 // Batched plain walk (docs/PLAN-tp2-concurrency.md P1.4c)
 // ---------------------------------------------------------------------------------------------
@@ -2612,6 +2757,9 @@ void TP2GenerationCore::execute_plain_batch(
         bool prefilled              = false;
         Clock::time_point begin;
         Clock::time_point first_token;
+        // S1: the context window the pages this lane reserved give it. The executor sets it after
+        // admit_lane returns - admit_lane resets the whole state struct on entry.
+        std::uint32_t kv_window = 0;
     };
     // P2.2: the lane arrays cover the whole lane capacity rather than the batch that happened to
     // arrive, because a lane that retires frees its slot for a request still waiting in the queue.
@@ -2741,6 +2889,13 @@ void TP2GenerationCore::execute_plain_batch(
             lane.result.timings.total_seconds = total;
         }
         lane.pending->result = std::move(lane.result);
+        // S1: the pages this request held go back to the shared pool as it retires, so the next
+        // request admitted onto this lane can use them. The session is copied into its host slabs
+        // first - that copy reads the lane's device pages - because once they are free another lane
+        // may overwrite them, and retention state that still named them would make the next request
+        // skip its prefill and read somebody else's tokens.
+        retire_lane_session(lane.slot);
+        release_lane_kv(lane.slot);
         // P0.2: retire the member here rather than at the end of the batch. This lane is done, and
         // its submitter must be free to return while the other lanes keep running.
         publish_lane(*lane.pending);
@@ -3007,8 +3162,22 @@ void TP2GenerationCore::execute_plain_batch(
         return true;
     };
 
-    for (std::size_t index = 0; index < batch.size(); ++index) {
-        if (admit_lane(index, *batch[index])) { active.push_back(index); }
+    // S1: a member only takes its lane once the pages its own prompt plus output budget need are
+    // available. The driver already collected the batch, so a member the shared pool cannot serve
+    // right now goes back to the head of the queue and leaves the batch - the driver's safety net
+    // publishes whatever is still in `batch`, and a requeued member must not be published empty.
+    for (std::size_t index = 0; index < batch.size();) {
+        const std::uint32_t need_tokens = lane_need_tokens(*batch[index]);
+        if (!reserve_lane_kv(static_cast<std::uint32_t>(index), need_tokens)) {
+            requeue_lane_front(std::move(batch[index]));
+            batch.erase(batch.begin() + static_cast<std::ptrdiff_t>(index));
+            continue;
+        }
+        if (admit_lane(index, *batch[index])) {
+            lanes[index].kv_window = lane_kv_window(lane_kv_pages(need_tokens));
+            active.push_back(index);
+        }
+        ++index;
     }
 
     // Round watermark. Prefill's chunk scopes have handed the arena back, so the decode rounds
@@ -3056,12 +3225,25 @@ void TP2GenerationCore::execute_plain_batch(
                 }
             }
             if (index == lane_capacity) { break; }
+            // S1: the request's own pages have to be available before it may take the lane. If the
+            // shared pool cannot cover it right now it goes back to the head of the queue rather
+            // than losing its place to the requests that arrived after it. It is never dropped: the
+            // admission ceiling guarantees a request that fits the policy fits an empty pool, so
+            // this only ever waits for another lane to retire.
+            const std::uint32_t need_tokens = lane_need_tokens(*next);
+            if (!reserve_lane_kv(static_cast<std::uint32_t>(index), need_tokens)) {
+                requeue_lane_front(std::move(next));
+                break;
+            }
             batch.push_back(next);
             if (lane_trace_enabled()) {
                 std::fprintf(stderr, "[tp2-lane] admit slot=%zu live=%zu\n", index,
                              active.size() + 1);
             }
-            if (admit_lane(index, *next)) { active.push_back(index); }
+            if (admit_lane(index, *next)) {
+                lanes[index].kv_window = lane_kv_window(lane_kv_pages(need_tokens));
+                active.push_back(index);
+            }
         }
         if (active.empty()) { break; }
 
@@ -3252,6 +3434,9 @@ void TP2GenerationCore::execute_spec_batch(
         bool prefilled = false;
         Clock::time_point begin;
         Clock::time_point first_token;
+        // S1: the context window the pages this lane reserved give it. The executor sets it after
+        // admit_lane returns - admit_lane resets the whole state struct on entry.
+        std::uint32_t kv_window = 0;
     };
 
     // P2.2: the lane arrays cover the whole lane capacity rather than the batch that happened to
@@ -3391,6 +3576,13 @@ void TP2GenerationCore::execute_spec_batch(
             lane.result.timings.total_seconds = total;
         }
         lane.pending->result = std::move(lane.result);
+        // S1: the pages this request held go back to the shared pool as it retires, so the next
+        // request admitted onto this lane can use them. The session is copied into its host slabs
+        // first - that copy reads the lane's device pages - because once they are free another lane
+        // may overwrite them, and retention state that still named them would make the next request
+        // skip its prefill and read somebody else's tokens.
+        retire_lane_session(lane.slot);
+        release_lane_kv(lane.slot);
         // P0.2: retire the member here rather than at the end of the batch. This lane is done, and
         // its submitter must be free to return while the other lanes keep running.
         publish_lane(*lane.pending);
@@ -3673,8 +3865,22 @@ void TP2GenerationCore::execute_spec_batch(
         return true;
     };
 
-    for (std::size_t index = 0; index < batch.size(); ++index) {
-        if (admit_lane(index, *batch[index])) { active.push_back(index); }
+    // S1: a member only takes its lane once the pages its own prompt plus output budget need are
+    // available. The driver already collected the batch, so a member the shared pool cannot serve
+    // right now goes back to the head of the queue and leaves the batch - the driver's safety net
+    // publishes whatever is still in `batch`, and a requeued member must not be published empty.
+    for (std::size_t index = 0; index < batch.size();) {
+        const std::uint32_t need_tokens = lane_need_tokens(*batch[index]);
+        if (!reserve_lane_kv(static_cast<std::uint32_t>(index), need_tokens)) {
+            requeue_lane_front(std::move(batch[index]));
+            batch.erase(batch.begin() + static_cast<std::ptrdiff_t>(index));
+            continue;
+        }
+        if (admit_lane(index, *batch[index])) {
+            lanes[index].kv_window = lane_kv_window(lane_kv_pages(need_tokens));
+            active.push_back(index);
+        }
+        ++index;
     }
 
     shard_a_.round_base = ws_a.used();
@@ -3747,27 +3953,39 @@ void TP2GenerationCore::execute_spec_batch(
                 }
             }
             if (index == lane_capacity) { break; }
+            // S1: the request's own pages have to be available before it may take the lane. If the
+            // shared pool cannot cover it right now it goes back to the head of the queue rather
+            // than losing its place to the requests that arrived after it. It is never dropped: the
+            // admission ceiling guarantees a request that fits the policy fits an empty pool, so
+            // this only ever waits for another lane to retire.
+            const std::uint32_t need_tokens = lane_need_tokens(*next);
+            if (!reserve_lane_kv(static_cast<std::uint32_t>(index), need_tokens)) {
+                requeue_lane_front(std::move(next));
+                break;
+            }
             batch.push_back(next);
             if (lane_trace_enabled()) {
                 std::fprintf(stderr, "[tp2-lane] admit slot=%zu live=%zu\n", index,
                              active.size() + 1);
             }
-            if (admit_lane(index, *next)) { active.push_back(index); }
+            if (admit_lane(index, *next)) {
+                lanes[index].kv_window = lane_kv_window(lane_kv_pages(need_tokens));
+                active.push_back(index);
+            }
         }
         if (active.empty()) { break; }
 
         const std::int32_t columns = static_cast<std::int32_t>(active.size());
-        // The live speculative route owns the draft count and the context ceiling: every lane holds a
-        // fixed slice of the shared pool, so its own window bounds the positions a round may write.
+        // The live speculative route owns the draft count: every lane reserved its own pages when it
+        // was admitted, so the window those pages give it bounds the positions a round may write.
         const std::uint32_t draft_window = mtp_enabled_ ? mtp_drafts_ : dflash_drafts_;
-        const std::uint32_t lane_window  = lane_context_window();
         std::uint32_t max_position = 0;
         for (std::int32_t column = 0; column < columns; ++column) {
             const LaneState& lane = lanes[active[column]];
             const std::uint32_t budget_remaining = lane.pending->request->budget.remaining();
             const std::uint32_t max_by_budget = budget_remaining > 1U ? budget_remaining - 1U : 0U;
             const std::uint32_t capacity_left =
-                lane.position + 1U < lane_window ? lane_window - lane.position - 1U : 0U;
+                lane.position + 1U < lane.kv_window ? lane.kv_window - lane.position - 1U : 0U;
             lane_extent[column] = static_cast<std::int32_t>(
                 std::min({draft_window, max_by_budget, capacity_left}));
             max_position = std::max(max_position, lane.position);
@@ -6581,7 +6799,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             const std::uint32_t budget_remaining = request.budget.remaining();
             const std::uint32_t max_by_budget =
                 budget_remaining > 1 ? budget_remaining - 1U : 0U;
-            const std::uint32_t lane_window = lane_context_window();
+            const std::uint32_t lane_window = lane_admission_limit();
             const std::uint32_t capacity_left =
                 position + 1U < lane_window ? lane_window - position - 1U : 0U;
             // The draft is never declined, whatever boundary the scan took: the ring beside an

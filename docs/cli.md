@@ -275,7 +275,10 @@ layout. This includes the selected speculative backend, fixed sequence state, un
 and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
 unallocated. It does not probe allocations or resize the pool at request time. The single-request
 CLI normally leaves the option omitted so it follows
-`--max-context`; the distinction matters primarily to a concurrent Engine or server.
+`--max-context`; the distinction matters primarily to a concurrent Engine or server. On the TP-2
+server route the pool is shared dynamically and `--lane-context N` caps how much context one lane
+may reserve (`0` lets one lane take the whole pool); see
+[HTTP serving](serving.md#tensor-parallel-2-tp-2).
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
 Program workspace, and a separate CUDA Graph driver allowance. With Vision enabled, that one

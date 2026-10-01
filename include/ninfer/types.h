@@ -174,6 +174,11 @@ struct EngineOptions {
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
+    // TP-2 multi-lane admission ceiling in tokens: 0 (the default) lets a lane reserve the whole
+    // shared KV pool, a positive value caps what one lane may admit so the first request cannot
+    // take the pool from the others (llama.cpp's --kv-unified-per-slot). Ignored when the route
+    // runs one lane, which always owns the whole context.
+    std::uint32_t lane_context = 0;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;

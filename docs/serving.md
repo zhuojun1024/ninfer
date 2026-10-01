@@ -70,10 +70,14 @@ RTX 5060 Ti cards but not one.
   into one decode round. A request that arrives while a round is running joins a later round of the
   same batch as soon as a lane retires, so a second conversation starts producing while the first one
   is still decoding instead of waiting for it to finish. The default `--max-concurrency 1` runs one
-  request at a time. The lanes share
-  one KV pool, so they partition the context ceiling instead of each reserving it, but the
-  linear-attention state arena grows by about 294 MiB per card per lane: the shipped 262,144-token
-  configuration keeps `--max-concurrency 1`, and two to four lanes need `--max-context 131072`.
+  request at a time. The lanes share one KV
+  pool dynamically: a request is admitted only once the pages its own prompt plus output budget need
+  are free, so a lane that runs alone may use the whole context ceiling instead of a fixed 1/lanes
+  slice, and a request the pool cannot cover right now keeps its place in the queue instead of
+  failing - only a prompt longer than the pool's admission ceiling is rejected as
+  `context_length_exceeded`. What still grows per lane is the linear-attention state arena, about
+  294 MiB per card per lane: the shipped 262,144-token configuration keeps `--max-concurrency 1`,
+  and two to four lanes need `--max-context 131072`.
 - Batched TP-2 decoding covers the plain route and both speculative rounds (`--spec dflash2` and
   `--spec mtp`). The DFlash v1 backend is rejected at construction on this route, so no speculative
   backend ever collapses a `--max-concurrency` above `1`. The multi-lane
@@ -844,6 +848,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
+| `--lane-context N` | TP-2 multi-lane admission ceiling in tokens: how much context one lane may reserve; `0` lets one lane take the whole shared KV pool (ignored at `--max-concurrency 1`) | `0` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
@@ -1049,6 +1054,10 @@ resolves once at startup.
 
 Admission reserves the full prompt-plus-effective-output page entitlement through request
 completion. A request remains queued until a legal resource plan can satisfy that entitlement.
+On the TP-2 route that entitlement comes from the pool the lanes share, so `--lane-context N`
+caps how much context one lane may reserve: `--lane-context 32768` with four lanes reproduces the
+old fixed per-lane slice, while `0` (the default) lets a lane that runs alone use the whole pool.
+A `--max-concurrency 1` route ignores the ceiling because its one lane already owns the context.
 
 Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
 finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas

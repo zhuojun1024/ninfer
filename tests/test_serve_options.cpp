@@ -161,6 +161,20 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
+    bool lane_context_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--max-context", "8192",
+                     "--lane-context", "16384"});
+    } catch (const std::invalid_argument&) { lane_context_rejected = true; }
+    failures += check(lane_context_rejected,
+                      "--lane-context accepted a ceiling wider than --max-context");
+
+    const ServeOptions lane_scoped = parse({"ninfer-serve", "model.ninfer", "--max-context",
+                                            "8192", "--max-concurrency", "4",
+                                            "--lane-context", "4096"});
+    failures += check(lane_scoped.lane_context == 4096,
+                      "--lane-context did not reach serving options");
+
     const ServeOptions configured = parse({"ninfer-serve",
                                            "model.ninfer",
                                            "--no-prefix-reuse",

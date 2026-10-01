@@ -32,6 +32,9 @@ struct ServeOptions {
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency      = 1;
+    // TP-2 multi-lane admission ceiling in tokens; 0 lets a lane reserve the whole KV pool. See
+    // EngineOptions::lane_context. A single-lane route ignores it.
+    std::uint32_t lane_context         = 0;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
