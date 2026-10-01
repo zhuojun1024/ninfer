@@ -66,7 +66,8 @@ struct DFlash2RoundSpec {
 [[nodiscard]] DFlash2RoundSpec plan_dflash2_round(const DraftConfig& draft, const TextConfig& target,
                                                   std::uint32_t feature_columns,
                                                   std::uint32_t draft_window,
-                                                  std::size_t proposal_workspace_bytes);
+                                                  std::size_t proposal_workspace_bytes,
+                                                  std::uint32_t batch_capacity = 1);
 
 // Peak device workspace one DFlash2 masked-block proposal forward consumes at this geometry, planned
 // with the same capacity functions the single-device route sizes its arena with
@@ -115,10 +116,20 @@ public:
     // beside the image, because the ring's coverage is [frontier - window, frontier) and no byte of
     // the payload encodes it.
     [[nodiscard]] std::size_t context_image_bytes() const noexcept { return ring_payload_bytes_; }
-    void copy_context_to_host(std::byte* destination, cudaStream_t stream) const;
-    void copy_context_from_host(const std::byte* source, cudaStream_t stream);
-    void copy_context_to_device(DeviceSpan destination, cudaStream_t stream) const;
-    void copy_context_from_device(DeviceSpan source, cudaStream_t stream);
+    // The bytes one resident lane's ring occupies inside that image. A multi-lane round keeps one
+    // ring slot per lane, so an image carries every lane and a caller addresses its own through this
+    // extent - the same shape the GDN state image uses (core/linear_attention_state.h).
+    [[nodiscard]] std::size_t lane_context_image_bytes() const noexcept {
+        return ring_payload_bytes_ / static_cast<std::size_t>(spec_.batch_capacity);
+    }
+    void copy_context_to_host(std::byte* destination, cudaStream_t stream,
+                              std::int32_t lane = 0) const;
+    void copy_context_from_host(const std::byte* source, cudaStream_t stream,
+                                std::int32_t lane = 0);
+    void copy_context_to_device(DeviceSpan destination, cudaStream_t stream,
+                                std::int32_t lane = 0) const;
+    void copy_context_from_device(DeviceSpan source, cudaStream_t stream,
+                                  std::int32_t lane = 0);
     [[nodiscard]] std::size_t proposal_workspace_capacity() const noexcept;
     [[nodiscard]] std::size_t proposal_workspace_peak() const noexcept;
     void reset_proposal_workspace_peak() noexcept;
@@ -129,7 +140,7 @@ public:
     // --- prefill capture (target forward -> draft context) ---
     // The sink the target prefill taps its residual blocks into. Its consumer commits each captured
     // chunk through append() on the caller's resident workspace.
-    [[nodiscard]] DFlashFeatureSink make_prefill_sink(ExecutionCore execution);
+    [[nodiscard]] DFlashFeatureSink make_prefill_sink(ExecutionCore execution, std::int32_t lane = 0);
     // Commits one captured feature window [target_features, width, B] into the draft's local ring.
     // exact is the number of live columns the target forward produced; lane names the destination
     // lane (0 for the one resident session).
@@ -141,13 +152,21 @@ public:
     // owns no consumer: the captured columns land in the draft's pending staging buffer and are
     // committed one round later by append_pending, exactly as the single-device route's
     // prepare_ragged_prefix hand-off does. width is the verify window (K+1) and batch the resident
-    // rows; the destination lane is frame active_lanes.
-    [[nodiscard]] DFlashFeatureSink make_verify_sink();
+    // rows; the destination lane is frame active_lanes. batch is the number of live rows this round
+    // (frame rows beyond it are not captured), and it must equal the verify window's lane count.
+    [[nodiscard]] DFlashFeatureSink make_verify_sink(std::int32_t batch = 1);
     // Commits the pending verify-window features [start, end) - the columns of the window that the
     // next round has committed - into the draft's local ring at those absolute positions. start is
     // the draft's context frontier, end the target's execution frontier; end - start must fit the
     // round's feature_lanes, which is the pending staging width. A zero-width call is a no-op.
     void append_pending(ExecutionCore execution, std::uint32_t start, std::uint32_t end);
+    // The multi-lane form of append_pending: one (lane, state slot, start, end) row per live lane.
+    // Every row's state slot is the draft ring slot that lane's proposal wrote, and end - start is
+    // that lane's own committed width. Lanes with a zero-width window are skipped. One ragged-prefix
+    // pass fans the staged features out to the per-lane ring slots.
+    void append_pending_batch(ExecutionCore execution, const std::int32_t* slots,
+                              const std::int32_t* starts, const std::int32_t* ends,
+                              std::int32_t batch);
     [[nodiscard]] std::uint32_t draft_window() const noexcept { return spec_.draft_window; }
     [[nodiscard]] std::int32_t feature_lanes() const noexcept { return spec_.feature_lanes; }
 
@@ -159,7 +178,7 @@ public:
     // leaves its outputs in the frame. card registers the peer half of the column-split token
     // embedding on TP-2; it is null whenever the text stack is not split.
     void propose(ExecutionCore execution, const qwen3_5::PagedKVCache& text_cache, TextContext* card,
-                 std::uint32_t k, DFlashEnvelopes envelopes);
+                 std::uint32_t k, DFlashEnvelopes envelopes, std::int32_t batch = 1);
 
     [[nodiscard]] qwen3_5::DFlashDecodeState& frame() noexcept { return *frame_; }
     [[nodiscard]] const qwen3_5::DFlashDecodeState& frame() const noexcept { return *frame_; }
@@ -192,6 +211,11 @@ private:
     // Scratch that outlives the frame: the continuation hidden the verify stage stores.
     std::unique_ptr<DeviceArena> scratch_arena_;
     Tensor continuation_hidden_;
+    // The verify sink's lane bindings, sliced to the round's live rows. They must outlive the sink
+    // because scatter_bf16_batch requires lanes/valid_columns to have exactly one entry per source
+    // column, while the frame rows are sized for batch_capacity.
+    Tensor verify_lanes_;
+    Tensor verify_valid_;
 
     qwen3_5::DFlashDecodeIngress ingress_{};
     qwen3_5::DFlashDecodeEgress egress_{};

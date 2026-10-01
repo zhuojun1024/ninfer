@@ -6,11 +6,12 @@
 
 namespace ninfer::ops::detail {
 
-void fill_i32_positions_launch(Tensor& positions, std::int32_t start, cudaStream_t stream) {
+void fill_i32_positions_launch(Tensor& positions, std::int32_t start, std::int32_t stride,
+                               cudaStream_t stream) {
     constexpr int block = 256;
     const int grid      = div_up(positions.ne[0], block);
     fill_i32_positions_kernel<<<grid, block, 0, stream>>>(
-        static_cast<std::int32_t*>(positions.data), positions.ne[0], start);
+        static_cast<std::int32_t*>(positions.data), positions.ne[0], start, stride);
     CUDA_CHECK(cudaGetLastError());
 }
 

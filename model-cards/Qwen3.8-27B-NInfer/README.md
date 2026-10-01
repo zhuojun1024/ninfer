@@ -254,7 +254,8 @@ card reports no AIME results.
 
 - NInfer executes on one RTX 5090 (or one TP-2 pair of identical RTX 5060 Ti cards on the server
   route) and one resident model, with a startup-fixed capacity of 1–8 active requests per Engine
-  (the TP-2 route runs one request at a time).
+  (the TP-2 pair batches up to four queued requests on its plain route and runs one at a time
+  otherwise).
 - It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
   general multi-GPU execution, CPU/GPU offload, or distributed serving.
 - Context allocation is subject to GPU memory and the selected KV-cache type.

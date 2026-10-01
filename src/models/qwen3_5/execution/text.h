@@ -131,6 +131,11 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // The MTP layer's KV execution row the prefill chunk appends into and attends over. The TP-2
+    // route primes one lane at a time, so it re-points this view (and the round state's scalar KV
+    // row) before each lane's priming (P2.1b).
+    void set_mtp_prefill_view(qwen3_5::PagedKVCacheView view) noexcept { mtp_kv_ = view; }
+
     // Tensor-parallel surface: run one layer's mixer (attention or GDN) on this shard's device,
     // writing the row-parallel output-projection delta (without the residual add) into delta.
     // A tensor-parallel driver calls this on each shard context and all-reduces the delta before
@@ -187,9 +192,27 @@ public:
     // its bounds matter, because the small-T route derives the active split count and the key
     // partition from the device-side positions. The peer's logits buffer is allocated internally
     // (the caller only samples from this shard's), so the captured layout is self-contained.
+    // `lane` selects the paged-KV execution row and the linear-attention state slot this window
+    // appends to. It is 0 for the single-lane route; the multi-lane route binds one lane per serial
+    // walk (P1.4), and the batched window below takes the whole lane vector instead.
     void forward_tp2_decode_window(TextContext& peer, tp::DevicePair& pair,
                                    const std::int32_t* token, const std::int32_t* position,
-                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits);
+                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits,
+                                   std::int32_t lane = 0);
+    // The plain decode step for a batch of resident sequences, one column (lane) per sequence. It
+    // runs exactly the sequence forward_tp2_decode_window runs, with every per-round operand
+    // widened to a [B] vector: tokens are the lane tokens, positions their absolute cache/RoPE
+    // positions, kv_table_rows the paged-KV execution-table row each lane appends to, and
+    // state_slots the linear-attention state slot each lane owns. All four are pinned host arrays
+    // of batch int32 read by both shards (the same values drive each). envelope must bound the
+    // whole batch inclusive key extent. The peer logits buffer is allocated internally, so the
+    // caller samples from this shard [V, B] logits.
+    void forward_tp2_decode_window_batch(TextContext& peer, tp::DevicePair& pair,
+                                         const std::int32_t* tokens, const std::int32_t* positions,
+                                         const std::int32_t* kv_table_rows,
+                                         const std::int32_t* state_slots, std::int32_t batch,
+                                         ops::CausalAttentionExecutionEnvelope envelope,
+                                         Tensor& logits);
     // Tensor-parallel single-token forward at `position` returning the argmax token id on this
     // shard's device. Both shards hold the complete logits, so their argmax must agree; a
     // disagreement is a shard divergence.
@@ -217,12 +240,14 @@ public:
     // `vision` (optional) switches the chunk to the multimodal bindings: the mixer reads the prompt's
     // 3-axis RoPE table instead of its plain absolute positions, and a chunk overlapping an encoded
     // item scatters that item's embeddings into the residual stream before the layer loop.
+    // `lane` binds the chunk to one lane's paged-KV execution row and linear-attention state slot;
+    // the multi-lane route prefills its lanes one at a time against their own lane (P1.4).
     void forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair, std::span<const int> ids,
                              std::int32_t first_position, Tensor* logits, Tensor* logits_peer,
                              Tensor* mtp_input_hidden = nullptr, Tensor* logits_columns = nullptr,
                              Tensor* hidden_columns = nullptr, Phase phase = Phase::Prefill,
                              const Tp2VisionChunk* vision = nullptr,
-                             DFlashFeatureSink* sink = nullptr);
+                             DFlashFeatureSink* sink = nullptr, std::int32_t lane = 0);
 
     // Tensor-parallel verify window with capture-safe inputs. It runs exactly forward_tp2_prefill's
     // prefill phase over a small speculative window, but every per-round input is supplied as pinned
@@ -248,6 +273,23 @@ public:
                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits_columns,
                             Tensor* hidden_columns, DFlashFeatureSink* sink,
                             const std::int32_t* valid_columns);
+    // The same window for a batch of resident sequences: each lane owns `width` consecutive columns
+    // and the aggregate is `width * batch`, laid out lane by lane (dim 0 fastest, so every
+    // per-column operand is indexed `lane * width + column`). kv_table_rows and state_slots are
+    // [batch] pinned host arrays naming each lane's paged-KV execution row and linear-attention state
+    // slot; the per-column device bindings repeat them across that lane's window. logits_columns is
+    // [V, width*batch] and hidden_columns, when requested, the same. A one-lane window keeps the
+    // scalar bindings (extra lanes are what publish the per-column vectors), so the single-lane
+    // verify route stays byte-identical. valid_columns here is [batch] pinned host memory: the
+    // attention op takes one clamp extent per lane, and forward_tp2_window keeps its [1] contract.
+    void forward_tp2_window_batch(TextContext& peer, tp::DevicePair& pair, const std::int32_t* ids,
+                                  const std::int32_t* positions,
+                                  const std::int32_t* kv_table_rows,
+                                  const std::int32_t* state_slots, std::int32_t width,
+                                  std::int32_t batch,
+                                  ops::CausalAttentionExecutionEnvelope envelope,
+                                  Tensor& logits_columns, Tensor* hidden_columns,
+                                  DFlashFeatureSink* sink, const std::int32_t* valid_columns);
 
     // Registers the peer shard's context and the device pair. The tensor-parallel driver sets this
     // on both shards once, so operations that only run on one shard (the MTP stem) can still drive

@@ -13,18 +13,21 @@ using namespace ninfer::test;
 
 namespace {
 
-int fill_case(std::int32_t count, std::int32_t start) {
+int fill_case(std::int32_t count, std::int32_t start, std::int32_t stride) {
     std::vector<std::int32_t> expected(static_cast<std::size_t>(count));
-    for (std::int32_t i = 0; i < count; ++i) { expected[static_cast<std::size_t>(i)] = start + i; }
+    for (std::int32_t i = 0; i < count; ++i) {
+        expected[static_cast<std::size_t>(i)] = start + i * stride;
+    }
 
     GuardedDeviceBuffer output(static_cast<std::size_t>(count) * sizeof(std::int32_t));
     output.fill(0xcd);
     Tensor output_tensor(output.data(), DType::I32, {count});
-    ops::fill_i32_positions(output_tensor, start, nullptr);
+    ops::fill_i32_positions(output_tensor, start, stride, nullptr);
     cuda_synchronize();
 
-    const std::string label =
-        "fill_i32_positions T=" + std::to_string(count) + " start=" + std::to_string(start);
+    const std::string label = "fill_i32_positions T=" + std::to_string(count) +
+                              " start=" + std::to_string(start) +
+                              " stride=" + std::to_string(stride);
     int failures = verify_exact(
         label.c_str(), from_device<std::int32_t>(output.data(), expected.size()), expected);
     failures += output.verify_guards(label.c_str());
@@ -146,9 +149,11 @@ int main() {
             for (int axes : {1, 3})
                 for (bool in_place : {false, true})
                     failures += lane_offset_case(width, batch, axes, in_place);
-    failures += fill_case(1, 0);
-    failures += fill_case(6, 262144);
-    failures += fill_case(1024, 131072);
+    failures += fill_case(1, 0, 1);
+    failures += fill_case(6, 262144, 1);
+    failures += fill_case(1024, 131072, 1);
+    failures += fill_case(4, 131072, 6);
+    failures += fill_case(3, 262144, 1023);
     failures += offset_case(1, -17, false);
     failures += offset_case(6, 31, true);
     failures += offset_case(1024, -257, false);

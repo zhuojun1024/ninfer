@@ -33,7 +33,10 @@ use the same architecture, binding and execution path. The implementation target
 is tuned on NVIDIA GeForce RTX 5090.
 
 Generation uses one GPU, one resident model, startup-fixed concurrency of one to eight requests,
-bounded FIFO ingress, no active-request preemption, and one compact decode batch per round.
+bounded FIFO ingress, no active-request preemption, and one compact decode batch per round. The
+dedicated TP-2 route (`ninfer-serve --devices a,b`) fills that one round with up to four queued
+requests on its plain, DFlash2 and MTP rounds; its contract, limits, and measurements are in
+`docs/serving.md`.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale/preemptive continuous

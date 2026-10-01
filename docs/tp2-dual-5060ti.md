@@ -2,8 +2,8 @@
 
 This note records the tensor-parallel-2 (TP-2) adaptation of this engine for two RTX 5060 Ti
 (16 GiB) cards running `Qwen3.8-27B` NVFP4. Numbers were measured on this machine with
-`ninfer-serve` on `--devices 0,1`, greedy sampling, one request at a time. The routines live in
-`tools/tp_bootstrap/`.
+`ninfer-serve` on `--devices 0,1`, greedy sampling. The serving numbers below are single-request
+unless a concurrency is named. The routines live in `tools/tp_bootstrap/`.
 
 ## Recommended configuration
 
@@ -483,8 +483,14 @@ Constraints and limits:
   keeps the masked draft live (see the masked-draft section).
 - `--chat-template FILE` reaches this route: the core builds the serving frontend with the option, so a
   maintained template can replace the artifact's embedded one.
-- Session switching happens at request boundaries only. A request that arrives while another is
-  generating waits for it, because TP-2 runs one request at a time.
+- Session switching happens at request boundaries only. On the default one-lane route a request
+  that arrives while another is generating waits for it. On the batched route (`--max-concurrency`
+  `2..4`, plain, DFlash2 and MTP rounds) up to that many queued requests share one decode round.
+  Cross-session retention stays on: the checkpoint ring and the session catalog are sliced by lane, so
+  each lane recalls its own previous conversation independently. A Vision request encodes its media
+  inside the round on the Vision shard, and a reused prefix additionally requires matching media
+  identity -- a checkpoint records each image's digest, grid, and consumer spans -- so two prompts that
+  differ only in image content never share cached KV.
 
 ## Device memory budget
 

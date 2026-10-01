@@ -98,6 +98,59 @@ build probe.txt: noop
     return ($process.ExitCode -eq 0)
 }
 
+# MSVC prints its /showIncludes line in a localized string, and CMake stores the prefix it
+# discovered re-encoded: on a Chinese Visual Studio the rule ends up with "娉ㄦ剰: 鍖呭惈鏂囦欢:  "
+# while cl.exe actually writes UTF-8 "注意: 包含文件:  ". ninja then matches no line at all, so every
+# C++ object records zero header dependencies and editing a header silently stops triggering a
+# rebuild - which has already linked a binary whose translation units disagreed about a class
+# layout. Ask cl.exe what it really prints and write those exact bytes back. A prefix that changed
+# under an existing build needs the affected objects recompiled once (touch their sources) before
+# the corrected deps are recorded.
+function Repair-MsvcDepsPrefix([string] $BuildDir) {
+    $rules = Join-Path $BuildDir "CMakeFiles/rules.ninja"
+    if (-not (Test-Path $rules)) { return }
+    $probe = Join-Path $BuildDir "_deps_probe.cpp"
+    $out = Join-Path $BuildDir "_deps_probe.out"
+    Set-Content -Path $probe -Encoding ascii "#include <cstddef>"
+    Remove-Item $out -ErrorAction SilentlyContinue
+    $process = Start-Process -FilePath "cmd" -NoNewWindow -PassThru `
+        -ArgumentList "/c cl /nologo /showIncludes /c `"$probe`" > `"$out`" 2>&1"
+    if (-not $process.WaitForExit(60000)) { $process.Kill(); $process.WaitForExit() }
+    $prefix = $null
+    if (Test-Path $out) {
+        $lines = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($out)) -split "`r?`n"
+        foreach ($line in $lines) {
+            # The prefix itself contains a colon and spaces; what follows it is a "<drive>:\" path,
+            # so take everything before the drive letter rather than before the colon.
+            $probe_match = [regex]::Match($line, '^(.*?)[A-Za-z]:\\')
+            if ($probe_match.Success) { $prefix = $probe_match.Groups[1].Value; break }
+        }
+    }
+    Remove-Item $probe, $out, (Join-Path $BuildDir "_deps_probe.obj") -ErrorAction SilentlyContinue
+    if (-not $prefix) { return }
+    $bytes = [System.IO.File]::ReadAllBytes($rules)
+    $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+    $current = [regex]::Match($text, "msvc_deps_prefix = (.*)").Groups[1].Value.TrimEnd([char]13)
+    if ($current -ceq $prefix) { return }
+    Write-Host "build: repairing msvc_deps_prefix (ninja records no header deps otherwise)"
+    $lines = $text -split "`r`n"
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i].StartsWith("msvc_deps_prefix = ")) { $lines[$i] = "msvc_deps_prefix = " + $prefix }
+    }
+    [System.IO.File]::WriteAllText($rules, ($lines -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+    # Every dependency ninja recorded under the old prefix is garbage: it stripped a prefix of the
+    # wrong length, so the path it stored is the tail of the include line. Loading that database
+    # again makes ninja stat a path like ":\Documents\..." and fail before the first job. Drop it,
+    # and touch the C++ sources so the objects are relearned under the corrected prefix instead of
+    # being kept with no dependencies at all.
+    Remove-Item (Join-Path $BuildDir ".ninja_deps") -ErrorAction SilentlyContinue
+    $sources = Get-ChildItem -Path (Join-Path $SourceDir "src"), (Join-Path $SourceDir "tests") `
+        -Recurse -Include *.cpp,*.cc -ErrorAction SilentlyContinue
+    $now = Get-Date
+    foreach ($source in $sources) { $source.LastWriteTime = $now }
+    Write-Host ("build: reset header dependency state; {0} C++ sources will be recompiled" -f $sources.Count)
+}
+
 if (-not $SkipProbe -and -not (Test-ChildProcessPipes)) {
     Write-Host ""
     Write-Host "build: ninja cannot start a child process here."
@@ -138,6 +191,8 @@ if ($Configure) {
     }
     Invoke-Bounded "cmake" $arguments $log "configure"
 }
+
+Repair-MsvcDepsPrefix $BuildDir
 
 Invoke-Bounded "cmake" @("--build", $BuildDir, "-j", "$Jobs") $log "build"
 

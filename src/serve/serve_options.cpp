@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -427,9 +428,16 @@ std::string resolve_public_model_id(const ServeOptions& options,
 }
 
 EffectiveRequestCapacity effective_request_capacity(const ServeOptions& options) {
-    // Mirrors normalize_engine_options: the TP-2 generation route runs exactly one request at a
-    // time with one queued behind it. A single-GPU or scoring route keeps the configured values.
-    if (options.device_b >= 0) { return EffectiveRequestCapacity{1, 1}; }
+    // Mirrors normalize_engine_options: the TP-2 generation route can run only as many requests at
+    // once as its core can batch into one decode round, while the queue in front of that keeps the
+    // configured depth. Both limits come from the same constants the Engine reads, so a request the
+    // service accepted is never rejected by the Engine as overloaded. A single-GPU or scoring route
+    // keeps the configured values.
+    if (options.device_b >= 0) {
+        return EffectiveRequestCapacity{
+            tp2_generation_concurrency(options.max_concurrency, options.speculative.backend),
+            options.max_pending_requests};
+    }
     return EffectiveRequestCapacity{options.max_concurrency, options.max_pending_requests};
 }
 

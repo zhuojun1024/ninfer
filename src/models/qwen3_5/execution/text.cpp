@@ -1611,9 +1611,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     const std::int32_t record_rows = active_sequence_batch_ > 0 ? active_sequence_batch_ : 1;
     GdnReplayRecordLayer records{};
     if (recording && shard_config_ != nullptr) {
-        if (record_rows != 1) {
-            throw std::logic_error("Replay-record GDN on a shard requires one record row");
-        }
+        // One record row per lane: the record planes are [..., width, record_rows] with the lane as
+        // the outer dimension, so a multi-lane verify window records one physical row per lane.
         records = replay_records_->layer(gidx, record_rows);
     }
     if (batched_verify) {
@@ -1721,12 +1720,67 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                     .view({dimension(cfg.gdn->linear_value_head_dim),
                            dimension(cfg.gdn->linear_num_value_heads), T});
         }
-        Tensor conv_state_in =
-            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
-        Tensor conv_state_out =
-            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
-        ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
-                                      s);
+        // A batched verify on a head-split shard needs one convolution window per lane, which the
+        // split form cannot express: its state pair is scalar and its accepted row profile is a
+        // fixed triplet. The snapshot form takes the per-lane initial and destination slot vectors
+        // and writes [C, W, B]; each lane here is one column and advances its own slot in place
+        // (its destination interval is its own initial slot, which the op allows). Its output is a
+        // single contiguous [q|k|v, B] buffer, so the three regions are copied into the compact
+        // buffers the recurrence views, because a row slice of the wider parent is a strided
+        // window.
+        const bool per_lane_conv = shard_config_ != nullptr &&
+                                   (ph == Phase::Verify || recording) &&
+                                   active_sequence_batch_ > 1;
+        if (per_lane_conv) {
+            if (!recording && active_sequence_width_ != 1) {
+                throw std::logic_error("the GDN shard window supports one column per lane");
+            }
+            const std::int32_t conv_channels = 2 * gdn_q_rows + gdn_v_rows;
+            const std::int32_t window = recording ? T / active_sequence_batch_ : 1;
+            Tensor conv_out    = work_.alloc(DType::BF16, {conv_channels, T});
+            Tensor conv_states = state_.layer_view(static_cast<std::uint32_t>(gidx)).conv;
+            const Tensor conv_input = qkv.view({conv_channels, window, active_sequence_batch_});
+            Tensor conv_window      = conv_out.view({conv_channels, window, active_sequence_batch_});
+            if (recording) {
+                // A recording window is wider than one column, so its per-lane convolution runs on a
+                // private copy of the pool: the fold rebuilds the committed history from the record
+                // and the restored pool, so this window must not advance the live convolution state,
+                // and the [W] slot reservations a wide window needs cannot overlap live slots. The
+                // staging copy keeps the whole pool in front, so the initial channel is still the
+                // pool's own slot index and each lane's reservation follows after it.
+                const std::int32_t lanes = active_sequence_batch_;
+                const std::int32_t slots = static_cast<std::int32_t>(conv_states.ne[2]);
+                Tensor staged =
+                    work_.alloc(DType::BF16, {conv_channels, 3, slots + lanes * window});
+                CUDA_CHECK(cudaMemcpyAsync(staged.data, conv_states.data, conv_states.bytes(),
+                                           cudaMemcpyDeviceToDevice, s));
+                // Each lane's reservation starts one window after the previous lane's, so the
+                // bases are the arithmetic progression `slots + lane * window`. They are built on
+                // the device: a host staging pointer would be baked into a captured verify graph
+                // (P2.2c) and read a dead stack slot on every replay.
+                Tensor base_slots = work_.alloc(DType::I32, {lanes});
+                ops::fill_i32_positions(base_slots, slots, window, s);
+                ops::causal_conv1d_silu_snapshot(conv_input, p.convolution, staged, Tensor{},
+                                                 *active_linear_state_source_slots_, base_slots,
+                                                 conv_window, s);
+            } else {
+                ops::causal_conv1d_silu_snapshot(
+                    conv_input, p.convolution, conv_states, Tensor{},
+                    *active_linear_state_source_slots_, *active_linear_state_destination_slots_,
+                    conv_window, s);
+            }
+            const Tensor conv_matrix = conv_out.view({conv_channels, T});
+            copy_row_block(conv_matrix, 0, gdn_q_rows, qc, s);
+            copy_row_block(conv_matrix, gdn_q_rows, gdn_q_rows, kc, s);
+            copy_row_block(conv_matrix, 2 * gdn_q_rows, gdn_v_rows, vc, s);
+        } else {
+            Tensor conv_state_in =
+                state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
+            Tensor conv_state_out =
+                state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
+            ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc,
+                                          kc, vc, s);
+        }
         if (recording && shard_config_ != nullptr) {
             // The fold rebuilds the convolution history as tail_3(old_history || record[0:committed]),
             // so the record is the raw pre-convolution window. This route already materializes that
@@ -1811,7 +1865,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         // the fold that replays the committed prefix. Its outputs are defined to be bit-identical to
         // the normalized gated_delta_net below, so the window's own columns keep the same logits.
         Tensor recurrent_states  = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
-        const std::int32_t width = T;
+        const std::int32_t width = T / record_rows;
         Tensor q_batch           = q_recurrent.view({dimension(cfg.gdn->linear_key_head_dim),
                                                       dimension(cfg.gdn->linear_num_key_heads), width,
                                                       record_rows});
@@ -1827,13 +1881,48 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             beta_local.view({dimension(cfg.gdn->linear_num_value_heads), width, record_rows});
         Tensor out_batch = o.view({dimension(cfg.gdn->linear_value_head_dim),
                                    dimension(cfg.gdn->linear_num_value_heads), width, record_rows});
-        Tensor initial_slots = work_.alloc(DType::I32, {record_rows});
-        ops::set_i32_scalar(initial_slots, linear_state_source_slot_, s);
+        // A one-row record keeps the historic scalar slot; a multi-lane window hands the engine's
+        // per-lane source slots straight through as the op's [record_rows] initial channel.
+        Tensor initial_slots;
+        if (active_linear_state_source_slots_ != nullptr) {
+            initial_slots = *active_linear_state_source_slots_;
+        } else {
+            initial_slots = work_.alloc(DType::I32, {record_rows});
+            ops::set_i32_scalar(initial_slots, linear_state_source_slot_, s);
+        }
         ops::gated_delta_net_replay_record(
             q_batch, k_batch, v_batch, g_batch, beta_batch,
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(cfg.gdn->linear_key_head_dim))),
             recurrent_states, Tensor{}, initial_slots, records.key, records.value, records.gate,
             out_batch, s);
+    } else if (shard_config_ != nullptr && ph == Phase::Verify && active_sequence_batch_ > 1) {
+        // Batched verify on a head-split shard: one state slot per lane, one column each. This is
+        // the same kernel the full-model batched verify runs; the shard (8 key heads, 24 value
+        // heads) pair passes the head-count rule, the pool layer holds one recurrent plane per
+        // slot, and each lane advances its own slot in place. The gating rows arrive as a compact
+        // [local_heads, T] block because the shard heads are a strided window of the full 48.
+        if (active_sequence_width_ != 1) {
+            throw std::logic_error("the GDN shard window supports one column per lane");
+        }
+        const std::int32_t value_heads = dimension(cfg.gdn->linear_num_value_heads);
+        Tensor recurrent_states = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
+        Tensor q_batch          = q_recurrent.view({dimension(cfg.gdn->linear_key_head_dim),
+                                                    dimension(cfg.gdn->linear_num_key_heads), 1,
+                                                    active_sequence_batch_});
+        Tensor k_batch          = k_recurrent.view({dimension(cfg.gdn->linear_key_head_dim),
+                                                    dimension(cfg.gdn->linear_num_key_heads), 1,
+                                                    active_sequence_batch_});
+        Tensor v_batch = vv.view({dimension(cfg.gdn->linear_value_head_dim), value_heads, 1,
+                                  active_sequence_batch_});
+        Tensor g_batch    = g_local.view({value_heads, 1, active_sequence_batch_});
+        Tensor beta_batch = beta_local.view({value_heads, 1, active_sequence_batch_});
+        Tensor out_batch  = o.view({dimension(cfg.gdn->linear_value_head_dim), value_heads, 1,
+                                   active_sequence_batch_});
+        ops::gated_delta_net_batch_update(
+            q_batch, k_batch, v_batch, g_batch, beta_batch,
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(cfg.gdn->linear_key_head_dim))),
+            /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
+            *active_linear_state_destination_slots_, out_batch, s);
     } else {
         Tensor recurrent_state_in =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
@@ -2156,7 +2245,7 @@ void TextContext::forward_tp2(TextContext& peer, tp::DevicePair& pair, std::int3
 void TextContext::forward_tp2_decode_window(TextContext& peer, tp::DevicePair& pair,
                                             const std::int32_t* token, const std::int32_t* position,
                                             ops::CausalAttentionExecutionEnvelope envelope,
-                                            Tensor& logits) {
+                                            Tensor& logits, std::int32_t lane) {
     const std::int32_t hidden = dimension(config_.hidden_size);
     const std::int32_t vocab  = dimension(config_.vocab_size);
     if (token == nullptr || position == nullptr) {
@@ -2193,11 +2282,11 @@ void TextContext::forward_tp2_decode_window(TextContext& peer, tp::DevicePair& p
         bind.rope_positions = arena.alloc(DType::I32, {1});
         copy_i32(position, bind.rope_positions, card.ctx_.stream);
         bind.kv_table_rows = arena.alloc(DType::I32, {1});
-        ops::set_i32_scalar(bind.kv_table_rows, 0, card.ctx_.stream);
+        ops::set_i32_scalar(bind.kv_table_rows, lane, card.ctx_.stream);
         bind.state_source = arena.alloc(DType::I32, {1});
-        ops::set_i32_scalar(bind.state_source, 0, card.ctx_.stream);
+        ops::set_i32_scalar(bind.state_source, lane, card.ctx_.stream);
         bind.state_destination = arena.alloc(DType::I32, {1});
-        ops::set_i32_scalar(bind.state_destination, 0, card.ctx_.stream);
+        ops::set_i32_scalar(bind.state_destination, lane, card.ctx_.stream);
         return bind;
     };
     const BindState bind0 = make_bind(*this, work_);
@@ -2241,6 +2330,106 @@ void TextContext::forward_tp2_decode_window(TextContext& peer, tp::DevicePair& p
     project_head_tp2(peer, pair, hidden_out, hidden_out_peer, logits, logits_peer);
 }
 
+void TextContext::forward_tp2_decode_window_batch(TextContext& peer, tp::DevicePair& pair,
+                                                  const std::int32_t* tokens,
+                                                  const std::int32_t* positions,
+                                                  const std::int32_t* kv_table_rows,
+                                                  const std::int32_t* state_slots,
+                                                  std::int32_t batch,
+                                                  ops::CausalAttentionExecutionEnvelope envelope,
+                                                  Tensor& logits) {
+    const std::int32_t hidden = dimension(config_.hidden_size);
+    const std::int32_t vocab  = dimension(config_.vocab_size);
+    if (tokens == nullptr || positions == nullptr || kv_table_rows == nullptr ||
+        state_slots == nullptr) {
+        throw std::invalid_argument(
+            "forward_tp2_decode_window_batch requires pinned host lane arrays");
+    }
+    if (batch < 1 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        throw std::invalid_argument("forward_tp2_decode_window_batch: batch is out of range");
+    }
+    if (vocab % 2 != 0 || logits.ne[0] != vocab || logits.ne[1] != batch) {
+        throw std::invalid_argument("forward_tp2_decode_window_batch: logits must be [V,B]");
+    }
+    if (envelope.min_visible_keys == 0 || envelope.max_visible_keys < envelope.min_visible_keys) {
+        throw std::invalid_argument("forward_tp2_decode_window_batch: envelope is invalid");
+    }
+    // The batched GDN state kernels start at two lanes, so a one-column batch still runs the scalar
+    // path, and that path reads the slot pair published by set_linear_state_slots instead of the
+    // bound per-lane vectors. A batch that shrank to one lane therefore has to publish its own slot:
+    // without this it keeps the last prefill's slot and advances another lane's recurrence.
+    if (batch == 1) {
+        const std::int32_t slot = state_slots[0];
+        set_linear_state_slots(slot, slot);
+        peer.set_linear_state_slots(slot, slot);
+    }
+    // Same lockstep sequence as forward_tp2_decode_window, widened from one column to batch: the
+    // layer loop derives every width from x.ne[1], the mixers read their batch through the scoped
+    // bindings below, and the head is column-generic. The only per-lane operands are the four
+    // vectors, which arrive as pinned host arrays and become one small device copy per shard.
+    struct BindState {
+        Tensor ids;
+        Tensor cache_positions;
+        Tensor rope_positions;
+        Tensor kv_table_rows;
+        Tensor state_slots;
+    };
+    auto make_bind = [&](TextContext& card, WorkspaceArena& arena) {
+        card.ctx_.bind_to_current_thread();
+        BindState bind;
+        bind.ids = arena.alloc(DType::I32, {batch});
+        copy_i32(tokens, bind.ids, card.ctx_.stream);
+        bind.cache_positions = arena.alloc(DType::I32, {batch});
+        copy_i32(positions, bind.cache_positions, card.ctx_.stream);
+        bind.rope_positions = arena.alloc(DType::I32, {batch});
+        copy_i32(positions, bind.rope_positions, card.ctx_.stream);
+        bind.kv_table_rows = arena.alloc(DType::I32, {batch});
+        copy_i32(kv_table_rows, bind.kv_table_rows, card.ctx_.stream);
+        bind.state_slots = arena.alloc(DType::I32, {batch});
+        copy_i32(state_slots, bind.state_slots, card.ctx_.stream);
+        return bind;
+    };
+    const BindState bind0 = make_bind(*this, work_);
+    const BindState bind1 = make_bind(peer, peer.work_);
+    ScopedPositions cache0(active_cache_positions_, bind0.cache_positions);
+    ScopedPositions rope0(active_rope_positions_, bind0.rope_positions);
+    ScopedEnvelope envelope0(active_causal_attention_envelope_, envelope);
+    ScopedValue<const Tensor*> kv0(active_kv_table_rows_, &bind0.kv_table_rows);
+    ScopedValue<const Tensor*> source0(active_linear_state_source_slots_, &bind0.state_slots);
+    ScopedValue<const Tensor*> destination0(active_linear_state_destination_slots_,
+                                            &bind0.state_slots);
+    ScopedValue<std::int32_t> batch0(active_sequence_batch_, batch);
+    ScopedValue<std::int32_t> width0(active_sequence_width_, 1);
+    ScopedPositions cache1(peer.active_cache_positions_, bind1.cache_positions);
+    ScopedPositions rope1(peer.active_rope_positions_, bind1.rope_positions);
+    ScopedEnvelope envelope1(peer.active_causal_attention_envelope_, envelope);
+    ScopedValue<const Tensor*> kv1(peer.active_kv_table_rows_, &bind1.kv_table_rows);
+    ScopedValue<const Tensor*> source1(peer.active_linear_state_source_slots_, &bind1.state_slots);
+    ScopedValue<const Tensor*> destination1(peer.active_linear_state_destination_slots_,
+                                            &bind1.state_slots);
+    ScopedValue<std::int32_t> batch1(peer.active_sequence_batch_, batch);
+    ScopedValue<std::int32_t> width1(peer.active_sequence_width_, 1);
+
+    ctx_.bind_to_current_thread();
+    Tensor x      = work_.alloc(DType::BF16, {hidden, batch});
+    Tensor x_peer = peer.work_.alloc(DType::BF16, {hidden, batch});
+    embedding_tp2(peer, pair, bind0.ids, &bind1.ids, x, &x_peer);
+    NullTap tap;
+    run_layers_tp2(peer, pair, x, x_peer, Phase::Verify, tap);
+
+    ctx_.bind_to_current_thread();
+    Tensor hidden_out      = work_.alloc(DType::BF16, {hidden, batch});
+    peer.ctx_.bind_to_current_thread();
+    Tensor hidden_out_peer = peer.work_.alloc(DType::BF16, {hidden, batch});
+    ctx_.bind_to_current_thread();
+    ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden_out, ctx_.stream);
+    peer.ctx_.bind_to_current_thread();
+    ops::rmsnorm(x_peer, *peer.final_norm_, config_.rms_norm_eps, true, hidden_out_peer,
+                 peer.ctx_.stream);
+    Tensor logits_peer = peer.work_.alloc(DType::BF16, {vocab, batch});
+    project_head_tp2(peer, pair, hidden_out, hidden_out_peer, logits, logits_peer);
+}
+
 std::int32_t TextContext::forward_tp2_token(TextContext& peer, tp::DevicePair& pair,
                                             std::int32_t token, std::int32_t position) {
     const std::int32_t vocab = dimension(config_.vocab_size);
@@ -2281,7 +2470,8 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
                                       Tensor* logits, Tensor* logits_peer,
                                       Tensor* mtp_input_hidden, Tensor* logits_columns,
                                       Tensor* hidden_columns, Phase phase,
-                                      const Tp2VisionChunk* vision, DFlashFeatureSink* sink) {
+                                      const Tp2VisionChunk* vision, DFlashFeatureSink* sink,
+                                      std::int32_t lane) {
     const std::int32_t hidden = dimension(config_.hidden_size);
     const std::int32_t vocab  = dimension(config_.vocab_size);
     const std::int32_t tokens = static_cast<std::int32_t>(ids.size());
@@ -2337,7 +2527,7 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
         b.ids         = arena.alloc(DType::I32, {tokens});
         b.positions   = arena.alloc(DType::I32, {tokens});
         copy_i32(ids.data(), b.ids, c.ctx_.stream);
-        ops::fill_i32_positions(b.positions, first_position, c.ctx_.stream);
+        ops::fill_i32_positions(b.positions, first_position, 1, c.ctx_.stream);
         if (vision != nullptr) {
             // A multimodal prompt carries its own 3-axis (temporal, height, width) RoPE table for
             // every token; the cache position stays the plain absolute index, so the two bindings
@@ -2357,11 +2547,11 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
             b.rope_positions = b.positions;
         }
         b.kv_table_rows = arena.alloc(DType::I32, {1});
-        ops::set_i32_scalar(b.kv_table_rows, 0, c.ctx_.stream);
+        ops::set_i32_scalar(b.kv_table_rows, lane, c.ctx_.stream);
         b.state_source = arena.alloc(DType::I32, {1});
-        ops::set_i32_scalar(b.state_source, 0, c.ctx_.stream);
+        ops::set_i32_scalar(b.state_source, lane, c.ctx_.stream);
         b.state_destination = arena.alloc(DType::I32, {1});
-        ops::set_i32_scalar(b.state_destination, 0, c.ctx_.stream);
+        ops::set_i32_scalar(b.state_destination, lane, c.ctx_.stream);
         return b;
     };
     const BindState bind0 = make_bind(*this, work_);
@@ -2485,7 +2675,7 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
                                                   &verify_backend_rows);
         // The verify path reads positions as [width, batch]; prefill binds them flat for its chunk.
         Tensor verify_positions = work_.alloc(DType::I32, {tokens, 1});
-        ops::fill_i32_positions(verify_positions, first_position, ctx_.stream);
+        ops::fill_i32_positions(verify_positions, first_position, 1, ctx_.stream);
         ScopedPositions verify_cache(active_cache_positions_, verify_positions);
         ScopedPositions verify_rope(active_rope_positions_, verify_positions);
         ScopedValue<std::int32_t> verify_peer_batch(peer.active_sequence_batch_, 1);
@@ -2726,16 +2916,47 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
                                      ops::CausalAttentionExecutionEnvelope envelope,
                                      Tensor& logits_columns, Tensor* hidden_columns,
                                      DFlashFeatureSink* sink, const std::int32_t* valid_columns) {
+    // The single-lane verify window is the batch form with no per-lane bindings, so it keeps the
+    // historic scalar execution row 0 and state slot 0 and its numerics stay untouched.
+    const std::int32_t window = logits_columns.ne[1];
+    forward_tp2_window_batch(peer, pair, ids, positions, nullptr, nullptr, window, 1, envelope,
+                             logits_columns, hidden_columns, sink, valid_columns);
+}
+
+void TextContext::forward_tp2_window_batch(TextContext& peer, tp::DevicePair& pair,
+                                           const std::int32_t* ids, const std::int32_t* positions,
+                                           const std::int32_t* kv_table_rows,
+                                           const std::int32_t* state_slots, std::int32_t width,
+                                           std::int32_t batch,
+                                           ops::CausalAttentionExecutionEnvelope envelope,
+                                           Tensor& logits_columns, Tensor* hidden_columns,
+                                           DFlashFeatureSink* sink,
+                                           const std::int32_t* valid_columns) {
     const std::int32_t hidden = dimension(config_.hidden_size);
     const std::int32_t vocab  = dimension(config_.vocab_size);
     if (ids == nullptr || positions == nullptr) {
-        throw std::invalid_argument("forward_tp2_window requires pinned host ids and positions");
+        throw std::invalid_argument("forward_tp2_window_batch requires pinned host ids and positions");
+    }
+    if (width <= 0 || batch < 1 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        throw std::invalid_argument("forward_tp2_window_batch: the window shape is out of range");
+    }
+    // The per-lane bindings are what select the batched aggregate shape. The single-lane caller
+    // passes neither and keeps the scalar bindings; a one-member batch of the multi-lane route still
+    // passes both, because its KV execution row and state slot belong to a lane other than 0.
+    const bool per_lane_window = kv_table_rows != nullptr || state_slots != nullptr;
+    if (per_lane_window && (kv_table_rows == nullptr || state_slots == nullptr)) {
+        throw std::invalid_argument("forward_tp2_window_batch requires both per-lane bindings");
+    }
+    if (batch > 1 && !per_lane_window) {
+        throw std::invalid_argument("forward_tp2_window_batch requires the per-lane bindings");
     }
     if (logits_columns.dtype != DType::BF16 || logits_columns.ne[0] != vocab) {
-        throw std::invalid_argument("forward_tp2_window: logits columns must be [V,T] BF16");
+        throw std::invalid_argument("forward_tp2_window_batch: logits columns must be [V,width*B] BF16");
     }
-    const std::int32_t tokens = logits_columns.ne[1];
-    if (tokens <= 0) { throw std::invalid_argument("forward_tp2_window requires tokens"); }
+    const std::int32_t tokens = width * batch;
+    if (logits_columns.ne[1] != tokens) {
+        throw std::invalid_argument("forward_tp2_window_batch: logits columns do not match the window");
+    }
     if (envelope.min_visible_keys == 0 || envelope.max_visible_keys < envelope.min_visible_keys) {
         throw std::invalid_argument("forward_tp2_window: envelope does not cover the window");
     }
@@ -2745,6 +2966,9 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
         throw std::invalid_argument("forward_tp2_window: hidden columns must be [hidden,T] BF16");
     }
 
+    // Execution rows and state slots are per lane, not per column: the paged-KV row and the linear
+    // state slot identify a sequence, and the batch ops take one entry per lane while the column
+    // axis stays inside the op (cache positions are the per-column binding, laid out lane-major).
     struct BindState {
         Tensor ids;
         Tensor positions;
@@ -2760,19 +2984,31 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
     auto make_bind = [&](TextContext& card, WorkspaceArena& arena) {
         card.ctx_.bind_to_current_thread();
         BindState bind;
-        bind.envelope          = envelope;
-        bind.ids               = arena.alloc(DType::I32, {tokens});
-        bind.positions         = arena.alloc(DType::I32, {tokens});
-        bind.kv_table_rows     = arena.alloc(DType::I32, {1});
-        bind.state_source      = arena.alloc(DType::I32, {1});
-        bind.state_destination = arena.alloc(DType::I32, {1});
+        bind.envelope  = envelope;
+        bind.ids       = arena.alloc(DType::I32, {tokens});
+        bind.positions = arena.alloc(DType::I32, {tokens});
         copy_i32(ids, bind.ids, card.ctx_.stream);
         copy_i32(positions, bind.positions, card.ctx_.stream);
-        ops::set_i32_scalar(bind.kv_table_rows, 0, card.ctx_.stream);
-        ops::set_i32_scalar(bind.state_source, 0, card.ctx_.stream);
-        ops::set_i32_scalar(bind.state_destination, 0, card.ctx_.stream);
+        if (per_lane_window) {
+            bind.kv_table_rows     = arena.alloc(DType::I32, {batch});
+            bind.state_source      = arena.alloc(DType::I32, {batch});
+            bind.state_destination = arena.alloc(DType::I32, {batch});
+            copy_i32(kv_table_rows, bind.kv_table_rows, card.ctx_.stream);
+            copy_i32(state_slots, bind.state_source, card.ctx_.stream);
+            copy_i32(state_slots, bind.state_destination, card.ctx_.stream);
+        } else {
+            bind.kv_table_rows     = arena.alloc(DType::I32, {1});
+            bind.state_source      = arena.alloc(DType::I32, {1});
+            bind.state_destination = arena.alloc(DType::I32, {1});
+            ops::set_i32_scalar(bind.kv_table_rows, 0, card.ctx_.stream);
+            ops::set_i32_scalar(bind.state_source, 0, card.ctx_.stream);
+            ops::set_i32_scalar(bind.state_destination, 0, card.ctx_.stream);
+        }
         if (valid_columns != nullptr) {
-            bind.valid = arena.alloc(DType::I32, {1});
+            // valid_columns carries one entry per lane, so the window binding is [batch]: the attention
+            // op takes [batch] and a scalar would be an out-of-range read on the two-lane route. The
+            // single-lane caller is already one member wide and keeps [1].
+            bind.valid = arena.alloc(DType::I32, {per_lane_window ? batch : 1});
             copy_i32(valid_columns, bind.valid, card.ctx_.stream);
         }
         return bind;
@@ -2789,6 +3025,10 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
     ScopedValue<const Tensor*> source0(active_linear_state_source_slots_, &bind0.state_source);
     ScopedValue<const Tensor*> destination0(active_linear_state_destination_slots_,
                                             &bind0.state_destination);
+    // A multi-lane window publishes the aggregate shape; a one-lane window leaves the scalar
+    // binding in place exactly as the single-lane route always has.
+    ScopedValue<std::int32_t> batch0(active_sequence_batch_, per_lane_window ? batch : 0);
+    ScopedValue<std::int32_t> width0(active_sequence_width_, per_lane_window ? width : 0);
     ScopedPositions cache1(peer.active_cache_positions_, bind1.positions);
     ScopedPositions rope1(peer.active_rope_positions_, bind1.positions);
     ScopedValue<const Tensor*> valid1(peer.active_valid_columns_, &bind1.valid);
@@ -2798,6 +3038,17 @@ void TextContext::forward_tp2_window(TextContext& peer, tp::DevicePair& pair,
                                        &bind1.state_source);
     ScopedValue<const Tensor*> destination1(peer.active_linear_state_destination_slots_,
                                             &bind1.state_destination);
+    ScopedValue<std::int32_t> batch1(peer.active_sequence_batch_, per_lane_window ? batch : 0);
+    ScopedValue<std::int32_t> width1(peer.active_sequence_width_, per_lane_window ? width : 0);
+    // A one-member per-lane window still runs the scalar convolution path (the batched GDN state
+    // kernels start at two rows) and that path reads the scalar slot pair rather than the bound
+    // vectors, so publish this member's slot - exactly what the plain one-column batch does. A wider
+    // window records per lane and never reads the scalar pair.
+    if (batch == 1 && per_lane_window) {
+        const std::int32_t slot = state_slots[0];
+        set_linear_state_slots(slot, slot);
+        peer.set_linear_state_slots(slot, slot);
+    }
 
     ctx_.bind_to_current_thread();
     Tensor x      = work_.alloc(DType::BF16, {hidden, tokens});
@@ -2934,7 +3185,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             copy_i32(ids.data() + t0, ids_device, s);
 
             Tensor positions = roots.positions;
-            ops::fill_i32_positions(positions, base_i + t0, s);
+            ops::fill_i32_positions(positions, base_i + t0, 1, s);
 
             Tensor rope_positions = positions;
             std::vector<std::int32_t> rope_positions_host;

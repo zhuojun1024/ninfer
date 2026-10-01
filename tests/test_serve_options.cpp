@@ -277,10 +277,14 @@ int main() {
         parse({"ninfer-serve", "model.ninfer", "--reasoning-effort", "medium"});
     failures += check(effort_default.default_reasoning_effort == ninfer::ReasoningEffort::Medium,
                       "--reasoning-effort did not reach serving options");
-    ninfer::PromptCapabilities medium_capabilities    = prompt_capabilities;
-    medium_capabilities.reasoning_effort.medium       = true;
+    ninfer::PromptCapabilities medium_capabilities = prompt_capabilities;
+    medium_capabilities.reasoning_effort.medium    = true;
+    // The effective effort is only defined for a request that thinks: with thinking off there is no
+    // budget for an effort level to describe.
+    GenerationRequest thinking_request = request;
+    thinking_request.enable_thinking   = true;
     const auto medium_semantics =
-        resolve_prompt_semantics(request, effort_default, medium_capabilities);
+        resolve_prompt_semantics(thinking_request, effort_default, medium_capabilities);
     failures += check(medium_semantics.effective_reasoning_effort == ninfer::ReasoningEffort::Medium,
                       "server reasoning-effort default was not resolved");
     bool unsupported_effort_rejected = false;
@@ -406,15 +410,33 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
-    // The Engine normalizes a TP-2 generation route to one active request and one queued request
-    // (normalize_engine_options). The service layer and the HTTP thread pool must size themselves
-    // from the same numbers, or a request the service accepted is rejected by the Engine as
-    // overloaded instead of waiting in its FIFO.
+    // The Engine clamps a TP-2 generation route to what its core can batch into one decode round
+    // (kTp2GenerationMaxConcurrency) while keeping the configured pending-request depth. The service
+    // layer and the HTTP thread pool must size themselves from the same numbers, or a request the
+    // service accepted is rejected by the Engine as overloaded instead of waiting in its FIFO.
     const ServeOptions tp2 = parse({"ninfer-serve", "model.ninfer", "--devices", "0,1",
-                                    "--max-concurrency", "3", "--max-pending-requests", "5"});
+                                    "--max-concurrency",
+                                    std::to_string(ninfer::kTp2GenerationMaxConcurrency + 1),
+                                    "--max-pending-requests", "5"});
     const EffectiveRequestCapacity tp2_capacity = effective_request_capacity(tp2);
-    failures += check(tp2_capacity.max_concurrency == 1 && tp2_capacity.max_pending_requests == 1,
-                      "TP-2 route did not normalize the service request capacity");
+    failures += check(tp2_capacity.max_concurrency == ninfer::kTp2GenerationMaxConcurrency,
+                      "TP-2 route did not clamp the service concurrency to the core capability");
+    failures += check(tp2_capacity.max_pending_requests == 5,
+                      "TP-2 route dropped the service pending-request depth");
+    // The MTP and DFlash2 rounds both carry a batch (P2.1b), so both routes advertise the lanes the
+    // core executes; a route without one advertises a single lane, or the service would accept a
+    // concurrency the core can never reach.
+    const ServeOptions tp2_spec = parse({"ninfer-serve", "model.ninfer", "--devices", "0,1",
+                                         "--max-concurrency", "2", "--spec", "dflash2",
+                                         "--draft-tokens", "5"});
+    const EffectiveRequestCapacity tp2_spec_capacity = effective_request_capacity(tp2_spec);
+    failures += check(tp2_spec_capacity.max_concurrency == 2,
+                      "DFlash2 TP-2 route did not advertise the lanes its core executes");
+    const ServeOptions tp2_mtp = parse({"ninfer-serve", "model.ninfer", "--devices", "0,1",
+                                        "--max-concurrency", "4", "--spec", "mtp",
+                                        "--draft-tokens", "5"});
+    failures += check(effective_request_capacity(tp2_mtp).max_concurrency == 4,
+                      "MTP TP-2 route did not advertise the lanes its core executes");
     const EffectiveRequestCapacity single_capacity = effective_request_capacity(defaults);
     failures += check(single_capacity.max_concurrency == defaults.max_concurrency &&
                           single_capacity.max_pending_requests == defaults.max_pending_requests,

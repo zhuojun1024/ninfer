@@ -65,8 +65,37 @@ RTX 5060 Ti cards but not one.
   wrong, the startup error lists the CUDA-visible devices.
 - Both devices must be `sm_120a` (compute capability 12.0) and identical by name; the engine fails
   fast at construction otherwise.
-- The TP-2 route runs one request at a time: `--max-concurrency` and `--max-pending-requests` are
-  normalized to `1`, and requests queue in arrival order.
+- The TP-2 route queues requests in arrival order. `--max-pending-requests` bounds that queue and is
+  kept as configured; `--max-concurrency` (1..4) is how many of the queued requests the core batches
+  into one decode round. The default `--max-concurrency 1` runs one request at a time. The lanes share
+  one KV pool, so they partition the context ceiling instead of each reserving it, but the
+  linear-attention state arena grows by about 294 MiB per card per lane: the shipped 262,144-token
+  configuration keeps `--max-concurrency 1`, and two to four lanes need `--max-context 131072`.
+- Batched TP-2 decoding covers the plain route and both speculative rounds (`--spec dflash2` and
+  `--spec mtp`). Only the DFlash v1 backend still collapses a `--max-concurrency` above `1` back to
+  `1` at startup with a warning (that backend is rejected on this route regardless). The multi-lane
+  route keeps cross-session KV retention, with the checkpoint ring and the session catalog sliced by
+  lane, so each lane recalls its own previous conversation independently. Vision requests take part in
+  a batch, each lane encoding its own media on the Vision shard; only a tool-grammar request runs lane
+  by lane instead of as one round. A reused prefix must also match on media identity: a checkpoint
+  carries the digest, grid, and consumer spans of every image or video item inside it, so a prompt
+  whose media differs from the one that produced the cached KV is re-prefilled from that item's first
+  token instead of being served the other image's answer. The batched round replays
+  its own CUDA Graphs (the batched verify window and the plain decode step), so an individual request
+  is no longer slower than on the one-lane route: plain `predicted_ms` measured 1233 at
+  `--max-concurrency 4` against 1259 on the default route, and `--spec mtp` 711 ms at two lanes against
+  810 ms at one. Measured aggregate decode throughput on two RTX 5060 Ti (16 GiB) cards with
+  `--max-context 131072 --kv-dtype int8 --spec none`: 1.76-1.91x at `--max-concurrency 2` and 2.80x at
+  `4`; with `--spec dflash2` 2.07x at four lanes, and with `--spec mtp --draft-tokens 5` 1.48x at two
+  lanes and 2.26x at four. The aggregate gain depends on how evenly the batch members finish, because a
+  round costs as much as its longest member: a pair whose two outputs differ two-fold measured 1.41x.
+
+  Batched lanes are not guaranteed to reproduce the text of the same request run alone. Every lane in a
+  round shares one attention envelope, so the widest lane's window bounds the others and a shorter lane
+  can drift by a few ulp and flip a near-tied token. Four concurrent prompts of 24/22/20/20 tokens
+  flipped one late token on the two shorter lanes on the plain route, while pairs whose positions
+  differed by two tokens stayed byte-identical, and DFlash2 did not flip on those same prompts. Compare
+  concurrent output to a single-request run with a near-tie criterion, not byte identity.
 - `--spec mtp` and `--spec dflash2` are the speculative backends on this route (`--spec dflash`,
   the DFlash v1 masked draft, is rejected at construction), and `--vision` is supported. The DFlash2
   masked draft keeps its local context ring on shard 0; its budget-clamped verify columns are masked

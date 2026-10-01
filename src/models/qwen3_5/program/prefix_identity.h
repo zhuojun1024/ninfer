@@ -59,6 +59,11 @@ private:
     std::vector<std::array<std::uint64_t, 2>> digests_;
 };
 
+// Whether two vision items describe the same media at the same place. Every image merges to the
+// same placeholder token ids, so token ids alone cannot tell two pictures apart; this compares the
+// identity behind them (modality, grid, patch window, encoded-media digest, timestamps, spans).
+[[nodiscard]] bool same_vision_item(const VisionItem& left, const VisionItem& right);
+
 [[nodiscard]] bool prefix_matches(const PreparedPromptData& prompt,
                                   std::span<const TokenId> resident_tokens,
                                   const ResidentPrefixIdentity& resident_identity,

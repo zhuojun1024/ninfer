@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/tp2_capacity.h"
 #include "ninfer/types.h"
 #include "product/logging/logging.h"
 

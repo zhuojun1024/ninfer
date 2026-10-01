@@ -12,14 +12,15 @@ namespace ninfer::ops {
  * Op: fill_i32_positions
  *
  * Math / indexing:
- *   positions[i] = start + i, 0 <= i < T.
+ *   positions[i] = start + i * stride, 0 <= i < T.
  *
  * Logical shapes:
  *   positions is a contiguous I32 vector [T].
  *
  * Numeric:
- *   T is positive, start is nonnegative, and start+T must not exceed INT32_MAX. Thus every
- *   emitted value is a nonnegative I32 position.
+ *   T and stride are positive, start is nonnegative, and start + (T-1) * stride must not exceed
+ *   INT32_MAX. Thus every emitted value is a nonnegative I32 position. Stride one emits consecutive
+ *   positions; a larger stride lays out disjoint reservation windows of that width.
  *
  * Effects:
  *   Writes the full positions vector.
@@ -27,7 +28,8 @@ namespace ninfer::ops {
  * Workspace:
  *   None. The Op has no other state side effect.
  */
-void fill_i32_positions(Tensor& positions, std::int32_t start, cudaStream_t stream);
+void fill_i32_positions(Tensor& positions, std::int32_t start, std::int32_t stride,
+                        cudaStream_t stream);
 
 /**
  * Op: offset_i32_positions

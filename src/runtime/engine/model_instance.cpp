@@ -4,9 +4,11 @@
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "product/speculative_options.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -83,11 +85,32 @@ std::size_t current_free_device_bytes() {
 
 EngineOptions normalize_engine_options(EngineOptions options) {
     if (options.device_b >= 0 && options.purpose == EnginePurpose::Generation) {
-        // Dedicated tensor-parallel (TP-2) generation core: exactly one request at a time, no
-        // speculative decoding, no CUDA Graphs, no context cache, and a page-aligned KV capacity
-        // sized to the full context (the core builds its own paged cache from max_context).
-        options.max_concurrency      = 1;
-        options.max_pending_requests = 1;
+        // Dedicated tensor-parallel (TP-2) generation core: no CUDA Graphs, no context cache, and a
+        // page-aligned KV capacity sized to the full context (the core builds its own paged cache
+        // from max_context).
+        //
+        // The core owns its own round loop, so it - not this normalization - is the authority on how
+        // many requests it can run at once. Clamp to what it can batch instead of forcing one and
+        // silently ignoring what the operator asked for; the clamp lives in one constant that the
+        // service layer reads too, so accepted capacity and executed capacity cannot drift apart.
+        // `max_pending_requests` is the depth of the FIFO in front of that concurrency and is the
+        // operator's to set.
+        //
+        // The plain, MTP and DFlash2 rounds all carry a batch; `--spec dflash` is the only
+        // speculative route without a TP-2 context layout, and it collapses to one lane here rather
+        // than failing startup because the batch that follows rejects it outright. The production
+        // command line (--max-concurrency N --spec dflash2 or --spec mtp) therefore keeps its lanes;
+        // the warning is what tells the operator which route discarded them.
+        const std::uint32_t requested_concurrency = options.max_concurrency;
+        options.max_concurrency =
+            tp2_generation_concurrency(requested_concurrency, options.speculative.backend);
+        if (options.max_concurrency == 1U && requested_concurrency > 1U) {
+            std::fprintf(stderr,
+                         "[tp2-lane] --max-concurrency %u collapses to 1 lane on the %s route "
+                         "(see PLAN-tp2-concurrency.md)\n",
+                         requested_concurrency, product::speculative_backend_name(
+                                                    options.speculative.backend));
+        }
         // The TP-2 core reads the prefill chunk itself. Clamp the request to the range its
         // cross-device allreduce staging buffer and its per-chunk activation peak can carry
         // (0 selects the default width).

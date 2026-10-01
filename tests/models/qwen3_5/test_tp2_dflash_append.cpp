@@ -707,7 +707,7 @@ int main(int argc, char** argv) {
         Tensor direct_positions = direct_arena->alloc(DType::I32, {chunk});
         CUDA_CHECK(cudaMemcpyAsync(features_copy.data, round.state().prefill_features.data,
                                    features_copy.bytes(), cudaMemcpyDeviceToDevice, device0->stream));
-        ops::fill_i32_positions(direct_positions, 0, device0->stream);
+        ops::fill_i32_positions(direct_positions, 0, 1, device0->stream);
         direct.append(execution_core(), features_copy, direct_positions,
                       static_cast<std::uint32_t>(chunk));
         const RingSnapshot direct1 = read_ring(*device0, direct.ring());

@@ -18,15 +18,20 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/generation_budget.h"
+#include "ninfer/tp2_capacity.h"
 #include "ninfer/types.h"
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer {
@@ -120,6 +125,25 @@ public:
     void reset_memory_peaks() noexcept;
 
 private:
+    // One lane's GDN image inside a whole-pool state buffer (the live pool or a device snapshot).
+    // The pool keeps the slot as its outermost dimension, so a lane's image is one block per layer;
+    // the pinned image is those blocks back to back with no arena padding.
+    struct LaneStateGeometry {
+        std::size_t image_bytes        = 0;
+        std::size_t conv_bytes         = 0;
+        std::size_t recurrent_bytes    = 0;
+        std::ptrdiff_t conv_base       = 0;
+        std::ptrdiff_t recurrent_base  = 0;
+        std::ptrdiff_t conv_pitch      = 0;
+        std::ptrdiff_t recurrent_pitch = 0;
+        std::uint32_t layers           = 0;
+    };
+    // Which reserved group of the host checkpoint ring a write lands in. The grid and the tail
+    // anchors rotate through their own slots; the divergence anchor and the block anchor own a fixed
+    // slot each and are rewritten in place, so they advance no cursor and neither rotation can evict
+    // them.
+    enum class HostRing { Grid, Tail, Divergence, Block };
+
     struct Shard {
         DeviceContext device;
         std::unique_ptr<models::qwen3_5::Model> model;
@@ -133,6 +157,9 @@ private:
         std::unique_ptr<DeviceArena> state_arena;
         std::unique_ptr<LinearAttentionStatePool> state;
         DeviceSpan state_backing;
+        // One lane's GDN image inside any whole-pool state buffer of this shard (the live pool or a
+        // device snapshot), computed once the pool exists.
+        LaneStateGeometry lane_state_geometry;
         // GDN state at reuse boundaries of the last completed prefill (see kReuseSnapshot* in the
         // implementation), used to skip a shared prompt prefix on the next request.
         std::array<DeviceSpan, kReuseSnapshotCount + 1> state_snapshots{};
@@ -141,29 +168,37 @@ private:
         // previous prompt restarts at the deepest checkpoint at or before that prefix instead of
         // recomputing from zero. The ring is sized from the host state-image budget
         // (--host-state-slots) and costs no device memory.
+        //
+        // A slot holds one compact single-lane image and belongs to the lane whose slice of the ring
+        // it is, so the pinned budget is the lanes=1 budget whatever the lane count. The per-frontier
+        // fields are indexed by lane to keep a stale claim from a re-partitioned ring readable.
         struct HostCheckpoint {
             std::unique_ptr<PinnedHostBuffer> buffer;
             // The masked draft's context at the same frontier, on the shard that owns the draft
             // (shard 0). The draft cannot be recomputed from the target state, so a checkpoint that
             // carries only the GDN image would leave the draft context describing the wrong tokens.
+            // Like buffer, it holds one compact ring image per lane.
             std::unique_ptr<PinnedHostBuffer> dflash_buffer;
-            std::uint32_t dflash_frontier = 0;
-            std::uint32_t position   = 0;
-            // The prefill that wrote this checkpoint. A prefill that never completed (cancelled)
-            // leaves its slots invalid instead of usable state.
-            std::uint64_t prefill_id = 0;
+            std::array<std::uint32_t, kTp2GenerationMaxConcurrency> dflash_frontier{};
+            std::array<std::uint32_t, kTp2GenerationMaxConcurrency> position{};
+            // The prefill that wrote this lane's checkpoint. A prefill that never completed
+            // (cancelled) leaves its slots invalid instead of usable state.
+            std::array<std::uint64_t, kTp2GenerationMaxConcurrency> prefill_id{};
             // Set when that prefill completes and cleared as soon as a later request's shared prefix
             // stops covering this frontier: the state is only the state of *this* prompt's prefix
             // while the whole lineage agrees on the tokens before it.
-            bool valid = false;
+            std::array<bool, kTp2GenerationMaxConcurrency> valid{};
         };
-        // The ring is split in two: [0, grid_slots) holds the position grid, which keeps the whole
-        // context covered and is never evicted by the tail anchors; [grid_slots, size) holds the
-        // tail anchors, refreshed every prefill, which land within one chunk of a prompt end.
+        // Within a lane's slice the ring is split in two: [0, grid_slots) holds the position grid,
+        // which keeps the whole context covered and is never evicted by the tail anchors;
+        // [grid_slots, size) holds the tail anchors, refreshed every prefill, which land within one
+        // chunk of a prompt end.
         std::vector<HostCheckpoint> host_checkpoints;
         std::size_t host_checkpoint_grid_slots = 0;
-        std::size_t host_checkpoint_next       = 0;
-        std::size_t host_checkpoint_tail_next  = 0;
+        // One round-robin cursor per lane: a lane's coverage belongs to its own conversation, so a
+        // store on one lane must not advance where another lane writes next.
+        std::array<std::size_t, kTp2GenerationMaxConcurrency> host_checkpoint_next{};
+        std::array<std::size_t, kTp2GenerationMaxConcurrency> host_checkpoint_tail_next{};
         std::unique_ptr<DeviceArena> workspace;
         Tensor prefill_hidden;
         // Workspace offset after the tensors that must survive every round scope (prefill_hidden and
@@ -172,22 +207,54 @@ private:
         std::size_t round_base = 0;
         models::qwen3_5::RoundState io;
         std::unique_ptr<models::qwen3_5::execution::TextContext> context;
-        std::vector<DeviceKVPageLease> kv_pages;
-        std::vector<DeviceKVPageHandle> kv_page_handles;
-        KVExecutionRowLease kv_row;
-        // MTP layer KV (shard 0 only, when --spec mtp): its own page list and execution row.
+        // One KV execution row per lane (P1.2c). lanes == 1 reproduces the original single row.
+        // Every row covers its own disjoint physical page group, published once at startup and
+        // reused in place across requests. Cross-session retention is per lane as well (P2.3), so
+        // the export and import paths address this lane's own handle list.
+        std::vector<std::vector<DeviceKVPageLease>> kv_lane_pages;
+        std::vector<std::vector<DeviceKVPageHandle>> kv_lane_handles;
+        std::vector<KVExecutionRowLease> kv_rows;
+        // MTP layer KV (shard 0 only, when --spec mtp): its own page list and one execution row per
+        // lane, split the same way as the text cache (P2.1b). `mtp_page_handles` stays the flat
+        // physical page list a host checkpoint exports; `mtp_lane_handles`/`mtp_rows`/`mtp_views` are
+        // indexed by lane. The MTP layer's extra page groups are dead capacity - the single-GPU
+        // route never publishes them either - so only the `logical` slice is mapped.
         std::vector<DeviceKVPageLease> mtp_pages;
         std::vector<DeviceKVPageHandle> mtp_page_handles;
-        KVExecutionRowLease mtp_row;
+        std::vector<std::vector<DeviceKVPageHandle>> mtp_lane_handles;
+        std::vector<KVExecutionRowLease> mtp_rows;
+        std::vector<models::qwen3_5::PagedKVCacheView> mtp_views;
         // Round scratch for the MTP proposal (step token/position, RoPE delta, backend KV table row
         // and the MTP prefill/autoregressive buffers). Its backing must outlive the context.
         std::unique_ptr<DeviceArena> round_arena;
         // ReplaySSM records for one speculative verify window and the plan that folds the accepted
         // record prefix back into the live linear-attention state (shard 0 only). The verify forward
         // runs with RecordForReplay, so the live state only advances when the fold says so.
+        //
+        // The window carries one record row per active lane, and the record op requires each layer's
+        // slice of the outer extent to be contiguous - which holds only when the row count equals
+        // record_capacity. A round that drives fewer lanes than the route's capacity therefore needs
+        // its own narrower geometry, not a slice of the widest one. The backing is sized once for the
+        // full lane count and carries one bound view per batch size; a round picks the view matching
+        // its own lane count, and the record path and the fold must agree on it.
         std::unique_ptr<DeviceArena> record_arena;
-        GdnReplayRecords records;
-        std::unique_ptr<ops::GdnReplayFoldPlan> replay_fold;
+        struct ReplayViews {
+            GdnReplayRecords records;
+            std::unique_ptr<ops::GdnReplayFoldPlan> fold;
+        };
+        std::vector<ReplayViews> replay_views;  // index batch - 1
+        [[nodiscard]] const GdnReplayRecords& records_for(std::int32_t batch) const {
+            if (batch < 1 || static_cast<std::size_t>(batch) > replay_views.size()) {
+                throw std::out_of_range("TP-2 replay record batch is out of range");
+            }
+            return replay_views[static_cast<std::size_t>(batch - 1)].records;
+        }
+        [[nodiscard]] ops::GdnReplayFoldPlan& fold_for(std::int32_t batch) const {
+            if (batch < 1 || static_cast<std::size_t>(batch) > replay_views.size()) {
+                throw std::out_of_range("TP-2 replay fold batch is out of range");
+            }
+            return *replay_views[static_cast<std::size_t>(batch - 1)].fold;
+        }
         // Final-norm hidden at the last prompt position: the first round's MTP bridge input.
         Tensor mtp_anchor_hidden;
         // DFlash2 masked-draft round, owned by the shard that materialized the draft component
@@ -205,6 +272,17 @@ private:
         std::unique_ptr<DeviceArena> dflash_snapshot_arena;
     };
 
+    // Identity of one Vision consumer inside a prepared prompt, in prompt-token coordinates. Every
+    // image merges to the same placeholder token ids, so two prompts showing different pictures
+    // compare equal on tokens alone; the digest and the span it covers are what tell them apart, and
+    // a reuse boundary that would keep KV from another picture has to be pulled back to this item's
+    // begin. `collect_media_spans` builds one of these per Vision item.
+    struct MediaSpan {
+        std::uint32_t begin = 0;
+        std::uint32_t end   = 0;
+        models::qwen3_5::VisionItem item;
+    };
+
     // Cross-session KV retention. Exactly one session's KV and GDN state live in the device pools,
     // so a request that belongs to another conversation evicts the resident session to pinned host
     // memory and pulls the returning one back instead of prefilling it again. An entry owns the
@@ -219,14 +297,20 @@ private:
         // the device returned, while the tokens still say which conversation this is, and the prefix
         // scan needs the longer of the two to find where the next prompt diverges from this one.
         std::vector<TokenId> tokens;
+        // The Vision items that history carries, in the same coordinates as the tokens above. The
+        // catalog entry is what a recall compares a prompt against, so it has to carry the media
+        // identity its token ids cannot see.
+        std::vector<MediaSpan> media;
         std::uint32_t frontier = 0;
         // Token count of the prompt the last completed prefill for this conversation walked. A later
         // prompt that still shares this many tokens contains that whole prompt, which is what makes
         // it a later turn of the same conversation instead of a client switching away from it. It
         // stays put while decode extends `tokens`, and survives an eviction and a recall unchanged.
         std::uint32_t prompt_end = 0;
-        // True while this entry's KV and GDN state are the ones in the device pools.
-        bool device_resident = false;
+        // The lane whose device pools hold this entry's KV and GDN state, or -1 when it is evicted.
+        // Each lane carries one resident conversation, so residency is an (entry, lane) pair rather
+        // than a single flag.
+        std::int32_t device_lane = -1;
         // The conversation the client named for this entry, when it named one. Naming a session is
         // how a client says it will come back, so a named entry outranks an anonymous continuation
         // when the catalog has to shed one. Only the newest entry of a conversation carries its
@@ -286,6 +370,35 @@ private:
     [[nodiscard]] GenerationResult execute_walk(Request& request, OutputSink* sink,
                                                 const CancellationView& cancellation);
 
+    // Multi-lane admission (PLAN-tp2-concurrency.md P1.4). Only reachable when lanes_ > 1, which the
+    // constructor keeps for every backend but DFlash v1 (that one collapses to one lane). A submission
+    // never touches the device itself: it appends a PendingRequest to the FIFO and then either waits
+    // for the batch that picks it up, or - when no driver is active - becomes the driver and forms
+    // batches of at most lanes_ from the queue head. The driver holds `execution_mutex_`, so
+    // "exactly one thread drives the devices" survives the split, and admission order is FIFO.
+    struct PendingRequest {
+        std::unique_ptr<Request> request;
+        OutputSink* sink = nullptr;
+        CancellationView cancellation;
+        GenerationResult result;
+        std::exception_ptr failure;
+        bool complete = false;
+    };
+    [[nodiscard]] GenerationResult wait_lanes(std::unique_ptr<Request> request, OutputSink* sink,
+                                              const CancellationView& cancellation);
+    void drive_lane_queue();
+    [[nodiscard]] GenerationResult execute_lane(PendingRequest& pending, std::uint32_t lane);
+    // P1.4c: one shared decode round for the whole batch, which is the only path that turns
+    // concurrency into throughput. Prefill stays serial per lane, each on its own KV row and GDN
+    // slot; only the decode rounds are shared. Reachable only for a plain, unconstrained, text-only
+    // group, and the constructor keeps lanes_ > 1 to the plain route already.
+    void execute_plain_batch(const std::vector<std::shared_ptr<PendingRequest>>& batch);
+    // P2.1c: the same shared-round shape as execute_plain_batch, but each round runs one masked-draft
+    // proposal over the whole batch and one batched target verify, then accepts and folds per lane.
+    // Reachable only for a DFlash2 group with no tool grammar and no media; the plain route keeps the
+    // function above, and MTP keeps the serial walk (its draft chain is still single-row).
+    void execute_spec_batch(const std::vector<std::shared_ptr<PendingRequest>>& batch);
+
     // The turn this lineage generated, adopted when the client's rendering of it is the same turn.
     // The template trims the reasoning and the content and writes its own separators between them,
     // so a replay can differ from the generated bytes in exactly those runs and still describe the
@@ -301,13 +414,15 @@ private:
         std::size_t divergence = 0;
     };
     [[nodiscard]] TurnAdoption adopt_generated_turn(models::qwen3_5::PreparedPromptData& data,
-                                                    std::uint32_t prompt_tokens, bool trace) const;
+                                                    std::uint32_t prompt_tokens, bool trace,
+                                                    std::uint32_t lane) const;
 
     // Names the boundary the prefix scan accepted in the checkpoint vocabulary the Engine already
     // publishes, so a serve log can tell an exact endpoint apart from a fall-back behind the answer
     // this lineage generated.
     [[nodiscard]] PrefixReusePath reuse_path(std::uint32_t reuse,
-                                             std::uint32_t block_frontier) const noexcept;
+                                             std::uint32_t block_frontier,
+                                             std::uint32_t lane) const noexcept;
 
     void build_shard(Shard& shard, int shard_index);
 
@@ -315,13 +430,26 @@ private:
     // by what the cross-device all-reduce staging buffer carries in one payload (see the definition).
     [[nodiscard]] std::uint32_t prefill_chunk_width(const models::qwen3_5::TextConfig& config) const;
 
+    // The context ceiling a lane may actually write at. `lane_token_capacity_` is the KV budget a
+    // lane owns after the static page split, but a lane that reached that position would write on
+    // the next lane's first page (and the last lane past the pool), so the admitted window stops one
+    // token short of it. A batched MTP route also runs its draft chain a few columns past the
+    // longest lane's position, so it keeps that write tail inside the lane's own pages too (P2.1b).
+    // The single-lane route keeps advertising `options_.max_context` unchanged.
+    [[nodiscard]] std::uint32_t lane_context_window() const noexcept {
+        if (lanes_ == 1U) { return options_.max_context; }
+        const std::uint32_t margin = mtp_enabled_ ? mtp_drafts_ + 2U : 1U;
+        return lane_token_capacity_ > margin ? lane_token_capacity_ - margin : 1U;
+    }
+
     // MTP prefill priming on shard 0: runs the MTP layer over one prefill chunk, appending its own
     // K/V from the chunk's final-norm hidden. last_token is the token sampled from the final chunk's
     // logits, which the MTP layer's last prompt column embeds; that column's hidden becomes the first
-    // round's bridge input.
+    // round's bridge input. Priming re-points the MTP prefill view and the round state's scalar KV
+    // row at `lane`'s own execution row and writes the anchor hidden into `lane`'s column (P2.1b).
     void mtp_prefill_priming(Shard& shard, const int* ids, std::uint32_t length,
                              std::uint32_t first_position, Tensor& mtp_input,
-                             const Tensor* last_token, bool final_chunk);
+                             const Tensor* last_token, bool final_chunk, std::int32_t lane = 0);
 
     // One MTP proposal window on shard 0: the layer's column at this position embeds the anchor
     // token (the one just sampled) and predicts the token after it; the rest of the window follows
@@ -335,15 +463,16 @@ private:
     // every backend other than DFlash/DFlash2); the prefill call site then runs NullTap exactly as
     // before.
     [[nodiscard]] std::optional<models::qwen3_5::execution::DFlashFeatureSink>
-    make_dflash_prefill_sink(Shard& shard);
+    make_dflash_prefill_sink(Shard& shard, std::int32_t lane = 0);
 
     // The masked draft's context image, on the shard that owns the draft; a no-op on shard 1 and on
     // every backend other than DFlash2. The device slot pairs with state_snapshots[slot] and the
     // host image with a checkpoint or session slab, so the two are always copied and restored
-    // together with the target state at the same absolute frontier.
-    void store_dflash_image(Shard& shard, PinnedHostBuffer& image);
-    void load_dflash_image(Shard& shard, const PinnedHostBuffer& image);
-    void snapshot_dflash_state(Shard& shard, std::size_t slot);
+    // together with the target state at the same absolute frontier. Every image carries one compact
+    // ring image per lane and the lane index selects the slice, exactly like the target state image.
+    void store_dflash_image(Shard& shard, PinnedHostBuffer& image, std::uint32_t lane);
+    void load_dflash_image(Shard& shard, const PinnedHostBuffer& image, std::uint32_t lane);
+    void snapshot_dflash_state(Shard& shard, std::size_t slot, std::uint32_t lane);
 
     // The Engine routes TP-2 submissions from the calling (HTTP) thread, so this core owns
     // serialization: the shard state, the startup-materialized KV pages and the DevicePair belong
@@ -371,7 +500,14 @@ private:
         // the single-GPU MTP graph relies on.
         std::uint32_t visible_begin = 0;
         std::uint32_t visible_end   = 0;
-        bool captured               = false;
+        // Lane shape this capture belongs to. 'batch' is the number of active lanes the graph was
+        // captured for; 'lane' is the state slot a single-column capture baked into the scalar
+        // decode path (-1 when the capture binds every slot from device memory, which is the case
+        // from two lanes up). One graph per (bucket, batch, lane) is therefore reusable by any
+        // assignment of lanes that has that shape.
+        std::int32_t batch = 1;
+        std::int32_t lane  = -1;
+        bool captured      = false;
         // Rendezvous id channel for this graph (see DevicePair::create_ar_channel): the host publishes
         // a fresh id block before every replay, and the graph's memcpy node carries it in.
         tp::DevicePair::ArChannel ar_channel = tp::DevicePair::kNoArChannel;
@@ -388,13 +524,17 @@ private:
     };
     // The captured graph covering an envelope bucket, or nullptr when no bucket does.
     [[nodiscard]] static WindowGraph* select_window_graph(std::vector<WindowGraph>& graphs,
-                                                          std::uint32_t visible_end);
+                                                          std::uint32_t visible_end,
+                                                          std::int32_t batch = 1,
+                                                          std::int32_t lane  = -1);
     // The captured graph covering this window that the current request can still use, or nullptr
     // when the window has to be captured (again). A capture bakes the workspace watermark it ran at,
     // so a request whose own watermark is higher has to capture afresh: the graphs therefore track
     // the highest watermark seen rather than the first one.
     [[nodiscard]] WindowGraph* reusable_window_graph(std::vector<WindowGraph>& graphs,
-                                                     std::uint32_t visible_end);
+                                                     std::uint32_t visible_end,
+                                                     std::int32_t batch = 1,
+                                                     std::int32_t lane  = -1);
     // Launches one captured window on both devices, leaving shard A's device current.
     void launch_window_graph(WindowGraph& graph);
     void capture_verify_graph(WindowGraph& graph, const std::int32_t* ids,
@@ -402,6 +542,18 @@ private:
                               Tensor& hidden_columns,
                               models::qwen3_5::execution::DFlashFeatureSink* sink,
                               const std::int32_t* valid_columns);
+    // The batched form of the verify window (P2.2c): the aggregate window is width * batch columns
+    // and every per-lane binding is read from the caller's pinned arrays by memcpy nodes, so one
+    // capture covers every assignment of a given lane count. A one-column batch still runs the
+    // scalar GDN path of the window, whose slot the capture bakes (see WindowGraph::lane).
+    void capture_verify_batch_graph(WindowGraph& graph, const std::int32_t* ids,
+                                    const std::int32_t* positions,
+                                    const std::int32_t* kv_table_rows,
+                                    const std::int32_t* state_slots, std::int32_t width,
+                                    std::int32_t batch, Tensor& logits_columns,
+                                    Tensor& hidden_columns,
+                                    models::qwen3_5::execution::DFlashFeatureSink* sink,
+                                    const std::int32_t* valid_columns);
     // The speculative verify window. sink, when non-null, is the masked-draft feature sink the
     // target residual blocks are tapped into; its device scatters travel with a captured window
     // (stable addresses, per-round lane/column tensors re-read by the kernels) while its host
@@ -412,6 +564,26 @@ private:
                            Tensor& logits_columns, Tensor& hidden_columns,
                            models::qwen3_5::execution::DFlashFeatureSink* sink = nullptr,
                            std::int32_t valid_columns = 0);
+
+    // The batched form of the verify window (P2.1a): the aggregate window is width * batch columns,
+    // lane by lane, and every per-lane binding is a [batch] host array - the paged-KV execution row,
+    // the linear-attention state slot, and optionally the clamp extent. first_position must be the
+    // farthest lane's first column, because the attention envelope has to cover every lane. It
+    // records the window's transitions one physical row per lane, so the fold visits every active
+    // lane. On the multi-lane route the window runs through the batch captures below (P2.2c); its
+    // single-lane caller stays eager.
+    void run_verify_window_batch(const std::int32_t* ids, const std::int32_t* positions,
+                                 const std::int32_t* kv_table_rows, const std::int32_t* state_slots,
+                                 std::int32_t width, std::int32_t batch, std::int32_t first_position,
+                                 Tensor& logits_columns, Tensor& hidden_columns,
+                                 models::qwen3_5::execution::DFlashFeatureSink* sink,
+                                 const std::int32_t* valid_columns);
+    // Replays each active lane's recorded verify-window prefix into its own state slot. state_slots
+    // and commit_columns are [batch] host arrays naming the slot a lane recorded into and how many
+    // leading columns that lane commits; rows are one per lane, in lane order. The caller restores
+    // the round snapshot first, exactly as the single-lane routes do.
+    void fold_verify_window(const std::int32_t* state_slots, const std::int32_t* commit_columns,
+                            std::int32_t batch);
 
     // One plain (non-speculative) decode step at the given position. The launch mechanism is the
     // decode step mode: a captured graph by default, the eager forward for either A/B partner.
@@ -428,6 +600,22 @@ private:
     void capture_decode_graph(WindowGraph& graph, const std::int32_t* token,
                               const std::int32_t* position, Tensor& logits);
 
+    // The batched form of the plain decode step (P2.2b): one token per active lane in one capture.
+    // The four per-lane operands arrive as pinned host arrays and become a small device copy per
+    // shard inside the captured sequence, so the graph carries no lane identity of its own except
+    // the one the scalar single-column path bakes (see WindowGraph::lane). The round's own scratch
+    // and logits are allocated by the caller before this call: the batch stores set the watermark at
+    // a startup constant, so a captured layout is reproduced by every later round of that width.
+    void capture_decode_batch_graph(WindowGraph& graph, const std::int32_t* tokens,
+                                    const std::int32_t* positions, const std::int32_t* kv_table_rows,
+                                    const std::int32_t* state_slots, std::int32_t columns,
+                                    Tensor& logits);
+    void run_plain_decode_step_batch(const std::int32_t* tokens, const std::int32_t* positions,
+                                     const std::int32_t* kv_table_rows,
+                                     const std::int32_t* state_slots, std::int32_t columns,
+                                     const ops::CausalAttentionExecutionEnvelope& exact_envelope,
+                                     Tensor& logits);
+
     // A captured step bakes a bucket-wide attention envelope, so the eager partners stay reachable:
     // EagerBucket isolates the launch mechanism from the envelope, and EagerExact reproduces the
     // pre-graph behaviour of an exact visible extent. The plain decode step and the MTP draft chain
@@ -437,6 +625,26 @@ private:
     std::vector<WindowGraph> verify_graphs_;
     std::unique_ptr<PinnedHostBuffer> verify_window_host_;
     bool verify_graph_enabled_ = false;
+
+    // Batched verify windows, one graph per (bucket, lane count, and the slot a one-column capture
+    // bakes), captured on the multi-lane speculative route. The single-lane route keeps
+    // verify_graphs_. NINFER_TP2_VERIFY_BATCH_GRAPH selects the launch mechanism like the other
+    // graph switches.
+    std::vector<WindowGraph> verify_batch_graphs_;
+    StepLaunchMode verify_batch_mode_ = StepLaunchMode::EagerExact;
+
+    // Per-lane operands of a batched verify window, in the same layout as the look-ahead decode
+    // round's: width columns of tokens, then the same of positions, then one entry per lane for the
+    // clamp extent, the paged-KV execution row and the linear-attention state slot. A captured
+    // window re-reads them through memcpy nodes, so their addresses are baked and the buffer is a
+    // member whose sections are laid out with the startup lane count, not the round's live one.
+    // The block is laid out as [ids: width * lanes_][positions: width * lanes_][valid: lanes_]
+    // [KV rows: lanes_][state slots: lanes_], so the width-scaled sections come first and the
+    // per-lane ones follow.
+    std::unique_ptr<PinnedHostBuffer> batch_window_host_;
+    [[nodiscard]] std::int32_t* batch_window_base() noexcept {
+        return static_cast<std::int32_t*>(batch_window_host_->data());
+    }
 
     // The MTP draft chain, captured per envelope bucket like the verify window. One pinned
     // [anchor, position, position+1, drafts(K)] buffer carries every per-round input and output.
@@ -450,6 +658,25 @@ private:
     std::unique_ptr<PinnedHostBuffer> decode_window_host_;
     StepLaunchMode decode_step_mode_ = StepLaunchMode::Graph;
 
+    // Batched plain decode steps, one graph per (bucket, lane count, and the slot a one-lane
+    // capture bakes). Captured on the multi-lane route only; the single-lane route keeps
+    // decode_graphs_. NINFER_TP2_DECODE_BATCH_GRAPH selects the launch mechanism like the other
+    // graph switches.
+    std::vector<WindowGraph> decode_batch_graphs_;
+    StepLaunchMode decode_batch_mode_ = StepLaunchMode::EagerExact;
+
+    // Per-lane operands of a batched decode round: tokens, absolute positions, paged-KV execution
+    // rows and linear-attention state slots, one lane per entry, with the lane index as the stride
+    // in every section. A captured batch step reads these through memcpy nodes, so the addresses
+    // are baked into the graph: the buffer has to outlive the round and keep its address, which is
+    // why it is a member rather than the round's stack. The fifth section carries the per-round
+    // logical positions, whose copy stays eager and does not have to be pinned for a replay.
+    std::unique_ptr<PinnedHostBuffer> batch_lane_host_;
+    [[nodiscard]] std::int32_t* batch_lane_host_section(std::size_t section) noexcept {
+        auto* base = static_cast<std::int32_t*>(batch_lane_host_->data());
+        return base + section * static_cast<std::size_t>(lanes_);
+    }
+
     // Total seconds spent loading and materializing both shards (for LoadSummary).
     double load_seconds_ = 0.0;
 
@@ -460,7 +687,25 @@ private:
     // Which frozen state a recall restores: the frontier the entry was evicted at, the end of the
     // prompt its last prefill walked, or the boundary another conversation diverged at.
     enum class RecallState : std::uint8_t { Frontier, PromptEnd, Shared };
-    void session_recall(std::span<const TokenId> prompt_tokens);
+    [[nodiscard]] static LaneStateGeometry make_lane_state_geometry(const Shard& shard);
+    // Copies the GDN state this lane's device slot holds right now into the ring slot the group
+    // owns, tagged with the frontier it captures. A prefill writes these at its chunk boundaries and
+    // the sweep that follows a completed prefill is what makes them usable.
+    void snapshot_host_checkpoint(Shard& shard, std::uint32_t frontier, HostRing ring,
+                                  std::uint32_t lane);
+    // Copies one lane's image between a whole-pool device buffer and its compact pinned image, or
+    // between two whole-pool device buffers. `other` is the compact pinned image for a host copy
+    // and the source pool for a device-to-device one.
+    static void copy_lane_state(const LaneStateGeometry& geometry, const void* device_base,
+                                std::int32_t lane, void* other, cudaMemcpyKind kind,
+                                cudaStream_t stream);
+    static void zero_lane_state(const LaneStateGeometry& geometry, void* device_base,
+                                std::int32_t lane, cudaStream_t stream);
+    // `media` is the incoming prompt's Vision identity. The token ids alone cannot license a
+    // boundary: every image merges to the same placeholder ids, so a comparison that stops at the
+    // tokens would recall another conversation's KV for a prompt showing a different picture.
+    void session_recall(std::uint32_t lane, std::span<const TokenId> prompt_tokens,
+                        std::span<const MediaSpan> media);
     // Freezes the state at 'position' into an evicted entry's shared-prefix image. 'from_device'
     // takes it from the device pools, which still hold the state the walk is about to advance;
     // otherwise the two pointers are pinned host images to copy from.
@@ -468,14 +713,15 @@ private:
     // the shard that owns the draft; 'from_device' takes the live ring instead.
     void session_capture_shared_state(std::size_t index, std::uint32_t position, bool from_device,
                                       const PinnedHostBuffer* const* frozen,
-                                      const PinnedHostBuffer* dflash_frozen);
+                                      const PinnedHostBuffer* dflash_frozen, std::uint32_t lane);
     // Copies the resident session into its host slabs. Returns false when the host budget cannot
     // hold it, in which case the entry is dropped instead: the next prefill overwrites the device
     // pools, and an entry must never claim state that no longer exists.
-    bool session_store_active();
+    bool session_store_active(std::uint32_t lane);
     // Copies an entry's host slabs back into the device pools and makes it the resident session:
     // the KV before 'boundary' plus the frozen GDN state 'state' names.
-    void session_restore(SessionEntry& entry, std::uint32_t boundary, RecallState state);
+    void session_restore(SessionEntry& entry, std::uint32_t boundary, RecallState state,
+                         std::uint32_t lane);
     // Frees an entry's host slabs, drops it from the catalog, and keeps the active index valid.
     void session_drop(std::size_t index);
     // Gives entry host KV slabs of at least 'pages' pages per shard, reusing larger existing ones.
@@ -498,7 +744,8 @@ private:
     // forwarded until the first decode round, so a finished response's frontier is one token short
     // of its history.
     void session_publish(const std::vector<TokenId>& history, std::uint32_t frontier,
-                         const models::qwen3_5::PreparedContextCache& cache_hints);
+                         const models::qwen3_5::PreparedContextCache& cache_hints,
+                         std::span<const MediaSpan> media, std::uint32_t lane);
     // The in-kernel transport gives up on its deadline instead of waiting forever (see DevicePair),
     // so a stalled rendezvous no longer freezes the process: it surfaces here as a round whose data
     // is a local partial sum rather than an allreduce result. Fails the request with the retryable
@@ -508,41 +755,140 @@ private:
     // Retires the prefix-reuse checkpoint ring. A checkpoint is only usable while every prompt that
     // followed the prefill that wrote it agreed on the tokens before its position; once the device
     // pools hold another session, that chain is broken even though the ring's positions may still
-    // sit inside the recalled history.
+    // sit inside the recalled history. The lane-scoped overload retires one lane's slice of the
+    // ring, which is what a single lane's own recall or abort must do; the global one is for a
+    // failure that leaves the device pools describing no lineage at all.
     void invalidate_host_checkpoints();
+    void invalidate_host_checkpoints(std::uint32_t lane);
     // Drops only the resident entry and invalidates the device lineage: the paths that abort a
     // walk leave the device pools holding a prefix no catalog entry describes, while every
     // host-resident entry stays valid.
-    void session_invalidate_active();
-    // Prefix-reuse bookkeeping: the token ids of the last completed prefill, the absolute token
-    // positions its state snapshots correspond to, and whether those snapshots are usable.
-    std::vector<TokenId> cached_prompt_tokens_;
-    std::array<std::uint32_t, kReuseSnapshotCount> cached_boundaries_{};
-    bool cached_state_valid_ = false;
-    // Session catalog. sessions_ holds the resident entry plus the host-resident ones; the
-    // resident entry is the device lineage, so cached_prompt_tokens_ mirrors its history while
-    // the GDN state sits at its frontier (live_state_valid_).
+    void session_invalidate_active(std::uint32_t lane);
+    // Retires every lane's resident lineage, for the paths that cannot name one lane.
+    void session_invalidate_all();
+    // The boundary a batched lane accepted in the prefix scan, plus the ring cursor the prefill that
+    // follows it starts from. Both batched executors run the same scan the single-lane walk runs, on
+    // the lane they are prefilling, so the three share these steps instead of a copy each.
+    struct LaneReuse {
+        std::uint32_t tokens               = 0;
+        std::uint32_t slot                 = 0;
+        std::uint32_t next_host_checkpoint = 0;
+    };
+    // Scans this lane's own lineage for the deepest boundary at or before the shared prefix, tags
+    // the checkpoints the coming prefill will write, and records the source in the lane's retention
+    // state. Everything it reads is per lane, so two lanes in one batch never see each other's state.
+    [[nodiscard]] LaneReuse scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> token_ids,
+                                            std::span<const MediaSpan> media,
+                                            std::uint32_t prompt_tokens, std::size_t replay_split,
+                                            bool adopted, bool trace);
+    // The Vision identity of one prepared prompt: one span per item, in prompt-token coordinates,
+    // ordered by `begin`. Empty for a text-only prompt.
+    [[nodiscard]] static std::vector<MediaSpan> collect_media_spans(
+        const models::qwen3_5::PreparedPromptData& data, std::size_t limit);
+    // Caps a token-id shared prefix at the first Vision item the two prompts do not share, so a
+    // boundary never keeps KV from a picture the incoming prompt does not show. Both lists are
+    // ordered by `begin` and describe their own prompt, so the walk is a merge; an item that starts
+    // at or beyond the boundary constrains nothing, because the boundary does not reuse it.
+    [[nodiscard]] static std::size_t media_prefix_cap(std::span<const MediaSpan> cached,
+                                                      std::span<const MediaSpan> incoming,
+                                                      std::size_t shared_prefix);
+    // Brings this lane's GDN state to the scanned boundary on both shards.
+    void restore_lane_gdn(std::uint32_t lane, const LaneReuse& reuse);
+    // Brings this lane's masked-draft ring to the same boundary, on the shard that owns the draft.
+    // 'zero_when_none' clears the whole ring when there is no boundary: the single-lane walk needs
+    // that because it may leave the ring at another lineage's frontier, while a batched lane rebuilds
+    // the whole ring from its own prefill sink.
+    void restore_lane_dflash(std::uint32_t lane, const LaneReuse& reuse, bool zero_when_none);
+    // Publishes a completed lane prefill: the catalog entry, the checkpoint sweep that makes this
+    // prefill's ring slots usable, and this lane's slice of snapshot plane 0 (GDN state and, on a
+    // masked-draft route, the draft ring).
+    void publish_lane_prefill(std::uint32_t lane, std::uint32_t prompt_tokens,
+                              const std::vector<TokenId>& tokens,
+                              std::span<const MediaSpan> media,
+                              const models::qwen3_5::PreparedContextCache& cache_hints);
+    // Retires this lane's lineage after a torn prefill, so the next request cannot stand on a state
+    // this one left half written.
+    void invalidate_lane_prefill(std::uint32_t lane);
+    // Opens this request's Vision prefill session on top of the startup plan (P2.4). Returns null
+    // when the request carries no media, or when every item it carries lies entirely inside the
+    // reused prefix and is therefore already in the KV. The caller keeps `plan` alive while the
+    // session lives, because the session binds it by reference.
+    [[nodiscard]] std::unique_ptr<models::qwen3_5::execution::VisionPrefillSession>
+    open_vision_session(models::qwen3_5::PreparedPromptData& data, std::uint32_t reuse,
+                        models::qwen3_5::execution::VisionPrefillPlan& plan);
+    // Which memory the prefix scan's winning boundary restores its GDN state from. LiveState means
+    // the device state already sits at that boundary - the resident session's frontier restored by
+    // a recall, or the tail of a conversation that just decoded - so nothing is copied at all.
+    enum class ReuseSource : std::uint8_t { None, DeviceSnapshot, HostCheckpoint, LiveState };
+
+    // Per-lane retention state (PLAN-tp2-concurrency.md P2.3). The single-lane walk drives slot 0;
+    // the batched executors drive one slot per active lane. Everything a lane needs in order to know
+    // what prefix it may reuse lives here, because a lane's device state is its own slot in the
+    // shared pools and two lanes must never share a cached lineage.
+    struct RetentionState {
+        // Prefix-reuse bookkeeping: the token ids of the last completed prefill, the absolute token
+        // positions its state snapshots correspond to, and whether those snapshots are usable.
+        std::vector<TokenId> cached_prompt_tokens;
+        // The Vision items `cached_prompt_tokens` carries, mirroring the catalog entry's. A reuse
+        // scan compares the incoming prompt's items against these: the merged placeholder ids are
+        // identical across pictures, so only this can say whether the KV a boundary would keep
+        // belongs to the picture the new prompt shows.
+        std::vector<MediaSpan> cached_media;
+        std::array<std::uint32_t, kReuseSnapshotCount> cached_boundaries{};
+        bool cached_state_valid = false;
+        // The catalog entry this lane's device pools hold, if any.
+        std::size_t active_session = kNoSession;
+        // The catalog entry whose history the running prefill compares this prompt against, and
+        // therefore the one a divergence state at or before the shared prefix belongs to: after a
+        // recall, the entry that recall restored, whose own history is what the scan reads; after a
+        // switch, the session the switch just moved into its host slabs. kNoSession when the prompt
+        // is compared against no catalog entry, or against one the host budget could not keep. Every
+        // prefill reads it once, before the walk advances the state.
+        std::size_t anchor_session = kNoSession;
+        // Set while this lane's device GDN state sits exactly at the resident entry's frontier, so a
+        // prompt that extends that history can reuse it in place with no state copy at all. Every
+        // path that aborts a walk clears it before the catalog can be read again.
+        bool live_state_valid = false;
+        // The block boundary the last prefill's own prompt named, and the ring id that froze its
+        // state. A conversation keeps it across its turns and hands it to its slabs when it is
+        // evicted, so the next conversation that opens with the same block is recalled on the
+        // boundary instead of prefilling the block again. Zero means the running lineage has none.
+        std::uint32_t block_anchor_position   = 0;
+        std::uint64_t block_anchor_prefill_id = 0;
+        ReuseSource reuse_source              = ReuseSource::None;
+        // The ring id the running prefill tags its new checkpoints with.
+        std::uint64_t host_checkpoint_live_id = 0;
+        // DFlash2: how far the draft's local ring has been materialized, in absolute target tokens.
+        // The prefill sink advances it by each chunk; every decode round advances it by the
+        // committed prefix of the previous round's verify window (append_pending). It never exceeds
+        // the target execution frontier and lags it by at most one verify window.
+        std::uint32_t dflash_context_frontier = 0;
+        // MTP: the first draft of the previous decode step, and whether there is one to compare. A
+        // draft proposed at position p predicts the token at p+2, so the target's argmax at the next
+        // step is exactly the acceptance oracle for it.
+        std::int32_t mtp_previous_draft = -1;
+        bool mtp_have_previous          = false;
+    };
+    // One slot per lane; a route with fewer lanes leaves the tail unused.
+    std::array<RetentionState, kTp2GenerationMaxConcurrency> lane_retention_{};
+    [[nodiscard]] RetentionState& retention(std::uint32_t lane) noexcept {
+        return lane_retention_[lane];
+    }
+    [[nodiscard]] const RetentionState& retention(std::uint32_t lane) const noexcept {
+        return lane_retention_[lane];
+    }
+    // Session catalog. sessions_ holds the resident entries plus the host-resident ones; a resident
+    // entry is the device lineage of exactly one lane, so a lane's cached_prompt_tokens mirrors its
+    // history while its GDN state sits at that entry's frontier (live_state_valid).
     std::vector<SessionEntry> sessions_;
-    std::size_t active_session_      = kNoSession;
     std::uint64_t session_lru_clock_ = 0;
-    // The catalog entry whose history the running prefill compares this prompt against, and therefore
-    // the one a divergence state at or before the shared prefix belongs to: after a recall, the entry
-    // that recall restored, whose own history is what the scan reads; after a switch, the session the
-    // switch just moved into its host slabs. kNoSession when the prompt is compared against no
-    // catalog entry, or against one the host budget could not keep. Every prefill reads it once,
-    // before the walk advances the state.
-    std::size_t anchor_session_ = kNoSession;
-    // Entries the catalog accepts, resident one included. Zero disables session retention, which
+    // Entries the catalog accepts, resident ones included. Zero disables session retention, which
     // is what a zero host KV budget selects.
     std::size_t session_capacity_    = 0;
     std::size_t host_kv_shard_bytes_ = 0;
     // One pinned host KV arena per shard, built lazily on the first eviction so a single-session
     // workload never pins the budget. Shard A's arena also carries the MTP layer geometry.
     std::array<std::unique_ptr<HostKVArena>, 2> host_kv_arena_;
-    // Set while the device GDN state sits exactly at the resident entry's frontier, so a prompt
-    // that extends that history can reuse it in place with no state copy at all. Every path that
-    // aborts a walk clears it before the catalog can be read again.
-    bool live_state_valid_ = false;
     // Diagnostics counters, reported by NINFER_TP2_SESSION_TRACE and the runtime ledger.
     std::uint64_t session_recalls_       = 0;
     std::uint64_t session_stores_        = 0;
@@ -550,32 +896,29 @@ private:
     std::uint64_t session_full_prefills_ = 0;
 
     // Host checkpoint ring: the token stride between checkpoints (0 disables the ring, which is
-    // what a zero host state-image budget selects), the id the running prefill tags its new
-    // checkpoints with, and the next id to hand out. Which checkpoints are usable is decided per
-    // request by Shard::HostCheckpoint::valid, not by the id.
+    // what a zero host state-image budget selects), and the next id to hand out. Which checkpoints
+    // are usable is decided per request by Shard::HostCheckpoint::valid, not by the id.
+    // Decode width this core was provisioned for (PLAN-tp2-concurrency.md P1.2).
+    std::uint32_t lanes_                      = 1;
     std::uint32_t host_checkpoint_stride_     = 0;
     std::uint32_t host_checkpoint_tail_slots_ = 0;
-    std::uint64_t host_checkpoint_live_id_    = 0;
+    // Grid slots in one lane's slice of the ring (the whole ring at lanes=1).
+    std::uint32_t host_checkpoint_grid_slots_ = 0;
+    // Each lane owns this many ring slots, and a slot holds one compact single-lane state image, so
+    // the pinned footprint is the lanes=1 budget whatever the lane count
+    // (PLAN-tp2-concurrency.md 12.6).
+    std::uint32_t host_checkpoint_slots_per_lane_ = 0;
     std::uint64_t host_checkpoint_next_id_    = 1;
+    // Host-ring writes of the request being served, reported by the NINFER_TP2_TIMING trace.
+    std::uint64_t prefill_host_writes_        = 0;
     // Slots appended to the end of every shard's ring for the divergence anchor and for the stable
     // block's own anchor. They sit outside the configured --host-state-slots budget: the anchors
     // answer a different question than the position grid, and carving them out of the grid would
     // coarsen the stride that covers the whole context. They cost pinned host memory only.
     std::uint32_t host_checkpoint_divergence_slots_ = 0;
     std::uint32_t host_checkpoint_block_slots_      = 0;
-    // The block boundary the last prefill's own prompt named, and the ring id that froze its state.
-    // A conversation keeps it across its turns and hands it to its slabs when it is evicted, so the
-    // next conversation that opens with the same block is recalled on the boundary instead of
-    // prefilling the block again. Zero means the running lineage has none.
-    std::uint32_t block_anchor_position_   = 0;
-    std::uint64_t block_anchor_prefill_id_ = 0;
     // Committed history below this many tokens is not worth a catalog slot; 0 retains everything.
     std::uint32_t session_retention_floor_tokens_ = 0;
-    // Which memory the prefix scan's winning boundary restores its GDN state from. LiveState means
-    // the device state already sits at that boundary - the resident session's frontier restored by
-    // a recall, or the tail of a conversation that just decoded - so nothing is copied at all.
-    enum class ReuseSource : std::uint8_t { None, DeviceSnapshot, HostCheckpoint, LiveState };
-    ReuseSource reuse_source_ = ReuseSource::None;
 
     // Multi-token prediction (--spec mtp): whether proposals are enabled, and the proposal window
     // width (how many drafts the MTP layer proposes per decode round).
@@ -594,16 +937,19 @@ private:
     // exclusive (the option normalizer admits one), and DFlash2 keeps its own proposal width.
     bool dflash2_enabled_         = false;
     std::uint32_t dflash_drafts_  = 0;
-    // How far the draft's local ring has been materialized, in absolute target tokens. The prefill
-    // sink advances it by each chunk; every decode round advances it by the committed prefix of the
-    // previous round's verify window (append_pending). It never exceeds the target execution
-    // frontier and lags it by at most one verify window.
-    std::uint32_t dflash_context_frontier_ = 0;
-    // The first draft of the previous decode step, and whether there is one to compare. A draft
-    // proposed at position p predicts the token at p+2, so the target's argmax at the next step is
-    // exactly the acceptance oracle for it.
-    std::int32_t mtp_previous_draft_       = -1;
-    bool mtp_have_previous_                = false;
+
+    // Multi-lane admission state (P1.4). `lane_token_capacity_` is the KV budget every lane owns
+    // after the static page split, which is the context ceiling submit() must clamp against once
+    // lanes_ > 1: the pool is shared, so no lane may be offered the whole options_.max_context.
+    std::deque<std::shared_ptr<PendingRequest>> lane_queue_;
+    std::mutex lane_queue_mutex_;
+    std::condition_variable lane_queue_cv_;
+    bool lane_driver_active_ = false;
+    std::uint32_t lane_token_capacity_ = 0;
+    // The lane the batch member currently driving is bound to. It only reaches the non-batch windows,
+    // which take it as an argument; the driver holds `execution_mutex_`, so there is exactly one
+    // writer and one reader at a time. It stays 0 on the single-lane route.
+    std::int32_t active_lane_ = 0;
 
     // Monotonic counters for runtime_stats().
     std::uint64_t computed_prefill_tokens_ = 0;

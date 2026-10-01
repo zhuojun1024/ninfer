@@ -1,6 +1,7 @@
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/tp/device_pair.h"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -51,6 +53,13 @@ std::pair<int, int> pick_devices() {
 // 300-token prompt, which spans five pages, and the autoregressive decode test covers 32.
 constexpr std::uint32_t kTestCacheTokens   = 2048;
 constexpr std::uint32_t kTestCachePages    = kTestCacheTokens / 64;
+// The TP-2 batch route keeps one KV execution row and one GDN state slot per lane, so the module
+// exercises two lanes and, below, the one-column batch a shrinking batch produces.
+constexpr std::uint32_t kTestLanes         = 2;
+constexpr std::uint32_t kTestPoolPages     = kTestCachePages * kTestLanes;
+// Speculative verify window (draft count + 1). The replay records are sized for one window per
+// lane, and the two-lane window test below records exactly this many columns.
+constexpr std::int32_t kTestVerifyWindow   = 4;
 
 struct ShardState {
     std::unique_ptr<DeviceArena> kv_arena;
@@ -58,12 +67,14 @@ struct ShardState {
     std::unique_ptr<DeviceArena> state_arena;
     std::unique_ptr<LinearAttentionStatePool> state;
     DeviceSpan state_backing;
-    std::vector<DeviceKVPageLease> kv_pages;      // the physical pages KV execution row 0 maps
+    std::vector<DeviceKVPageLease> kv_pages;      // every lane's physical pages, lane by lane
     std::vector<DeviceKVPageHandle> kv_handles;
-    KVExecutionRowLease kv_row;
+    std::vector<KVExecutionRowLease> kv_rows;     // one KV execution row per lane
     std::unique_ptr<DeviceArena> workspace;
     qwen::RoundState io;
     Tensor prefill_hidden;
+    std::unique_ptr<DeviceArena> record_arena;
+    GdnReplayRecords records; // one physical record row per lane
 };
 
 // Build the minimal per-shard execution state: a paged KV cache large enough to prefill a short
@@ -82,8 +93,8 @@ ShardState build_shard_state(DeviceContext& device, const qwen::TextConfig& conf
                      .attention_head_dim        = qwen::execution::dimension(config.attention->head_dim),
                      .kv_storage                = KvCacheStorage::BFloat16,
                      .enable_mtp                = false,
-                     .kv_table_rows             = 1,
-                     .text_physical_page_groups = kTestCachePages,
+                     .kv_table_rows             = kTestLanes,
+                     .text_physical_page_groups = kTestPoolPages,
                      .mtp_physical_page_groups  = 0,
                  });
     const std::size_t kv_bytes = kv_builder.finish(256);
@@ -100,7 +111,7 @@ ShardState build_shard_state(DeviceContext& device, const qwen::TextConfig& conf
         .value_heads   = (config.gdn ? qwen::execution::dimension(config.gdn->linear_num_value_heads) : 0),
         .value_head_dim = (config.gdn ? qwen::execution::dimension(config.gdn->linear_value_head_dim) : 0),
         .key_head_dim   = (config.gdn ? qwen::execution::dimension(config.gdn->linear_key_head_dim) : 0),
-        .slot_count     = 1,
+        .slot_count     = kTestLanes,
         .conv_dtype     = DType::BF16,
     };
     LayoutBuilder state_builder;
@@ -113,6 +124,26 @@ ShardState build_shard_state(DeviceContext& device, const qwen::TextConfig& conf
     CUDA_CHECK(cudaMemset(state_backing.data, 0, state_bytes));
     shard.state        = std::make_unique<LinearAttentionStatePool>(state_backing, state_layout);
     shard.state_backing = state_backing;
+
+    // ReplaySSM transition records for a batched speculative verify window: one physical row per
+    // lane, one window wide, per-shard GDN geometry (mirroring the engine's construction).
+    LayoutBuilder record_builder;
+    const GdnReplayRecordLayout record_layout = plan_gdn_replay_records(
+        record_builder,
+        GdnReplayRecordSpec{
+            .layers          = static_cast<std::int32_t>(config.linear_attention_layers),
+            .record_capacity = static_cast<std::int32_t>(kTestLanes),
+            .width           = kTestVerifyWindow,
+            .conv_channels   = (config.gdn ? qwen::execution::dimension(config.gdn->conv_channels()) : 0),
+            .qk_heads        = (config.gdn ? qwen::execution::dimension(config.gdn->linear_num_key_heads) : 0),
+            .value_heads     = (config.gdn ? qwen::execution::dimension(config.gdn->linear_num_value_heads) : 0),
+            .key_dim         = (config.gdn ? qwen::execution::dimension(config.gdn->linear_key_head_dim) : 0),
+            .value_dim       = (config.gdn ? qwen::execution::dimension(config.gdn->linear_value_head_dim) : 0),
+        });
+    const std::size_t record_bytes = record_builder.finish(256);
+    device.bind_to_current_thread();
+    shard.record_arena = std::make_unique<DeviceArena>(record_bytes);
+    shard.records = GdnReplayRecords(shard.record_arena->alloc_bytes(record_bytes, 256), record_layout);
 
     // Workspace arena: the single-token forward peaks at ~600 KB (the full-vocab logits buffer
     // plus a handful of [N,1] activation tensors), so 256 MiB is ample. The 1 GiB default left
@@ -255,21 +286,28 @@ int main(int argc, char** argv) {
             device->bind_to_current_thread();
             auto& pool   = shard->decoder->text_kv.page_pool();
             auto& tables = shard->decoder->text_kv.execution_tables();
-            std::optional<DeviceKVPageReservation> reserved = pool.reserve(kTestCachePages);
+            std::optional<DeviceKVPageReservation> reserved = pool.reserve(kTestPoolPages);
             if (!reserved.has_value()) { throw std::logic_error("KV page reservation failed"); }
             DeviceKVPageReservation reservation = std::move(*reserved);
-            shard->kv_pages.reserve(kTestCachePages);
-            pool.materialize(reservation, kTestCachePages, shard->kv_pages);
+            shard->kv_pages.reserve(kTestPoolPages);
+            pool.materialize(reservation, kTestPoolPages, shard->kv_pages);
             shard->kv_handles.clear();
             shard->kv_handles.reserve(shard->kv_pages.size());
             for (const auto& lease : shard->kv_pages) {
                 shard->kv_handles.push_back(lease.handle());
             }
-            shard->kv_row = tables.acquire(0);
-            // Order the block-table H2D copy on the device stream: the attention kernels run on
-            // the non-blocking ctx_.stream, which does not implicitly synchronize with the legacy
-            // default stream that a default-argument publish would use.
-            tables.publish(shard->kv_row.handle(), 0, shard->kv_handles, device->stream);
+            shard->kv_rows.clear();
+            for (std::uint32_t lane = 0; lane < kTestLanes; ++lane) {
+                shard->kv_rows.push_back(tables.acquire(static_cast<std::int32_t>(lane)));
+                // Order the block-table H2D copy on the device stream: the attention kernels run on
+                // the non-blocking ctx_.stream, which does not implicitly synchronize with the legacy
+                // default stream that a default-argument publish would use.
+                tables.publish(shard->kv_rows.back().handle(), 0,
+                               std::span<const DeviceKVPageHandle>(
+                                   shard->kv_handles.data() + lane * kTestCachePages,
+                                   kTestCachePages),
+                               device->stream);
+            }
             CUDA_CHECK(cudaMemsetAsync(shard->state_backing.data, 0, shard->state_backing.bytes,
                                        device->stream));
         };
@@ -609,10 +647,322 @@ int main(int argc, char** argv) {
                   << " argmax_batched=" << argmax_of(whole_long) << "\n";
         print_top("sequential", seq_long);
 
+        // 5. One-column batch decode. The batched GDN state kernels only start at two lanes, so a
+        //    batch that shrank back to one column runs the scalar state path, and that path reads
+        //    the slot pair published by set_linear_state_slots instead of the bound per-lane
+        //    vectors. The batch entry therefore has to republish the surviving lane's slot: if it
+        //    keeps the last prefilled lane's, the survivor advances another lane's recurrence while
+        //    attending over its own cache row. Lane 0 is prefilled first here and lane 1 second, so
+        //    the leftover slot pair points at the other lane; the two lanes carry different tokens,
+        //    otherwise their recurrences would coincide and a wrong slot would be invisible.
+        const std::int32_t lane_position = 8;
+        const std::vector<int> lane_ids(prompt_ids.begin(), prompt_ids.begin() + lane_position);
+        const std::vector<int> other_ids(prompt_ids.begin() + 150,
+                                         prompt_ids.begin() + 150 + lane_position);
+        auto prefill_lane = [&](std::int32_t lane, const std::vector<int>& ids) {
+            // Mirror the core's lane loop: it publishes the lane's scalar slot pair before the
+            // chunk (the prefill phase runs the mixer's scalar state path) and binds the same lane
+            // into the chunk's paged-KV execution row and device state vectors.
+            card0.set_linear_state_slots(lane, lane);
+            card1.set_linear_state_slots(lane, lane);
+            auto scope0 = shard0.workspace->scope();
+            auto scope1 = shard1.workspace->scope();
+            Tensor last_a = shard0.workspace->alloc(DType::BF16, {vocab, 1});
+            Tensor last_b = shard1.workspace->alloc(DType::BF16, {vocab, 1});
+            card0.forward_tp2_prefill(card1, pair, std::span<const int>(ids), 0, &last_a, &last_b,
+                                      nullptr, nullptr, nullptr, qwen::TextPhase::Prefill, nullptr,
+                                      nullptr, lane);
+        };
+        auto one_column_step = [&](std::int32_t lane) {
+            device0->bind_to_current_thread();
+            Tensor out = shard0.workspace->alloc(DType::BF16, {vocab, 1});
+            auto scope0 = shard0.workspace->scope();
+            auto scope1 = shard1.workspace->scope();
+            const std::int32_t tokens[1]    = {lane_ids.back()};
+            const std::int32_t positions[1] = {lane_position};
+            const std::int32_t rows[1]      = {lane};
+            const std::int32_t slots[1]     = {lane};
+            card0.forward_tp2_decode_window_batch(
+                card1, pair, tokens, positions, rows, slots, 1,
+                ops::CausalAttentionExecutionEnvelope{
+                    1, static_cast<std::uint32_t>(lane_position + 1)},
+                out);
+            return host_logits(device0.get(), out);
+        };
+        auto run_one_column = [&](bool with_other_lane) {
+            reset_state();
+            prefill_lane(0, lane_ids);
+            if (with_other_lane) { prefill_lane(1, other_ids); }
+            return one_column_step(0);
+        };
+        const auto lane_alone  = run_one_column(false);
+        const auto lane_shrunk = run_one_column(true);
+        const float lane_drift = max_abs_diff(lane_alone, lane_shrunk);
+        std::cout << "  one-column batch after a two-lane prefill: argmax_alone="
+                  << argmax_of(lane_alone) << " argmax_shrunk=" << argmax_of(lane_shrunk)
+                  << " max_logit_diff=" << lane_drift << "\n";
+        if (argmax_of(lane_alone) != argmax_of(lane_shrunk) || lane_drift != 0.0F) {
+            std::cerr << "FAIL: a one-column batch did not run its own lane's state\n";
+            return 1;
+        }
+        // 6. Batched speculative verify window. MTP and DFlash2 replace a decode round with one
+        //    verify window per lane, and the multi-lane route runs those windows in a single
+        //    forward. The GDN record planes carry the lane as their outer index, so every lane
+        //    writes its own physical row while the fold replays each lane's accepted prefix into
+        //    that lane's own state slot. The batched window must produce, for every lane and every
+        //    column, the token the same lane produces alone, up to an accepted route difference:
+        //    the column count itself moves the engine tiling, so a batched window is judged on
+        //    bounded drift plus a token that only changes inside a near tie. Lane 0 and lane 1 are
+        //    prefilled with different tokens, the same two sequences the one-column test uses.
+        const std::vector<int> lane_window(prompt_ids.begin() + lane_position,
+                                           prompt_ids.begin() + lane_position + kTestVerifyWindow);
+        const std::vector<int> other_window(
+            prompt_ids.begin() + 150 + lane_position,
+            prompt_ids.begin() + 150 + lane_position + kTestVerifyWindow);
+        // The one-column host_logits helper sizes its staging buffer for one column, so a window
+        // needs its own copy of the whole [vocab, columns] block.
+        auto host_logits_columns = [&](DeviceContext* device, const Tensor& device_logits) {
+            const std::size_t count = device_logits.bytes() / sizeof(__nv_bfloat16);
+            std::vector<__nv_bfloat16> raw(count);
+            std::vector<float> values(count);
+            device->bind_to_current_thread();
+            CUDA_CHECK(cudaStreamSynchronize(device->stream));
+            CUDA_CHECK(cudaMemcpy(raw.data(), device_logits.data, device_logits.bytes(),
+                                  cudaMemcpyDeviceToHost));
+            for (std::size_t i = 0; i < count; ++i) { values[i] = __bfloat162float(raw[i]); }
+            return values;
+        };
+        // The flat buffer is a [vocab, columns] logits block copied back in memory order, so column
+        // c occupies [c * vocab, (c + 1) * vocab).
+        auto column_of = [&](const std::vector<float>& flat, std::int32_t column) {
+            std::vector<float> values(static_cast<std::size_t>(vocab));
+            for (std::int32_t v = 0; v < vocab; ++v) {
+                values[static_cast<std::size_t>(v)] =
+                    flat[static_cast<std::size_t>(column) * static_cast<std::size_t>(vocab) +
+                         static_cast<std::size_t>(v)];
+            }
+            return values;
+        };
+        // Top-two margin of one column: an argmax flip inside a near tie is a rounding artefact,
+        // whereas a flip with a wide margin is a structural difference.
+        auto top_two_margin = [&](const std::vector<float>& column) {
+            float first  = -3.4e38F;
+            float second = -3.4e38F;
+            for (float value : column) {
+                if (value > first) {
+                    second = first;
+                    first  = value;
+                } else if (value > second) {
+                    second = value;
+                }
+            }
+            return first - second;
+        };
+        auto record_action = [&](bool record) {
+            const auto action = record ? qwen::execution::GdnStateAction::RecordForReplay
+                                       : qwen::execution::GdnStateAction::UpdateInPlace;
+            card0.set_gdn_state_action(action, record ? &shard0.records : nullptr);
+            card1.set_gdn_state_action(action, record ? &shard1.records : nullptr);
+        };
+
+        // One lane's window through the per-lane entry with a one-member batch: exactly what the
+        // multi-lane route runs for a request that ends up alone in its round.
+        auto run_window_solo = [&](std::int32_t lane) {
+            reset_state();
+            prefill_lane(lane, lane == 0 ? lane_ids : other_ids);
+            device0->bind_to_current_thread();
+            Tensor out = shard0.workspace->alloc(DType::BF16, {vocab, kTestVerifyWindow});
+            auto scope0 = shard0.workspace->scope();
+            auto scope1 = shard1.workspace->scope();
+            const std::vector<int>& window = lane == 0 ? lane_window : other_window;
+            std::vector<std::int32_t> host(static_cast<std::size_t>(2 * kTestVerifyWindow));
+            for (std::int32_t j = 0; j < kTestVerifyWindow; ++j) {
+                host[static_cast<std::size_t>(j)] = window[static_cast<std::size_t>(j)];
+                host[static_cast<std::size_t>(kTestVerifyWindow + j)] = lane_position + j;
+            }
+            const std::int32_t row[1]  = {lane};
+            const std::int32_t slot[1] = {lane};
+            record_action(true);
+            card0.forward_tp2_window_batch(
+                card1, pair, host.data(), host.data() + kTestVerifyWindow, row, slot,
+                kTestVerifyWindow, 1,
+                ops::CausalAttentionExecutionEnvelope{
+                    1, static_cast<std::uint32_t>(lane_position + kTestVerifyWindow)},
+                out, nullptr, nullptr, nullptr);
+            record_action(false);
+            return host_logits_columns(device0.get(), out);
+        };
+        // The same lane 0 window through the historic single-lane entry, which keeps its scalar
+        // execution row and state slot: these are the C = 1 route's numerics.
+        auto run_window_legacy = [&]() {
+            reset_state();
+            prefill_lane(0, lane_ids);
+            device0->bind_to_current_thread();
+            Tensor out = shard0.workspace->alloc(DType::BF16, {vocab, kTestVerifyWindow});
+            auto scope0 = shard0.workspace->scope();
+            auto scope1 = shard1.workspace->scope();
+            std::vector<std::int32_t> host(static_cast<std::size_t>(2 * kTestVerifyWindow));
+            for (std::int32_t j = 0; j < kTestVerifyWindow; ++j) {
+                host[static_cast<std::size_t>(j)] = lane_window[static_cast<std::size_t>(j)];
+                host[static_cast<std::size_t>(kTestVerifyWindow + j)] = lane_position + j;
+            }
+            record_action(true);
+            card0.forward_tp2_window(
+                card1, pair, host.data(), host.data() + kTestVerifyWindow,
+                ops::CausalAttentionExecutionEnvelope{
+                    1, static_cast<std::uint32_t>(lane_position + kTestVerifyWindow)},
+                out, nullptr, nullptr, nullptr);
+            record_action(false);
+            return host_logits_columns(device0.get(), out);
+        };
+        // Both windows in one forward: ids and positions are lane-major, each lane a contiguous run
+        // of its own columns.
+        auto run_window_batch = [&]() {
+            reset_state();
+            prefill_lane(0, lane_ids);
+            prefill_lane(1, other_ids);
+            device0->bind_to_current_thread();
+            Tensor out = shard0.workspace->alloc(DType::BF16, {vocab, 2 * kTestVerifyWindow});
+            auto scope0 = shard0.workspace->scope();
+            auto scope1 = shard1.workspace->scope();
+            const std::vector<int>* windows[2] = {&lane_window, &other_window};
+            std::vector<std::int32_t> host(static_cast<std::size_t>(4 * kTestVerifyWindow));
+            for (std::int32_t lane = 0; lane < 2; ++lane) {
+                for (std::int32_t j = 0; j < kTestVerifyWindow; ++j) {
+                    host[static_cast<std::size_t>(lane * kTestVerifyWindow + j)] =
+                        (*windows[lane])[static_cast<std::size_t>(j)];
+                    host[static_cast<std::size_t>(2 * kTestVerifyWindow +
+                                                  lane * kTestVerifyWindow + j)] = lane_position + j;
+                }
+            }
+            const std::int32_t rows[2]  = {0, 1};
+            const std::int32_t slots[2] = {0, 1};
+            record_action(true);
+            card0.forward_tp2_window_batch(
+                card1, pair, host.data(), host.data() + 2 * kTestVerifyWindow, rows, slots,
+                kTestVerifyWindow, 2,
+                ops::CausalAttentionExecutionEnvelope{
+                    1, static_cast<std::uint32_t>(lane_position + kTestVerifyWindow)},
+                out, nullptr, nullptr, nullptr);
+            record_action(false);
+            return host_logits_columns(device0.get(), out);
+        };
+        // Control: both lanes carry lane 0's request. Two lanes with the same prompt, the same
+        // window and their own (zero-initialised, identically advanced) state slots must agree bit
+        // for bit; any difference here is a per-lane binding defect, not a rounding difference
+        // between the batched kernel and the single-lane route.
+        auto run_window_batch_dup = [&]() {
+            reset_state();
+            prefill_lane(0, lane_ids);
+            prefill_lane(1, lane_ids);
+            device0->bind_to_current_thread();
+            Tensor out = shard0.workspace->alloc(DType::BF16, {vocab, 2 * kTestVerifyWindow});
+            auto scope0 = shard0.workspace->scope();
+            auto scope1 = shard1.workspace->scope();
+            std::vector<std::int32_t> host(static_cast<std::size_t>(4 * kTestVerifyWindow));
+            for (std::int32_t lane = 0; lane < 2; ++lane) {
+                for (std::int32_t j = 0; j < kTestVerifyWindow; ++j) {
+                    host[static_cast<std::size_t>(lane * kTestVerifyWindow + j)] =
+                        lane_window[static_cast<std::size_t>(j)];
+                    host[static_cast<std::size_t>(2 * kTestVerifyWindow +
+                                                  lane * kTestVerifyWindow + j)] = lane_position + j;
+                }
+            }
+            const std::int32_t rows[2]  = {0, 1};
+            const std::int32_t slots[2] = {0, 1};
+            record_action(true);
+            card0.forward_tp2_window_batch(
+                card1, pair, host.data(), host.data() + 2 * kTestVerifyWindow, rows, slots,
+                kTestVerifyWindow, 2,
+                ops::CausalAttentionExecutionEnvelope{
+                    1, static_cast<std::uint32_t>(lane_position + kTestVerifyWindow)},
+                out, nullptr, nullptr, nullptr);
+            record_action(false);
+            return host_logits_columns(device0.get(), out);
+        };
+
+        const auto window_lane0  = run_window_solo(0);
+        const auto window_lane1  = run_window_solo(1);
+        const auto window_legacy = run_window_legacy();
+        const auto window_batch  = run_window_batch();
+        // A batched window cannot agree with a solo window bitwise: the column count alone moves the
+        // engine tiling, and a one-lane eight-column window already differs from a four-column one
+        // by more than a logit. That route difference is an accepted property of the prefill kernels.
+        // What the product needs is narrower, and it is what this case checks: every lane reads its
+        // own KV row and its own state slot, the route difference stays bounded, and only two
+        // near-tied candidates may swap places.
+        constexpr float kRouteDriftBound = 2.5F;
+        float batch_gap                   = 0.0F;
+        std::int32_t batch_mismatches     = 0;
+        std::int32_t batch_near_tie_flips = 0;
+        for (std::int32_t lane = 0; lane < 2; ++lane) {
+            const std::vector<float>& solo = lane == 0 ? window_lane0 : window_lane1;
+            for (std::int32_t j = 0; j < kTestVerifyWindow; ++j) {
+                const auto solo_column  = column_of(solo, j);
+                const auto batch_column = column_of(window_batch, lane * kTestVerifyWindow + j);
+                const float gap = max_abs_diff(solo_column, batch_column);
+                batch_gap = std::max(batch_gap, gap);
+                const std::int32_t solo_argmax  = argmax_of(solo_column);
+                const std::int32_t batch_argmax = argmax_of(batch_column);
+                const float margin_batch        = top_two_margin(batch_column);
+                if (solo_argmax != batch_argmax) {
+                    ++batch_mismatches;
+                    if (margin_batch <= kRouteDriftBound) { ++batch_near_tie_flips; }
+                }
+                std::cout << "    lane=" << lane << " col=" << j << " gap=" << gap
+                          << " solo=" << solo_argmax << " batch=" << batch_argmax
+                          << " margin_batch=" << margin_batch << "\n";
+            }
+        }
+        const float legacy_gap = max_abs_diff(window_legacy, window_lane0);
+        std::cout << "  two-lane verify window (" << kTestVerifyWindow << " columns x 2 lanes): "
+                  << "max_logit_diff=" << batch_gap << " argmax_mismatches=" << batch_mismatches
+                  << " near_tie_flips=" << batch_near_tie_flips
+                  << " legacy_vs_lane0_diff=" << legacy_gap
+                  << " legacy_argmax=" << argmax_of(window_legacy)
+                  << " lane0_argmax=" << argmax_of(window_lane0) << "\n";
+        const auto window_dup = run_window_batch_dup();
+        float dup_lane_gap            = 0.0F;
+        float dup_solo_gap            = 0.0F;
+        float dup_other_gap           = 0.0F;
+        std::int32_t dup_mismatches   = 0;
+        for (std::int32_t j = 0; j < kTestVerifyWindow; ++j) {
+            const auto dup0   = column_of(window_dup, j);
+            const auto dup1   = column_of(window_dup, kTestVerifyWindow + j);
+            const auto solo   = column_of(window_lane0, j);
+            const auto batch0 = column_of(window_batch, j);
+            const float lane_gap  = max_abs_diff(dup0, dup1);
+            const float solo_gap  = max_abs_diff(solo, dup0);
+            const float other_gap = max_abs_diff(dup0, batch0);
+            dup_lane_gap  = std::max(dup_lane_gap, lane_gap);
+            dup_solo_gap  = std::max(dup_solo_gap, solo_gap);
+            dup_other_gap = std::max(dup_other_gap, other_gap);
+            if (argmax_of(solo) != argmax_of(dup0)) { ++dup_mismatches; }
+            std::cout << "    dup lane0 col=" << j << " lane_gap=" << lane_gap
+                      << " solo_gap=" << solo_gap << " other_lane1_gap=" << other_gap
+                      << " solo_argmax=" << argmax_of(solo) << " dup_argmax=" << argmax_of(dup0)
+                      << " batch_argmax=" << argmax_of(batch0) << "\n";
+        }
+        std::cout << "  duplicated-lane control: lane_gap=" << dup_lane_gap
+                  << " solo_gap=" << dup_solo_gap << " batch_lane0_gap=" << dup_other_gap
+                  << " argmax_mismatches=" << dup_mismatches << "\n";
+        if (dup_lane_gap != 0.0F || dup_other_gap != 0.0F || dup_mismatches != 0) {
+            std::cerr << "FAIL: two lanes with identical requests produced different windows\n";
+            return 1;
+        }
+        if (batch_gap > kRouteDriftBound || batch_mismatches != batch_near_tie_flips) {
+            std::cerr << "FAIL: the batched verify window changed a token outside a near tie\n";
+            return 1;
+        }
+        if (legacy_gap != 0.0F || argmax_of(window_legacy) != argmax_of(window_lane0)) {
+            std::cerr << "FAIL: the per-lane one-member window diverged from the single-lane route\n";
+            return 1;
+        }
         std::cout << "TP-2 single-token forward passed: all " << probe_tokens.size()
                   << " probes shard-consistent; " << decode_steps
                   << "-step autoregressive decode shard-consistent; batched prefill consistent with"
-                     " the sequential walk and chunk-split invariant\n";
+                     " the sequential walk and chunk-split invariant; batched verify window"
+                     " lane-consistent under bounded route drift\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

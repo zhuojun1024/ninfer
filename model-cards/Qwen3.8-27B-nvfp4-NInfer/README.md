@@ -234,6 +234,16 @@ records the memory budget, the recommended configuration, and the measurements, 
 [Windows native build guide](https://github.com/Neroued/ninfer/blob/master/docs/windows.md) covers
 the native two-card setup.
 
+The route also batches queued requests: `--max-concurrency 2..4` fills one decode round with that many
+queued requests, while the default `1` runs one at a time. The KV pool is shared, so concurrent lanes
+partition the context ceiling instead of each reserving it, and the linear-attention state arena grows
+by about 294 MiB per card per lane. The shipped 262,144-token configuration therefore keeps
+`--max-concurrency` at `1`; use `--max-context 131072` for two to four lanes. Measured aggregate decode
+throughput at that setting with `--kv-dtype int8` is 1.76-1.91x at two lanes and 2.80x at four on the
+plain route, 2.07x at four with `--spec dflash2`, and 1.48x at two / 2.26x at four with
+`--spec mtp --draft-tokens 5`. Batched lanes share one attention envelope, so compare concurrent output
+to a single-request run with a near-tie criterion rather than byte identity.
+
 ## Supported use
 
 The artifact supports:
@@ -349,7 +359,8 @@ AIME results.
 
 - NInfer executes on one RTX 5090 (or one TP-2 pair of identical RTX 5060 Ti cards on the server
   route) and one resident model, with a startup-fixed capacity of 1–8 active requests per Engine
-  (the TP-2 route runs one request at a time).
+  (the TP-2 pair batches up to four queued requests on its plain route and runs one at a time
+  otherwise).
 - It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
   general multi-GPU execution, CPU/GPU offload, or distributed serving.
 - Context allocation is subject to GPU memory and the selected KV-cache type.

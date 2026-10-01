@@ -250,7 +250,8 @@ The product boundary remains intentionally small:
 - one RTX 5090 (or one TP-2 pair of identical RTX 5060 Ti cards on the server route) and one
   resident model per Engine;
 - a startup-fixed capacity of one to eight active requests with bounded FIFO ingress (the TP-2
-  route runs one request at a time);
+  pair batches up to four queued requests on its plain, DFlash2 and MTP rounds and runs one at a
+  time otherwise);
 - no request preemption, priority/QoS, active-request swapping, weight offload, or distributed
   serving; multi-GPU is limited to the two-card TP-2 server route;
 - one shared startup-fixed KV pool across active requests and retained prefixes;

@@ -26,12 +26,18 @@ void require_i32_scalar(const Tensor& tensor, const char* name) {
 
 } // namespace
 
-void fill_i32_positions(Tensor& positions, std::int32_t start, cudaStream_t stream) {
+void fill_i32_positions(Tensor& positions, std::int32_t start, std::int32_t stride,
+                        cudaStream_t stream) {
     require_i32_vector(positions, "fill_i32_positions positions");
-    if (start < 0 || start > std::numeric_limits<std::int32_t>::max() - positions.ne[0]) {
+    if (stride < 1) {
+        throw std::invalid_argument("fill_i32_positions: stride must be positive");
+    }
+    const std::int64_t last = static_cast<std::int64_t>(start) +
+                              static_cast<std::int64_t>(positions.ne[0] - 1) * stride;
+    if (start < 0 || last > std::numeric_limits<std::int32_t>::max()) {
         throw std::invalid_argument("fill_i32_positions: range is outside non-negative I32");
     }
-    detail::fill_i32_positions_launch(positions, start, stream);
+    detail::fill_i32_positions_launch(positions, start, stride, stream);
 }
 
 void offset_i32_positions(const Tensor& source, const Tensor& delta, Tensor& destination,

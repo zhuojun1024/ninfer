@@ -21,12 +21,6 @@ bool same_spans(const std::vector<TokenSpan>& left, const std::vector<TokenSpan>
                                                      });
 }
 
-bool same_item(const VisionItem& left, const VisionItem& right) {
-    return left.modality == right.modality && same_grid(left.grid, right.grid) &&
-           left.patch_begin == right.patch_begin && left.patch_count == right.patch_count &&
-           left.content_digest == right.content_digest && left.timestamps == right.timestamps &&
-           same_spans(left.token_spans, right.token_spans);
-}
 
 bool prefix_item_count(const std::vector<VisionItem>& items, std::size_t tokens,
                        std::size_t* count) {
@@ -131,6 +125,13 @@ std::size_t checked_vision_end(const VisionItem& item, std::size_t prompt_tokens
 }
 
 } // namespace
+
+bool same_vision_item(const VisionItem& left, const VisionItem& right) {
+    return left.modality == right.modality && same_grid(left.grid, right.grid) &&
+           left.patch_begin == right.patch_begin && left.patch_count == right.patch_count &&
+           left.content_digest == right.content_digest && left.timestamps == right.timestamps &&
+           same_spans(left.token_spans, right.token_spans);
+}
 
 void ResidentPrefixIdentity::reserve(std::size_t tokens) {
     token_types_.reserve(tokens);
@@ -243,7 +244,7 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
         return false;
     }
     for (std::size_t i = 0; i < incoming_items; ++i) {
-        if (!same_item(prompt.vision_items[i], vision_items_[i])) { return false; }
+        if (!same_vision_item(prompt.vision_items[i], vision_items_[i])) { return false; }
     }
     const auto incoming_end =
         std::upper_bound(prompt.identity.rewrite_execution_frontiers.begin(),
@@ -281,7 +282,7 @@ bool ResidentPrefixIdentity::prefix_equals(const ResidentPrefixIdentity& other,
         return false;
     }
     for (std::size_t index = 0; index < left_items; ++index) {
-        if (!same_item(vision_items_[index], other.vision_items_[index])) { return false; }
+        if (!same_vision_item(vision_items_[index], other.vision_items_[index])) { return false; }
     }
     const auto left_end  = std::upper_bound(rewrite_execution_frontiers_.begin(),
                                             rewrite_execution_frontiers_.end(), count);

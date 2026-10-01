@@ -11,6 +11,7 @@
 #include "models/qwen3_5/frontend/tool_call_constraint.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/dflash_round.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "ninfer/ops/argmax.h"
@@ -324,6 +325,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     shard_a_.device = DeviceContext(device_a);
     shard_b_.device = DeviceContext(device_b);
     validate_tp2_devices(shard_a_.device, shard_b_.device);
+    lanes_ = (options_.max_concurrency == 0 ? 1U : options_.max_concurrency);
 
     models::LoadOptions load;
     load.vision        = options.enable_vision;
@@ -338,6 +340,23 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     if (dflash2_enabled_) {
         dflash_drafts_ = std::clamp<std::uint32_t>(options.speculative.draft_tokens, 1U,
                                                    qwen::kDFlashDecodeMaximumDrafts);
+    }
+    // The plain, MTP and DFlash2 rounds all carry a batch (PLAN-tp2-concurrency.md P2.1c/P2.1b);
+    // only `--spec dflash` has no TP-2 context layout, so a multi-lane run on that route would
+    // silently feed every lane through row 0. Collapse it and report. The plain route keeps its
+    // lanes.
+    //
+    // `normalize_engine_options` already applies `tp2_generation_concurrency`, so a service built
+    // from normalized options never reaches this branch; it is the belt-and-braces guard for a core
+    // constructed directly from un-normalized options, and it reports rather than corrupting.
+    if (lanes_ > 1U && !mtp_enabled_ && !dflash2_enabled_ &&
+        options_.speculative.backend != SpeculativeBackend::None) {
+        std::fprintf(stderr,
+                     "[tp2-lane] --max-concurrency %u collapses to 1 lane on the speculative "
+                     "route (only the MTP and DFlash2 rounds are batched; see "
+                     "PLAN-tp2-concurrency.md)\n",
+                     lanes_);
+        lanes_ = 1U;
     }
 
     artifact::Reader reader(options.artifact_path);
@@ -358,14 +377,27 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     {
         const std::uint32_t host_slots = options_.context_cache.host_state_slots;
         session_retention_floor_tokens_ = options_.context_cache.session_retention_floor_tokens;
+        // PLAN-tp2-concurrency.md 12.6: a checkpoint is one compact single-lane state image, and
+        // each lane owns its own slice of the ring, so the pinned budget is the lanes=1 budget
+        // whatever the lane count. The batch executors recall into their own lane (Stage 1d), so
+        // the ring is live at every lane count.
         if (host_slots != 0) {
-            host_checkpoint_tail_slots_ =
-                std::max(1U, std::min(kReuseTailCheckpointCount, host_slots / 2U));
             host_checkpoint_divergence_slots_ = kReuseDivergenceCheckpointCount;
             host_checkpoint_block_slots_      = kReuseBlockCheckpointCount;
-            const std::uint32_t grid_slots =
-                std::max(1U, host_slots - host_checkpoint_tail_slots_);
-            const std::uint32_t per_slot = (options_.max_context + grid_slots - 1U) / grid_slots;
+            const std::uint32_t total = host_slots + host_checkpoint_divergence_slots_ +
+                                        host_checkpoint_block_slots_;
+            host_checkpoint_slots_per_lane_ = std::max(1U, total / lanes_);
+            const std::uint32_t per_lane = host_checkpoint_slots_per_lane_;
+            const std::uint32_t fixed =
+                host_checkpoint_divergence_slots_ + host_checkpoint_block_slots_;
+            const std::uint32_t flexible = per_lane > fixed ? per_lane - fixed : 0U;
+            host_checkpoint_tail_slots_ =
+                std::max(1U, std::min(kReuseTailCheckpointCount, flexible / 2U));
+            const std::uint32_t used = fixed + host_checkpoint_tail_slots_;
+            host_checkpoint_grid_slots_ = per_lane > used ? per_lane - used : 1U;
+            const std::uint32_t per_slot =
+                (options_.max_context + host_checkpoint_grid_slots_ - 1U) /
+                host_checkpoint_grid_slots_;
             const std::uint32_t rounded  = (per_slot + 127U) / 128U * 128U;
             host_checkpoint_stride_      = std::max(kReuseCheckpointStride, rounded);
         }
@@ -386,6 +418,8 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         // One entry is the resident conversation; retention needs room for at least one more.
         // DFlash2 takes part: a session slab holds the draft ring beside the target KV and GDN
         // state, so a recall restores the whole conversation rather than only its target half.
+        // A session image carries the same per-lane state, so the catalog splits its slabs by lane
+        // (PLAN-tp2-concurrency.md 12.6).
         if (host_kv_bytes / 2 != 0 && sessions > 1) {
             host_kv_shard_bytes_ = host_kv_bytes / 2;
             session_capacity_    = sessions;
@@ -398,6 +432,20 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
 
     build_shard(shard_a_, 0);
     build_shard(shard_b_, 1);
+    // The KV pool is one physical allocation split statically across the lanes, so a lane owns
+    // `per_lane` pages and the context ceiling a request may be admitted against is that lane's
+    // share of the pool, not the whole of it. The last lane takes the page remainder, so this is
+    // the guaranteed minimum. Single-lane keeps reading options_.max_context directly: the page
+    // rounding above must not widen the ceiling it has always advertised.
+    if (lanes_ > 1) {
+        const std::uint32_t pages_per_lane = pages_for_tokens(options_.max_context) / lanes_;
+        lane_token_capacity_ = pages_per_lane * static_cast<std::uint32_t>(kPagedKVPageSize);
+        // The batched executors stage their per-lane operands here, one section per operand with
+        // the lane index as the stride. A captured batch step reads these addresses through memcpy
+        // nodes, so the buffer may not move between rounds (P2.2b).
+        batch_lane_host_ = std::make_unique<PinnedHostBuffer>(
+            5 * static_cast<std::size_t>(lanes_) * sizeof(std::int32_t), true);
+    }
     if (session_capacity_ != 0) {
         // Report the budget in the unit an operator sizes against: full-context conversations per
         // shard. The MTP layer's own slab is not counted, so shard 0 holds slightly fewer.
@@ -420,7 +468,10 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
 
     if ((mtp_enabled_ || dflash2_enabled_) && pair_.in_kernel_allreduce()) {
         const char* env        = std::getenv("NINFER_TP2_VERIFY_GRAPH");
-        verify_graph_enabled_  = env == nullptr || env[0] != '0';
+        // A captured window bakes one lane's state-slot and KV-row bindings and freezes the
+        // workspace watermark it was captured at, so the batched route runs eager and the multi-lane
+        // captures land with the rest of P2.2.
+        verify_graph_enabled_  = (env == nullptr || env[0] != '0') && lanes_ == 1U;
     }
     {
         const char* env = std::getenv("NINFER_TP2_MTP_CHAIN_GRAPH");
@@ -462,6 +513,43 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
                 options_.max_context, static_cast<std::uint64_t>(profile.max) + window_width));
             verify_graphs_.push_back(std::move(graph));
         }
+        // The batch form of the window (P2.2c). Every per-lane binding is read from this pinned
+        // member through memcpy nodes, so one capture covers any assignment of a lane count; a
+        // one-column batch still bakes the GDN slot its scalar path publishes and therefore needs
+        // one graph per lane. The sections are laid out with the startup lane count, not the
+        // round's live one, so a capture replays on the addresses it baked.
+        batch_window_host_ = std::make_unique<PinnedHostBuffer>(
+            (static_cast<std::size_t>(2) * window_width + 3U) * lanes_ * sizeof(std::int32_t), true);
+        const char* batch_env = std::getenv("NINFER_TP2_VERIFY_BATCH_GRAPH");
+        if (lanes_ > 1U && pair_.in_kernel_allreduce() &&
+            !(batch_env != nullptr && std::strcmp(batch_env, "exact") == 0)) {
+            verify_batch_mode_ = (batch_env != nullptr && std::strcmp(batch_env, "0") == 0)
+                                     ? StepLaunchMode::EagerBucket
+                                     : StepLaunchMode::Graph;
+            for (const auto& profile : profiles) {
+                const std::uint32_t visible_begin = mtp_enabled_ ? profile.min + 1U : 1U;
+                const std::uint32_t visible_end = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    options_.max_context, static_cast<std::uint64_t>(profile.max) + window_width));
+                for (std::uint32_t batch = 1; batch <= lanes_; ++batch) {
+                    if (batch > 1U) {
+                        WindowGraph graph;
+                        graph.visible_begin = visible_begin;
+                        graph.visible_end   = visible_end;
+                        graph.batch         = static_cast<std::int32_t>(batch);
+                        verify_batch_graphs_.push_back(std::move(graph));
+                        continue;
+                    }
+                    for (std::uint32_t slot = 0; slot < lanes_; ++slot) {
+                        WindowGraph graph;
+                        graph.visible_begin = visible_begin;
+                        graph.visible_end   = visible_end;
+                        graph.batch         = 1;
+                        graph.lane          = static_cast<std::int32_t>(slot);
+                        verify_batch_graphs_.push_back(std::move(graph));
+                    }
+                }
+            }
+        }
     }
     if (mtp_enabled_) {
         // The draft chain is the same kind of object as the verify window: one captured sequence per
@@ -496,6 +584,10 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
             decode_step_mode_ = StepLaunchMode::EagerExact;
         }
         if (!pair_.in_kernel_allreduce()) { decode_step_mode_ = StepLaunchMode::EagerExact; }
+        // The single-lane step bakes its KV execution row and GDN slot into the captured sequence
+        // (lane 0), so the graph cannot be replayed on behalf of another lane. The multi-lane route
+        // runs the step eagerly, where the lane is an ordinary forward argument (P1.4).
+        if (lanes_ > 1) { decode_step_mode_ = StepLaunchMode::EagerExact; }
         if (decode_step_mode_ != StepLaunchMode::EagerExact) {
             for (const auto& profile : qwen::detail::ordinary_graph_profiles(options_.max_context)) {
                 WindowGraph graph;
@@ -506,22 +598,72 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         }
         decode_window_host_ = std::make_unique<PinnedHostBuffer>(
             static_cast<std::size_t>(2) * sizeof(std::int32_t), true);
-        std::fprintf(stderr, "[tp2-graph] plain decode step: %s | verify step: %s | mtp chain: %s\n",
+        // The batched plain step on the multi-lane route. Its lanes are bound from device memory as
+        // soon as there are two of them, so one graph covers every assignment of a given lane count;
+        // a one-column batch still runs the scalar GDN path, whose slot is a host value the capture
+        // bakes and therefore needs one graph per lane. The single-lane vector above is unreachable
+        // here: the multi-lane route forces the scalar step to eager.
+        {
+            const char* batch_env = std::getenv("NINFER_TP2_DECODE_BATCH_GRAPH");
+            const bool capture_batch =
+                lanes_ > 1 && pair_.in_kernel_allreduce() &&
+                !(batch_env != nullptr && std::strcmp(batch_env, "exact") == 0);
+            if (capture_batch) {
+                decode_batch_mode_ = (batch_env != nullptr && std::strcmp(batch_env, "0") == 0)
+                                         ? StepLaunchMode::EagerBucket
+                                         : StepLaunchMode::Graph;
+                for (const auto& profile :
+                     qwen::detail::ordinary_graph_profiles(options_.max_context)) {
+                    const std::uint32_t visible_begin = profile.min + 1U;
+                    const std::uint32_t visible_end =
+                        std::min(options_.max_context, profile.max + 1U);
+                    for (std::uint32_t width = 1; width <= lanes_; ++width) {
+                        if (width > 1) {
+                            WindowGraph graph;
+                            graph.visible_begin = visible_begin;
+                            graph.visible_end   = visible_end;
+                            graph.batch         = static_cast<std::int32_t>(width);
+                            decode_batch_graphs_.push_back(std::move(graph));
+                            continue;
+                        }
+                        for (std::uint32_t slot = 0; slot < lanes_; ++slot) {
+                            WindowGraph graph;
+                            graph.visible_begin = visible_begin;
+                            graph.visible_end   = visible_end;
+                            graph.batch         = 1;
+                            graph.lane          = static_cast<std::int32_t>(slot);
+                            decode_batch_graphs_.push_back(std::move(graph));
+                        }
+                    }
+                }
+            }
+        }
+        std::fprintf(stderr,
+                     "[tp2-graph] plain decode step: %s | batched: %s | verify step: %s | "
+                     "verify batch: %s | mtp chain: %s\n",
                      decode_step_mode_ == StepLaunchMode::Graph        ? "graph"
                      : decode_step_mode_ == StepLaunchMode::EagerBucket ? "eager(bucket)"
                                                                        : "eager(exact)",
+                     decode_batch_mode_ == StepLaunchMode::Graph        ? "graph"
+                     : decode_batch_mode_ == StepLaunchMode::EagerBucket ? "eager(bucket)"
+                                                                        : "eager(exact)",
                      verify_graph_enabled_ ? "graph" : "eager",
+                     verify_batch_mode_ == StepLaunchMode::Graph        ? "graph"
+                     : verify_batch_mode_ == StepLaunchMode::EagerBucket ? "eager(bucket)"
+                                                                        : "eager(exact)",
                      mtp_chain_mode_ == StepLaunchMode::Graph        ? "graph"
                      : mtp_chain_mode_ == StepLaunchMode::EagerBucket ? "eager(bucket)"
                                                                      : "eager(exact)");
     }
 
     // The rendezvous id space is one channel per captured graph, and the bucket sets above are the
-    // complete set of graphs that can ever be captured (verify window, MTP draft chain, plain decode
-    // step). Reserve them all: MTP K >= 3 alone needs 2 x 9 buckets, past the fixed 16 default, and a
+    // complete set of graphs that can ever be captured (single- and multi-lane verify windows, MTP
+    // draft chain, single- and multi-lane plain decode steps). Reserve them all: the multi-lane
+    // families alone are one graph per (bucket, lane count), far past the fixed 16 default, and a
     // bucket that cannot get a channel fails every later request that needs it.
-    pair_.reserve_ar_channels(
-        verify_graphs_.size() + mtp_chain_graphs_.size() + decode_graphs_.size());
+    pair_.reserve_ar_channels(verify_graphs_.size() + verify_batch_graphs_.size() +
+                              mtp_chain_graphs_.size() + decode_graphs_.size() +
+                              decode_batch_graphs_.size());
 
     frontend_ = std::make_unique<qwen::Frontend>(
         qwen::make_frontend(shard_a_.model->resources(),
@@ -548,6 +690,12 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     // Multi-token prediction runs on shard 0 (see the class comment): only that shard plans and
     // materializes the MTP layer's own KV cache.
     const bool mtp_shard = mtp_enabled_ && shard_index == 0;
+    // Resource provisioning width: how many concurrent decode lanes every shared resource is
+    // planned for. `kTp2GenerationMaxConcurrency` (include/ninfer/tp2_capacity.h) pins this to
+    // one today, so the layouts below stay byte-for-byte the single-request ones; raising that
+    // gate additionally requires the batch execution path and per-lane KV/GDN publication, not
+    // just this width. P1.2 of PLAN-tp2-concurrency.md.
+    const std::int32_t lanes = static_cast<std::int32_t>(lanes_);
 
     // Per-shard config: the mixer head counts are halved (each shard owns half the attention/GDN
     // heads), so the KV cache and GDN state are sized for the per-shard geometry while the
@@ -564,7 +712,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     shard.shard_config = std::move(shard_config);
     const auto& scfg = *shard.shard_config;
 
-    // Paged KV cache: full-attention layers only, one execution-table row (single request).
+    // Paged KV cache: full-attention layers only, one execution-table row per lane.
     // The MTP layer appends its own K/V up to `mtp_drafts_` positions past the committed frontier
     // (the speculative window), so its pool carries that many tokens of extra physical pages; its
     // execution row only maps the logical capacity.
@@ -589,7 +737,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
             .attention_head_dim    = qwen::execution::dimension(scfg.attention->head_dim),
             .kv_storage            = options_.kv_cache,
             .enable_mtp            = mtp_shard,
-            .kv_table_rows         = 1,
+            .kv_table_rows         = lanes,
             .text_physical_page_groups = pages_for_tokens(capacity),
             .mtp_physical_page_groups  = mtp_physical_pages,
         });
@@ -604,7 +752,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     shard.decoder  = std::make_unique<qwen::DecoderState>(shard.kv_arena->alloc_bytes(kv_bytes, 256),
                                                           kv_layout);
 
-    // GDN state pool: linear-attention layers, one slot, zeroed. Sized for the per-shard
+    // GDN state pool: linear-attention layers, one slot per lane, zeroed. Sized for the per-shard
     // geometry (half the value heads and conv channels); each shard owns its local heads.
     const LinearAttentionStatePoolSpec gdn_spec{
         .layers         = scfg.linear_attention_layers,
@@ -613,7 +761,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         .value_heads    = (scfg.gdn ? qwen::execution::dimension(scfg.gdn->linear_num_value_heads) : 0),
         .value_head_dim = (scfg.gdn ? qwen::execution::dimension(scfg.gdn->linear_value_head_dim) : 0),
         .key_head_dim   = (scfg.gdn ? qwen::execution::dimension(scfg.gdn->linear_key_head_dim) : 0),
-        .slot_count     = 1,
+        .slot_count     = lanes,
         .conv_dtype     = DType::BF16,
     };
     LayoutBuilder state_builder;
@@ -622,7 +770,8 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     const std::size_t state_bytes = state_builder.finish(256);
     shard.device.bind_to_current_thread();
     // Live linear-attention pool (two buffers), one prefix-reuse snapshot per slot, and the MTP
-    // round scratch (~77 MiB per plane).
+    // round scratch (~77 MiB per plane). `state_bytes` already covers `lanes` slots, so the
+    // per-lane cost is `(2 + kReuseSnapshotCount) * (state_bytes / lanes)`.
     shard.state_arena   = std::make_unique<DeviceArena>((2 + kReuseSnapshotCount) * state_bytes);
     shard.state_backing = shard.state_arena->alloc_bytes(state_bytes, 256);
     for (auto& snapshot : shard.state_snapshots) {
@@ -630,29 +779,33 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     }
     CUDA_CHECK(cudaMemset(shard.state_backing.data, 0, state_bytes));
     shard.state = std::make_unique<LinearAttentionStatePool>(shard.state_backing, state_layout);
+    shard.lane_state_geometry = make_lane_state_geometry(shard);
     if (host_checkpoint_stride_ != 0) {
         // Portable pinned memory, like the MTP verify window: every checkpoint is read and written
         // through this shard's own device, but a portable allocation keeps that true if the
-        // execution context ever binds the peer first.
-        const std::uint32_t slots = options_.context_cache.host_state_slots +
-                                    host_checkpoint_divergence_slots_ +
-                                    host_checkpoint_block_slots_;
+        // execution context ever binds the peer first. A slot holds one compact single-lane image
+        // and belongs to the lane whose slice of the ring it is, so the pinned footprint is the
+        // lanes=1 budget whatever the lane count (PLAN-tp2-concurrency.md 12.6).
+        const std::uint32_t slots = lanes_ * host_checkpoint_slots_per_lane_;
 
-        shard.host_checkpoint_grid_slots = options_.context_cache.host_state_slots -
-                                           host_checkpoint_tail_slots_;
+        shard.host_checkpoint_grid_slots = host_checkpoint_grid_slots_;
         shard.host_checkpoints.reserve(slots);
         for (std::uint32_t index = 0; index < slots; ++index) {
             Shard::HostCheckpoint checkpoint;
-            checkpoint.buffer = std::make_unique<PinnedHostBuffer>(shard.state_backing.bytes, true);
+            checkpoint.buffer =
+                std::make_unique<PinnedHostBuffer>(shard.lane_state_geometry.image_bytes, true);
             shard.host_checkpoints.push_back(std::move(checkpoint));
         }
+        std::fprintf(stderr, "[mem] host checkpoint ring %u slots x %.1f MiB/lane/shard\n", slots,
+                     static_cast<double>(shard.lane_state_geometry.image_bytes) / 1048576.0);
     }
 
     std::size_t record_bytes        = 0;
     std::size_t round_bytes         = 0;
     std::size_t dflash_image_bytes  = 0;
     if (mtp_enabled_ || dflash2_enabled_) {
-        // ReplaySSM records for one verify window wide, one physical row, per-shard GDN geometry.
+        // ReplaySSM records for one verify window wide, one physical row per lane, per-shard GDN
+        // geometry.
         // Both shards verify the window, so both need their own records and fold plan.
         // The verify forward records here instead of advancing the live state, and the fold replays
         // the accepted prefix back into it (in place: with a single row the Op allows it, so the
@@ -663,7 +816,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
             record_builder,
             GdnReplayRecordSpec{
                 .layers          = qwen::execution::dimension(scfg.linear_attention_layers),
-                .record_capacity = 1,
+                .record_capacity = lanes,
                 .width           = static_cast<std::int32_t>(mtp_enabled_ ? mtp_drafts_ : dflash_drafts_) + 1,
                 .conv_channels =
                     (scfg.gdn ? qwen::execution::dimension(scfg.gdn->conv_channels()) : 0),
@@ -679,10 +832,28 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         record_bytes = record_builder.finish(256);
         shard.record_arena = std::make_unique<DeviceArena>(record_bytes);
         shard.device.bind_to_current_thread();
-        DeviceSpan record_backing = shard.record_arena->alloc_bytes(record_bytes, 256);
-        shard.records             = GdnReplayRecords(record_backing, record_layout);
-        shard.replay_fold =
-            std::make_unique<ops::GdnReplayFoldPlan>(shard.records, shard.state->all_layers_view());
+        const DeviceSpan record_backing = shard.record_arena->alloc_bytes(record_bytes, 256);
+        // One bound record/fold pair per batch the route can form. The widest view sizes the backing;
+        // every narrower one re-plans the same geometry with its own row count so that a layer's
+        // record slice stays contiguous, which is what the record op requires.
+        shard.replay_views.clear();
+        shard.replay_views.reserve(static_cast<std::size_t>(lanes));
+        for (std::int32_t batch = 1; batch <= lanes; ++batch) {
+            LayoutBuilder batch_builder;
+            GdnReplayRecordSpec batch_spec = record_layout.spec;
+            batch_spec.record_capacity     = batch;
+            const GdnReplayRecordLayout batch_layout =
+                plan_gdn_replay_records(batch_builder, batch_spec);
+            if (batch_builder.finish(256) > record_bytes) {
+                throw std::logic_error(
+                    "TP-2 replay record geometry does not scale down to a smaller batch");
+            }
+            Shard::ReplayViews views;
+            views.records = GdnReplayRecords(record_backing, batch_layout);
+            views.fold    = std::make_unique<ops::GdnReplayFoldPlan>(
+                views.records, shard.state->all_layers_view());
+            shard.replay_views.push_back(std::move(views));
+        }
     }
 
     // Workspace arena: ample for the single-token forward (full-vocab logits plus a handful of
@@ -690,12 +861,12 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     shard.device.bind_to_current_thread();
     shard.workspace = std::make_unique<DeviceArena>(kWorkspaceBytes);
     shard.prefill_hidden = shard.workspace->alloc(DType::BF16,
-                                                  {2 * qwen::execution::dimension(config.hidden_size), 1});
+                                                  {2 * qwen::execution::dimension(config.hidden_size), lanes});
     if (mtp_shard) {
         // Survives every round scope: the first round's MTP bridge consumes the last prompt column's
         // final-norm hidden, captured during prefill priming.
         shard.mtp_anchor_hidden =
-            shard.workspace->alloc(DType::BF16, {qwen::execution::dimension(config.hidden_size), 1});
+            shard.workspace->alloc(DType::BF16, {qwen::execution::dimension(config.hidden_size), lanes});
     }
     // Vision (--vision) runs on the shard that materialized the Vision component: the static split
     // that keeps the MTP layer on shard 0 puts the Vision tower and its encode/handoff workspace on
@@ -766,9 +937,9 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         // arena it is handed, and that workspace holds the resident prefill hidden state.
         const std::size_t proposal_bytes = qwen::execution::dflash2_proposal_workspace_bytes(
             *shard.parameters, config, capacity, ProposalHead::Full,
-            static_cast<std::int32_t>(draft_window) + 1, 1);
+            static_cast<std::int32_t>(draft_window) + 1, static_cast<std::int32_t>(lanes_));
         const qwen::execution::DFlash2RoundSpec dflash_spec = qwen::execution::plan_dflash2_round(
-            draft, config, feature_columns, draft_window, proposal_bytes);
+            draft, config, feature_columns, draft_window, proposal_bytes, lanes_);
         shard.device.bind_to_current_thread();
         shard.dflash_round =
             std::make_unique<qwen::execution::DFlash2Round>(shard.device, dflash_spec);
@@ -782,9 +953,12 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                      static_cast<double>(proposal_bytes) / 1048576.0);
         // The draft context at the two reuse boundaries the GDN snapshots freeze. It is one ring per
         // boundary, allocated here because only the round knows the ring's image size; the state
-        // arena itself holds no draft slot (see Shard::dflash_snapshots).
-        const std::size_t dflash_image = shard.dflash_round->context_image_bytes();
-        dflash_image_bytes              = dflash_image;
+        // arena itself holds no draft slot (see Shard::dflash_snapshots). Each boundary carries one
+        // compact ring image per lane, so a snapshot is lanes_ images and a lane addresses its own
+        // slice - the same shape as the target state image beside it.
+        const std::size_t dflash_lane_image = shard.dflash_round->lane_context_image_bytes();
+        const std::size_t dflash_image = static_cast<std::size_t>(lanes_) * dflash_lane_image;
+        dflash_image_bytes             = dflash_lane_image;
         shard.device.bind_to_current_thread();
         shard.dflash_snapshot_arena =
             std::make_unique<DeviceArena>(kReuseSnapshotCount * dflash_image);
@@ -806,32 +980,38 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         std::size_t free_bytes = 0, total_bytes = 0;
         cudaMemGetInfo(&free_bytes, &total_bytes);
         std::fprintf(stderr,
-                     "[mem] shard %d capacity %u | weights+ctx %.1f | kv %.1f | state %.1f | "
+                     "[mem] shard %d capacity %u lanes %u | weights+ctx %.1f | kv %.1f | "
+                     "state %.1f | "
                      "record %.1f | draft-snap %.1f | round %.1f | workspace %u.0 | vision %.1f | "
                      "free %.1f of %.1f MiB\n",
-                     shard_index, capacity, resident_bytes,
+                     shard_index, capacity, lanes_, resident_bytes,
                      static_cast<double>(kv_bytes) / 1048576.0,
                      static_cast<double>((2 + kReuseSnapshotCount) * state_bytes) / 1048576.0,
                      static_cast<double>(record_bytes) / 1048576.0,
-                     static_cast<double>(kReuseSnapshotCount * dflash_image_bytes) / 1048576.0,
+                     static_cast<double>(kReuseSnapshotCount * lanes_ * dflash_image_bytes) /
+                         1048576.0,
                      static_cast<double>(round_bytes) / 1048576.0,
                      static_cast<unsigned>(kWorkspaceBytes >> 20),
                      static_cast<double>(vision_bytes) / 1048576.0,
                      static_cast<double>(free_bytes) / 1048576.0,
                      static_cast<double>(total_bytes) / 1048576.0);
         if (!shard.host_checkpoints.empty()) {
-            // The per-slot size is the target state image; the masked draft adds one ring image to
-            // each slot on the shard that owns it, which is the second pinned figure.
+            // The per-slot size is one compact single-lane target state image, not the whole pool:
+            // each lane owns its own slice of the ring and a slot holds one lane's image. The masked
+            // draft adds one compact ring image per lane to each slot on the shard that owns it,
+            // which is the second pinned figure.
             std::fprintf(stderr,
                          "[mem] host-checkpoints shard %d slots %zu (grid %zu + tail %u + "
                          "divergence %u + block %u) x %.1f MiB | stride %u tok | pinned %.1f MiB\n",
                          shard_index, shard.host_checkpoints.size(),
                          shard.host_checkpoint_grid_slots, host_checkpoint_tail_slots_,
                          host_checkpoint_divergence_slots_, host_checkpoint_block_slots_,
-                         static_cast<double>(shard.state_backing.bytes) / 1048576.0,
+                         static_cast<double>(shard.lane_state_geometry.image_bytes) / 1048576.0,
                          host_checkpoint_stride_,
-                         static_cast<double>((shard.state_backing.bytes + dflash_image_bytes) *
-                                             shard.host_checkpoints.size()) / 1048576.0);
+                         static_cast<double>((shard.lane_state_geometry.image_bytes +
+                                              static_cast<std::size_t>(lanes_) * dflash_image_bytes) *
+                                             shard.host_checkpoints.size()) /
+                             1048576.0);
         }
     }
 
@@ -839,36 +1019,74 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     // execution view, which only exists after the page list above is materialized.
 
     // Materialize the full KV page list once at startup. The pool is a fixed physical allocation
-    // reused in place across requests (max_concurrency 1, single execution row), so pinning the
-    // page leases and execution row 0 here means each request only re-zeros the GDN state; there
-    // is no per-request reserve/allocate churn (which would leak the pool's capacity after the
-    // first request). The block-table mapping is identical every request, so publishing once
-    // suffices.
+    // reused in place across requests, so pinning the page leases and the execution rows here
+    // means each request only re-zeros the GDN state; there is no per-request reserve/allocate
+    // churn (which would leak the pool's capacity after the first request). The block-table
+    // mapping is identical every request, so publishing once suffices.
+    //
+    // The pages are split statically: lane l owns [l*per_lane, (l+1)*per_lane) of the pool, and
+    // the last lane takes the remainder so every page is assigned exactly once. Phase 1 has no
+    // backfill and no preemption, so a lane can never need another lane's pages; the cost is that
+    // each lane's context is divided by the lane count (--kv-capacity is the machine total).
     {
         auto& pool   = shard.decoder->text_kv.page_pool();
         auto& tables = shard.decoder->text_kv.execution_tables();
-        const std::uint32_t pages = pages_for_tokens(capacity);
+        const std::uint32_t pages    = pages_for_tokens(capacity);
+        const std::uint32_t per_lane = pages / static_cast<std::uint32_t>(lanes);
+        if (per_lane == 0) {
+            throw std::logic_error(
+                "TP-2 KV budget cannot give every lane a page; lower --max-concurrency or raise "
+                "--max-context");
+        }
         shard.device.bind_to_current_thread();
-        auto reserved = pool.reserve(pages);
-        if (!reserved.has_value()) { throw std::logic_error("TP-2 KV page reservation failed"); }
-        DeviceKVPageReservation reservation = std::move(*reserved);
-        shard.kv_pages.reserve(pages);
-        pool.materialize(reservation, pages, shard.kv_pages);
-        shard.kv_page_handles.clear();
-        shard.kv_page_handles.reserve(shard.kv_pages.size());
-        for (const auto& lease : shard.kv_pages) { shard.kv_page_handles.push_back(lease.handle()); }
-        shard.kv_row = tables.acquire(0);
-        tables.publish(shard.kv_row.handle(), 0, shard.kv_page_handles, shard.device.stream);
+        shard.kv_lane_pages.resize(static_cast<std::size_t>(lanes));
+        shard.kv_lane_handles.resize(static_cast<std::size_t>(lanes));
+        shard.kv_rows.clear();
+        shard.kv_rows.reserve(static_cast<std::size_t>(lanes));
+        std::uint32_t assigned = 0;
+        for (std::int32_t lane = 0; lane < lanes; ++lane) {
+            const auto index  = static_cast<std::size_t>(lane);
+            auto&      leases = shard.kv_lane_pages[index];
+            auto&      handles = shard.kv_lane_handles[index];
+            const std::uint32_t count = (lane + 1 == lanes) ? (pages - assigned) : per_lane;
+            auto reserved = pool.reserve(count);
+            if (!reserved.has_value()) {
+                throw std::logic_error("TP-2 KV page reservation failed");
+            }
+            DeviceKVPageReservation reservation = std::move(*reserved);
+            leases.clear();
+            leases.reserve(count);
+            pool.materialize(reservation, count, leases);
+            handles.clear();
+            handles.reserve(leases.size());
+            for (const auto& lease : leases) { handles.push_back(lease.handle()); }
+            shard.kv_rows.push_back(tables.acquire(lane));
+            tables.publish(shard.kv_rows.back().handle(), 0, handles, shard.device.stream);
+            assigned += count;
+        }
+        if (lanes > 1) {
+            std::fprintf(stderr,
+                         "[mem] shard %d KV pages %u over %d lanes = %u pages (%u tokens) per "
+                         "lane\n",
+                         shard_index, pages, lanes, per_lane, per_lane * 64U);
+        }
     }
 
     // The MTP layer's own attention context. Same fixed-page treatment as the text cache: one
-    // physical page list, one execution row, published once.
+    // physical page list split across the lanes, one execution row per lane, each published once
+    // (P2.1b). Only the `logical` slice is mapped; the layer's extra page groups are dead capacity
+    // exactly as on the single-GPU route, so they are materialized but never published.
     if (mtp_shard) {
         auto* cache = shard.decoder->mtp_cache();
         if (cache == nullptr) { throw std::logic_error("TP-2 MTP KV cache was not planned"); }
         auto& pool   = cache->page_pool();
         auto& tables = cache->execution_tables();
         const std::uint32_t logical_pages = pages_for_tokens(capacity);
+        const std::uint32_t per_lane      = logical_pages / lanes;
+        if (per_lane == 0U) {
+            throw std::logic_error("TP-2 MTP KV budget cannot give every lane a page; lower "
+                                   "--max-concurrency or raise --max-context");
+        }
         shard.device.bind_to_current_thread();
         auto reserved = pool.reserve(mtp_physical_pages);
         if (!reserved.has_value()) {
@@ -882,8 +1100,30 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         for (std::uint32_t i = 0; i < logical_pages; ++i) {
             shard.mtp_page_handles.push_back(shard.mtp_pages[i].handle());
         }
-        shard.mtp_row = tables.acquire(0);
-        tables.publish(shard.mtp_row.handle(), 0, shard.mtp_page_handles, shard.device.stream);
+        shard.mtp_lane_handles.assign(lanes, {});
+        shard.mtp_rows.clear();
+        shard.mtp_rows.reserve(lanes);
+        shard.mtp_views.clear();
+        shard.mtp_views.reserve(lanes);
+        std::uint32_t assigned = 0;
+        for (std::uint32_t lane = 0; lane < lanes; ++lane) {
+            const std::uint32_t count = lane + 1U == lanes ? logical_pages - assigned : per_lane;
+            auto& handles             = shard.mtp_lane_handles[lane];
+            handles.reserve(count);
+            for (std::uint32_t i = 0; i < count; ++i) {
+                handles.push_back(shard.mtp_pages[assigned + i].handle());
+            }
+            assigned += count;
+            KVExecutionRowLease row = tables.acquire(static_cast<std::int32_t>(lane));
+            tables.publish(row.handle(), 0, handles, shard.device.stream);
+            shard.mtp_views.push_back(cache->execution_view(row));
+            shard.mtp_rows.push_back(std::move(row));
+        }
+        if (lanes > 1U) {
+            std::fprintf(stderr,
+                         "[mem] shard %d MTP KV pages %u over %u lanes = %u pages per lane\n",
+                         shard_index, logical_pages, lanes, per_lane);
+        }
     }
 
     // MTP proposal scratch (shard 0): the round state carries the step token/position, the RoPE
@@ -897,7 +1137,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
             qwen::RoundStateSpec{
                 .hidden         = qwen::execution::dimension(config.hidden_size),
                 .output_rows    = qwen::execution::dimension(config.vocab_size),
-                .batch_capacity = 1,
+                .batch_capacity = static_cast<std::uint32_t>(lanes),
                 .draft_window   = mtp_drafts_,
                 .backend        = SpeculativeBackend::Mtp,
             });
@@ -909,7 +1149,8 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         CUDA_CHECK(cudaMemset(backing.data, 0, round_bytes));
         shard.io = qwen::RoundState(backing, round_layout);
         ops::set_i32_scalar(shard.io.backend_kv_table_row, 0, shard.device.stream);
-        mtp_view  = shard.decoder->mtp_cache()->execution_view(shard.mtp_row);
+        // Lane 0's view is only the constructor's default; priming re-points it per lane (P2.1b).
+        mtp_view  = shard.mtp_views.empty() ? qwen::PagedKVCacheView() : shard.mtp_views.front();
         batch_mtp = shard.decoder->mtp_cache();
     }
 
@@ -930,13 +1171,22 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
 
 void TP2GenerationCore::mtp_prefill_priming(Shard& shard, const int* ids, std::uint32_t length,
                                             std::uint32_t first_position, Tensor& mtp_input,
-                                            const Tensor* last_token, bool final_chunk) {
+                                            const Tensor* last_token, bool final_chunk,
+                                            std::int32_t lane) {
     const auto& config = shard.model->config().text;
     const std::int32_t hidden = qwen::execution::dimension(config.hidden_size);
     const std::int32_t vocab  = qwen::execution::dimension(config.vocab_size);
     auto& ws = *shard.workspace;
     shard.device.bind_to_current_thread();
     cudaStream_t stream = shard.device.stream;
+    // The MTP layer owns one execution row per lane (P2.1b). Priming is serial across lanes, so it
+    // re-points both the prefill view's own K/V appends and the round state's scalar row - which the
+    // non-batch attention reads - at this lane before the chunk runs.
+    if (lane < 0 || static_cast<std::size_t>(lane) >= shard.mtp_views.size()) {
+        throw std::logic_error("TP-2 MTP priming lane is outside the lane rows");
+    }
+    shard.context->set_mtp_prefill_view(shard.mtp_views[static_cast<std::size_t>(lane)]);
+    ops::set_i32_scalar(shard.io.backend_kv_table_row, lane, stream);
     // The MTP layer's embedding column i is the token at position i+1: its input is shifted by one
     // relative to the hidden columns. Only the final chunk's last column is unknown here (the token
     // that follows the prompt), so it is overwritten on the device with the sampled token.
@@ -954,7 +1204,7 @@ void TP2GenerationCore::mtp_prefill_priming(Shard& shard, const int* ids, std::u
                                    cudaMemcpyDeviceToDevice, stream));
     }
     Tensor positions = ws.alloc(DType::I32, {static_cast<std::int32_t>(length)});
-    ops::fill_i32_positions(positions, static_cast<std::int32_t>(first_position), stream);
+    ops::fill_i32_positions(positions, static_cast<std::int32_t>(first_position), 1, stream);
     const std::uint32_t visible = first_position + length;
     const ops::CausalAttentionExecutionEnvelope envelope{visible, visible};
     // The MTP layer's own K/V appends at the same absolute positions as the text layers, so the
@@ -965,25 +1215,35 @@ void TP2GenerationCore::mtp_prefill_priming(Shard& shard, const int* ids, std::u
                                      false, nullptr, nullptr, nullptr);
     if (final_chunk) {
         // This chunk's last column is the prompt's last position: its hidden feeds the first bridge.
-        CUDA_CHECK(cudaMemcpyAsync(shard.mtp_anchor_hidden.data,
-                                   mtp_input.slice(1, static_cast<std::int32_t>(length) - 1, 1).data,
-                                   shard.mtp_anchor_hidden.bytes(), cudaMemcpyDeviceToDevice,
-                                   stream));
+        // One hidden row - this lane's own column of the [hidden, lanes] anchor tensor - not the whole
+        // tensor, whose remaining columns belong to other lanes (P2.1b).
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::uint8_t*>(shard.mtp_anchor_hidden.data) +
+                static_cast<std::size_t>(lane) * static_cast<std::size_t>(hidden) *
+                    sizeof(std::uint16_t),
+            mtp_input.slice(1, static_cast<std::int32_t>(length) - 1, 1).data,
+            static_cast<std::size_t>(hidden) * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice,
+            stream));
     }
 }
 
-TP2GenerationCore::WindowGraph*
-TP2GenerationCore::select_window_graph(std::vector<WindowGraph>& graphs, std::uint32_t visible_end) {
+TP2GenerationCore::WindowGraph* TP2GenerationCore::select_window_graph(
+    std::vector<WindowGraph>& graphs, std::uint32_t visible_end, std::int32_t batch,
+    std::int32_t lane) {
     for (WindowGraph& graph : graphs) {
+        if (graph.batch != batch) { continue; }
+        // A capture that binds every slot from device memory carries no lane identity, so it
+        // matches any assignment of its width; a single-column capture baked one slot.
+        if (graph.lane != -1 && graph.lane != lane) { continue; }
         if (graph.visible_begin <= visible_end && visible_end <= graph.visible_end) { return &graph; }
     }
     return nullptr;
 }
 
-TP2GenerationCore::WindowGraph*
-TP2GenerationCore::reusable_window_graph(std::vector<WindowGraph>& graphs,
-                                         std::uint32_t visible_end) {
-    WindowGraph* graph = select_window_graph(graphs, visible_end);
+TP2GenerationCore::WindowGraph* TP2GenerationCore::reusable_window_graph(
+    std::vector<WindowGraph>& graphs, std::uint32_t visible_end, std::int32_t batch,
+    std::int32_t lane) {
+    WindowGraph* graph = select_window_graph(graphs, visible_end, batch, lane);
     if (graph == nullptr || !graph->captured || graph->round_base[0] < shard_a_.round_base ||
         graph->round_base[1] < shard_b_.round_base) {
         return nullptr;
@@ -1023,9 +1283,9 @@ void TP2GenerationCore::capture_verify_graph(WindowGraph& graph, const std::int3
     // columns from the pre-round snapshot. The action is a launch-time choice, so the capture must
     // run with it set and a replay picks it up from the recorded kernels.
     shard_a.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
-                                          &shard_a.records);
+                                          &shard_a.records_for(1));
     shard_b.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
-                                          &shard_b.records);
+                                          &shard_b.records_for(1));
     if (graph.ar_channel == tp::DevicePair::kNoArChannel) {
         graph.ar_channel = pair_.create_ar_channel();
     }
@@ -1039,6 +1299,53 @@ void TP2GenerationCore::capture_verify_graph(WindowGraph& graph, const std::int3
         // runs the unmasked, sink-less sequence (the clamp KV-append race is back).
         shard_a.context->forward_tp2_window(*shard_b.context, pair_, ids, positions, envelope,
                                            logits_columns, &hidden_columns, sink, valid_columns);
+    });
+    pair_.end_capture();
+    graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
+    graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
+    shard_a.device.bind_to_current_thread();
+    graph.executable[0].instantiate(graph.definition[0]);
+    shard_b.device.bind_to_current_thread();
+    graph.executable[1].instantiate(graph.definition[1]);
+    shard_a.device.bind_to_current_thread();
+    graph.captured = true;
+}
+
+void TP2GenerationCore::capture_verify_batch_graph(
+    WindowGraph& graph, const std::int32_t* ids, const std::int32_t* positions,
+    const std::int32_t* kv_table_rows, const std::int32_t* state_slots, std::int32_t width,
+    std::int32_t batch, Tensor& logits_columns, Tensor& hidden_columns,
+    qwen::execution::DFlashFeatureSink* sink, const std::int32_t* valid_columns) {
+    Shard& shard_a = shard_a_;
+    Shard& shard_b = shard_b_;
+    const ops::CausalAttentionExecutionEnvelope envelope{graph.visible_begin, graph.visible_end};
+    shard_a.device.bind_to_current_thread();
+    graph.round_base[0]  = shard_a.round_base;
+    graph.round_base[1]  = shard_b.round_base;
+    graph.arena_begin[0] = shard_a.workspace->used();
+    graph.arena_begin[1] = shard_b.workspace->used();
+    // Same recorded-transition contract as the single-lane capture, with the record view of this
+    // lane count: the fold replays the committed columns of every active lane from the pre-round
+    // snapshot, and the action is a launch-time choice the capture bakes like any other argument.
+    shard_a.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
+                                          &shard_a.records_for(batch));
+    shard_b.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
+                                          &shard_b.records_for(batch));
+    DecodeGraphDefinition* definitions[2] = {&graph.definition[0], &graph.definition[1]};
+    cudaStream_t streams[2] = {shard_a.device.stream, shard_b.device.stream};
+    if (graph.ar_channel == tp::DevicePair::kNoArChannel) {
+        graph.ar_channel = pair_.create_ar_channel();
+    }
+    pair_.begin_capture(graph.ar_channel);
+    const ArCaptureGuard capture_guard{pair_};
+    DecodeGraphDefinition::capture_group(definitions, streams, [&] {
+        // The per-lane bindings reach the captured sequence through memcpy nodes from the caller's
+        // pinned sections, exactly as ids/positions do, so the window carries no lane identity of
+        // its own beyond the one a one-column capture bakes.
+        shard_a.context->forward_tp2_window_batch(*shard_b.context, pair_, ids, positions,
+                                                  kv_table_rows, state_slots, width, batch, envelope,
+                                                  logits_columns, &hidden_columns, sink,
+                                                  valid_columns);
     });
     pair_.end_capture();
     graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
@@ -1073,19 +1380,10 @@ void TP2GenerationCore::run_verify_window(const std::int32_t* ids, std::int32_t 
     if (!verify_graph_enabled_) {
         // The eager route runs the same window and the same envelope; only the launch differs. That
         // keeps NINFER_TP2_VERIFY_GRAPH=0 a true A/B of the captured sequence rather than a
-        // comparison of two different attention routes.
-        const WindowGraph* bucket = select_window_graph(verify_graphs_, visible_end);
-        if (bucket == nullptr) {
-            throw std::logic_error("TP-2 verify window coverage is incomplete");
-        }
-        const ops::CausalAttentionExecutionEnvelope envelope{bucket->visible_begin,
-                                                             bucket->visible_end};
-        shard_a.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
-                                              &shard_a.records);
-        shard_b.context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
-                                              &shard_b.records);
-        shard_a.context->forward_tp2_window(*shard_b.context, pair_, ids, positions, envelope,
-                                            logits_columns, &hidden_columns, sink, valid_ptr);
+        // comparison of two different attention routes. It is also the batch entry with a single
+        // lane, so the one-lane eager route and the batched one cannot drift apart.
+        run_verify_window_batch(ids, positions, nullptr, nullptr, static_cast<std::int32_t>(width), 1,
+                                first_position, logits_columns, hidden_columns, sink, valid_ptr);
     } else {
         WindowGraph* graph = select_window_graph(verify_graphs_, visible_end);
         if (graph == nullptr) {
@@ -1118,6 +1416,120 @@ void TP2GenerationCore::run_verify_window(const std::int32_t* ids, std::int32_t 
     shard_b.context->set_gdn_state_action(qwen::execution::GdnStateAction::UpdateInPlace, nullptr);
 }
 
+void TP2GenerationCore::run_verify_window_batch(const std::int32_t* ids,
+                                                const std::int32_t* positions,
+                                                const std::int32_t* kv_table_rows,
+                                                const std::int32_t* state_slots, std::int32_t width,
+                                                std::int32_t batch, std::int32_t first_position,
+                                                Tensor& logits_columns, Tensor& hidden_columns,
+                                                qwen::execution::DFlashFeatureSink* sink,
+                                                const std::int32_t* valid_columns) {
+    const bool per_lane = kv_table_rows != nullptr || state_slots != nullptr;
+    if (width < 1 || batch < 1) {
+        throw std::logic_error("TP-2 verify window needs a positive width and lane count");
+    }
+    if (batch > 1 && !per_lane) {
+        throw std::logic_error("the batched TP-2 verify window needs per-lane bindings");
+    }
+    const std::uint32_t visible_end =
+        static_cast<std::uint32_t>(first_position) + static_cast<std::uint32_t>(width);
+    // The bucket envelope and the captured sequence come from the family this call owns: the batch
+    // captures when the caller binds every lane from device memory on the multi-lane route, the
+    // single-lane family everywhere else (which is also what the one-lane eager arm below reads its
+    // bucket from). Both families are built from the same profiles, so the envelope is the one the
+    // single-lane route always ran and the eager arms keep comparing the launch mechanism alone.
+    const bool batch_family = per_lane && !verify_batch_graphs_.empty();
+    std::vector<WindowGraph>& graphs = batch_family ? verify_batch_graphs_ : verify_graphs_;
+    const StepLaunchMode mode = batch_family ? verify_batch_mode_ : StepLaunchMode::EagerExact;
+    // The envelope comes from the single-lane family, which is built for every route that owns a
+    // verify window and carries every bucket unsliced; the batch family below only keys the launch.
+    const WindowGraph* bucket = select_window_graph(verify_graphs_, visible_end);
+    if (bucket == nullptr) {
+        throw std::logic_error("TP-2 verify window coverage is incomplete");
+    }
+    const ops::CausalAttentionExecutionEnvelope envelope{bucket->visible_begin, bucket->visible_end};
+    // The record view follows the lane count, so a round driving batch lanes records into batch
+    // physical rows and the fold reads the same geometry. A captured window carries the record
+    // kernels and never re-runs this host code, so the action is cleared after every arm.
+    const auto set_record = [&] {
+        for (Shard* shard : {&shard_a_, &shard_b_}) {
+            shard->context->set_gdn_state_action(qwen::execution::GdnStateAction::RecordForReplay,
+                                                 &shard->records_for(batch));
+        }
+    };
+    const auto reset_record = [&] {
+        for (Shard* shard : {&shard_a_, &shard_b_}) {
+            shard->context->set_gdn_state_action(qwen::execution::GdnStateAction::UpdateInPlace,
+                                                 nullptr);
+        }
+    };
+    if (mode == StepLaunchMode::EagerExact) {
+        set_record();
+        shard_a_.context->forward_tp2_window_batch(*shard_b_.context, pair_, ids, positions,
+                                                   kv_table_rows, state_slots, width, batch, envelope,
+                                                   logits_columns, &hidden_columns, sink,
+                                                   valid_columns);
+        reset_record();
+        return;
+    }
+    // A one-column batch still runs the scalar GDN path, whose state slot is a host value the
+    // capture bakes; a wider batch binds every slot from device memory and carries no lane identity.
+    const std::int32_t lane = batch == 1 ? (state_slots != nullptr ? state_slots[0] : 0) : -1;
+    WindowGraph* graph = select_window_graph(graphs, visible_end, batch, lane);
+    if (graph == nullptr) {
+        throw std::logic_error("TP-2 batched verify window coverage is incomplete");
+    }
+    const bool captured = mode == StepLaunchMode::Graph;
+    WindowGraph* reusable =
+        captured ? reusable_window_graph(graphs, visible_end, batch, lane) : nullptr;
+    if (reusable == nullptr) {
+        if (captured) {
+            capture_verify_batch_graph(*graph, ids, positions, kv_table_rows, state_slots, width,
+                                       batch, logits_columns, hidden_columns, sink, valid_columns);
+            launch_window_graph(*graph);
+        } else {
+            // The eager arm runs the same bucket envelope, so the A/B compares the launch mechanism
+            // alone.
+            set_record();
+            shard_a_.context->forward_tp2_window_batch(*shard_b_.context, pair_, ids, positions,
+                                                       kv_table_rows, state_slots, width, batch,
+                                                       envelope, logits_columns, &hidden_columns,
+                                                       sink, valid_columns);
+        }
+        reset_record();
+        return;
+    }
+    if (shard_a_.workspace->used() != graph->arena_begin[0] ||
+        shard_b_.workspace->used() != graph->arena_begin[1]) {
+        throw std::logic_error(
+            "TP-2 batched verify CUDA Graph replay found a different workspace layout");
+    }
+    launch_window_graph(*graph);
+    if (graph->arena_bytes[0] > 0) { (void)shard_a_.workspace->alloc_bytes(graph->arena_bytes[0]); }
+    if (graph->arena_bytes[1] > 0) { (void)shard_b_.workspace->alloc_bytes(graph->arena_bytes[1]); }
+    reset_record();
+}
+
+void TP2GenerationCore::fold_verify_window(const std::int32_t* state_slots,
+                                           const std::int32_t* commit_columns, std::int32_t batch) {
+    if (batch < 1 || state_slots == nullptr || commit_columns == nullptr) {
+        throw std::logic_error("the TP-2 verify fold needs one row per active lane");
+    }
+    std::vector<ops::GdnReplayFoldRow> rows(static_cast<std::size_t>(batch));
+    for (std::int32_t lane = 0; lane < batch; ++lane) {
+        const std::int32_t slot = state_slots[lane];
+        rows[static_cast<std::size_t>(lane)] = ops::GdnReplayFoldRow{
+            .source_state_slot      = slot,
+            .destination_state_slot = slot,
+            .commit_columns         = commit_columns[lane]};
+    }
+    const std::span<const ops::GdnReplayFoldRow> fold_rows(rows.data(), rows.size());
+    for (Shard* shard : {&shard_a_, &shard_b_}) {
+        shard->device.bind_to_current_thread();
+        shard->fold_for(batch).execute(fold_rows, shard->device.stream);
+    }
+}
+
 void TP2GenerationCore::capture_decode_graph(WindowGraph& graph, const std::int32_t* token,
                                              const std::int32_t* position, Tensor& logits) {
     Shard& shard_a = shard_a_;
@@ -1139,7 +1551,7 @@ void TP2GenerationCore::capture_decode_graph(WindowGraph& graph, const std::int3
     const ArCaptureGuard capture_guard{pair_};
     DecodeGraphDefinition::capture_group(definitions, streams, [&] {
         shard_a.context->forward_tp2_decode_window(*shard_b.context, pair_, token, position,
-                                                  envelope, logits);
+                                                  envelope, logits, active_lane_);
     });
     pair_.end_capture();
     graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
@@ -1193,7 +1605,7 @@ Tensor TP2GenerationCore::run_plain_decode_step(std::int32_t token, std::uint32_
             // The eager arm runs the same sequence with the same bucket envelope, so the A/B compares
             // the launch mechanism alone.
             shard_a.context->forward_tp2_decode_window(*shard_b.context, pair_, window, window + 1,
-                                                       envelope, logits);
+                                                       envelope, logits, active_lane_);
         }
         return logits;
     }
@@ -1207,6 +1619,95 @@ Tensor TP2GenerationCore::run_plain_decode_step(std::int32_t token, std::uint32_
     if (graph->arena_bytes[0] > 0) { (void)shard_a.workspace->alloc_bytes(graph->arena_bytes[0]); }
     if (graph->arena_bytes[1] > 0) { (void)shard_b.workspace->alloc_bytes(graph->arena_bytes[1]); }
     return logits;
+}
+
+void TP2GenerationCore::capture_decode_batch_graph(WindowGraph& graph, const std::int32_t* tokens,
+                                                   const std::int32_t* positions,
+                                                   const std::int32_t* kv_table_rows,
+                                                   const std::int32_t* state_slots,
+                                                   std::int32_t columns, Tensor& logits) {
+    Shard& shard_a = shard_a_;
+    Shard& shard_b = shard_b_;
+    const ops::CausalAttentionExecutionEnvelope envelope{graph.visible_begin, graph.visible_end};
+    shard_a.device.bind_to_current_thread();
+    graph.round_base[0]  = shard_a.round_base;
+    graph.round_base[1]  = shard_b.round_base;
+    graph.arena_begin[0] = shard_a.workspace->used();
+    graph.arena_begin[1] = shard_b.workspace->used();
+    // A plain decode advances its state in place, exactly like the single-lane step: nothing here
+    // records or replays a GDN transition.
+    DecodeGraphDefinition* definitions[2] = {&graph.definition[0], &graph.definition[1]};
+    cudaStream_t streams[2] = {shard_a.device.stream, shard_b.device.stream};
+    if (graph.ar_channel == tp::DevicePair::kNoArChannel) {
+        graph.ar_channel = pair_.create_ar_channel();
+    }
+    pair_.begin_capture(graph.ar_channel);
+    const ArCaptureGuard capture_guard{pair_};
+    DecodeGraphDefinition::capture_group(definitions, streams, [&] {
+        shard_a.context->forward_tp2_decode_window_batch(*shard_b.context, pair_, tokens, positions,
+                                                        kv_table_rows, state_slots, columns, envelope,
+                                                        logits);
+    });
+    pair_.end_capture();
+    graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
+    graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
+    shard_a.device.bind_to_current_thread();
+    graph.executable[0].instantiate(graph.definition[0]);
+    shard_b.device.bind_to_current_thread();
+    graph.executable[1].instantiate(graph.definition[1]);
+    shard_a.device.bind_to_current_thread();
+    graph.captured = true;
+}
+
+void TP2GenerationCore::run_plain_decode_step_batch(
+    const std::int32_t* tokens, const std::int32_t* positions, const std::int32_t* kv_table_rows,
+    const std::int32_t* state_slots, std::int32_t columns,
+    const ops::CausalAttentionExecutionEnvelope& exact_envelope, Tensor& logits) {
+    Shard& shard_a = shard_a_;
+    Shard& shard_b = shard_b_;
+    if (decode_batch_mode_ == StepLaunchMode::EagerExact) {
+        // The pre-graph route: the exact visible extent, with the per-lane operands read straight
+        // from the pinned arrays. Kept as the reference arm of the A/B.
+        shard_a.context->forward_tp2_decode_window_batch(*shard_b.context, pair_, tokens, positions,
+                                                        kv_table_rows, state_slots, columns,
+                                                        exact_envelope, logits);
+        return;
+    }
+    const std::uint32_t visible_end = exact_envelope.max_visible_keys;
+    // A one-column batch still runs the scalar GDN path, which reads the slot published by
+    // set_linear_state_slots, so its captured sequence bakes that slot and needs one graph per lane.
+    const std::int32_t lane = columns == 1 ? state_slots[0] : -1;
+    WindowGraph* graph =
+        select_window_graph(decode_batch_graphs_, visible_end, columns, lane);
+    if (graph == nullptr) {
+        throw std::logic_error("TP-2 batched decode step coverage is incomplete");
+    }
+    const bool captured = decode_batch_mode_ == StepLaunchMode::Graph;
+    WindowGraph* reusable =
+        captured ? reusable_window_graph(decode_batch_graphs_, visible_end, columns, lane) : nullptr;
+    const ops::CausalAttentionExecutionEnvelope envelope{graph->visible_begin, graph->visible_end};
+    if (reusable == nullptr) {
+        if (captured) {
+            capture_decode_batch_graph(*graph, tokens, positions, kv_table_rows, state_slots, columns,
+                                       logits);
+            launch_window_graph(*graph);
+        } else {
+            // The eager arm runs the same sequence with the same bucket envelope, so the A/B
+            // compares the launch mechanism alone.
+            shard_a.context->forward_tp2_decode_window_batch(*shard_b.context, pair_, tokens,
+                                                            positions, kv_table_rows, state_slots,
+                                                            columns, envelope, logits);
+        }
+        return;
+    }
+    if (shard_a.workspace->used() != graph->arena_begin[0] ||
+        shard_b.workspace->used() != graph->arena_begin[1]) {
+        throw std::logic_error(
+            "TP-2 batched decode CUDA Graph replay found a different workspace layout");
+    }
+    launch_window_graph(*graph);
+    if (graph->arena_bytes[0] > 0) { (void)shard_a.workspace->alloc_bytes(graph->arena_bytes[0]); }
+    if (graph->arena_bytes[1] > 0) { (void)shard_b.workspace->alloc_bytes(graph->arena_bytes[1]); }
 }
 
 void TP2GenerationCore::mtp_chain_body(Shard& shard, Tensor& mtp_input, const std::int32_t* pins,
@@ -1379,13 +1880,14 @@ std::uint32_t TP2GenerationCore::prefill_chunk_width(const qwen::TextConfig& con
 }
 
 std::optional<qwen::execution::DFlashFeatureSink>
-TP2GenerationCore::make_dflash_prefill_sink(Shard& shard) {
+TP2GenerationCore::make_dflash_prefill_sink(Shard& shard, std::int32_t lane) {
     if (shard.dflash_round == nullptr) { return std::nullopt; }
     // The chunk width the prefill forward will actually run with. The sink's buffer is sized for the
     // maximum and each chunk slices its own prefix out of it (capture_positions copies the matching
     // positions prefix, consume_prefill_chunk slices the feature prefix). Only the prefill fields are
     // set: the batch (verify-window) fields stay null until the masked draft has its verify wiring.
-    // One resident session, so the draft ring's lane is 0 and the whole captured chunk is committed.
+    // The single-lane route stages into the ring's lane 0; a batched lane stages into its own slot,
+    // and the whole captured chunk is committed either way.
     const std::uint32_t chunk = prefill_chunk_width(shard.model->config().text);
     return shard.dflash_round->make_prefill_sink(qwen::execution::ExecutionCore{
         .device           = shard.device,
@@ -1397,37 +1899,53 @@ TP2GenerationCore::make_dflash_prefill_sink(Shard& shard) {
         .prefill_hidden   = shard.prefill_hidden,
         .prefill_chunk    = chunk,
         .proposal_head    = options_.speculative.proposal_head,
-    });
+    }, lane);
 }
 
-void TP2GenerationCore::store_dflash_image(Shard& shard, PinnedHostBuffer& image) {
+void TP2GenerationCore::store_dflash_image(Shard& shard, PinnedHostBuffer& image,
+                                           std::uint32_t lane) {
     if (shard.dflash_round == nullptr) { return; }
-    if (image.size() < shard.dflash_round->context_image_bytes()) {
-        throw std::logic_error("draft context host image is smaller than the draft ring");
+    const std::size_t lane_bytes = shard.dflash_round->lane_context_image_bytes();
+    if (image.size() < static_cast<std::size_t>(lane + 1) * lane_bytes) {
+        throw std::logic_error("draft context host image is smaller than the lane's draft ring");
     }
     shard.device.bind_to_current_thread();
-    shard.dflash_round->copy_context_to_host(static_cast<std::byte*>(image.data()),
-                                             shard.device.stream);
+    shard.dflash_round->copy_context_to_host(
+        static_cast<std::byte*>(image.data()) + static_cast<std::size_t>(lane) * lane_bytes,
+        shard.device.stream, static_cast<std::int32_t>(lane));
 }
 
-void TP2GenerationCore::load_dflash_image(Shard& shard, const PinnedHostBuffer& image) {
+void TP2GenerationCore::load_dflash_image(Shard& shard, const PinnedHostBuffer& image,
+                                          std::uint32_t lane) {
     if (shard.dflash_round == nullptr) { return; }
-    if (image.size() < shard.dflash_round->context_image_bytes()) {
-        throw std::logic_error("draft context host image is smaller than the draft ring");
+    const std::size_t lane_bytes = shard.dflash_round->lane_context_image_bytes();
+    if (image.size() < static_cast<std::size_t>(lane + 1) * lane_bytes) {
+        throw std::logic_error("draft context host image is smaller than the lane's draft ring");
     }
     shard.device.bind_to_current_thread();
-    shard.dflash_round->copy_context_from_host(static_cast<const std::byte*>(image.data()),
-                                               shard.device.stream);
+    shard.dflash_round->copy_context_from_host(
+        static_cast<const std::byte*>(image.data()) + static_cast<std::size_t>(lane) * lane_bytes,
+        shard.device.stream, static_cast<std::int32_t>(lane));
 }
 
-void TP2GenerationCore::snapshot_dflash_state(Shard& shard, std::size_t slot) {
+void TP2GenerationCore::snapshot_dflash_state(Shard& shard, std::size_t slot,
+                                              std::uint32_t lane) {
     if (shard.dflash_round == nullptr) { return; }
     if (slot >= shard.dflash_snapshots.size() ||
         shard.dflash_snapshots[slot].data == nullptr) {
         throw std::logic_error("draft context snapshot slot is unavailable");
     }
+    const std::size_t lane_bytes = shard.dflash_round->lane_context_image_bytes();
+    const DeviceSpan snapshot     = shard.dflash_snapshots[slot];
+    if (snapshot.bytes < static_cast<std::size_t>(lane + 1) * lane_bytes) {
+        throw std::logic_error("draft context snapshot is smaller than the lane's draft ring");
+    }
     shard.device.bind_to_current_thread();
-    shard.dflash_round->copy_context_to_device(shard.dflash_snapshots[slot], shard.device.stream);
+    shard.dflash_round->copy_context_to_device(
+        DeviceSpan{static_cast<std::byte*>(snapshot.data) +
+                       static_cast<std::size_t>(lane) * lane_bytes,
+                   lane_bytes},
+        shard.device.stream, static_cast<std::int32_t>(lane));
 }
 
 TP2GenerationCore::Submission TP2GenerationCore::submit(
@@ -1436,8 +1954,19 @@ TP2GenerationCore::Submission TP2GenerationCore::submit(
     GenerationObservationOptions, std::chrono::steady_clock::time_point) {
     auto output = frontend_->make_output_session(prompt, options.stop, options.output,
                                                  options.execution.thinking);
+    // Multi-lane (P1.4): every lane owns a fixed slice of the shared KV pool, so the context
+    // ceiling is that slice - one token short of its page boundary, and on the MTP route one draft
+    // chain short of the tail that chain writes past the current position (P2.1b). Single-lane keeps
+    // the advertised options_.max_context, which the page-rounded per-lane figure would only widen.
+    const std::uint32_t context_window = lane_context_window();
+    // A lane can only ever hold its own slice of the shared pool, so reject an overflow before the
+    // subtraction below wraps it into a capacity that looks infinite.
+    if (lanes_ > 1 && summary.prompt_tokens > context_window) {
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           "prompt exceeds this lane's context capacity");
+    }
     const std::uint32_t capacity_output =
-        options_.max_context - summary.prompt_tokens + static_cast<std::uint32_t>(1);
+        context_window - summary.prompt_tokens + static_cast<std::uint32_t>(1);
     const std::uint32_t effective =
         std::min(options.execution.requested_output_tokens, capacity_output);
     const FinishReason limit_reason =
@@ -1465,12 +1994,1943 @@ GenerationResult TP2GenerationCore::Submission::wait(OutputSink* sink,
         throw std::invalid_argument(
             "GenerationHandle wait sink does not match its submitted consumer mode");
     }
+    // The multi-lane route owns its own admission: the request joins the core's FIFO instead of
+    // taking the device here, and whichever thread drives the batch that picks it up holds
+    // `execution_mutex_` for the whole batch. The single-lane route keeps the direct hand-off.
+    if (owner_->lanes_ > 1) {
+        return owner_->wait_lanes(std::move(request_), sink, cancellation);
+    }
     // Take the single execution slot. A request cancelled while queued still enters execute(),
     // whose first cancellation check is cheap and returns a Cancelled result with the proper
     // preview state.
     std::unique_lock<std::mutex> slot(owner_->execution_mutex_);
     return owner_->execute(*request_, sink, cancellation);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Multi-lane admission (PLAN-tp2-concurrency.md P1.4)
+// ---------------------------------------------------------------------------------------------
+
+// A submission to the multi-lane route never touches the device itself. It appends itself to the
+// FIFO and then either becomes the driver - the one thread allowed past `execution_mutex_` - or
+// waits for the batch that picks it up. The driver forms batches of at most `lanes_` from the
+// queue head, so admission is FIFO and no lane is ever handed a request younger than one still
+// waiting. A request cancelled while queued is not skipped: it enters the walk, whose first
+// cancellation check returns a Cancelled result with the proper preview state.
+GenerationResult TP2GenerationCore::wait_lanes(std::unique_ptr<Request> request, OutputSink* sink,
+                                               const CancellationView& cancellation) {
+    auto pending          = std::make_shared<PendingRequest>();
+    pending->request      = std::move(request);
+    pending->sink         = sink;
+    pending->cancellation = cancellation;
+    const std::shared_ptr<PendingRequest> mine = pending;
+    bool drives = false;
+    {
+        std::unique_lock<std::mutex> queue(lane_queue_mutex_);
+        lane_queue_.push_back(std::move(pending));
+        // Wake the driver's batch-formation window: this enqueue is exactly the arrival it is
+        // waiting for before it commits to a batch.
+        lane_queue_cv_.notify_all();
+        if (lane_driver_active_) {
+            lane_queue_cv_.wait(queue, [&] { return mine->complete; });
+        } else {
+            // The thread that found no driver drives. It covers every waiter behind it, including
+            // whatever arrives while it runs: those requests join batches it has not formed yet.
+            lane_driver_active_ = true;
+            drives              = true;
+        }
+    }
+    if (drives) {
+        // The driver is the only thread past this lock for as long as it drives, which is the
+        // invariant the single-lane route states by holding it inside execute().
+        std::unique_lock<std::mutex> device(execution_mutex_);
+        drive_lane_queue();
+    }
+    if (mine->failure != nullptr) { std::rethrow_exception(mine->failure); }
+    return std::move(mine->result);
+}
+
+// How long a driver that found the queue short of the batch size waits for peers to arrive. A
+// submission becomes the driver the instant it enqueues, so without this window a burst of requests
+// that are already inside submit() would still run one at a time: each would drain its own batch
+// before the next one landed. The window only delays a batch that is not yet full, and the batch it
+// delays would have run for hundreds of milliseconds anyway.
+constexpr std::chrono::microseconds kBatchFormationWindow{3000};
+
+// The driver loop. Each pass takes the oldest lanes_ requests, runs them, publishes their results
+// and immediately looks for work that arrived in the meantime, so the queue drains while its owner
+// is still inside this call.
+void TP2GenerationCore::drive_lane_queue() {
+    for (;;) {
+        std::vector<std::shared_ptr<PendingRequest>> batch;
+        batch.reserve(lanes_);
+        {
+            std::unique_lock<std::mutex> queue(lane_queue_mutex_);
+            if (lane_queue_.size() < lanes_) {
+                lane_queue_cv_.wait_for(queue, kBatchFormationWindow,
+                                        [&] { return lane_queue_.size() >= lanes_; });
+            }
+            while (batch.size() < lanes_ && !lane_queue_.empty()) {
+                batch.push_back(std::move(lane_queue_.front()));
+                lane_queue_.pop_front();
+            }
+            if (batch.empty()) {
+                lane_driver_active_ = false;
+                lane_queue_cv_.notify_all();
+                return;
+            }
+        }
+        // Reachable batched shapes at lanes_ > 1: the plain route, MTP and DFlash2. Only the
+        // legacy DFlash backend collapses to one lane in the constructor.
+        // A multimodal member no longer forces the serial lane walk (P2.4): the batch prefills one
+        // lane at a time, so that lane's Vision session runs on the single startup arena exactly as
+        // the serial walk's does. A tool-call grammar still refuses, because the constraint is a
+        // mask over one decode round's logits and the batched step carries no per-lane mask.
+        bool batchable         = lanes_ > 1;
+        const char* refusal    = batchable ? nullptr : "route";
+        if (batchable) {
+            for (const auto& member : batch) {
+                const auto& data = qwen::PreparedPromptAccess::view(member->request->prompt);
+                if (data.tool_call_output != nullptr) {
+                    batchable = false;
+                    refusal   = "grammar";
+                    break;
+                }
+            }
+        }
+        static const bool lane_trace = [] {
+            const char* env = std::getenv("NINFER_TP2_LANE_TRACE");
+            return env != nullptr && env[0] == '1';
+        }();
+        if (lane_trace) {
+            std::fprintf(stderr, "[tp2-lane] batch=%zu capacity=%u path=%s%s\n", batch.size(),
+                         static_cast<unsigned>(lanes_), batchable ? "batched" : "serial",
+                         refusal != nullptr ? refusal : "");
+        }
+        try {
+            if (batchable) {
+                // Writes every member's result in place. Both speculative routes drive their own
+                // batched proposal/verify/accept round; the plain route decodes one token per lane.
+                if (dflash2_enabled_ || mtp_enabled_) {
+                    execute_spec_batch(batch);
+                } else {
+                    execute_plain_batch(batch);
+                }
+            } else {
+                // P1.4a runs one lane of the batch at a time; the state machine and admission are
+                // already the shape the batched round needs.
+                for (std::size_t lane = 0; lane < batch.size(); ++lane) {
+                    batch[lane]->result =
+                        execute_lane(*batch[lane], static_cast<std::uint32_t>(lane));
+                }
+            }
+        } catch (...) {
+            // D4: the batch commits or fails whole. A lane that already finished its own walk is
+            // discarded with the rest. Its published retention state is deliberately not rolled
+            // back: the device pools still hold the prompt that lane prefilled, so the catalog and
+            // the checkpoint ring can keep naming it.
+            //
+            // The sink only surfaces a generic internal error, so report the reason here; without
+            // this line a failing batch is undiagnosable from the client side.
+            const std::exception_ptr failure = std::current_exception();
+            try {
+                std::rethrow_exception(failure);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[tp2-lane] batch of %zu failed: %s\n", batch.size(), error.what());
+            } catch (...) {
+                std::fprintf(stderr, "[tp2-lane] batch of %zu failed: unknown error\n", batch.size());
+            }
+            // A failed batch leaves every lane's device state where the catalog cannot name it.
+            session_invalidate_all();
+            for (auto& member : batch) { member->failure = failure; }
+        }
+        {
+            std::unique_lock<std::mutex> queue(lane_queue_mutex_);
+            for (auto& member : batch) { member->complete = true; }
+            lane_queue_cv_.notify_all();
+            if (lane_queue_.empty()) {
+                lane_driver_active_ = false;
+                lane_queue_cv_.notify_all();
+                return;
+            }
+        }
+    }
+}
+
+// Bind the lane's own execution resources, then run the walk. The paged-KV execution row reaches
+// the non-batch windows through `active_lane_`, and the GDN slot below is both the state this lane's
+// walk starts from and the one it updates in place. That state is zeroed by the walk itself, so a
+// lane never inherits the recurrence of whatever ran on it before.
+GenerationResult TP2GenerationCore::execute_lane(PendingRequest& pending, std::uint32_t lane) {
+    Shard* const shards[2] = {&shard_a_, &shard_b_};
+    active_lane_           = static_cast<std::int32_t>(lane);
+    for (Shard* shard : shards) {
+        shard->device.bind_to_current_thread();
+        shard->context->set_linear_state_slots(active_lane_, active_lane_);
+    }
+    return execute(*pending.request, pending.sink, pending.cancellation);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Batched-lane prefix retention (PLAN-tp2-concurrency.md P2.3)
+// ---------------------------------------------------------------------------------------------
+//
+// A batched lane owns one KV row, one GDN state slot and one slice of every retention buffer, so
+// it runs the same boundary scan the single-lane walk runs on the lane it is prefilling: recall the
+// conversation the prompt belongs to, accept the deepest boundary this lane's own lineage offers,
+// restore its GDN state (and, on a masked-draft route, its draft ring), then prefill only the
+// suffix. The three executors share these steps rather than a copy each.
+std::vector<TP2GenerationCore::MediaSpan> TP2GenerationCore::collect_media_spans(
+    const qwen::PreparedPromptData& data, std::size_t limit) {
+    std::vector<MediaSpan> spans;
+    spans.reserve(data.vision_items.size());
+    for (const qwen::VisionItem& item : data.vision_items) {
+        if (item.token_spans.empty()) { continue; }
+        std::uint32_t begin = std::numeric_limits<std::uint32_t>::max();
+        std::uint32_t end   = 0;
+        for (const qwen::TokenSpan& span : item.token_spans) {
+            begin = std::min(begin, static_cast<std::uint32_t>(span.begin));
+            end   = std::max(end, static_cast<std::uint32_t>(span.begin + span.count));
+        }
+        // An item the prompt stops in the middle of is not one this prompt carries whole, so it
+        // must not license a boundary: the KV a reuse would keep ends inside it.
+        if (end > limit) { continue; }
+        MediaSpan entry;
+        entry.begin = begin;
+        entry.end   = end;
+        entry.item  = item;
+        spans.push_back(std::move(entry));
+    }
+    return spans;
+}
+
+std::size_t TP2GenerationCore::media_prefix_cap(std::span<const MediaSpan> cached,
+                                                std::span<const MediaSpan> incoming,
+                                                std::size_t shared_prefix) {
+    std::size_t left_index  = 0;
+    std::size_t right_index = 0;
+    while (left_index < cached.size() || right_index < incoming.size()) {
+        const MediaSpan* left  = left_index < cached.size() ? &cached[left_index] : nullptr;
+        const MediaSpan* right = right_index < incoming.size() ? &incoming[right_index] : nullptr;
+        // A boundary at or before an item's begin does not reuse that item, so it cannot constrain
+        // the boundary, and the lists are ordered, so nothing after it can either.
+        if (left != nullptr && left->begin >= shared_prefix) { left = nullptr; }
+        if (right != nullptr && right->begin >= shared_prefix) { right = nullptr; }
+        if (left == nullptr && right == nullptr) { break; }
+        if (left != nullptr && right != nullptr && left->begin == right->begin) {
+            if (!qwen::detail::same_vision_item(left->item, right->item)) { return left->begin; }
+            ++left_index;
+            ++right_index;
+            continue;
+        }
+        // One prompt shows an item where the other does not: the KV past that point belongs to
+        // media the other prompt never showed.
+        return left != nullptr && (right == nullptr || left->begin < right->begin) ? left->begin
+                                                                                  : right->begin;
+    }
+    return shared_prefix;
+}
+
+TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t lane,
+                                                               std::span<const TokenId> token_ids,
+                                                               std::span<const MediaSpan> media,
+                                                               std::uint32_t prompt_tokens,
+                                                               std::size_t replay_split,
+                                                               bool adopted, bool trace) {
+    RetentionState& lane_state = retention(lane);
+    LaneReuse result;
+    std::size_t shared_prefix = 0;
+    lane_state.reuse_source   = ReuseSource::None;
+    if (lane_state.cached_state_valid && !lane_state.cached_prompt_tokens.empty()) {
+        const std::size_t common =
+            std::min(lane_state.cached_prompt_tokens.size(), static_cast<std::size_t>(prompt_tokens));
+        while (shared_prefix < common &&
+               lane_state.cached_prompt_tokens[shared_prefix] == token_ids[shared_prefix]) {
+            ++shared_prefix;
+        }
+        // The token ids cannot see media: every image merges to the same placeholder ids, so two
+        // prompts showing different pictures compare equal here. The identity behind those ids is
+        // what tells them apart, and a boundary that would keep KV from another picture is not this
+        // prompt's to reuse.
+        shared_prefix = media_prefix_cap(lane_state.cached_media, media, shared_prefix);
+        // A checkpoint is only this prompt's while the lineage agrees on the tokens before it, so a
+        // checkpoint past the shared prefix can never become usable again.
+        for (Shard* shard : {&shard_a_, &shard_b_}) {
+            for (auto& checkpoint : shard->host_checkpoints) {
+                if (checkpoint.position[lane] > shared_prefix) { checkpoint.valid[lane] = false; }
+            }
+        }
+        const auto take = [&](std::uint32_t position, std::uint32_t slot, ReuseSource source) {
+            if (position == 0 || position > shared_prefix || position >= prompt_tokens ||
+                position <= result.tokens) {
+                return;
+            }
+            result.tokens           = position;
+            result.slot             = slot;
+            lane_state.reuse_source = source;
+        };
+        if (lane_state.live_state_valid && lane_state.active_session != kNoSession) {
+            take(sessions_[lane_state.active_session].frontier, 0, ReuseSource::LiveState);
+        }
+        for (std::uint32_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
+            take(lane_state.cached_boundaries[slot], slot, ReuseSource::DeviceSnapshot);
+        }
+        for (std::uint32_t slot = 0; slot < shard_a_.host_checkpoints.size(); ++slot) {
+            const auto& checkpoint = shard_a_.host_checkpoints[slot];
+            if (checkpoint.valid[lane]) {
+                take(checkpoint.position[lane], slot, ReuseSource::HostCheckpoint);
+            }
+        }
+    }
+    if (trace) {
+        std::size_t valid_checkpoints = 0;
+        for (const auto& checkpoint : shard_a_.host_checkpoints) {
+            valid_checkpoints += checkpoint.valid[lane] ? 1U : 0U;
+        }
+        const char* source = lane_state.reuse_source == ReuseSource::HostCheckpoint ? "host"
+                             : lane_state.reuse_source == ReuseSource::LiveState    ? "live"
+                             : lane_state.reuse_source == ReuseSource::DeviceSnapshot ? "device"
+                                                                             : "none";
+        std::fprintf(stderr,
+                     "[tp2-reuse] lane=%u prompt=%u cached=%zu shared=%zu replay_split=%zu "
+                     "adopted=%d prefill_end=%u host=%zu/%zu stride=%u -> reuse=%u slot=%u "
+                     "src=%s\n",
+                     lane, prompt_tokens, lane_state.cached_prompt_tokens.size(), shared_prefix,
+                     replay_split, adopted ? 1 : 0, lane_state.cached_boundaries[0],
+                     valid_checkpoints, shard_a_.host_checkpoints.size(), host_checkpoint_stride_,
+                     result.tokens, result.slot, source);
+    }
+    // Tag the checkpoints this prefill leaves behind and start the ring at the first stride multiple
+    // past the reused boundary: a checkpoint at the boundary itself would only duplicate the device
+    // snapshot the prefill starts from. The new checkpoints become usable when it completes.
+    lane_state.host_checkpoint_live_id = host_checkpoint_next_id_++;
+    if (host_checkpoint_stride_ != 0) {
+        result.next_host_checkpoint = host_checkpoint_stride_;
+        while (result.next_host_checkpoint <= result.tokens) {
+            result.next_host_checkpoint += host_checkpoint_stride_;
+        }
+    }
+    return result;
+}
+
+void TP2GenerationCore::restore_lane_gdn(std::uint32_t lane, const LaneReuse& reuse) {
+    const ReuseSource source = retention(lane).reuse_source;
+    for (Shard* shard : {&shard_a_, &shard_b_}) {
+        shard->device.bind_to_current_thread();
+        switch (source) {
+        case ReuseSource::None:
+            // A lane only owns its own slot, so a reset must not touch its neighbours.
+            zero_lane_state(shard->lane_state_geometry, shard->state_backing.data,
+                            static_cast<std::int32_t>(lane), shard->device.stream);
+            break;
+        case ReuseSource::LiveState:
+            // The device state already sits at this boundary: a restored session put it there, or
+            // the conversation that just decoded left it exactly at its frontier.
+            break;
+        case ReuseSource::DeviceSnapshot:
+            copy_lane_state(shard->lane_state_geometry, shard->state_backing.data,
+                            static_cast<std::int32_t>(lane),
+                            shard->state_snapshots[reuse.slot].data, cudaMemcpyDeviceToDevice,
+                            shard->device.stream);
+            break;
+        case ReuseSource::HostCheckpoint:
+            // The slot's buffer holds one compact state image per lane, so this lane's slice is an
+            // offset into it; a whole-pool image would let one lane restore another's state.
+            copy_lane_state(shard->lane_state_geometry, shard->state_backing.data,
+                            static_cast<std::int32_t>(lane),
+                            static_cast<std::byte*>(
+                                shard->host_checkpoints[reuse.slot].buffer->data()) +
+                                static_cast<std::size_t>(lane) *
+                                    shard->lane_state_geometry.image_bytes,
+                            cudaMemcpyHostToDevice, shard->device.stream);
+            break;
+        }
+    }
+}
+
+void TP2GenerationCore::restore_lane_dflash(std::uint32_t lane, const LaneReuse& reuse,
+                                            bool zero_when_none) {
+    Shard& shard = shard_a_;
+    if (shard.dflash_round == nullptr) { return; }
+    shard.device.bind_to_current_thread();
+    switch (retention(lane).reuse_source) {
+    case ReuseSource::None:
+        if (zero_when_none) { shard.dflash_round->zero_context(); }
+        return;
+    case ReuseSource::LiveState:
+        // The live ring already reaches this boundary: a recall restored it, or the conversation
+        // that just decoded left it flushed to its frontier at publish.
+        return;
+    case ReuseSource::DeviceSnapshot: {
+        const std::size_t lane_bytes = shard.dflash_round->lane_context_image_bytes();
+        shard.dflash_round->copy_context_from_device(
+            DeviceSpan{static_cast<std::byte*>(shard.dflash_snapshots[reuse.slot].data) +
+                           static_cast<std::size_t>(lane) * lane_bytes,
+                       lane_bytes},
+            shard.device.stream, static_cast<std::int32_t>(lane));
+        return;
+    }
+    case ReuseSource::HostCheckpoint: {
+        const Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[reuse.slot];
+        if (checkpoint.dflash_buffer == nullptr ||
+            checkpoint.dflash_frontier[lane] != checkpoint.position[lane]) {
+            throw std::logic_error(
+                "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
+        }
+        shard.dflash_round->copy_context_from_host(
+            static_cast<const std::byte*>(checkpoint.dflash_buffer->data()) +
+                static_cast<std::size_t>(lane) * shard.dflash_round->lane_context_image_bytes(),
+            shard.device.stream, static_cast<std::int32_t>(lane));
+        return;
+    }
+    }
+}
+
+void TP2GenerationCore::publish_lane_prefill(
+    std::uint32_t lane, std::uint32_t prompt_tokens, const std::vector<TokenId>& tokens,
+    std::span<const MediaSpan> media,
+    const models::qwen3_5::PreparedContextCache& cache_hints) {
+    RetentionState& lane_state = retention(lane);
+    // Publish this lane's lineage. The device snapshot planes are shared by every lane, but only
+    // this lane's slice of plane 0 is written - at this lane's own prefill end - and the host ring
+    // and the catalog entry are this lane's own too.
+    lane_state.cached_prompt_tokens.assign(tokens.begin(), tokens.end());
+    lane_state.cached_media.assign(media.begin(), media.end());
+    lane_state.cached_boundaries.fill(0);
+    lane_state.cached_state_valid = true;
+    session_publish(tokens, prompt_tokens, cache_hints, media, lane);
+    if (lane_state.active_session != kNoSession) {
+        sessions_[lane_state.active_session].prompt_end = prompt_tokens;
+    }
+    // Only now are this prefill's checkpoints usable: their state is one the prefill reached and
+    // their KV prefix is one it wrote.
+    for (Shard* shard : {&shard_a_, &shard_b_}) {
+        for (auto& checkpoint : shard->host_checkpoints) {
+            if (checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id) {
+                checkpoint.valid[lane] = true;
+            }
+        }
+    }
+    // Plane 0 carries this lane's prefill-end state, the boundary a store reads for the prompt-end
+    // image and the one a returning turn can stand on without the host ring. execute_walk writes
+    // the whole plane at its own prefill end; a batched lane writes only its own slice, which is
+    // all a per-lane boundary needs, and the slice stays valid until this lane prefills again.
+    for (Shard* shard : {&shard_a_, &shard_b_}) {
+        shard->device.bind_to_current_thread();
+        // See snapshot_lane_state in execute_walk: the device-to-device branch copies into its
+        // first device pointer, so the plane is the destination and the pool is the source.
+        copy_lane_state(shard->lane_state_geometry, shard->state_snapshots[0].data,
+                        static_cast<std::int32_t>(lane), shard->state_backing.data,
+                        cudaMemcpyDeviceToDevice, shard->device.stream);
+    }
+    // The masked draft's ring is part of that same boundary: a lane that later accepts plane 0 has
+    // to get its draft context back too, or the skipped prefix would leave a hole in the ring.
+    if (shard_a_.dflash_round != nullptr) { snapshot_dflash_state(shard_a_, 0, lane); }
+    lane_state.cached_boundaries[0] = prompt_tokens;
+}
+
+void TP2GenerationCore::invalidate_lane_prefill(std::uint32_t lane) {
+    RetentionState& lane_state = retention(lane);
+    // A torn prefill leaves this lane's slot somewhere no boundary names, so retire the lineage and
+    // the catalog claim with it: the next request must not stand on a state this one left half
+    // written.
+    lane_state.cached_state_valid = false;
+    lane_state.cached_boundaries.fill(0);
+    lane_state.live_state_valid = false;
+    session_invalidate_active(lane);
+}
+// ---------------------------------------------------------------------------------------------
+// Batched plain walk (PLAN-tp2-concurrency.md P1.4c)
+// ---------------------------------------------------------------------------------------------
+//
+// One round of this walk runs a single batched decode window for every lane still live. That shared
+// forward is where the throughput comes from: a single-lane step is weight-stream bound, so two
+// lanes cost one weight pass instead of two.
+//
+// Reachability: the driver routes a batch here only on the plain route, and only when no member
+// carries a tool grammar or media; the speculative routes run execute_spec_batch instead. Anything
+// else keeps the serial P1.4a walk in execute_lane.
+//
+// Invariants this function owns:
+//  - Lane "slot" is both the KV execution row and the GDN state slot that lane owns, exactly as
+//    execute_lane binds them. A batched lane is structurally a single-lane plain request whose
+//    prefix reuse is scanned on that lane alone: prefill from the accepted boundary, first-token
+//    sample, then one token per shared round.
+//  - Retention is per lane (P2.3). Each lane scans its own lineage, restores its own GDN slot and
+//    publishes its own catalog entry, checkpoint ring slots and plane 0 slice. No lane ever reads
+//    another lane's state, and the pool is never wiped as a whole.
+//  - D4: any throw leaves the driver to mark the whole batch failed. A lane that had already
+//    finished is deliberately discarded with the rest.
+//  - The arena watermark below is fixed by the constructor's lane count rather than by this batch
+//    (P2.2b), so the captured batch decode step finds the same layout on every replay.
+void TP2GenerationCore::execute_plain_batch(
+    const std::vector<std::shared_ptr<PendingRequest>>& batch) {
+    DeviceArena& ws_a = *shard_a_.workspace;
+    DeviceArena& ws_b = *shard_b_.workspace;
+    auto& ctx_a       = *shard_a_.context;
+    auto& ctx_b       = *shard_b_.context;
+    shard_a_.device.bind_to_current_thread();
+
+    const std::int32_t vocab =
+        qwen::execution::dimension(shard_a_.model->config().text.vocab_size);
+    const std::int32_t public_tokens =
+        static_cast<std::int32_t>(shard_a_.model->resources().public_token_count);
+    const std::uint32_t prefill_chunk = prefill_chunk_width(shard_a_.model->config().text);
+    // Prefix-reuse trace, the same switch the single-lane walk reads (NINFER_TP2_REUSE_TRACE).
+    const bool reuse_trace = [] {
+        const char* env = std::getenv("NINFER_TP2_REUSE_TRACE");
+        return env != nullptr && env[0] == '1';
+    }();
+    // The tail anchors cover the last few chunk ends of a lane's prefill. Their count is bounded by
+    // the tail sub-ring, so a narrow chunk cannot flood the ring with anchors that all sit within one
+    // chunk of the prompt end.
+    const std::uint32_t tail_span =
+        std::min<std::uint32_t>(kReuseTailWindow,
+                                prefill_chunk * std::max(1U, host_checkpoint_tail_slots_));
+
+    Tp2RoundTiming& timing = tp2_timing();
+    timing.init();
+    timing.reset();
+
+    // One entry per admitted lane. The slot is the batch position, which is simultaneously the KV
+    // execution row and the GDN state slot handed to the forwards.
+    struct LaneState {
+        PendingRequest* pending     = nullptr;
+        std::uint32_t slot          = 0;
+        GenerationResult result;
+        std::int32_t current        = 0;
+        std::uint32_t position      = 0;
+        std::uint32_t prompt_tokens = 0;
+        bool have_first             = false;
+        bool finished               = false;
+        // Set once this lane's prefill published its lineage; only then does the device state at
+        // `position` describe a conversation a later turn may extend.
+        bool prefilled              = false;
+        Clock::time_point begin;
+        Clock::time_point first_token;
+    };
+    const std::size_t lane_capacity = batch.size();
+    std::vector<LaneState> lanes(lane_capacity);
+    for (std::size_t index = 0; index < lane_capacity; ++index) {
+        lanes[index].pending     = batch[index].get();
+        lanes[index].slot        = static_cast<std::uint32_t>(index);
+        lanes[index].begin       = Clock::now();
+        lanes[index].first_token = lanes[index].begin;
+    }
+
+    // Batch-resident state lives below every round watermark, so a round scope can never move it.
+    auto lifetime_a = ws_a.scope();
+    auto lifetime_b = ws_b.scope();
+
+    std::vector<ops::SamplingConfig> configs(lane_capacity);
+    for (std::size_t index = 0; index < lane_capacity; ++index) {
+        configs[index] = make_sampling_config(batch[index]->request->sampling);
+    }
+    // A request with a configured penalty accumulates its committed tokens in device memory, one
+    // slice per lane so the shared sample reads per-lane counts. The array is sized for the widest
+    // batch this route can form rather than for this batch: the round watermark, and with it every
+    // captured batch graph, has to be the same for every request. A request with no configured
+    // penalty simply never reads its slice, and only the live span is cleared.
+    {
+        Tensor counts = ws_a.alloc(
+            DType::I32, {static_cast<std::int32_t>(public_tokens * static_cast<std::int32_t>(lanes_))});
+        shard_a_.device.bind_to_current_thread();
+        CUDA_CHECK(cudaMemsetAsync(
+            counts.data, 0,
+            sizeof(std::int32_t) * static_cast<std::size_t>(public_tokens) * lane_capacity,
+            shard_a_.device.stream));
+        auto* base = static_cast<std::int32_t*>(counts.data);
+        for (std::size_t index = 0; index < lane_capacity; ++index) {
+            if (configs[index].presence_penalty == 0.0F &&
+                configs[index].frequency_penalty == 0.0F) {
+                continue;
+            }
+            configs[index].token_counts =
+                base + static_cast<std::size_t>(index) * static_cast<std::size_t>(public_tokens);
+        }
+    }
+
+    // Device copy of the per-lane sampler configs. Staging this once lets the prefill samples read
+    // their own lane's entry directly; the decode rounds still build a compacted copy per round,
+    // because a lane that left the batch no longer occupies its original column. Like the counts
+    // array, the reservation covers the whole lane count so the watermark does not move with the
+    // batch, and only the live lanes are filled.
+    DeviceSpan configs_dev = ws_a.alloc_bytes(sizeof(ops::SamplingConfig) * lanes_, 256);
+    shard_a_.device.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(configs_dev.data, configs.data(),
+                               sizeof(ops::SamplingConfig) * lane_capacity,
+                               cudaMemcpyHostToDevice, shard_a_.device.stream));
+
+    // Pinned host staging for the four per-lane vectors the batched window copies, plus the
+    // per-round logical positions. This is the core member, not a round local: a captured batch step
+    // reads the four through memcpy nodes, so their addresses are baked into the graph.
+    std::int32_t* host_tokens    = batch_lane_host_section(0);
+    std::int32_t* host_positions = batch_lane_host_section(1);
+    std::int32_t* host_kv_rows   = batch_lane_host_section(2);
+    std::int32_t* host_slots     = batch_lane_host_section(3);
+    std::int32_t* host_logical   = batch_lane_host_section(4);
+
+    // Per-lane preview publication, mirroring the single-lane lambda: a terminal call first names
+    // the reason the walk stopped, then the committed preview is appended to this lane's result and
+    // streamed to its own sink.
+    auto publish_preview = [](LaneState& lane, bool terminal) {
+        Request& request = *lane.pending->request;
+        if (terminal) {
+            (void)request.output.preview_terminal(request.budget.limit_reason());
+        }
+        auto published = request.output.commit_preview();
+        for (const auto& delta : published) {
+            if (delta.channel == OutputChannel::Reasoning) {
+                lane.result.reasoning += delta.text;
+            } else {
+                lane.result.content += delta.text;
+            }
+            if (lane.pending->sink != nullptr) { lane.pending->sink->publish(delta); }
+        }
+    };
+
+    // Fills a lane's result from everything its walk accumulated, in the same order the single-lane
+    // walk does at its exit. A lane that never produced a first token reports an empty decode.
+    // Publish a retired lane's lineage before its result takes the generated tokens away: the pools
+    // hold prompt plus committed output and the live GDN state sits at the frontier the lane's last
+    // committed round left - one short of the history, because the last sampled token is never
+    // forwarded. execute_walk publishes the same pair at its exit.
+    auto finalize = [this](LaneState& lane) {
+        Request& request = *lane.pending->request;
+        if (lane.prefilled) {
+            auto& data = qwen::PreparedPromptAccess::mutable_view(request.prompt);
+            std::vector<TokenId> history(data.token_ids.begin(), data.token_ids.end());
+            history.insert(history.end(), request.generated.begin(), request.generated.end());
+            session_publish(history, static_cast<std::uint32_t>(lane.position), data.context_cache,
+                            collect_media_spans(data, data.token_ids.size()), lane.slot);
+        }
+        const Clock::time_point done = Clock::now();
+        lane.result.generated_token_ids = std::move(request.generated);
+        lane.result.tool_calls          = request.output.take_tool_calls();
+        lane.result.tool_call_parse     = request.output.tool_call_parse_diagnostics();
+        lane.result.reasoning_tokens    = request.output.reasoning_tokens();
+        lane.result.matched_stop_string = request.output.matched_stop_string();
+        lane.result.thinking            = request.output.thinking_stats();
+        const double total = std::chrono::duration<double>(done - lane.begin).count();
+        if (lane.have_first) {
+            const double decode =
+                std::chrono::duration<double>(done - lane.first_token).count();
+            lane.result.timings.decode_seconds          = decode;
+            lane.result.timings.generation_wall_seconds = decode;
+            lane.result.timings.first_token_seconds =
+                lane.result.timings.prepare_seconds + lane.result.timings.prompt_wall_seconds;
+            lane.result.timings.total_seconds = total;
+        } else {
+            lane.result.timings.decode_seconds          = 0.0;
+            lane.result.timings.generation_wall_seconds = 0.0;
+            lane.result.timings.prompt_wall_seconds     = total;
+            lane.result.timings.first_token_seconds =
+                lane.result.timings.prepare_seconds + total;
+            lane.result.timings.total_seconds = total;
+        }
+        lane.pending->result = std::move(lane.result);
+    };
+
+    // Each lane's GDN slot is brought to its own starting state in the loop below: a lane that
+    // reuses a boundary is copied from its image, and a lane that does not is zeroed. The pool as a
+    // whole is never wiped, because a lane continuing a conversation holds the state its previous
+    // round left, and that state is exactly what its reuse boundary names (P2.3 Stage 1).
+
+    // Prefill is serial per lane: each lane owns a private KV row and GDN slot, so the only shared
+    // resource is the workspace arena, and the chunk scopes below hand it back between lanes.
+    std::vector<std::size_t> active;
+    active.reserve(lane_capacity);
+    for (std::size_t index = 0; index < lane_capacity; ++index) {
+        LaneState& lane  = lanes[index];
+        Request& request = *lane.pending->request;
+        // The batch column is also the KV execution row and the GDN state slot this lane owns, which
+        // is the lane index every session_* and retention helper takes (P2.3).
+        const std::uint32_t lane_id = lane.slot;
+        auto& data = qwen::PreparedPromptAccess::mutable_view(request.prompt);
+        lane.prompt_tokens = static_cast<std::uint32_t>(data.token_ids.size());
+        lane.result.prompt = request.summary;
+        lane.result.timings.prepare_seconds = request.prepare_seconds;
+        lane.result.speculative             = SpeculativeStats{};
+        active_lane_ = static_cast<std::int32_t>(lane.slot);
+        for (Shard* shard : {&shard_a_, &shard_b_}) {
+            shard->device.bind_to_current_thread();
+            shard->context->set_linear_state_slots(active_lane_, active_lane_);
+        }
+
+        // A client that re-rendered the answer this lane generated hands back a prompt whose last
+        // turn is the tokens the lineage really produced; adopting it keeps the conversation
+        // resident instead of retiring it over a re-tokenisation difference.
+        const TurnAdoption adoption =
+            adopt_generated_turn(data, lane.prompt_tokens, reuse_trace, lane_id);
+        if (adoption.adopted) {
+            lane.prompt_tokens               = adoption.prompt_tokens;
+            request.summary.prompt_tokens    = lane.prompt_tokens;
+            lane.result.prompt.prompt_tokens = lane.prompt_tokens;
+        }
+        const std::vector<TokenId>& tokens = data.token_ids;
+        const std::span<const TokenId> token_ids(tokens.data(), tokens.size());
+        lane.position = lane.prompt_tokens;
+        // The media identity this prompt carries. Every lane builds its own spans from its own
+        // prompt, so a batch mixes media and text lanes without either seeing the other's pictures.
+        const std::vector<MediaSpan> prompt_media = collect_media_spans(data, data.token_ids.size());
+        // Cross-session recall: a prompt belonging to a conversation another lane holds swaps that
+        // conversation onto this lane before the boundary scan reads the lineage.
+        session_recall(lane_id, token_ids, prompt_media);
+
+        // Prompt-prefix reuse, the scan execute_walk runs for a single lane, on this lane's own
+        // lineage: the host checkpoint ring, plane 0's slice of this lane (written at this lane's
+        // own prefill end, below), and the catalog entry. Two lanes in one batch never read each
+        // other's state, so the batch route reuses prefixes exactly as the serial walk does.
+        const LaneReuse lane_reuse =
+            scan_lane_reuse(lane_id, token_ids, prompt_media, lane.prompt_tokens, adoption.divergence,
+                            adoption.adopted, reuse_trace);
+        const std::uint32_t reuse          = lane_reuse.tokens;
+        std::uint32_t next_host_checkpoint = lane_reuse.next_host_checkpoint;
+
+        // Restore this lane's GDN state to the boundary the scan accepted. A reused prefix needs no KV
+        // work at all: the pages already hold it.
+        restore_lane_gdn(lane_id, lane_reuse);
+
+        lane.result.reused_prompt_tokens = reuse;
+        lane.result.prefix_reuse_path    = reuse_path(reuse, 0, lane_id);
+        if (lane.pending->sink != nullptr) {
+            lane.pending->sink->start(
+                GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
+        }
+
+        // This lane's Vision session, on top of the startup plan. Prefill is serial per lane, so the
+        // single startup arena is reused sequentially and only one session is ever alive; the plan
+        // must outlive the session, which binds it by reference.
+        const bool media = data.has_media();
+        qwen::execution::VisionPrefillPlan vision_plan;
+        std::unique_ptr<qwen::execution::VisionPrefillSession> vision_session =
+            open_vision_session(data, reuse, vision_plan);
+        bool cancelled                  = lane.pending->cancellation.requested();
+        FinishReason first_token_finish = FinishReason::None;
+        // Prefill starts at the accepted boundary: the KV pages before it are the restored ones and
+        // the GDN state was just brought to exactly that position, so re-forwarding the prefix would
+        // both duplicate pages and advance the state twice.
+        for (std::uint32_t t0 = reuse; !cancelled && t0 < lane.prompt_tokens;) {
+            if (lane.pending->cancellation.requested()) {
+                cancelled = true;
+                break;
+            }
+            std::uint32_t length = std::min(prefill_chunk, lane.prompt_tokens - t0);
+            // A multimodal chunk is capped at the boundary of the item it overlaps, so the encoder
+            // hands out one item at a time and the scatter below stays one contiguous column range
+            // of it; the next chunk re-enters the same item.
+            qwen::execution::VisionChunk vision_chunk;
+            if (vision_session) {
+                vision_chunk = vision_session->prepare_chunk(t0, length);
+                length       = static_cast<std::uint32_t>(vision_chunk.length);
+            }
+            qwen::execution::Tp2VisionChunk media_chunk;
+            const qwen::execution::Tp2VisionChunk* media_ptr = nullptr;
+            if (media) {
+                media_chunk.control       = vision_chunk.control;
+                media_chunk.embeddings    = &vision_chunk.embeddings;
+                media_chunk.positions     = data.positions.data();
+                media_chunk.prompt_tokens = data.token_ids.size();
+                media_ptr                 = &media_chunk;
+            }
+            auto scope_a    = ws_a.scope();
+            auto scope_b    = ws_b.scope();
+            Tensor logits_a = ws_a.alloc(DType::BF16, {vocab, 1});
+            Tensor logits_b = ws_b.alloc(DType::BF16, {vocab, 1});
+            shard_a_.device.bind_to_current_thread();
+            ctx_a.forward_tp2_prefill(ctx_b, pair_,
+                                      std::span<const int>(token_ids.data() + t0, length),
+                                      static_cast<std::int32_t>(t0), &logits_a, &logits_b, nullptr,
+                                      nullptr, nullptr, qwen::TextPhase::Prefill, media_ptr, nullptr,
+                                      active_lane_);
+            if (host_checkpoint_stride_ != 0) {
+                // One checkpoint per stride, tagged with the frontier this chunk actually reached, so
+                // a chunk width that does not divide the stride cannot mislabel a state; plus the
+                // dense tail window. The prompt end is skipped either way: the state there is the one
+                // the lane publishes as its frontier.
+                const std::uint32_t frontier = t0 + length;
+                if (frontier >= next_host_checkpoint) {
+                    snapshot_host_checkpoint(shard_a_, frontier, HostRing::Grid, lane_id);
+                    snapshot_host_checkpoint(shard_b_, frontier, HostRing::Grid, lane_id);
+                    next_host_checkpoint =
+                        (frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
+                } else if (frontier != lane.prompt_tokens &&
+                           static_cast<std::uint64_t>(frontier) + tail_span > lane.prompt_tokens) {
+                    snapshot_host_checkpoint(shard_a_, frontier, HostRing::Tail, lane_id);
+                    snapshot_host_checkpoint(shard_b_, frontier, HostRing::Tail, lane_id);
+                }
+            }
+            if (t0 + length == lane.prompt_tokens) {
+                Tensor logical_pos_lane = ws_a.alloc(DType::I32, {1});
+                shard_a_.device.bind_to_current_thread();
+                ops::set_i32_scalar(logical_pos_lane,
+                                    static_cast<std::int32_t>(lane.prompt_tokens),
+                                    shard_a_.device.stream);
+                Tensor sampled_a = ws_a.alloc(DType::I32, {1});
+                ops::sample(logits_a, sampled_a, public_tokens,
+                            static_cast<const ops::SamplingConfig*>(configs_dev.data) + lane.slot,
+                            logical_pos_lane, ops::kSamplePurposePrefill, ws_a,
+                            shard_a_.device.stream);
+                std::int32_t first = 0;
+                CUDA_CHECK(cudaMemcpyAsync(&first, sampled_a.data, sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToHost, shard_a_.device.stream));
+                CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+                abort_if_ar_stalled();
+                const TokenId first_token        = static_cast<TokenId>(first);
+                const std::uint32_t first_budget = request.budget.remaining();
+                if (first_budget == 0) {
+                    throw std::logic_error("prefill sampled a token with no output budget left");
+                }
+                const OutputDecision first_decision = request.output.preview_model(
+                    std::span<const TokenId>(&first_token, 1), first_budget,
+                    request.budget.limit_reason());
+                if (first_decision.accepted_tokens != 1) {
+                    throw std::logic_error("output policy rejected the prefill's first token");
+                }
+                request.generated.push_back(first_token);
+                request.budget.commit(1);
+                lane.have_first  = true;
+                lane.first_token = Clock::now();
+                lane.current     = static_cast<std::int32_t>(first_token);
+                lane.result.timings.prompt_wall_seconds =
+                    std::chrono::duration<double>(lane.first_token - lane.begin).count();
+                // The Vision encode is reported separately from the text walk, matching the serial
+                // walk and the single-device route; prompt wall time (the response's TTFT) is the
+                // whole span either way.
+                lane.result.timings.vision_seconds =
+                    vision_session ? vision_session->elapsed_seconds() : 0.0;
+                lane.result.timings.prefill_seconds =
+                    std::max(0.0, lane.result.timings.prompt_wall_seconds -
+                                      lane.result.timings.vision_seconds);
+                publish_preview(lane, false);
+                if (first_decision.finished()) {
+                    first_token_finish        = first_decision.finish_reason;
+                    lane.result.finish_reason = first_decision.finish_reason;
+                }
+            }
+            t0 += length;
+        }
+        if (vision_session) {
+            // Every item this lane's prefill overlapped is encoded and its embeddings are in the KV
+            // now, so release the host patch payloads and the handoff binding: the decode loop never
+            // revisits them. The arena itself is reused by the next lane's session.
+            vision_session->release_encoded_media_payloads();
+            vision_session->retire_handoff();
+        }
+        if (cancelled) {
+            invalidate_lane_prefill(lane_id);
+            (void)request.output.preview_terminal(FinishReason::Cancelled);
+            lane.result.finish_reason = FinishReason::Cancelled;
+            publish_preview(lane, false);
+            finalize(lane);
+            continue;
+        }
+        computed_prefill_tokens_ += lane.prompt_tokens - reuse;
+        publish_lane_prefill(lane_id, lane.prompt_tokens, tokens, prompt_media, data.context_cache);
+        lane.prefilled = true;
+        lane.finished = first_token_finish != FinishReason::None;
+        if (lane.finished) {
+            finalize(lane);
+        } else {
+            active.push_back(index);
+        }
+    }
+
+    // Round watermark. Prefill's chunk scopes have handed the arena back, so the decode rounds
+    // allocate above this point only and rewind to it every round.
+    shard_a_.round_base = ws_a.used();
+    shard_b_.round_base = ws_b.used();
+
+    while (!active.empty()) {
+        // Retire the lanes that asked to stop before this round is formed. A cancelled or
+        // budget-exhausted lane publishes its terminal preview and leaves; the remaining lanes keep
+        // decoding, so one lane's limit does not stall the others.
+        std::vector<std::size_t> live;
+        live.reserve(active.size());
+        for (const std::size_t index : active) {
+            LaneState& lane  = lanes[index];
+            Request& request = *lane.pending->request;
+            if (lane.pending->cancellation.requested()) {
+                (void)request.output.preview_terminal(FinishReason::Cancelled);
+                lane.result.finish_reason = FinishReason::Cancelled;
+                publish_preview(lane, false);
+                finalize(lane);
+                continue;
+            }
+            if (request.budget.remaining() == 0) {
+                (void)request.output.preview_terminal(request.budget.limit_reason());
+                lane.result.finish_reason = request.budget.limit_reason();
+                publish_preview(lane, false);
+                finalize(lane);
+                continue;
+            }
+            live.push_back(index);
+        }
+        active.swap(live);
+        if (active.empty()) { break; }
+
+        const std::int32_t columns = static_cast<std::int32_t>(active.size());
+        std::uint32_t max_position = 0;
+        for (std::size_t column = 0; column < active.size(); ++column) {
+            const LaneState& lane  = lanes[active[column]];
+            host_tokens[column]    = lane.current;
+            host_positions[column] = static_cast<std::int32_t>(lane.position);
+            host_kv_rows[column]   = static_cast<std::int32_t>(lane.slot);
+            host_slots[column]     = static_cast<std::int32_t>(lane.slot);
+            host_logical[column]   = static_cast<std::int32_t>(lane.position) + 1;
+            max_position           = std::max(max_position, lane.position);
+        }
+        position_arena(ws_a, shard_a_.round_base, shard_a_.round_base);
+        position_arena(ws_b, shard_b_.round_base, shard_b_.round_base);
+        auto scope_a = ws_a.scope();
+        auto scope_b = ws_b.scope();
+        shard_a_.device.bind_to_current_thread();
+        // The configs and the logical positions are restaged per round because a lane that left the
+        // batch no longer occupies its original column.
+        DeviceSpan round_configs =
+            ws_a.alloc_bytes(sizeof(ops::SamplingConfig) * static_cast<std::size_t>(columns), 256);
+        std::vector<ops::SamplingConfig> round_host(static_cast<std::size_t>(columns));
+        for (std::size_t column = 0; column < active.size(); ++column) {
+            round_host[column] = configs[lanes[active[column]].slot];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(round_configs.data, round_host.data(),
+                                   sizeof(ops::SamplingConfig) * static_cast<std::size_t>(columns),
+                                   cudaMemcpyHostToDevice, shard_a_.device.stream));
+        Tensor logical_positions = ws_a.alloc(DType::I32, {columns});
+        CUDA_CHECK(cudaMemcpyAsync(logical_positions.data, host_logical,
+                                   sizeof(std::int32_t) * static_cast<std::size_t>(columns),
+                                   cudaMemcpyHostToDevice, shard_a_.device.stream));
+        Tensor logits = ws_a.alloc(DType::BF16, {vocab, columns});
+        // The envelope is a launch/workspace promise over the batch maximum, not a mask: every
+        // column's own position still bounds its visible keys inside the kernel.
+        const ops::CausalAttentionExecutionEnvelope envelope{1, max_position + 1};
+        run_plain_decode_step_batch(host_tokens, host_positions, host_kv_rows, host_slots, columns,
+                                    envelope, logits);
+        Tensor sampled = ws_a.alloc(DType::I32, {columns});
+        shard_a_.device.bind_to_current_thread();
+        ops::sample(logits, sampled, public_tokens,
+                    static_cast<const ops::SamplingConfig*>(round_configs.data), logical_positions,
+                    ops::kSamplePurposeDecode, ws_a, shard_a_.device.stream);
+        std::vector<std::int32_t> next(static_cast<std::size_t>(columns), 0);
+        CUDA_CHECK(cudaMemcpyAsync(next.data(), sampled.data,
+                                   sizeof(std::int32_t) * static_cast<std::size_t>(columns),
+                                   cudaMemcpyDeviceToHost, shard_a_.device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+        abort_if_ar_stalled();
+
+        for (std::size_t column = 0; column < active.size(); ++column) {
+            LaneState& lane  = lanes[active[column]];
+            Request& request = *lane.pending->request;
+            std::vector<TokenId> step{static_cast<TokenId>(next[column])};
+            const std::uint32_t remaining = request.budget.remaining();
+            if (step.size() > remaining) { step.resize(remaining); }
+            const OutputDecision decision =
+                request.output.preview_model(step, remaining, request.budget.limit_reason());
+            if (decision.accepted_tokens == 0 || decision.accepted_tokens > step.size()) {
+                throw std::logic_error("TP-2 output policy returned an invalid licensed prefix");
+            }
+            request.generated.insert(request.generated.end(), step.begin(),
+                                     step.begin() + decision.accepted_tokens);
+            request.budget.commit(decision.accepted_tokens);
+            committed_decode_tokens_ += decision.accepted_tokens;
+            ++decode_rounds_;
+            publish_preview(lane, false);
+            lane.current = static_cast<std::int32_t>(step.back());
+            ++lane.position;
+            if (decision.finished()) {
+                lane.result.finish_reason = decision.finish_reason;
+                lane.finished             = true;
+                finalize(lane);
+            }
+            timing.committed += decision.accepted_tokens;
+            ++timing.rounds;
+        }
+        std::vector<std::size_t> still;
+        still.reserve(active.size());
+        for (const std::size_t index : active) {
+            if (!lanes[index].finished) { still.push_back(index); }
+        }
+        active.swap(still);
+    }
+    timing.report("plain-batch");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lane-parallel masked-draft walk (P2.1c)
+// ---------------------------------------------------------------------------------------------
+//
+// The batched sibling of the DFlash2 branch in execute_lane: one round drives every live lane
+// through a single proposal, a single batched verify window and a single replay fold, then commits
+// each lane's licensed prefix on its own.
+//
+// The batch is dense: active lane column occupies frame row column. A lane's own KV row, GDN state
+// slot and draft-ring slot travel through the ingress slot vectors as values (lane.slot), never as
+// the row index, so rows compact cleanly when a lane retires. Every frame tensor is sliced to
+// columns along its outermost (batch) dimension, which stays contiguous.
+//
+// Grammar-constrained members never reach here: drive_lane_queue refuses them on the batched path,
+// and a masked verify window has no per-lane logit mask.
+//
+// A round costs every lane the slowest lane's proposal plus verify, so a retired lane frees a row
+// but not time. Continuous batching is out of scope for P2.1c.
+void TP2GenerationCore::execute_spec_batch(
+    const std::vector<std::shared_ptr<PendingRequest>>& batch) {
+    DeviceArena& ws_a = *shard_a_.workspace;
+    DeviceArena& ws_b = *shard_b_.workspace;
+    auto& ctx_a       = *shard_a_.context;
+    auto& ctx_b       = *shard_b_.context;
+    shard_a_.device.bind_to_current_thread();
+
+    const std::int32_t vocab = qwen::execution::dimension(shard_a_.model->config().text.vocab_size);
+    const std::int32_t hidden =
+        qwen::execution::dimension(shard_a_.model->config().text.hidden_size);
+    const std::int32_t public_tokens =
+        static_cast<std::int32_t>(shard_a_.model->resources().public_token_count);
+    const std::uint32_t prefill_chunk = prefill_chunk_width(shard_a_.model->config().text);
+    // Prefix-reuse trace, the same switch the single-lane walk and the plain batch read.
+    const bool reuse_trace = [] {
+        const char* env = std::getenv("NINFER_TP2_REUSE_TRACE");
+        return env != nullptr && env[0] == '1';
+    }();
+    // The tail anchors cover the last few chunk ends of a lane's prefill. Their count is bounded by
+    // the tail sub-ring, so a narrow chunk cannot flood the ring with anchors that all sit within one
+    // chunk of the prompt end.
+    const std::uint32_t tail_span =
+        std::min<std::uint32_t>(kReuseTailWindow,
+                                prefill_chunk * std::max(1U, host_checkpoint_tail_slots_));
+    // DFlash2 and MTP each propose their own draft count, so one verify window is a column wider.
+    // Both rounds are batched (P2.1b); only the live route's count is non-zero.
+    const std::int32_t width =
+        static_cast<std::int32_t>(mtp_enabled_ ? mtp_drafts_ : dflash_drafts_) + 1;
+    Tp2RoundTiming& timing = tp2_timing();
+    timing.init();
+    timing.reset();
+
+    struct LaneState {
+        PendingRequest* pending = nullptr;
+        std::uint32_t slot      = 0;
+        GenerationResult result;
+        std::int32_t current        = 0;
+        std::uint32_t position      = 0;
+        std::uint32_t prompt_tokens = 0;
+        bool have_first             = false;
+        bool finished               = false;
+        // Set once this lane's prefill published its lineage, so finalize knows there is one to
+        // publish at the frontier.
+        bool prefilled = false;
+        Clock::time_point begin;
+        Clock::time_point first_token;
+    };
+
+    const std::size_t lane_capacity = batch.size();
+    std::vector<LaneState> lanes(lane_capacity);
+    for (std::size_t index = 0; index < lane_capacity; ++index) {
+        lanes[index].pending     = batch[index].get();
+        lanes[index].slot        = static_cast<std::uint32_t>(index);
+        lanes[index].begin       = Clock::now();
+        lanes[index].first_token = lanes[index].begin;
+    }
+    auto lifetime_a = ws_a.scope();
+    auto lifetime_b = ws_b.scope();
+
+    std::vector<ops::SamplingConfig> configs(lane_capacity);
+    for (std::size_t index = 0; index < lane_capacity; ++index) {
+        configs[index] = make_sampling_config(batch[index]->request->sampling);
+    }
+    // Same reservation rule as the plain batch: the penalty counts cover the widest batch this
+    // route can form, so the round watermark -- and with it every captured verify graph -- is the
+    // same for every request. A request with no configured penalty never reads its slice, and only
+    // the live span is cleared.
+    {
+        Tensor counts = ws_a.alloc(
+            DType::I32, {static_cast<std::int32_t>(public_tokens * static_cast<std::int32_t>(lanes_))});
+        shard_a_.device.bind_to_current_thread();
+        CUDA_CHECK(cudaMemsetAsync(
+            counts.data, 0,
+            sizeof(std::int32_t) * static_cast<std::size_t>(public_tokens) * lane_capacity,
+            shard_a_.device.stream));
+        auto* base = static_cast<std::int32_t*>(counts.data);
+        for (std::size_t index = 0; index < lane_capacity; ++index) {
+            if (configs[index].presence_penalty == 0.0F &&
+                configs[index].frequency_penalty == 0.0F) {
+                continue;
+            }
+            configs[index].token_counts =
+                base + static_cast<std::size_t>(index) * static_cast<std::size_t>(public_tokens);
+        }
+    }
+    // The prefill-tail samples read their own lane's entry through this staging copy, so it carries
+    // the same whole-lane-count reservation as the counts array.
+    DeviceSpan configs_dev = ws_a.alloc_bytes(sizeof(ops::SamplingConfig) * lanes_, 256);
+    shard_a_.device.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(configs_dev.data, configs.data(),
+                               sizeof(ops::SamplingConfig) * lane_capacity, cudaMemcpyHostToDevice,
+                               shard_a_.device.stream));
+
+    // Pinned staging for one round: the verify window's per-lane ids/positions/valid columns, plus
+    // the per-lane KV row and state slot vectors the window binds. This is the core member, not a
+    // round local: a captured verify window reads the whole staging block through memcpy nodes, so
+    // its address is baked into every graph and each section is strided by the startup lane count.
+    const std::size_t window_span = static_cast<std::size_t>(width) * lane_capacity;
+    const std::size_t id_span     = static_cast<std::size_t>(width) * lanes_;
+    std::int32_t* spec_ids       = batch_window_base();
+    std::int32_t* spec_positions = spec_ids + id_span;
+    std::int32_t* spec_valid     = spec_positions + id_span;
+    std::int32_t* spec_kv_rows   = spec_valid + lanes_;
+    std::int32_t* spec_slots     = spec_kv_rows + lanes_;
+
+    // Licensed prefixes come back through a second pinned allocation, together with the fold and
+    // retirement vectors computed from them.
+    PinnedHostBuffer accept_host((window_span + 6 * lane_capacity) * sizeof(std::int32_t), true);
+    auto* accept_base             = static_cast<std::int32_t*>(accept_host.data());
+    std::int32_t* licensed        = accept_base;
+    std::int32_t* licensed_counts = licensed + window_span;
+    std::int32_t* fold_slots      = licensed_counts + lane_capacity;
+    std::int32_t* fold_columns    = fold_slots + lane_capacity;
+    std::int32_t* tail_slots      = fold_columns + lane_capacity;
+    std::int32_t* tail_starts     = tail_slots + lane_capacity;
+    std::int32_t* tail_ends       = tail_starts + lane_capacity;
+
+    // The frontier each lane's pending draft features were staged at is retention(slot)'s own
+    // dflash_context_frontier (P2.3 Stage 2), the same member the single-lane walk keeps and the host
+    // checkpoint ring reads, one lane at a time. The next round appends the columns this round
+    // committed from there.
+
+    // Per-lane preview publication, mirroring the single-lane lambda: a terminal call first names
+    // the reason the walk stopped, then the committed preview is appended to this lane's result and
+    // streamed to its own sink.
+    auto publish_preview = [](LaneState& lane, bool terminal) {
+        Request& request = *lane.pending->request;
+        if (terminal) {
+            (void)request.output.preview_terminal(request.budget.limit_reason());
+        }
+        auto published = request.output.commit_preview();
+        for (const auto& delta : published) {
+            if (delta.channel == OutputChannel::Reasoning) {
+                lane.result.reasoning += delta.text;
+            } else {
+                lane.result.content += delta.text;
+            }
+            if (lane.pending->sink != nullptr) { lane.pending->sink->publish(delta); }
+        }
+    };
+
+    // Fills a lane's result from everything its walk accumulated, in the same order the single-lane
+    // walk does at its exit. A lane that never produced a first token reports an empty decode.
+    // Publish a retired lane's lineage before its result takes the generated tokens away, exactly as
+    // the plain batch and execute_walk do: the pools hold prompt plus committed output, and the live
+    // GDN state sits at the frontier the lane's last committed round left.
+    auto finalize = [this](LaneState& lane) {
+        Request& request = *lane.pending->request;
+        if (lane.prefilled) {
+            auto& data = qwen::PreparedPromptAccess::mutable_view(request.prompt);
+            std::vector<TokenId> history(data.token_ids.begin(), data.token_ids.end());
+            history.insert(history.end(), request.generated.begin(), request.generated.end());
+            session_publish(history, static_cast<std::uint32_t>(lane.position), data.context_cache,
+                            collect_media_spans(data, data.token_ids.size()), lane.slot);
+        }
+        const Clock::time_point done = Clock::now();
+        lane.result.generated_token_ids = std::move(request.generated);
+        lane.result.tool_calls          = request.output.take_tool_calls();
+        lane.result.tool_call_parse     = request.output.tool_call_parse_diagnostics();
+        lane.result.reasoning_tokens    = request.output.reasoning_tokens();
+        lane.result.matched_stop_string = request.output.matched_stop_string();
+        lane.result.thinking            = request.output.thinking_stats();
+        const double total = std::chrono::duration<double>(done - lane.begin).count();
+        if (lane.have_first) {
+            const double decode = std::chrono::duration<double>(done - lane.first_token).count();
+            lane.result.timings.decode_seconds          = decode;
+            lane.result.timings.generation_wall_seconds = decode;
+            lane.result.timings.first_token_seconds =
+                lane.result.timings.prepare_seconds + lane.result.timings.prompt_wall_seconds;
+            lane.result.timings.total_seconds = total;
+        } else {
+            lane.result.timings.decode_seconds          = 0.0;
+            lane.result.timings.generation_wall_seconds = 0.0;
+            lane.result.timings.prompt_wall_seconds     = total;
+            lane.result.timings.first_token_seconds =
+                lane.result.timings.prepare_seconds + total;
+            lane.result.timings.total_seconds = total;
+        }
+        lane.pending->result = std::move(lane.result);
+    };
+
+    // Each lane's GDN slot is brought to its own starting state in the loop below: a lane that
+    // reuses a boundary is copied from its image, and a lane that does not is zeroed. The pool as a
+    // whole is never wiped, because a lane continuing a conversation holds the state its previous
+    // round left, and that state is exactly what its reuse boundary names (P2.3 Stage 2).
+
+    // Prefill stays serial per lane: each lane stages its own masked-draft features into its own
+    // draft-ring slot, so every lane's ring is primed before the first shared proposal.
+    std::vector<std::size_t> active;
+    active.reserve(lane_capacity);
+    for (std::size_t index = 0; index < lane_capacity; ++index) {
+        LaneState& lane  = lanes[index];
+        Request& request = *lane.pending->request;
+        // The batch column is also the KV execution row and the GDN state slot this lane owns, which
+        // is the lane index every session_* and retention helper takes (P2.3).
+        const std::uint32_t lane_id = lane.slot;
+        auto& data = qwen::PreparedPromptAccess::mutable_view(request.prompt);
+        lane.prompt_tokens = static_cast<std::uint32_t>(data.token_ids.size());
+        lane.position      = lane.prompt_tokens;
+        lane.result.prompt = request.summary;
+        lane.result.timings.prepare_seconds = request.prepare_seconds;
+        const std::uint32_t draft_window = mtp_enabled_ ? mtp_drafts_ : dflash_drafts_;
+        lane.result.speculative =
+            SpeculativeStats{.backend               = mtp_enabled_ ? SpeculativeBackend::Mtp
+                                                                   : SpeculativeBackend::DFlash2,
+                             .enabled               = true,
+                             .draft_window          = draft_window,
+                             .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0)};
+        active_lane_ = static_cast<std::int32_t>(lane.slot);
+        for (Shard* shard : {&shard_a_, &shard_b_}) {
+            shard->device.bind_to_current_thread();
+            shard->context->set_linear_state_slots(active_lane_, active_lane_);
+        }
+
+        // A client that re-rendered the answer this lane generated hands back a prompt whose last
+        // turn is the tokens the lineage really produced; adopting it keeps the conversation
+        // resident instead of retiring it over a re-tokenisation difference.
+        const TurnAdoption adoption =
+            adopt_generated_turn(data, lane.prompt_tokens, reuse_trace, lane_id);
+        if (adoption.adopted) {
+            lane.prompt_tokens               = adoption.prompt_tokens;
+            lane.position                    = lane.prompt_tokens;
+            request.summary.prompt_tokens    = lane.prompt_tokens;
+            lane.result.prompt.prompt_tokens = lane.prompt_tokens;
+        }
+        const std::vector<TokenId>& tokens = data.token_ids;
+        const std::span<const TokenId> token_ids(tokens.data(), tokens.size());
+        const std::vector<MediaSpan> prompt_media = collect_media_spans(data, data.token_ids.size());
+
+        // Cross-session recall and the boundary scan, both on this lane's own lineage, exactly as the
+        // plain batch runs them (P2.3 Stage 2). Every lane owns its own GDN slot, draft-ring slot and
+        // slice of the host ring, so two lanes never share a boundary.
+        session_recall(lane_id, token_ids, prompt_media);
+        const LaneReuse lane_reuse =
+            scan_lane_reuse(lane_id, token_ids, prompt_media, lane.prompt_tokens, adoption.divergence,
+                            adoption.adopted, reuse_trace);
+        const std::uint32_t reuse          = lane_reuse.tokens;
+        std::uint32_t next_host_checkpoint = lane_reuse.next_host_checkpoint;
+        restore_lane_gdn(lane_id, lane_reuse);
+        // The batched lane rebuilds its whole draft ring from its own prefill sink below, so there is
+        // nothing to zero here: the ring is only read once this lane's prefill has primed it.
+        restore_lane_dflash(lane_id, lane_reuse, false);
+        retention(lane_id).dflash_context_frontier = reuse;
+        lane.result.reused_prompt_tokens           = reuse;
+        lane.result.prefix_reuse_path              = reuse_path(reuse, 0, lane_id);
+        if (lane.pending->sink != nullptr) {
+            lane.pending->sink->start(
+                GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
+        }
+
+        // This lane's Vision session, on top of the startup plan. Prefill is serial per lane, so the
+        // single startup arena is reused sequentially and only one session is ever alive; the plan
+        // must outlive the session, which binds it by reference.
+        const bool media = data.has_media();
+        qwen::execution::VisionPrefillPlan vision_plan;
+        std::unique_ptr<qwen::execution::VisionPrefillSession> vision_session =
+            open_vision_session(data, reuse, vision_plan);
+        bool cancelled                  = lane.pending->cancellation.requested();
+        FinishReason first_token_finish = FinishReason::None;
+        for (std::uint32_t t0 = reuse; !cancelled && t0 < lane.prompt_tokens;) {
+            if (lane.pending->cancellation.requested()) {
+                cancelled = true;
+                break;
+            }
+            std::uint32_t length = std::min(prefill_chunk, lane.prompt_tokens - t0);
+            // A multimodal chunk is capped at the boundary of the item it overlaps, so the encoder
+            // hands out one item at a time and the scatter below stays one contiguous column range
+            // of it; the next chunk re-enters the same item. The MTP priming below sees the capped
+            // length, exactly as the serial walk's does.
+            qwen::execution::VisionChunk vision_chunk;
+            if (vision_session) {
+                vision_chunk = vision_session->prepare_chunk(t0, length);
+                length       = static_cast<std::uint32_t>(vision_chunk.length);
+            }
+            qwen::execution::Tp2VisionChunk media_chunk;
+            const qwen::execution::Tp2VisionChunk* media_ptr = nullptr;
+            if (media) {
+                media_chunk.control       = vision_chunk.control;
+                media_chunk.embeddings    = &vision_chunk.embeddings;
+                media_chunk.positions     = data.positions.data();
+                media_chunk.prompt_tokens = data.token_ids.size();
+                media_ptr                 = &media_chunk;
+            }
+            auto scope_a               = ws_a.scope();
+            auto scope_b               = ws_b.scope();
+            Tensor logits_a            = ws_a.alloc(DType::BF16, {vocab, 1});
+            Tensor logits_b            = ws_b.alloc(DType::BF16, {vocab, 1});
+            // MTP priming consumes the chunk's final-norm hidden, so the forward hands it back.
+            Tensor mtp_input_a;
+            if (mtp_enabled_) {
+                mtp_input_a = ws_a.alloc(DType::BF16, {hidden, static_cast<std::int32_t>(length)});
+            }
+            // The masked draft taps this shard's prefill residual; the ring slot is this lane's own.
+            auto dflash_sink = make_dflash_prefill_sink(shard_a_, active_lane_);
+            shard_a_.device.bind_to_current_thread();
+            ctx_a.forward_tp2_prefill(
+                ctx_b, pair_, std::span<const int>(token_ids.data() + t0, length),
+                static_cast<std::int32_t>(t0), &logits_a, &logits_b,
+                mtp_enabled_ ? &mtp_input_a : nullptr, nullptr, nullptr, qwen::TextPhase::Prefill,
+                media_ptr, dflash_sink ? &*dflash_sink : nullptr, active_lane_);
+            if (dflash_sink) { retention(lane_id).dflash_context_frontier = t0 + length; }
+            if (host_checkpoint_stride_ != 0) {
+                // One checkpoint per stride, tagged with the frontier this chunk actually reached, so
+                // a chunk width that does not divide the stride cannot mislabel a state; plus the
+                // dense tail window. The prompt end is skipped either way: the state there is the one
+                // the lane publishes as its frontier.
+                const std::uint32_t frontier = t0 + length;
+                if (frontier >= next_host_checkpoint) {
+                    snapshot_host_checkpoint(shard_a_, frontier, HostRing::Grid, lane_id);
+                    snapshot_host_checkpoint(shard_b_, frontier, HostRing::Grid, lane_id);
+                    next_host_checkpoint =
+                        (frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
+                } else if (frontier != lane.prompt_tokens &&
+                           static_cast<std::uint64_t>(frontier) + tail_span > lane.prompt_tokens) {
+                    snapshot_host_checkpoint(shard_a_, frontier, HostRing::Tail, lane_id);
+                    snapshot_host_checkpoint(shard_b_, frontier, HostRing::Tail, lane_id);
+                }
+            }
+            if (mtp_enabled_ && t0 + length != lane.prompt_tokens) {
+                // The prompt's last column is primed after its first token exists, below.
+                mtp_prefill_priming(shard_a_, token_ids.data() + t0, length, t0, mtp_input_a,
+                                    nullptr, false, active_lane_);
+            }
+            if (t0 + length == lane.prompt_tokens) {
+                Tensor logical_pos_lane = ws_a.alloc(DType::I32, {1});
+                shard_a_.device.bind_to_current_thread();
+                ops::set_i32_scalar(logical_pos_lane, static_cast<std::int32_t>(lane.prompt_tokens),
+                                    shard_a_.device.stream);
+                Tensor sampled_a = ws_a.alloc(DType::I32, {1});
+                ops::sample(logits_a, sampled_a, public_tokens,
+                            static_cast<const ops::SamplingConfig*>(configs_dev.data) + lane.slot,
+                            logical_pos_lane, ops::kSamplePurposePrefill, ws_a,
+                            shard_a_.device.stream);
+                std::int32_t first = 0;
+                CUDA_CHECK(cudaMemcpyAsync(&first, sampled_a.data, sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToHost, shard_a_.device.stream));
+                CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+                abort_if_ar_stalled();
+                const TokenId first_token       = static_cast<TokenId>(first);
+                const std::uint32_t first_budget = request.budget.remaining();
+                if (first_budget == 0) {
+                    throw std::logic_error("prefill sampled a token with no output budget left");
+                }
+                const OutputDecision first_decision = request.output.preview_model(
+                    std::span<const TokenId>(&first_token, 1), first_budget,
+                    request.budget.limit_reason());
+                if (first_decision.accepted_tokens != 1) {
+                    throw std::logic_error("output policy rejected the prefill's first token");
+                }
+                request.generated.push_back(first_token);
+                request.budget.commit(1);
+                lane.have_first = true;
+                lane.first_token = Clock::now();
+                lane.current     = static_cast<std::int32_t>(first_token);
+                lane.result.timings.prompt_wall_seconds =
+                    std::chrono::duration<double>(lane.first_token - lane.begin).count();
+                // The Vision encode is reported separately from the text walk, matching the serial
+                // walk and the single-device route; prompt wall time (the response's TTFT) is the
+                // whole span either way.
+                lane.result.timings.vision_seconds =
+                    vision_session ? vision_session->elapsed_seconds() : 0.0;
+                lane.result.timings.prefill_seconds =
+                    std::max(0.0, lane.result.timings.prompt_wall_seconds -
+                                      lane.result.timings.vision_seconds);
+                publish_preview(lane, false);
+                if (mtp_enabled_) {
+                    // The final MTP column embeds the token just sampled, so the MTP layer's own K/V
+                    // for the prompt is appended only after the first token exists.
+                    mtp_prefill_priming(shard_a_, token_ids.data() + t0, length, t0, mtp_input_a,
+                                        &sampled_a, true, active_lane_);
+                }
+                if (first_decision.finished()) {
+                    first_token_finish        = first_decision.finish_reason;
+                    lane.result.finish_reason = first_decision.finish_reason;
+                }
+            }
+            t0 += length;
+        }
+        if (vision_session) {
+            // Every item this lane's prefill overlapped is encoded and its embeddings are in the KV
+            // now, so release the host patch payloads and the handoff binding: the decode loop never
+            // revisits them. The arena itself is reused by the next lane's session.
+            vision_session->release_encoded_media_payloads();
+            vision_session->retire_handoff();
+        }
+        if (cancelled) {
+            invalidate_lane_prefill(lane_id);
+            (void)request.output.preview_terminal(FinishReason::Cancelled);
+            lane.result.finish_reason = FinishReason::Cancelled;
+            publish_preview(lane, false);
+            finalize(lane);
+            continue;
+        }
+        computed_prefill_tokens_ += lane.prompt_tokens - reuse;
+        publish_lane_prefill(lane_id, lane.prompt_tokens, tokens, prompt_media, data.context_cache);
+        lane.prefilled = true;
+        lane.finished   = first_token_finish != FinishReason::None;
+        if (lane.finished) {
+            finalize(lane);
+        } else {
+            active.push_back(index);
+        }
+    }
+
+    shard_a_.round_base = ws_a.used();
+    shard_b_.round_base = ws_b.used();
+
+    // Null on the MTP route: the artifact is loaded without a masked-draft component there, so
+    // every use below is guarded by `dflash2_enabled_` (see the pending-feature tail).
+    auto* round = shard_a_.dflash_round.get();
+    qwen::execution::ExecutionCore dflash_execution{
+        .device           = shard_a_.device,
+        .parameters       = *shard_a_.parameters,
+        .work             = *shard_a_.workspace,
+        .linear_attention = *shard_a_.state,
+        .replay_records   = nullptr,
+        .io               = shard_a_.io,
+        .prefill_hidden   = shard_a_.prefill_hidden,
+        .prefill_chunk    = options_.prefill_chunk,
+        .proposal_head    = options_.speculative.proposal_head,
+    };
+
+    std::vector<std::int32_t> lane_extent(lane_capacity, 0);
+    std::vector<std::int32_t> append_slots(lane_capacity, 0);
+    std::vector<std::int32_t> append_starts(lane_capacity, 0);
+    std::vector<std::int32_t> append_ends(lane_capacity, 0);
+    // MTP round staging (P2.1b): the packed per-frame-row vectors, the per-step cache positions and
+    // the per-lane hidden selectors.
+    std::vector<std::int32_t> mtp_pack(7 * lane_capacity, 0);
+    std::vector<std::int32_t> mtp_step_host(lane_capacity, 0);
+    std::vector<std::int32_t> mtp_selectors_h(lane_capacity, 0);
+
+    while (!active.empty()) {
+        // Retirement scan: a lane that ran out of budget or was cancelled leaves the batch before
+        // the round is shaped, so every frame row in this round belongs to a live lane.
+        {
+            std::vector<std::size_t> live;
+            live.reserve(active.size());
+            for (std::size_t index : active) {
+                LaneState& lane  = lanes[index];
+                Request& request = *lane.pending->request;
+                if (lane.pending->cancellation.requested()) {
+                    (void)request.output.preview_terminal(FinishReason::Cancelled);
+                    lane.result.finish_reason = FinishReason::Cancelled;
+                    publish_preview(lane, false);
+                    finalize(lane);
+                    continue;
+                }
+                if (request.budget.remaining() == 0) {
+                    (void)request.output.preview_terminal(request.budget.limit_reason());
+                    lane.result.finish_reason = request.budget.limit_reason();
+                    publish_preview(lane, false);
+                    finalize(lane);
+                    continue;
+                }
+                live.push_back(index);
+            }
+            active.swap(live);
+            if (active.empty()) { break; }
+        }
+
+        const std::int32_t columns = static_cast<std::int32_t>(active.size());
+        // The live speculative route owns the draft count and the context ceiling: every lane holds a
+        // fixed slice of the shared pool, so its own window bounds the positions a round may write.
+        const std::uint32_t draft_window = mtp_enabled_ ? mtp_drafts_ : dflash_drafts_;
+        const std::uint32_t lane_window  = lane_context_window();
+        std::uint32_t max_position = 0;
+        for (std::int32_t column = 0; column < columns; ++column) {
+            const LaneState& lane = lanes[active[column]];
+            const std::uint32_t budget_remaining = lane.pending->request->budget.remaining();
+            const std::uint32_t max_by_budget = budget_remaining > 1U ? budget_remaining - 1U : 0U;
+            const std::uint32_t capacity_left =
+                lane.position + 1U < lane_window ? lane_window - lane.position - 1U : 0U;
+            lane_extent[column] = static_cast<std::int32_t>(
+                std::min({draft_window, max_by_budget, capacity_left}));
+            max_position = std::max(max_position, lane.position);
+        }
+
+        position_arena(ws_a, shard_a_.round_base, shard_a_.round_base);
+        position_arena(ws_b, shard_b_.round_base, shard_b_.round_base);
+        auto scope_a = ws_a.scope();
+        auto scope_b = ws_b.scope();
+        shard_a_.device.bind_to_current_thread();
+
+        // The accept kernel reads one sampling config per frame row, so the lanes' configs are
+        // compacted into frame order the same way the plain batch does it.
+        DeviceSpan round_configs =
+            ws_a.alloc_bytes(sizeof(ops::SamplingConfig) * static_cast<std::size_t>(columns), 256);
+        std::vector<ops::SamplingConfig> round_host(static_cast<std::size_t>(columns));
+        for (std::int32_t column = 0; column < columns; ++column) {
+            round_host[static_cast<std::size_t>(column)] = configs[lanes[active[column]].slot];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(round_configs.data, round_host.data(),
+                                   sizeof(ops::SamplingConfig) * static_cast<std::size_t>(columns),
+                                   cudaMemcpyHostToDevice, shard_a_.device.stream));
+
+        timing.record(0, shard_a_.device.stream);
+
+        // ---- Proposal and verify ------------------------------------------------------------
+        // DFlash2 proposes through its ring and selector; MTP runs its own autoregressive draft
+        // chain against each lane's own MTP KV row (P2.1b). Both routes end with the same per-lane
+        // verify inputs, so the batched verify window is shared, and both leave their licensed
+        // prefixes in the pinned buffers the per-lane commit below reads.
+        Tensor window_hidden3d;
+        Tensor mtp_selectors;
+        if (mtp_enabled_) {
+            std::int32_t max_extent = 0;
+            for (std::int32_t column = 0; column < columns; ++column) {
+                max_extent = std::max(max_extent, lane_extent[column]);
+            }
+            const std::size_t mtp_stride = static_cast<std::size_t>(columns);
+            const std::size_t hidden_bytes =
+                static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+
+            // One packed host image stages every per-frame-row vector the chain and the accept op
+            // bind: anchors, base positions, extents, lengths, MTP KV rows, valid widths and the
+            // next-round hidden selectors.
+            // This engine's tensors are densest along dim 0, so a rank-1 slice of one flat image
+            // stays contiguous while a row sliced out of a {7, columns} tensor and reshaped does not.
+            Tensor mtp_vec = ws_a.alloc(DType::I32, {7 * columns});
+            auto vec_row   = [&mtp_vec, columns](std::int32_t index) {
+                return mtp_vec.slice(0, index * columns, columns);
+            };
+            Tensor mtp_anchors = vec_row(0);
+            Tensor mtp_bases   = vec_row(1);
+            Tensor mtp_extents = vec_row(2);
+            Tensor mtp_lengths = vec_row(3);
+            Tensor mtp_rows    = vec_row(4);
+            Tensor mtp_valid   = vec_row(5);
+            mtp_selectors      = vec_row(6);
+            for (std::int32_t column = 0; column < columns; ++column) {
+                const LaneState& lane       = lanes[active[column]];
+                const std::size_t slot      = static_cast<std::size_t>(column);
+                mtp_pack[0 * mtp_stride + slot] = lane.current;
+                mtp_pack[1 * mtp_stride + slot] = static_cast<std::int32_t>(lane.position);
+                mtp_pack[2 * mtp_stride + slot] = lane_extent[column];
+                mtp_pack[3 * mtp_stride + slot] = static_cast<std::int32_t>(lane.position);
+                mtp_pack[4 * mtp_stride + slot] = static_cast<std::int32_t>(lane.slot);
+                mtp_pack[5 * mtp_stride + slot] = 1;
+                mtp_pack[6 * mtp_stride + slot] = 0;
+            }
+            shard_a_.device.bind_to_current_thread();
+            CUDA_CHECK(cudaMemcpyAsync(mtp_vec.data, mtp_pack.data(),
+                                       7 * mtp_stride * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, shard_a_.device.stream));
+
+            // The chain runs one MTP column per step for every lane: step s feeds the anchor (s == 0)
+            // or the previous step's draft with the lane's own hidden, at cache position
+            // `lane.position - 1 + s`, and proposes the next draft. The chain of a lane with a smaller
+            // extent is computed but unused, exactly as the single-lane route proposes its whole
+            // window before the accept decides.
+            // A tensor's strides are densest along dim 0, so the {K, columns} view of a flat image
+            // reads lane b's drafts at `flat[b * K + i]` - request-major, the layout the verify
+            // and accept kernels index (`drafts[row * k + i]`). Every write below therefore lands
+            // one lane's drafts at stride K, not one step's drafts contiguously.
+            Tensor mtp_drafts_flat =
+                ws_a.alloc(DType::I32, {static_cast<std::int32_t>(mtp_drafts_) * columns});
+            Tensor mtp_drafts =
+                mtp_drafts_flat.view({static_cast<std::int32_t>(mtp_drafts_), columns});
+            const std::size_t draft_row_bytes =
+                static_cast<std::size_t>(mtp_drafts_) * sizeof(std::int32_t);
+            Tensor chain_logits = ws_a.alloc(DType::BF16, {vocab, columns});
+            Tensor chain_anchor = ws_a.alloc(DType::BF16, {hidden, 1, columns});
+            for (std::int32_t column = 0; column < columns; ++column) {
+                const LaneState& lane = lanes[active[column]];
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<std::uint8_t*>(chain_anchor.data) +
+                        static_cast<std::size_t>(column) * hidden_bytes,
+                    static_cast<const std::uint8_t*>(shard_a_.mtp_anchor_hidden.data) +
+                        static_cast<std::size_t>(lane.slot) * hidden_bytes,
+                    hidden_bytes, cudaMemcpyDeviceToDevice, shard_a_.device.stream));
+            }
+            Tensor chain_a = ws_a.alloc(DType::BF16, {hidden, 1, columns});
+            Tensor chain_b = ws_a.alloc(DType::BF16, {hidden, 1, columns});
+            // The proposal writes a rank-1 request-major row, while the chain entry wants
+            // {1, columns} column-fastest and the next step's ids are a strided read of the drafts
+            // image. Both sides are staged through their own contiguous buffer.
+            Tensor step_ids    = ws_a.alloc(DType::I32, {1, columns});
+            Tensor step_drafts = ws_a.alloc(DType::I32, {columns});
+            // The chain's cache positions are refilled every step. The buffer is allocated once,
+            // outside the loop: the number of chain steps is this round's maximum lane extent, and
+            // an allocation inside the loop would move the verify window's workspace watermark
+            // with the draft acceptance, breaking the captured verify graph's replay layout.
+            Tensor positions = ws_a.alloc(DType::I32, {1, columns});
+            for (std::int32_t step = 0; step < max_extent; ++step) {
+                Tensor& out = (step % 2 == 0) ? chain_a : chain_b;
+                const Tensor& in =
+                    step == 0 ? chain_anchor : (step % 2 == 0 ? chain_b : chain_a);
+                Tensor ids;
+                if (step == 0) {
+                    ids = mtp_anchors.view({1, columns});
+                } else {
+                    ids = step_ids;
+                    // One previous-step draft per lane, gathered out of the request-major image:
+                    // four bytes every K int32.
+                    CUDA_CHECK(cudaMemcpy2DAsync(
+                        step_ids.data, sizeof(std::int32_t),
+                        static_cast<const std::uint8_t*>(mtp_drafts_flat.data) +
+                            static_cast<std::size_t>(step - 1) * sizeof(std::int32_t),
+                        draft_row_bytes, sizeof(std::int32_t),
+                        static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice,
+                        shard_a_.device.stream));
+                }
+                for (std::int32_t column = 0; column < columns; ++column) {
+                    mtp_step_host[static_cast<std::size_t>(column)] =
+                        mtp_pack[1 * mtp_stride + static_cast<std::size_t>(column)] - 1 + step;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(positions.data, mtp_step_host.data(),
+                                           mtp_stride * sizeof(std::int32_t),
+                                           cudaMemcpyHostToDevice, shard_a_.device.stream));
+                // The envelope steers split policy only; the kernels take their visible set from
+                // the per-lane positions, and the widest lane bounds every lane's window.
+                const std::uint32_t visible = max_position + static_cast<std::uint32_t>(step);
+                ctx_a.mtp_forward_decode_batch(
+                    ids, in, positions, positions, mtp_valid, mtp_rows,
+                    ops::CausalAttentionExecutionEnvelope{visible, visible}, out);
+                shard_a_.device.bind_to_current_thread();
+                ctx_a.mtp_propose_batch(out.view({hidden, columns}), chain_logits, step_drafts);
+                // Scatter that step back into every lane's own draft row: four bytes every K int32.
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    static_cast<std::uint8_t*>(mtp_drafts_flat.data) +
+                        static_cast<std::size_t>(step) * sizeof(std::int32_t),
+                    draft_row_bytes, step_drafts.data, sizeof(std::int32_t),
+                    sizeof(std::int32_t), static_cast<std::size_t>(columns),
+                    cudaMemcpyDeviceToDevice, shard_a_.device.stream));
+            }
+
+            // The verify window is one column wider than the longest lane's extent, so a lane with
+            // fewer valid drafts is still verified over its anchor column.
+            Tensor mtp_verify_ids       = ws_a.alloc(DType::I32, {width, columns});
+            Tensor mtp_verify_positions = ws_a.alloc(DType::I32, {width, columns});
+            ops::speculative_prepare_verify_inputs(mtp_anchors, mtp_drafts, mtp_bases, mtp_extents,
+                                                   mtp_verify_ids, mtp_verify_positions,
+                                                   shard_a_.device.stream);
+            Tensor window_logits2d = ws_a.alloc(DType::BF16, {vocab, width * columns});
+            Tensor window_logits3d = window_logits2d.view({vocab, width, columns});
+            Tensor window_hidden2d = ws_a.alloc(DType::BF16, {hidden, width * columns});
+            window_hidden3d        = window_hidden2d.view({hidden, width, columns});
+            const std::size_t window_live = static_cast<std::size_t>(width) * columns;
+            CUDA_CHECK(cudaMemcpyAsync(spec_ids, mtp_verify_ids.data,
+                                       window_live * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                       shard_a_.device.stream));
+            CUDA_CHECK(cudaMemcpyAsync(spec_positions, mtp_verify_positions.data,
+                                       window_live * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                       shard_a_.device.stream));
+            for (std::int32_t column = 0; column < columns; ++column) {
+                const LaneState& lane = lanes[active[column]];
+                spec_valid[column]    = lane_extent[column] + 1;
+                spec_kv_rows[column]  = static_cast<std::int32_t>(lane.slot);
+                spec_slots[column]    = static_cast<std::int32_t>(lane.slot);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+            timing.record(1, shard_a_.device.stream);
+
+            for (Shard* shard : {&shard_a_, &shard_b_}) {
+                shard->device.bind_to_current_thread();
+                CUDA_CHECK(cudaMemcpyAsync(shard->state_snapshots[kRoundScratchSlot].data,
+                                           shard->state_backing.data, shard->state_backing.bytes,
+                                           cudaMemcpyDeviceToDevice, shard->device.stream));
+            }
+            // The same ulp-drain the DFlash2 window needs: the two shards' bf16 kernels must agree
+            // before the window reads either one.
+            CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+            shard_b_.device.bind_to_current_thread();
+            CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            shard_a_.device.bind_to_current_thread();
+            CUDA_CHECK(cudaDeviceSynchronize());
+            run_verify_window_batch(spec_ids, spec_positions, spec_kv_rows, spec_slots, width,
+                                    columns, static_cast<std::int32_t>(max_position),
+                                    window_logits2d, window_hidden2d, nullptr, spec_valid);
+            timing.record(2, shard_a_.device.stream);
+
+            Tensor mtp_target          = ws_a.alloc(DType::I32, {width, columns});
+            Tensor mtp_target_flat     = mtp_target.view({width * columns});
+            Tensor mtp_licensed        = ws_a.alloc(DType::I32, {width, columns});
+            Tensor mtp_licensed_counts = ws_a.alloc(DType::I32, {columns});
+            Tensor mtp_accepted        = ws_a.alloc(DType::I32, {columns});
+            ops::argmax(window_logits2d, mtp_target_flat, public_tokens, shard_a_.device.stream);
+            ops::speculative_accept_greedy_drafts(
+                mtp_target, window_logits3d, mtp_drafts, mtp_extents, mtp_lengths, mtp_anchors,
+                mtp_licensed, mtp_licensed_counts, mtp_accepted, public_tokens,
+                reinterpret_cast<const ops::SamplingConfig*>(round_configs.data), ws_a,
+                shard_a_.device.stream);
+            timing.record(3, shard_a_.device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(licensed, mtp_licensed.data,
+                                       window_live * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                       shard_a_.device.stream));
+            CUDA_CHECK(cudaMemcpyAsync(licensed_counts, mtp_licensed_counts.data,
+                                       static_cast<std::size_t>(columns) * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, shard_a_.device.stream));
+            CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+            timing.record(4, shard_a_.device.stream);
+        } else {
+        // ---- Proposal -----------------------------------------------------------------------
+        // Each lane stages the features the previous round's verify wrote into its own ring slot,
+        // then one batched proposal fills every frame row of the ingress.
+        for (std::int32_t column = 0; column < columns; ++column) {
+            const LaneState& lane = lanes[active[column]];
+            append_slots[column]  = static_cast<std::int32_t>(lane.slot);
+            append_starts[column] =
+                static_cast<std::int32_t>(retention(lane.slot).dflash_context_frontier);
+            append_ends[column]   = static_cast<std::int32_t>(lane.position);
+        }
+        round->append_pending_batch(dflash_execution, append_slots.data(), append_starts.data(),
+                                   append_ends.data(), columns);
+        for (std::int32_t column = 0; column < columns; ++column) {
+            retention(lanes[active[column]].slot).dflash_context_frontier =
+                lanes[active[column]].position;
+        }
+
+        qwen::DFlashDecodeIngress& ingress = round->ingress();
+        ingress                            = {};
+        for (std::int32_t column = 0; column < columns; ++column) {
+            const LaneState& lane = lanes[active[column]];
+            ingress.anchors[column]                 = static_cast<TokenId>(lane.current);
+            ingress.execution_frontiers[column]     = static_cast<std::int32_t>(lane.position);
+            ingress.context_frontiers[column]       = static_cast<std::int32_t>(lane.position);
+            ingress.proposal_extents[column]        = lane_extent[column];
+            ingress.proposal_valid_columns[column]  = width;
+            ingress.target_valid_columns[column]    = lane_extent[column] + 1;
+            for (std::int32_t k = 0; k < width; ++k) {
+                ingress.target_rope_positions[static_cast<std::size_t>(column) * width + k] =
+                    static_cast<std::int32_t>(lane.position) + std::min(k, lane_extent[column]);
+            }
+            ingress.text_kv_table_rows[column]      = static_cast<std::int32_t>(lane.slot);
+            ingress.dflash_kv_table_rows[column]    = static_cast<std::int32_t>(lane.slot);
+            ingress.active_lanes[column]            = static_cast<std::int32_t>(lane.slot);
+            ingress.state_source_slots[column]      = static_cast<std::int32_t>(lane.slot);
+            ingress.state_destination_slots[column] = static_cast<std::int32_t>(lane.slot);
+            ingress.sampling[column]                = configs[lane.slot];
+        }
+        // The envelopes are a launch/workspace promise over the batch maximum, not a mask.
+        const qwen::execution::DFlashEnvelopes envelopes{
+            .local  = {0U, max_position},
+            .full   = {0U, max_position},
+            .append = {0U, static_cast<std::uint32_t>(width)}};
+        shard_a_.device.bind_to_current_thread();
+        round->propose(dflash_execution, shard_a_.decoder->text_kv, shard_a_.context.get(),
+                      dflash_drafts_, envelopes, columns);
+        timing.record(1, shard_a_.device.stream);
+
+        // ---- Batched verify window ----------------------------------------------------------
+        qwen::DFlashDecodeState& frame = round->frame();
+        // The accept op wants the [V, width, columns] view; the window wants it flattened.
+        Tensor window_logits3d = frame.target_logits.slice(2, 0, columns);
+        Tensor window_logits   = window_logits3d.view({vocab, width * columns});
+        Tensor window_hidden =
+            frame.target_hidden.slice(2, 0, columns).view({hidden, width * columns});
+
+        Tensor frame_verify_ids       = frame.verify_ids.slice(1, 0, columns);
+        Tensor frame_verify_positions = frame.verify_positions.slice(1, 0, columns);
+        Tensor frame_drafts           = frame.draft_tokens.slice(1, 0, columns);
+        Tensor frame_candidate_ids    = frame.candidate_ids.slice(2, 0, columns);
+        Tensor frame_proposal_q       = frame.proposal_q.slice(2, 0, columns);
+        Tensor frame_extents          = frame.proposal_extents.slice(0, 0, columns);
+        Tensor frame_frontiers        = frame.execution_frontiers.slice(0, 0, columns);
+        Tensor frame_anchors          = frame.anchors.slice(0, 0, columns);
+        Tensor frame_target_argmax    = frame.target_argmax.slice(1, 0, columns);
+        // `argmax` writes one flat entry per window column; accept reads the same memory as
+        // [width, columns], so the two views must share the column-fastest flattening.
+        Tensor target_argmax_flat     = frame_target_argmax.view({width * columns});
+        Tensor frame_licensed         = frame.licensed_tokens.slice(1, 0, columns);
+        Tensor frame_licensed_counts  = frame.licensed_counts.slice(0, 0, columns);
+        Tensor frame_accepted         = frame.accepted_drafts.slice(0, 0, columns);
+
+        shard_a_.device.bind_to_current_thread();
+        ops::speculative_prepare_verify_inputs(frame_anchors, frame_drafts, frame_frontiers,
+                                               frame_extents, frame_verify_ids,
+                                               frame_verify_positions, shard_a_.device.stream);
+        // The pinned window is sized for the full lane capacity, but a round that retired a lane only
+        // fills `width * columns` of it, so both the source tensor and the copy use the live span.
+        const std::size_t window_live = static_cast<std::size_t>(width) * columns;
+        CUDA_CHECK(cudaMemcpyAsync(spec_ids, frame_verify_ids.data,
+                                   window_live * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                   shard_a_.device.stream));
+        CUDA_CHECK(cudaMemcpyAsync(spec_positions, frame_verify_positions.data,
+                                   window_live * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                   shard_a_.device.stream));
+        for (std::int32_t column = 0; column < columns; ++column) {
+            const LaneState& lane = lanes[active[column]];
+            spec_valid[column]    = lane_extent[column] + 1;
+            spec_kv_rows[column]  = static_cast<std::int32_t>(lane.slot);
+            spec_slots[column]    = static_cast<std::int32_t>(lane.slot);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+
+        // The target state image is captured before the verify mutates it, so the fold can replay
+        // each lane's committed columns from the same frontier the single-lane route uses.
+        for (Shard* shard : {&shard_a_, &shard_b_}) {
+            shard->device.bind_to_current_thread();
+            CUDA_CHECK(cudaMemcpyAsync(shard->state_snapshots[kRoundScratchSlot].data,
+                                       shard->state_backing.data, shard->state_backing.bytes,
+                                       cudaMemcpyDeviceToDevice, shard->device.stream));
+        }
+
+        qwen::execution::DFlashFeatureSink verify_sink = round->make_verify_sink(columns);
+        // The masked draft's bf16 rounds differ by an ulp between the two shards' kernels, so both
+        // devices are drained before the window reads either one (DFlash2 requires this).
+        CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+        shard_b_.device.bind_to_current_thread();
+        CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        shard_a_.device.bind_to_current_thread();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        run_verify_window_batch(spec_ids, spec_positions, spec_kv_rows, spec_slots, width, columns,
+                                static_cast<std::int32_t>(max_position), window_logits,
+                                window_hidden, &verify_sink, spec_valid);
+        timing.record(2, shard_a_.device.stream);
+
+        ops::argmax(window_logits, target_argmax_flat, public_tokens, shard_a_.device.stream);
+        ops::speculative_accept_sparse_drafts(
+            frame_target_argmax, window_logits3d, frame_drafts, frame_candidate_ids,
+            frame_proposal_q, frame_extents, frame_frontiers, frame_anchors, frame_licensed,
+            frame_licensed_counts, frame_accepted, public_tokens,
+            reinterpret_cast<const ops::SamplingConfig*>(round_configs.data),
+            ops::SpeculativeAcceptExecutionEnvelope{false}, ws_a, shard_a_.device.stream);
+        timing.record(3, shard_a_.device.stream);
+        CUDA_CHECK(cudaMemcpyAsync(licensed, frame_licensed.data,
+                                   window_live * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                   shard_a_.device.stream));
+        CUDA_CHECK(cudaMemcpyAsync(licensed_counts, frame_licensed_counts.data,
+                                   static_cast<std::size_t>(columns) * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, shard_a_.device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+        timing.record(4, shard_a_.device.stream);
+        }
+
+        const Clock::time_point sync_start = Clock::now();
+        shard_b_.device.bind_to_current_thread();
+        CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
+        shard_a_.device.bind_to_current_thread();
+        timing.close_round(
+            std::chrono::duration<double, std::milli>(Clock::now() - sync_start).count());
+        abort_if_ar_stalled();
+
+        // ---- Per-lane licensing -------------------------------------------------------------
+        std::int32_t tail_count = 0;
+        for (std::int32_t column = 0; column < columns; ++column) {
+            LaneState& lane  = lanes[active[column]];
+            Request& request = *lane.pending->request;
+            const std::int32_t count = licensed_counts[column];
+            if (count < 1 || count > width) {
+                throw std::logic_error(
+                    mtp_enabled_ ? "TP-2 MTP round produced an invalid licensed prefix"
+                                 : "TP-2 DFlash2 round produced an invalid licensed prefix");
+            }
+            std::vector<TokenId> step(
+                licensed + static_cast<std::ptrdiff_t>(column) * width,
+                licensed + static_cast<std::ptrdiff_t>(column) * width + count);
+            if (lane_extent[column] == 0) {
+                lane.result.speculative.fallback_steps += 1;
+            } else {
+                lane.result.speculative.rounds += 1;
+                lane.result.speculative.drafted_tokens +=
+                    static_cast<std::uint64_t>(lane_extent[column]);
+                lane.result.speculative.accepted_tokens += static_cast<std::uint64_t>(count - 1);
+                for (std::int32_t position = 0; position < count - 1; ++position) {
+                    lane.result.speculative
+                        .accepted_per_position[static_cast<std::size_t>(position)] += 1;
+                }
+            }
+            const std::uint32_t remaining = request.budget.remaining();
+            if (step.size() > remaining) { step.resize(remaining); }
+            const OutputDecision decision =
+                request.output.preview_model(step, remaining, request.budget.limit_reason());
+            if (decision.accepted_tokens == 0 || decision.accepted_tokens > step.size()) {
+                throw std::logic_error("TP-2 output policy returned an invalid licensed prefix");
+            }
+            request.generated.insert(request.generated.end(), step.begin(),
+                                     step.begin() + decision.accepted_tokens);
+            request.budget.commit(decision.accepted_tokens);
+            committed_decode_tokens_ += decision.accepted_tokens;
+            ++decode_rounds_;
+            publish_preview(lane, false);
+
+            const std::uint32_t committed = decision.accepted_tokens;
+            const std::uint32_t base      = lane.position;
+            lane.position                 = base + committed;
+            lane.current                  = static_cast<std::int32_t>(step[committed - 1]);
+            fold_slots[column]            = static_cast<std::int32_t>(lane.slot);
+            fold_columns[column]          = static_cast<std::int32_t>(committed);
+            if (mtp_enabled_) {
+                mtp_selectors_h[column] = static_cast<std::int32_t>(committed) - 1;
+            }
+            timing.committed += committed;
+            ++timing.rounds;
+            if (decision.finished()) {
+                lane.result.finish_reason = decision.finish_reason;
+                lane.finished             = true;
+                retention(lane.slot).dflash_context_frontier = lane.position;
+                if (lane.position > base) {
+                    tail_slots[tail_count]  = static_cast<std::int32_t>(lane.slot);
+                    tail_starts[tail_count] = static_cast<std::int32_t>(base);
+                    tail_ends[tail_count]   = static_cast<std::int32_t>(lane.position);
+                    ++tail_count;
+                }
+                finalize(lane);
+            } else {
+                // The next round appends exactly the columns this round committed.
+                retention(lane.slot).dflash_context_frontier = base;
+            }
+        }
+
+        // MTP carries its next anchor in its own hidden column: the verify window's hidden one column
+        // before the new position is exactly what the next chain's first bridge consumes (P2.1b).
+        if (mtp_enabled_) {
+            shard_a_.device.bind_to_current_thread();
+            const std::size_t hidden_bytes =
+                static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+            CUDA_CHECK(cudaMemcpyAsync(mtp_selectors.data, mtp_selectors_h.data(),
+                                       static_cast<std::size_t>(columns) * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, shard_a_.device.stream));
+            Tensor selected = ws_a.alloc(DType::BF16, {hidden, columns});
+            ops::speculative_select_accepted_hidden(window_hidden3d, mtp_selectors, selected,
+                                                    shard_a_.device.stream);
+            for (std::int32_t column = 0; column < columns; ++column) {
+                const std::uint32_t slot = lanes[active[column]].slot;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<std::uint8_t*>(shard_a_.mtp_anchor_hidden.data) +
+                        static_cast<std::size_t>(slot) * hidden_bytes,
+                    static_cast<const std::uint8_t*>(selected.data) +
+                        static_cast<std::size_t>(column) * hidden_bytes,
+                    hidden_bytes, cudaMemcpyDeviceToDevice, shard_a_.device.stream));
+            }
+        }
+
+        // Both shards return to the pre-round image and one fold replays each lane's committed
+        // columns out of its own record row into its own state slot.
+        timing.record(5, shard_a_.device.stream);
+        for (Shard* shard : {&shard_a_, &shard_b_}) {
+            shard->device.bind_to_current_thread();
+            CUDA_CHECK(cudaMemcpyAsync(shard->state_backing.data,
+                                       shard->state_snapshots[kRoundScratchSlot].data,
+                                       shard->state_backing.bytes, cudaMemcpyDeviceToDevice,
+                                       shard->device.stream));
+        }
+        fold_verify_window(fold_slots, fold_columns, columns);
+        // The pending-feature tail belongs to the masked-draft ring, which the MTP route does not
+        // have at all (its draft round is null there).
+        if (tail_count > 0 && dflash2_enabled_) {
+            round->append_pending_batch(dflash_execution, tail_slots, tail_starts, tail_ends,
+                                        tail_count);
+        }
+        timing.record(6, shard_a_.device.stream);
+        timing.fold_ms += timing.elapsed(5, 6);
+
+        std::vector<std::size_t> still;
+        still.reserve(active.size());
+        for (std::size_t index : active) {
+            if (!lanes[index].finished) { still.push_back(index); }
+        }
+        active.swap(still);
+    }
+    timing.report("spec-batch");
+}
+
 
 // ---------------------------------------------------------------------------------------------
 // Cross-session KV retention
@@ -1506,38 +3966,129 @@ void TP2GenerationCore::abort_if_ar_stalled() {
     shard_a_.device.bind_to_current_thread();
     pair_.clear_ar_stall();
     invalidate_host_checkpoints();
-    session_invalidate_active();
-    cached_state_valid_ = false;
+    session_invalidate_all();
     throw RequestError(
         RequestErrorKind::Unavailable,
         "TP-2 allreduce stalled at rendezvous id " + std::to_string(stalled_id) +
             ": the request was failed and the reusable context was discarded");
 }
 
+TP2GenerationCore::LaneStateGeometry TP2GenerationCore::make_lane_state_geometry(const Shard& shard) {
+    LaneStateGeometry geometry;
+    if (shard.state == nullptr) { return geometry; }
+    const LinearAttentionStateSlotView view = shard.state->slot_view(0);
+    const std::byte* const base = static_cast<const std::byte*>(shard.state_backing.data);
+    geometry.conv_bytes      = view.conv_layer_bytes;
+    geometry.recurrent_bytes = view.recurrent_layer_bytes;
+    geometry.conv_base       = static_cast<const std::byte*>(view.conv_layer0.data) - base;
+    geometry.recurrent_base  = static_cast<const std::byte*>(view.recurrent_layer0.data) - base;
+    geometry.conv_pitch      = view.conv_layer_pitch_bytes;
+    geometry.recurrent_pitch = view.recurrent_layer_pitch_bytes;
+    geometry.layers          = view.layers;
+    geometry.image_bytes     = static_cast<std::size_t>(geometry.layers) *
+                               (geometry.conv_bytes + geometry.recurrent_bytes);
+    return geometry;
+}
+
+// A lane's GDN image is one contiguous block per layer inside the pool, and those blocks are
+// separated by the pool's layer pitch, but the compact pinned image is those blocks back to back,
+// so each half moves with a strided 2-D copy rather than one flat memcpy. The device-to-device
+// branch writes into its first device pointer and reads from its second.
+void TP2GenerationCore::copy_lane_state(const LaneStateGeometry& geometry, const void* device_base,
+                                        std::int32_t lane, void* other, cudaMemcpyKind kind,
+                                        cudaStream_t stream) {
+    if (geometry.image_bytes == 0) { return; }
+    const std::size_t offset = static_cast<std::size_t>(lane);
+    std::byte* const base = static_cast<std::byte*>(const_cast<void*>(device_base));
+    std::byte* const device_conv      = base + geometry.conv_base + offset * geometry.conv_bytes;
+    std::byte* const device_recurrent = base + geometry.recurrent_base + offset * geometry.recurrent_bytes;
+    if (kind == cudaMemcpyDeviceToDevice) {
+        // Both sides are whole pools with the same layout, so the lane's slice is strided here too.
+        // This writes into `device_base` and reads from `other`: a restore passes the pool first,
+        // a snapshot passes the plane first.
+        const std::byte* const source = static_cast<const std::byte*>(other);
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            device_conv, geometry.conv_pitch,
+            source + geometry.conv_base + offset * geometry.conv_bytes, geometry.conv_pitch,
+            geometry.conv_bytes, geometry.layers, kind, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            device_recurrent, geometry.recurrent_pitch,
+            source + geometry.recurrent_base + offset * geometry.recurrent_bytes,
+            geometry.recurrent_pitch, geometry.recurrent_bytes, geometry.layers, kind, stream));
+        return;
+    }
+    std::byte* const host = static_cast<std::byte*>(other);
+    std::byte* const host_recurrent =
+        host + static_cast<std::size_t>(geometry.layers) * geometry.conv_bytes;
+    if (kind == cudaMemcpyDeviceToHost) {
+        CUDA_CHECK(cudaMemcpy2DAsync(host, geometry.conv_bytes, device_conv, geometry.conv_pitch,
+                                     geometry.conv_bytes, geometry.layers, kind, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(host_recurrent, geometry.recurrent_bytes, device_recurrent,
+                                     geometry.recurrent_pitch, geometry.recurrent_bytes,
+                                     geometry.layers, kind, stream));
+        return;
+    }
+    CUDA_CHECK(cudaMemcpy2DAsync(device_conv, geometry.conv_pitch, host, geometry.conv_bytes,
+                                 geometry.conv_bytes, geometry.layers, kind, stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(device_recurrent, geometry.recurrent_pitch, host_recurrent,
+                                 geometry.recurrent_bytes, geometry.recurrent_bytes,
+                                 geometry.layers, kind, stream));
+}
+
+void TP2GenerationCore::zero_lane_state(const LaneStateGeometry& geometry, void* device_base,
+                                        std::int32_t lane, cudaStream_t stream) {
+    if (geometry.image_bytes == 0) { return; }
+    std::byte* const base = static_cast<std::byte*>(device_base);
+    std::byte* const device_conv =
+        base + geometry.conv_base + static_cast<std::size_t>(lane) * geometry.conv_bytes;
+    std::byte* const device_recurrent =
+        base + geometry.recurrent_base + static_cast<std::size_t>(lane) * geometry.recurrent_bytes;
+    CUDA_CHECK(cudaMemset2DAsync(device_conv, geometry.conv_pitch, 0, geometry.conv_bytes,
+                                 geometry.layers, stream));
+    CUDA_CHECK(cudaMemset2DAsync(device_recurrent, geometry.recurrent_pitch, 0,
+                                 geometry.recurrent_bytes, geometry.layers, stream));
+}
+
 void TP2GenerationCore::invalidate_host_checkpoints() {
+    for (std::uint32_t lane = 0; lane < lanes_; ++lane) { invalidate_host_checkpoints(lane); }
+}
+
+void TP2GenerationCore::invalidate_host_checkpoints(std::uint32_t lane) {
+    // The ring is sliced by lane, so one lane's stale lineage says nothing about another's.
     Shard* const shards[2] = {&shard_a_, &shard_b_};
     for (Shard* shard : shards) {
-        for (auto& checkpoint : shard->host_checkpoints) { checkpoint.valid = false; }
+        for (auto& checkpoint : shard->host_checkpoints) { checkpoint.valid[lane] = false; }
     }
 }
 
-void TP2GenerationCore::session_invalidate_active() {
-    if (active_session_ != kNoSession) { session_drop(active_session_); }
-    active_session_     = kNoSession;
-    live_state_valid_   = false;
-    cached_state_valid_ = false;
-    cached_prompt_tokens_.clear();
-    invalidate_host_checkpoints();
-    reuse_source_ = ReuseSource::None;
+void TP2GenerationCore::session_invalidate_active(std::uint32_t lane) {
+    RetentionState& lane_state = retention(lane);
+    if (lane_state.active_session != kNoSession) { session_drop(lane_state.active_session); }
+    lane_state.active_session     = kNoSession;
+    lane_state.live_state_valid   = false;
+    lane_state.cached_state_valid = false;
+    lane_state.cached_prompt_tokens.clear();
+    lane_state.cached_media.clear();
+    invalidate_host_checkpoints(lane);
+    lane_state.reuse_source = ReuseSource::None;
+}
+
+void TP2GenerationCore::session_invalidate_all() {
+    for (std::uint32_t lane = 0; lane < lanes_; ++lane) { session_invalidate_active(lane); }
 }
 
 void TP2GenerationCore::session_drop(std::size_t index) {
     if (index >= sessions_.size()) { return; }
     sessions_.erase(sessions_.begin() + static_cast<std::ptrdiff_t>(index));
-    if (active_session_ == index) {
-        active_session_ = kNoSession;
-    } else if (active_session_ != kNoSession && active_session_ > index) {
-        --active_session_;
+    // Every lane's claim on a catalog entry is an index into the same vector, so each one has to be
+    // told the vector shifted. The anchor a walk froze for its own comparison is left alone: it is
+    // only read inside the walk that set it, before any drop can move it.
+    for (RetentionState& lane_state : lane_retention_) {
+        if (lane_state.active_session == index) {
+            lane_state.active_session = kNoSession;
+        } else if (lane_state.active_session != kNoSession && lane_state.active_session > index) {
+            --lane_state.active_session;
+        }
     }
 }
 
@@ -1581,7 +4132,7 @@ bool TP2GenerationCore::session_evict_one() {
     // session reusable while one-off writes keep taking the device pools.
     std::size_t victim = kNoSession;
     for (std::size_t index = 0; index < sessions_.size(); ++index) {
-        if (sessions_[index].device_resident) { continue; }
+        if (sessions_[index].device_lane >= 0) { continue; }
         if (victim == kNoSession ||
             sessions_[index].retention_weight < sessions_[victim].retention_weight ||
             (sessions_[index].retention_weight == sessions_[victim].retention_weight &&
@@ -1670,7 +4221,10 @@ bool TP2GenerationCore::session_ensure_host_slabs(SessionEntry& entry, std::uint
         // safe to recall at all. A shard that owns no draft (shard 1, and every other backend) skips
         // all three.
         if (shard.dflash_round != nullptr) {
-            const std::size_t dflash_bytes = shard.dflash_round->context_image_bytes();
+            // One compact ring image per lane, so a lane restores its own slice of the slab exactly
+            // as it does for the target state image above.
+            const std::size_t dflash_bytes =
+                static_cast<std::size_t>(lanes_) * shard.dflash_round->lane_context_image_bytes();
             shard.device.bind_to_current_thread();
             if (entry.host_dflash[index] == nullptr) {
                 try {
@@ -1775,27 +4329,29 @@ bool TP2GenerationCore::session_ensure_host_slabs(SessionEntry& entry, std::uint
     return true;
 }
 
-// At most one entry describes the conversation the device pools hold: a recall restores one and a
-// publish installs one, and every other entry's device state is gone the moment that happens. The
-// eviction scan skips resident entries because their KV never reached the slabs, so a stale flag
-// makes an entry unevictable - and lets the scans believe the device still holds a conversation it
-// has already overwritten.
+// At most one entry describes the conversation a lane's device state holds: a recall restores one
+// and a publish installs one, and every other entry's claim on that lane is gone the moment that
+// happens. The eviction scan skips entries resident on any lane because their KV never reached the
+// slabs, so a stale lane makes an entry unevictable - and lets the scans believe a device still
+// holds a conversation it has already overwritten.
 template <typename Sessions>
-static void mark_device_resident(Sessions& sessions, std::size_t index) {
+static void mark_device_lane(Sessions& sessions, std::size_t index, std::int32_t lane) {
     for (std::size_t other = 0; other < sessions.size(); ++other) {
-        sessions[other].device_resident = other == index;
+        if (other != index && sessions[other].device_lane == lane) { sessions[other].device_lane = -1; }
     }
+    sessions[index].device_lane = lane;
 }
 
-bool TP2GenerationCore::session_store_active() {
-    if (active_session_ == kNoSession) { return true; }
-    SessionEntry& entry = sessions_[active_session_];
-    if (!entry.device_resident) { return true; }
+bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
+    RetentionState& lane_state = retention(lane);
+    if (lane_state.active_session == kNoSession) { return true; }
+    SessionEntry& entry = sessions_[lane_state.active_session];
+    if (entry.device_lane != static_cast<std::int32_t>(lane)) { return true; }
     const std::uint32_t pages = pages_for_tokens(entry.frontier);
     if (pages == 0) {
         // Nothing to copy, and nothing a recall could stand on either: clear the boundaries so a
         // later request cannot restore a state whose KV the device pools do not hold.
-        entry.device_resident = false;
+        entry.device_lane = -1;
         entry.host_prompt_end = 0;
         entry.host_shared_end = 0;
         entry.host_kv_end     = 0;
@@ -1806,40 +4362,50 @@ bool TP2GenerationCore::session_store_active() {
     for (std::size_t index = 0; index < 2; ++index) {
         Shard& shard = *shards[index];
         shard.device.bind_to_current_thread();
-        const std::span<const DeviceKVPageHandle> source(shard.kv_page_handles.data(), pages);
+        // This lane's own KV row and GDN slot carry the conversation being stored.
+        const std::span<const DeviceKVPageHandle> source(shard.kv_lane_handles[lane].data(), pages);
         const HostKVAllocationView view =
             host_kv_arena_[index]->writable_view(*entry.host_kv[index]).subview(0, pages);
         shard.decoder->text_kv.page_pool().copy_to_host(source, view, shard.device.stream);
-        CUDA_CHECK(cudaMemcpyAsync(entry.host_state[index]->data(), shard.state_backing.data,
-                                   shard.state_backing.bytes, cudaMemcpyDeviceToHost,
-                                   shard.device.stream));
+        copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
+                        static_cast<std::int32_t>(lane),
+                        static_cast<std::byte*>(entry.host_state[index]->data()) +
+                            static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
+                        cudaMemcpyDeviceToHost, shard.device.stream);
         // Snapshot slot 0 is the state the last completed prefill froze at this conversation's own
         // prompt end. A client that re-renders the answer it was handed sends a next prompt that
         // contains that whole prompt and then diverges inside the generated tail, so this image is
         // the one its return trip can stand on.
         if (entry.host_prompt_state[index] != nullptr) {
-            CUDA_CHECK(cudaMemcpyAsync(entry.host_prompt_state[index]->data(),
-                                       shard.state_snapshots[0].data, shard.state_backing.bytes,
-                                       cudaMemcpyDeviceToHost, shard.device.stream));
+            copy_lane_state(shard.lane_state_geometry, shard.state_snapshots[0].data,
+                            static_cast<std::int32_t>(lane),
+                            static_cast<std::byte*>(entry.host_prompt_state[index]->data()) +
+                                static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
+                            cudaMemcpyDeviceToHost, shard.device.stream);
         }
         // The masked draft's context rides every target image without an extent of its own: the
         // evicted frontier is the live ring, and the prompt-end image is the device snapshot slot 0
         // the GDN copy above just read. Both are the flat ring image, so the device snapshot is a
         // plain D2H.
         if (shard.dflash_round != nullptr) {
-            store_dflash_image(shard, *entry.host_dflash[index]);
+            const std::size_t draft_lane_bytes = shard.dflash_round->lane_context_image_bytes();
+            store_dflash_image(shard, *entry.host_dflash[index], lane);
             if (entry.host_dflash_prompt[index] != nullptr &&
                 shard.dflash_snapshots[0].data != nullptr) {
-                CUDA_CHECK(cudaMemcpyAsync(entry.host_dflash_prompt[index]->data(),
-                                           shard.dflash_snapshots[0].data,
-                                           shard.dflash_round->context_image_bytes(),
-                                           cudaMemcpyDeviceToHost, shard.device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<std::byte*>(entry.host_dflash_prompt[index]->data()) +
+                        static_cast<std::size_t>(lane) * draft_lane_bytes,
+                    static_cast<const std::byte*>(shard.dflash_snapshots[0].data) +
+                        static_cast<std::size_t>(lane) * draft_lane_bytes, draft_lane_bytes,
+                    cudaMemcpyDeviceToHost, shard.device.stream));
             }
         }
     }
     if (mtp_enabled_) {
         shard_a_.device.bind_to_current_thread();
-        const std::span<const DeviceKVPageHandle> source(shard_a_.mtp_page_handles.data(),
+        // The MTP KV this lane owns, not the whole table: each lane holds its own slice of the MTP
+        // page pool, so the session slab is one lane's extent.
+        const std::span<const DeviceKVPageHandle> source(shard_a_.mtp_lane_handles[lane].data(),
                                                          entry.host_mtp_pages);
         const HostKVAllocationView view =
             host_kv_arena_[0]->writable_view(*entry.host_mtp_kv).subview(0, entry.host_mtp_pages);
@@ -1853,7 +4419,7 @@ bool TP2GenerationCore::session_store_active() {
     }
 
     shard_a_.device.bind_to_current_thread();
-    entry.device_resident = false;
+    entry.device_lane = -1;
     // The slabs now carry the KV up to the frontier they were filled at, which is the extent every
     // later capture and recall has to stay inside. A shared-prefix image this shorter extent no
     // longer reaches - a partial recall whose walk stopped before it - goes with them.
@@ -1870,14 +4436,15 @@ bool TP2GenerationCore::session_store_active() {
     // state with them gives the entry a boundary the next conversation opening with the same block is
     // recalled on. Everything else the entry carries describes its own history; this describes the
     // part of it that outlives the conversation.
-    if (block_anchor_position_ != 0 && block_anchor_position_ <= entry.frontier) {
+    if (lane_state.block_anchor_position != 0 && lane_state.block_anchor_position <= entry.frontier) {
         const PinnedHostBuffer* frozen[2]   = {nullptr, nullptr};
         const PinnedHostBuffer* block_draft = nullptr;
         Shard* const shards[2] = {&shard_a_, &shard_b_};
         for (std::size_t index = 0; index < 2; ++index) {
             for (const Shard::HostCheckpoint& checkpoint : shards[index]->host_checkpoints) {
-                if (!checkpoint.valid || checkpoint.position != block_anchor_position_ ||
-                    checkpoint.prefill_id != block_anchor_prefill_id_ ||
+                if (!checkpoint.valid[lane] ||
+                    checkpoint.position[lane] != lane_state.block_anchor_position ||
+                    checkpoint.prefill_id[lane] != lane_state.block_anchor_prefill_id ||
                     checkpoint.buffer == nullptr) {
                     continue;
                 }
@@ -1887,8 +4454,8 @@ bool TP2GenerationCore::session_store_active() {
             }
         }
         if (frozen[0] != nullptr && frozen[1] != nullptr) {
-            session_capture_shared_state(active_session_, block_anchor_position_, false, frozen,
-                                         block_draft);
+            session_capture_shared_state(lane_state.active_session, lane_state.block_anchor_position, false, frozen,
+                                         block_draft, lane);
         }
     }
     entry.lru_clock       = ++session_lru_clock_;
@@ -1897,19 +4464,21 @@ bool TP2GenerationCore::session_store_active() {
 }
 
 void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t boundary,
-                                        RecallState state) {
+                                        RecallState state, std::uint32_t lane) {
     const std::uint32_t pages = pages_for_tokens(boundary);
     if (pages == 0) {
         entry.tokens.clear();
         entry.frontier = 0;
-        mark_device_resident(sessions_, static_cast<std::size_t>(&entry - sessions_.data()));
+        mark_device_lane(sessions_, static_cast<std::size_t>(&entry - sessions_.data()),
+                         static_cast<std::int32_t>(lane));
         return;
     }
     Shard* const shards[2] = {&shard_a_, &shard_b_};
     for (std::size_t index = 0; index < 2; ++index) {
         Shard& shard = *shards[index];
         shard.device.bind_to_current_thread();
-        const std::span<const DeviceKVPageHandle> destination(shard.kv_page_handles.data(), pages);
+        const std::span<const DeviceKVPageHandle> destination(shard.kv_lane_handles[lane].data(),
+                                                              pages);
         const HostKVAllocationConstView view =
             host_kv_arena_[index]->view(*entry.host_kv[index]).subview(0, pages);
         shard.decoder->text_kv.page_pool().copy_from_host(view, destination, shard.device.stream);
@@ -1919,9 +4488,11 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
                                         : state == RecallState::PromptEnd
                                             ? *entry.host_prompt_state[index]
                                             : *entry.host_shared_state[index];
-        CUDA_CHECK(cudaMemcpyAsync(shard.state_backing.data, frozen.data(),
-                                   shard.state_backing.bytes, cudaMemcpyHostToDevice,
-                                   shard.device.stream));
+        copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
+                        static_cast<std::int32_t>(lane),
+                        static_cast<std::byte*>(const_cast<void*>(frozen.data())) +
+                            static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
+                        cudaMemcpyHostToDevice, shard.device.stream);
         // The draft context comes back with the target state it belongs to: the skipped prefix
         // produces no target residual, so nothing else rebuilds the ring, and a recall that restored
         // only the target half would verify against a draft describing the wrong tokens. The state
@@ -1933,12 +4504,13 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
                                                     : state == RecallState::PromptEnd
                                                         ? *entry.host_dflash_prompt[index]
                                                         : *entry.host_dflash_shared[index];
-            load_dflash_image(shard, frozen_dflash);
+            load_dflash_image(shard, frozen_dflash, lane);
         }
     }
     if (mtp_enabled_) {
         shard_a_.device.bind_to_current_thread();
-        const std::span<const DeviceKVPageHandle> destination(shard_a_.mtp_page_handles.data(), pages);
+        const std::span<const DeviceKVPageHandle> destination(shard_a_.mtp_lane_handles[lane].data(),
+                                                              pages);
         const HostKVAllocationConstView view =
             host_kv_arena_[0]->view(*entry.host_mtp_kv).subview(0, pages);
         shard_a_.decoder->mtp_cache()->page_pool().copy_from_host(view, destination,
@@ -1957,7 +4529,8 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
     // history clipped to the restored frontier hides it behind the recall. The slabs the recall read
     // still carry the KV this history describes, which is what a capture into the entry pairs with.
     entry.frontier = boundary;
-    mark_device_resident(sessions_, static_cast<std::size_t>(&entry - sessions_.data()));
+    mark_device_lane(sessions_, static_cast<std::size_t>(&entry - sessions_.data()),
+                         static_cast<std::int32_t>(lane));
     entry.lru_clock = ++session_lru_clock_;
     ++session_recalls_;
 }
@@ -1965,7 +4538,8 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
 void TP2GenerationCore::session_capture_shared_state(std::size_t index, std::uint32_t position,
                                                      bool from_device,
                                                      const PinnedHostBuffer* const* frozen,
-                                                     const PinnedHostBuffer* dflash_frozen) {
+                                                     const PinnedHostBuffer* dflash_frozen,
+                                                     std::uint32_t lane) {
     if (index >= sessions_.size() || position == 0) { return; }
     SessionEntry& entry = sessions_[index];
     // The image is the state of the tokens before 'position' paired with the KV the slabs hold
@@ -1990,24 +4564,31 @@ void TP2GenerationCore::session_capture_shared_state(std::size_t index, std::uin
         Shard& shard = *shards[shard_index];
         if (from_device) {
             shard.device.bind_to_current_thread();
-            CUDA_CHECK(cudaMemcpyAsync(entry.host_shared_state[shard_index]->data(),
-                                       shard.state_backing.data, shard.state_backing.bytes,
-                                       cudaMemcpyDeviceToHost, shard.device.stream));
+            copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
+                            static_cast<std::int32_t>(lane),
+                            static_cast<std::byte*>(entry.host_shared_state[shard_index]->data()) +
+                                static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
+                            cudaMemcpyDeviceToHost, shard.device.stream);
             // The device draft ring sits at this boundary by construction: the walk restores it
             // there before the first chunk, which is when the from-device capture runs.
             if (shard.dflash_round != nullptr) {
-                store_dflash_image(shard, *entry.host_dflash_shared[shard_index]);
+                store_dflash_image(shard, *entry.host_dflash_shared[shard_index], lane);
             }
             continue;
         }
         if (frozen[shard_index] == nullptr) { return; }
-        std::memcpy(entry.host_shared_state[shard_index]->data(), frozen[shard_index]->data(),
-                    shard.state_backing.bytes);
+        std::memcpy(static_cast<std::byte*>(entry.host_shared_state[shard_index]->data()) +
+                        static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
+                    frozen[shard_index]->data(), shard.lane_state_geometry.image_bytes);
         if (shard.dflash_round != nullptr) {
-            // Both sides are flat ring images: the checkpoint's draft buffer is one, and so is the
-            // session slab.
-            std::memcpy(entry.host_dflash_shared[shard_index]->data(), dflash_frozen->data(),
-                        shard.dflash_round->context_image_bytes());
+            // Both sides are flat ring images, one compact image per lane: the checkpoint's draft
+            // buffer is one and so is the session slab, so the lane's slice is a straight offset.
+            const std::size_t draft_lane_bytes = shard.dflash_round->lane_context_image_bytes();
+            std::memcpy(static_cast<std::byte*>(entry.host_dflash_shared[shard_index]->data()) +
+                            static_cast<std::size_t>(lane) * draft_lane_bytes,
+                        static_cast<const std::byte*>(dflash_frozen->data()) +
+                            static_cast<std::size_t>(lane) * draft_lane_bytes,
+                        draft_lane_bytes);
         }
     }
     entry.host_shared_end = position;
@@ -2018,45 +4599,50 @@ void TP2GenerationCore::session_capture_shared_state(std::size_t index, std::uin
     if (session_trace_enabled()) {
         std::fprintf(stderr,
                      "[tp2-session] anchor entry=%zu position=%u resident=%d tokens=%zu\n", index,
-                     position, entry.device_resident ? 1 : 0, entry.tokens.size());
+                     position, entry.device_lane >= 0 ? 1 : 0, entry.tokens.size());
     }
 }
 
-void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
+void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const TokenId> prompt_tokens,
+                                       std::span<const MediaSpan> media) {
+    RetentionState& lane_state = retention(lane);
     if (session_capacity_ == 0) { return; }
     // The conversation this prompt is compared against is the only one that can still be told where
     // the two stopped matching, and the running prefill is the last walk that sees the shared state.
     // execute_walk reads this before it advances anything.
-    anchor_session_ = kNoSession;
+    lane_state.anchor_session = kNoSession;
     // How deep the resident lineage can start this prompt, mirroring what the reuse scan below
     // finds: the live state at its frontier, a device snapshot, or a host checkpoint. Zero means
     // the prompt shares nothing the device can reuse, and keeping the resident session would leave
     // the catalog describing a conversation the device no longer holds.
     std::size_t active_shared = 0;
-    if (active_session_ != kNoSession) {
-        const SessionEntry& entry = sessions_[active_session_];
+    if (lane_state.active_session != kNoSession) {
+        const SessionEntry& entry = sessions_[lane_state.active_session];
         const std::size_t common  = std::min(entry.tokens.size(), prompt_tokens.size());
         while (active_shared < common &&
                entry.tokens[active_shared] == prompt_tokens[active_shared]) {
             ++active_shared;
         }
+        // The resident entry's media identity has to license the same prefix the tokens do, or the
+        // recall would hand this prompt a conversation whose KV shows another picture.
+        active_shared = media_prefix_cap(entry.media, media, active_shared);
     }
     std::uint32_t resident_depth = 0;
-    if (cached_state_valid_) {
-        if (live_state_valid_ && active_session_ != kNoSession) {
-            const std::uint32_t frontier = sessions_[active_session_].frontier;
+    if (lane_state.cached_state_valid) {
+        if (lane_state.live_state_valid && lane_state.active_session != kNoSession) {
+            const std::uint32_t frontier = sessions_[lane_state.active_session].frontier;
             if (frontier != 0 && frontier <= active_shared) { resident_depth = frontier; }
         }
         for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
-            const std::uint32_t boundary = cached_boundaries_[slot];
+            const std::uint32_t boundary = lane_state.cached_boundaries[slot];
             if (boundary <= active_shared && boundary > resident_depth) {
                 resident_depth = boundary;
             }
         }
         for (const auto& checkpoint : shard_a_.host_checkpoints) {
-            if (checkpoint.valid && checkpoint.position <= active_shared &&
-                checkpoint.position > resident_depth) {
-                resident_depth = checkpoint.position;
+            if (checkpoint.valid[lane] && checkpoint.position[lane] <= active_shared &&
+                checkpoint.position[lane] > resident_depth) {
+                resident_depth = checkpoint.position[lane];
             }
         }
     }
@@ -2079,10 +4665,13 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
     RecallState best_state      = RecallState::Frontier;
     for (std::size_t index = 0; index < sessions_.size(); ++index) {
         const SessionEntry& entry = sessions_[index];
-        if (index == active_session_ || entry.device_resident || entry.tokens.empty()) { continue; }
+        if (index == lane_state.active_session || entry.device_lane >= 0 || entry.tokens.empty()) {
+            continue;
+        }
         const std::size_t common = std::min(entry.tokens.size(), prompt_tokens.size());
         std::size_t shared       = 0;
         while (shared < common && entry.tokens[shared] == prompt_tokens[shared]) { ++shared; }
+        shared = media_prefix_cap(entry.media, media, shared);
         static constexpr const char* kReachName[3] = {"frontier", "prompt-end", "shared"};
         const std::uint32_t offered[3] = {entry.frontier, entry.host_prompt_end, entry.host_shared_end};
         std::uint32_t reach = 0;
@@ -2113,7 +4702,7 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
                          index, entry.tokens.size(), entry.frontier, entry.host_kv_end,
                          entry.prompt_end, entry.host_shared_end, shared, reach,
                          reach == 0 ? "none" : kReachName[static_cast<std::size_t>(via)],
-                         entry.device_resident ? 1 : 0);
+                         entry.device_lane >= 0 ? 1 : 0);
         }
         if (reach == 0) { continue; }
         if (best_host == kNoSession || reach > best_frontier) {
@@ -2123,36 +4712,37 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
         }
     }
     if (best_host != kNoSession && best_frontier > resident_depth) {
-        const std::size_t previous = active_session_;
-        const bool drop_previous   = previous != kNoSession && !session_store_active();
+        const std::size_t previous = lane_state.active_session;
+        const bool drop_previous   = previous != kNoSession && !session_store_active(lane);
         // Restoring before dropping keeps the recalled entry's index valid: nothing has been erased
         // yet, and the drop below only shifts indices the restore is already done with.
-        session_restore(sessions_[best_host], best_frontier, best_state);
-        active_session_       = best_host;
-        live_state_valid_     = true;
-        cached_prompt_tokens_ = sessions_[best_host].tokens;
+        session_restore(sessions_[best_host], best_frontier, best_state, lane);
+        lane_state.active_session       = best_host;
+        lane_state.live_state_valid     = true;
+        lane_state.cached_prompt_tokens = sessions_[best_host].tokens;
+        lane_state.cached_media         = sessions_[best_host].media;
         // A recalled session has no device state snapshots of its own: those belong to the lineage
         // it displaces. Its frontier state is in the device pool already, which is what LiveState
         // means to the scan below. The checkpoint ring belongs to that lineage too, and its
         // positions can sit inside the recalled history while its states do not.
-        cached_boundaries_.fill(0);
-        invalidate_host_checkpoints();
-        cached_state_valid_ = true;
-        reuse_source_       = ReuseSource::None;
+        lane_state.cached_boundaries.fill(0);
+        invalidate_host_checkpoints(lane);
+        lane_state.cached_state_valid = true;
+        lane_state.reuse_source       = ReuseSource::None;
         if (drop_previous) { session_drop(previous); }
         // The scan below compared this prompt against the recalled entry's own history - the restore
         // kept it - so the boundary the two diverge at is that entry's to keep, not the one that just
         // left the device. The recall retires the ring it read from, which takes the outgoing
         // conversation's block boundary with it: this prompt names its own.
-        anchor_session_          = active_session_;
-        block_anchor_position_   = 0;
-        block_anchor_prefill_id_ = 0;
+        lane_state.anchor_session          = lane_state.active_session;
+        lane_state.block_anchor_position   = 0;
+        lane_state.block_anchor_prefill_id = 0;
         if (session_trace_enabled()) {
             std::fprintf(
                 stderr,
                 "[tp2-session] recall frontier=%u resident_depth=%u tokens=%zu entries=%zu\n",
-                sessions_[active_session_].frontier, resident_depth,
-                sessions_[active_session_].tokens.size(), sessions_.size());
+                sessions_[lane_state.active_session].frontier, resident_depth,
+                sessions_[lane_state.active_session].tokens.size(), sessions_.size());
         }
         return;
     }
@@ -2163,9 +4753,9 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
     // shared system prefix - the shape of a client switching conversations - is a different
     // conversation: the resident entry has to reach its host slabs before the prefill below
     // overwrites the device pools, or the conversation is lost.
-    const bool resident_continues = active_session_ != kNoSession &&
-                                    sessions_[active_session_].prompt_end != 0 &&
-                                    active_shared >= sessions_[active_session_].prompt_end;
+    const bool resident_continues = lane_state.active_session != kNoSession &&
+                                    sessions_[lane_state.active_session].prompt_end != 0 &&
+                                    active_shared >= sessions_[lane_state.active_session].prompt_end;
     if (resident_depth > 0 && resident_continues) {
         // The resident conversation already serves this prompt better than any host slab; the reuse
         // scan below turns its depth into a prefill start point.
@@ -2173,18 +4763,18 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
             std::fprintf(stderr,
                          "[tp2-session] continue active_shared=%zu resident_depth=%u frontier=%u "
                          "prompt_end=%u entries=%zu\n",
-                         active_shared, resident_depth, sessions_[active_session_].frontier,
-                         sessions_[active_session_].prompt_end, sessions_.size());
+                         active_shared, resident_depth, sessions_[lane_state.active_session].frontier,
+                         sessions_[lane_state.active_session].prompt_end, sessions_.size());
         }
         return;
     }
     // A different conversation, or one no host entry can serve: preserve the resident session when
-    // the budget allows. The prefix-reuse lineage survives the switch - cached_prompt_tokens_ and
+    // the budget allows. The prefix-reuse lineage survives the switch - lane_state.cached_prompt_tokens and
     // every checkpoint at or before this prompt's shared prefix still describe tokens this prompt
     // holds - so the scan below keeps whatever they cover instead of re-prefilling the whole system
     // prefix on every turn of a switch.
-    const std::size_t previous = active_session_;
-    bool stored                = previous == kNoSession || session_store_active();
+    const std::size_t previous = lane_state.active_session;
+    bool stored                = previous == kNoSession || session_store_active(lane);
     if (!stored) {
         // The host budget could not take the outgoing conversation. Shed the entries the retention
         // weights rank lowest and try again: the resident entry is never a candidate, so this only
@@ -2192,16 +4782,16 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
         // replace. Without it the outgoing conversation was dropped the first time its slabs did
         // not fit, and its next turn re-prefilled a whole history it had already paid for.
         while (session_evict_one()) {
-            if (session_store_active()) {
+            if (session_store_active(lane)) {
                 stored = true;
                 break;
             }
         }
     }
-    // session_drop keeps active_session_ on the same entry across an eviction, so the resident
+    // session_drop keeps lane_state.active_session on the same entry across an eviction, so the resident
     // index is re-read here instead of trusting the copy taken before the loop: a victim the loop
     // erased from in front of it shifts every later index.
-    const std::size_t resident = active_session_;
+    const std::size_t resident = lane_state.active_session;
     if (!stored) {
         // Only the resident is left, so its own KV is what the host budget cannot hold and no
         // eviction can ever make room. The conversation goes - the prefill below overwrites the
@@ -2215,13 +4805,13 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
     // The divergence was measured against the resident entry's history, and the eviction just put
     // that entry's KV in the slabs, so the state the walk starts from is its state at the same
     // boundary. A session the host budget could not keep has no slab to pair the anchor with.
-    anchor_session_            = stored ? resident : kNoSession;
-    block_anchor_position_     = 0;
-    block_anchor_prefill_id_   = 0;
+    lane_state.anchor_session            = stored ? resident : kNoSession;
+    lane_state.block_anchor_position     = 0;
+    lane_state.block_anchor_prefill_id   = 0;
     if (!stored) { session_drop(resident); }
-    active_session_   = kNoSession;
-    live_state_valid_ = false;
-    reuse_source_     = ReuseSource::None;
+    lane_state.active_session   = kNoSession;
+    lane_state.live_state_valid = false;
+    lane_state.reuse_source     = ReuseSource::None;
     ++session_full_prefills_;
     if (session_trace_enabled()) {
         std::fprintf(stderr,
@@ -2233,7 +4823,9 @@ void TP2GenerationCore::session_recall(std::span<const TokenId> prompt_tokens) {
 
 void TP2GenerationCore::session_publish(
     const std::vector<TokenId>& history, std::uint32_t frontier,
-    const models::qwen3_5::PreparedContextCache& cache_hints) {
+    const models::qwen3_5::PreparedContextCache& cache_hints, std::span<const MediaSpan> media,
+    std::uint32_t lane) {
+    RetentionState& lane_state = retention(lane);
     if (session_capacity_ == 0) { return; }
     // Served and forgotten. Re-prefilling a history this short costs less than the catalog slot it
     // would hold, and the slot is what a returning conversation needs; a client that fires a one-off
@@ -2244,21 +4836,24 @@ void TP2GenerationCore::session_publish(
     // and leave the conversation that owned it unreachable - which is what a short request beside a
     // new session used to prevent by taking the resident slot for itself.
     const bool extends_resident =
-        active_session_ != kNoSession && sessions_[active_session_].device_resident &&
-        history.size() >= sessions_[active_session_].tokens.size() &&
-        std::equal(sessions_[active_session_].tokens.begin(), sessions_[active_session_].tokens.end(),
+        lane_state.active_session != kNoSession &&
+        sessions_[lane_state.active_session].device_lane == static_cast<std::int32_t>(lane) &&
+        history.size() >= sessions_[lane_state.active_session].tokens.size() &&
+        std::equal(sessions_[lane_state.active_session].tokens.begin(), sessions_[lane_state.active_session].tokens.end(),
                    history.begin());
     if (extends_resident) {
-        SessionEntry& entry = sessions_[active_session_];
+        SessionEntry& entry = sessions_[lane_state.active_session];
         entry.tokens.assign(history.begin(), history.end());
+        entry.media.assign(media.begin(), media.end());
         entry.frontier  = frontier;
         entry.lru_clock = ++session_lru_clock_;
         bind_entry_session(entry, cache_hints);
         // The reuse scan compares against the resident history, so it has to carry the generated
         // tail too: that is what lets a continued turn start at the committed frontier instead of
         // replaying the previous answer.
-        cached_prompt_tokens_ = entry.tokens;
-        live_state_valid_     = true;
+        lane_state.cached_prompt_tokens = entry.tokens;
+        lane_state.cached_media.assign(media.begin(), media.end());
+        lane_state.live_state_valid     = true;
         return;
     }
     if (sessions_.size() >= session_capacity_ && !session_evict_one()) {
@@ -2268,14 +4863,16 @@ void TP2GenerationCore::session_publish(
     }
     SessionEntry entry;
     entry.tokens.assign(history.begin(), history.end());
+    entry.media.assign(media.begin(), media.end());
     entry.frontier  = frontier;
     entry.lru_clock = ++session_lru_clock_;
     bind_entry_session(entry, cache_hints);
     sessions_.push_back(std::move(entry));
-    active_session_ = sessions_.size() - 1;
-    mark_device_resident(sessions_, active_session_);
-    cached_prompt_tokens_ = sessions_[active_session_].tokens;
-    live_state_valid_     = true;
+    lane_state.active_session = sessions_.size() - 1;
+    mark_device_lane(sessions_, lane_state.active_session, static_cast<std::int32_t>(lane));
+    lane_state.cached_prompt_tokens = sessions_[lane_state.active_session].tokens;
+    lane_state.cached_media.assign(media.begin(), media.end());
+    lane_state.live_state_valid     = true;
 }
 
 GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
@@ -2286,23 +4883,25 @@ GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
     try {
         return execute_walk(request, sink, cancellation);
     } catch (...) {
-        session_invalidate_active();
+        session_invalidate_active(static_cast<std::uint32_t>(active_lane_));
         throw;
     }
 }
 
 TP2GenerationCore::TurnAdoption
 TP2GenerationCore::adopt_generated_turn(models::qwen3_5::PreparedPromptData& data,
-                                        std::uint32_t prompt_tokens, bool trace) const {
+                                        std::uint32_t prompt_tokens, bool trace,
+                                        std::uint32_t lane) const {
+    const RetentionState& lane_state = retention(lane);
     TurnAdoption adoption;
     adoption.prompt_tokens = prompt_tokens;
-    if (cached_prompt_tokens_.empty()) { return adoption; }
+    if (lane_state.cached_prompt_tokens.empty()) { return adoption; }
     // Where the client's rendering and this lineage's history part. Taken before anything is
     // replaced: it is both the reuse decision the scan would have made and, for the trace, the only
     // measurement of a re-rendered answer that survives the adoption itself.
-    const std::size_t common = std::min(cached_prompt_tokens_.size(), data.token_ids.size());
+    const std::size_t common = std::min(lane_state.cached_prompt_tokens.size(), data.token_ids.size());
     std::size_t shared        = 0;
-    while (shared < common && cached_prompt_tokens_[shared] == data.token_ids[shared]) { ++shared; }
+    while (shared < common && lane_state.cached_prompt_tokens[shared] == data.token_ids[shared]) { ++shared; }
     adoption.divergence = shared;
     // A multimodal request is left alone: its token array carries vision runs whose positions a
     // replacement would have to keep, and a media turn never comes back as pure text.
@@ -2311,11 +4910,11 @@ TP2GenerationCore::adopt_generated_turn(models::qwen3_5::PreparedPromptData& dat
     // lineage's last prefill ended on, which is exactly the position the answer starts at, and it
     // survives the catalog letting the conversation go. The session field is chunk-start bookkeeping,
     // so it is only the fallback for a walk that left no snapshot of its own.
-    std::size_t turn_begin = cached_boundaries_[0];
-    if (turn_begin == 0 && active_session_ != kNoSession) {
-        turn_begin = sessions_[active_session_].prompt_end;
+    std::size_t turn_begin = lane_state.cached_boundaries[0];
+    if (turn_begin == 0 && lane_state.active_session != kNoSession) {
+        turn_begin = sessions_[lane_state.active_session].prompt_end;
     }
-    const std::size_t turn_end = cached_prompt_tokens_.size();
+    const std::size_t turn_end = lane_state.cached_prompt_tokens.size();
     // The whole history in front of the turn has to match, or this is a different history and not a
     // replay of the answer this lineage wrote. An empty ring means no completed prefill is in reach.
     if (turn_begin == 0 || turn_end <= turn_begin || data.token_ids.size() <= turn_begin ||
@@ -2345,7 +4944,7 @@ TP2GenerationCore::adopt_generated_turn(models::qwen3_5::PreparedPromptData& dat
     }
     if (replay_end <= turn_begin || replay_end > data.token_ids.size()) { return adoption; }
     const std::span<const TokenId> generated_span =
-        std::span<const TokenId>(cached_prompt_tokens_)
+        std::span<const TokenId>(lane_state.cached_prompt_tokens)
             .subspan(turn_begin, turn_end - turn_begin);
     const std::span<const TokenId> replayed_span =
         std::span<const TokenId>(data.token_ids).subspan(turn_begin, replay_end - turn_begin);
@@ -2359,7 +4958,7 @@ TP2GenerationCore::adopt_generated_turn(models::qwen3_5::PreparedPromptData& dat
         std::fprintf(stderr,
                      "[tp2-diverge] prompt=%u cached=%zu prev_prompt=%zu shared=%zu in_turn=%zu "
                      "to_turn_end=%zu replay=%zu same_turn=%d",
-                     prompt_tokens, cached_prompt_tokens_.size(), turn_begin, shared,
+                     prompt_tokens, lane_state.cached_prompt_tokens.size(), turn_begin, shared,
                      shared > turn_begin ? shared - turn_begin : 0, turn_end - shared,
                      replayed_span.size(), same_turn ? 1 : 0);
         // Where the two texts part, in bytes: the prefixes below are capped, and a divergence deep
@@ -2399,8 +4998,8 @@ TP2GenerationCore::adopt_generated_turn(models::qwen3_5::PreparedPromptData& dat
     spliced.insert(spliced.end(), data.token_ids.begin(),
                    data.token_ids.begin() + static_cast<std::ptrdiff_t>(turn_begin));
     spliced.insert(spliced.end(),
-                   cached_prompt_tokens_.begin() + static_cast<std::ptrdiff_t>(turn_begin),
-                   cached_prompt_tokens_.end());
+                   lane_state.cached_prompt_tokens.begin() + static_cast<std::ptrdiff_t>(turn_begin),
+                   lane_state.cached_prompt_tokens.end());
     spliced.insert(spliced.end(),
                    data.token_ids.begin() + static_cast<std::ptrdiff_t>(replay_end),
                    data.token_ids.end());
@@ -2411,13 +5010,15 @@ TP2GenerationCore::adopt_generated_turn(models::qwen3_5::PreparedPromptData& dat
 }
 
 PrefixReusePath TP2GenerationCore::reuse_path(std::uint32_t reuse,
-                                              std::uint32_t block_frontier) const noexcept {
+                                              std::uint32_t block_frontier,
+                                              std::uint32_t lane) const noexcept {
+    const RetentionState& lane_state = retention(lane);
     if (reuse == 0) { return PrefixReusePath::Root; }
     if (block_frontier != 0 && reuse == block_frontier) {
         return PrefixReusePath::SharedStablePrefix;
     }
-    if (active_session_ != kNoSession) {
-        const SessionEntry& entry = sessions_[active_session_];
+    if (lane_state.active_session != kNoSession) {
+        const SessionEntry& entry = sessions_[lane_state.active_session];
         if (reuse == entry.frontier) { return PrefixReusePath::PrivateEndpoint; }
         // The boundary in front of the answer this lineage generated. A client that re-rendered that
         // answer cannot extend it and re-prefills from the generation opener instead.
@@ -2428,11 +5029,138 @@ PrefixReusePath TP2GenerationCore::reuse_path(std::uint32_t reuse,
     return PrefixReusePath::PrivateLongAnchor;
 }
 
+// Copies the GDN state this lane's device slot holds right now into the ring slot the group owns,
+// tagged with the frontier it captures. It rides the shard stream, so it sees exactly the tokens the
+// enclosing loop has enqueued and none of the later ones, and the ring slot it lands in is only
+// revisited by a later prefill's checkpoint at the same index.
+void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t frontier, HostRing ring,
+                                                 std::uint32_t lane) {
+    if (shard.host_checkpoints.empty()) { return; }
+    ++prefill_host_writes_;
+    const std::size_t grid = shard.host_checkpoint_grid_slots;
+    const std::size_t tail = host_checkpoint_tail_slots_;
+    std::size_t begin      = 0;
+    std::size_t count      = grid;
+    switch (ring) {
+        case HostRing::Grid: break;
+        case HostRing::Tail: begin = grid; count = tail; break;
+        case HostRing::Divergence:
+            begin = grid + tail;
+            count = host_checkpoint_divergence_slots_;
+            break;
+        case HostRing::Block:
+            begin = grid + tail + host_checkpoint_divergence_slots_;
+            count = host_checkpoint_block_slots_;
+            break;
+    }
+    // Each lane owns its own slice of the ring, laid out exactly like the whole ring at lanes=1, so a
+    // write never evicts another lane's checkpoints.
+    begin += static_cast<std::size_t>(lane) * host_checkpoint_slots_per_lane_;
+    if (count == 0 || begin + count > shard.host_checkpoints.size()) { return; }
+    const std::size_t index = ring == HostRing::Tail   ? shard.host_checkpoint_tail_next[lane]
+                              : ring == HostRing::Grid ? shard.host_checkpoint_next[lane]
+                                                       : 0;
+    shard.device.bind_to_current_thread();
+    Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[begin + index];
+    // Overwriting the slot already destroys the checkpoint it held, so retire it before the copy is
+    // enqueued: a prefill that throws between here and the publish sweep must not leave a torn buffer
+    // behind a flag that still says the last completed prefill wrote it. Only the sweep below, which
+    // runs after the prefill finished, makes a checkpoint usable again.
+    checkpoint.valid[lane] = false;
+    checkpoint.position[lane]   = frontier;
+    checkpoint.prefill_id[lane] = retention(lane).host_checkpoint_live_id;
+    // A slot holds one compact image per lane, so this lane writes its own slice: the ring is
+    // partitioned by lane and a whole-slot write would overwrite a neighbour's checkpoint.
+    copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
+                    static_cast<std::int32_t>(lane),
+                    static_cast<std::byte*>(checkpoint.buffer->data()) +
+                        static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
+                    cudaMemcpyDeviceToHost, shard.device.stream);
+    // The masked draft's context at the same frontier rides the same slot. A chunk boundary is
+    // exactly where the prefill sink has finished committing that chunk, so the ring reaches this
+    // frontier; the frontier is recorded so a restore can refuse a checkpoint whose draft half does
+    // not describe the position it names.
+    if (shard.dflash_round != nullptr && checkpoint.dflash_buffer != nullptr) {
+        checkpoint.dflash_frontier[lane] = retention(lane).dflash_context_frontier;
+        shard.dflash_round->copy_context_to_host(
+            static_cast<std::byte*>(checkpoint.dflash_buffer->data()) +
+                static_cast<std::size_t>(lane) * shard.dflash_round->lane_context_image_bytes(),
+            shard.device.stream, static_cast<std::int32_t>(lane));
+    }
+    if (ring == HostRing::Tail) {
+        shard.host_checkpoint_tail_next[lane] = (index + 1) % count;
+    } else if (ring == HostRing::Grid) {
+        shard.host_checkpoint_next[lane] = (index + 1) % count;
+    }
+}
+
+// Opens a request's Vision prefill session on top of the startup plan. One session owns the items
+// the request still has to encode: an item that lies entirely inside a reused prefix is already in
+// the KV - its embeddings were scattered when that prefix was first prefilled - so it is dropped
+// from the plan and its host patch payload is released. A request whose reused prefix covers every
+// item (the common case for a chat turn that carries an image in its history) gets no session at
+// all. The caller keeps `plan` alive as long as the session lives, because the session binds it by
+// reference. A batch executor calls this once per lane: prefill is serial per lane, so the single
+// startup arena is reused sequentially and only one session is ever alive.
+std::unique_ptr<qwen::execution::VisionPrefillSession> TP2GenerationCore::open_vision_session(
+    qwen::PreparedPromptData& data, std::uint32_t reuse,
+    qwen::execution::VisionPrefillPlan& plan) {
+    if (!data.has_media()) { return nullptr; }
+    if (!vision_workspace_ || vision_arena_ == nullptr) {
+        throw std::invalid_argument("multimodal request without a Vision workspace plan");
+    }
+    const auto& vision_config = shard_b_.model->config().vision.value();
+    auto control_plan = std::make_shared<qwen::VisionControlPlan>(
+        qwen::plan_vision_control(data, vision_config));
+    std::size_t max_merged = 0;
+    std::size_t first_item = control_plan->items.size();
+    plan.uses.reserve(control_plan->items.size());
+    for (std::size_t index = 0; index < control_plan->items.size(); ++index) {
+        const qwen::VisionItemControlPlan& item = control_plan->items[index];
+        if (item.merged_count > vision_workspace_->max_merged_tokens) {
+            throw std::invalid_argument(
+                "image needs " + std::to_string(item.merged_count) +
+                " vision tokens but this TP-2 route admitted only " +
+                std::to_string(vision_workspace_->max_merged_tokens) +
+                " at startup (see the [mem] vision ledger line)");
+        }
+        if (item.token_end <= reuse) {
+            // Already encoded by the prefill that owns the reused prefix; the patch payload is not
+            // needed again, so drop it instead of holding it for the request's lifetime.
+            data.media_payloads[index].reset();
+            continue;
+        }
+        if (first_item == control_plan->items.size()) { first_item = index; }
+        plan.uses.push_back(qwen::execution::VisionUseSpan{
+            .begin               = item.token_begin,
+            .end                 = item.token_end,
+            .prepared_item_index = static_cast<std::uint32_t>(index),
+            .control_index       = 0,
+        });
+        max_merged = std::max(max_merged, item.merged_count);
+    }
+    if (plan.uses.empty()) { return nullptr; }
+    const auto first      = static_cast<std::uint32_t>(first_item);
+    plan.max_merged_count = max_merged;
+    plan.control          = std::make_shared<const qwen::VisionControl>(
+        qwen::build_vision_control(data, *control_plan, first));
+    for (qwen::execution::VisionUseSpan& use : plan.uses) {
+        use.control_index = use.prepared_item_index - first;
+    }
+    shard_b_.device.bind_to_current_thread();
+    return std::make_unique<qwen::execution::VisionPrefillSession>(
+        shard_b_.device, *shard_b_.parameters,
+        DeviceSpan{vision_arena_->base(), vision_arena_->capacity()}, *vision_workspace_, data,
+        plan, vision_handoff_peak_bytes_);
+}
+
 GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* sink,
                                                  const CancellationView& cancellation) {
     const bool streaming = request.consumer_mode == OutputConsumerMode::Streaming;
     auto& data = qwen::PreparedPromptAccess::mutable_view(request.prompt);
     const auto& token_ids = data.token_ids;
+    const std::uint32_t lane = static_cast<std::uint32_t>(active_lane_);
+    RetentionState& lane_state = retention(lane);
     // A multimodal request runs its Vision prefill on the Vision shard and then decodes through the
     // same speculative window as a text request. A chat turn that carries an image keeps that image
     // in every later turn's history, so treating "has media" as "no speculation" would cost the whole
@@ -2495,15 +5223,15 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         const char* env = std::getenv("NINFER_TP2_REUSE_TRACE");
         return env != nullptr && env[0] == '1';
     }();
-    std::uint32_t prefill_chunks      = 0;
-    std::uint64_t prefill_host_writes = 0;
+    std::uint32_t prefill_chunks = 0;
+    prefill_host_writes_         = 0;
     Clock::time_point scan_done       = start;
     Clock::time_point state_done      = start;
     Clock::time_point walk_done       = start;
 
     // Cross-session recall, before the prefix scan reads the device lineage. A prompt that belongs
     // to another conversation makes the resident session swap out here, so by the time the scan
-    // below compares against cached_prompt_tokens_ the pools already hold the conversation this
+    // below compares against lane_state.cached_prompt_tokens the pools already hold the conversation this
     // prompt continues. A prompt that continues the resident conversation is left untouched.
     // A client that re-renders the answer it was handed does not have to pay for it: when the
     // replay describes the same turn, the tokens this lineage generated are the ones its KV holds,
@@ -2516,14 +5244,17 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // the tokens the walk will really forward keeps a conversation whose answer came back as text
     // resident, instead of retiring it over a divergence the adoption is about to remove. When
     // nothing is adopted the tokens are untouched and the recall sees exactly what it always did.
-    const TurnAdoption adoption = adopt_generated_turn(data, prompt_tokens, reuse_trace);
+    const TurnAdoption adoption = adopt_generated_turn(data, prompt_tokens, reuse_trace, lane);
     if (adoption.adopted) {
         prompt_tokens                 = adoption.prompt_tokens;
         request.summary.prompt_tokens = prompt_tokens;
         result.prompt.prompt_tokens   = prompt_tokens;
     }
 
-    session_recall(token_ids);
+    // The media identity this prompt carries, taken once. `token_ids` above is a view of the same
+    // vector, and adoption only rewrites the count, so the spans index into what the walk publishes.
+    const std::vector<MediaSpan> prompt_media = collect_media_spans(data, data.token_ids.size());
+    session_recall(lane, token_ids, prompt_media);
 
     // Prompt-prefix reuse. The KV pages hold the K/V of every position the last completed prefill
     // wrote, and the state snapshots hold the matching GDN states, so a prompt that extends the
@@ -2534,13 +5265,17 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     std::uint32_t reuse       = 0;
     std::size_t reuse_slot    = 0;
     std::size_t shared_prefix = 0;
-    reuse_source_             = ReuseSource::None;
-    if (cached_state_valid_ && !cached_prompt_tokens_.empty()) {
-        const std::size_t common = std::min(cached_prompt_tokens_.size(), token_ids.size());
+    lane_state.reuse_source             = ReuseSource::None;
+    if (lane_state.cached_state_valid && !lane_state.cached_prompt_tokens.empty()) {
+        const std::size_t common = std::min(lane_state.cached_prompt_tokens.size(), token_ids.size());
         while (shared_prefix < common &&
-               cached_prompt_tokens_[shared_prefix] == token_ids[shared_prefix]) {
+               lane_state.cached_prompt_tokens[shared_prefix] == token_ids[shared_prefix]) {
             ++shared_prefix;
         }
+        // Token ids cannot see media: every image merges to the same placeholder ids, so two prompts
+        // showing different pictures compare equal above. Cap the boundary at the first media item
+        // whose identity differs, or the reuse would keep KV written for another picture.
+        shared_prefix = media_prefix_cap(lane_state.cached_media, prompt_media, shared_prefix);
         // A host checkpoint is a state plus the KV before it, and both are only this prompt's while
         // the lineage agrees on the tokens before it: the state was taken over the tokens of the
         // prompt that wrote it, and every prefill since kept the KV consistent only up to the prefix
@@ -2552,7 +5287,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         Shard* const shards[2] = {&shard_a_, &shard_b_};
         for (Shard* shard : shards) {
             for (auto& checkpoint : shard->host_checkpoints) {
-                if (checkpoint.position > shared_prefix) { checkpoint.valid = false; }
+                if (checkpoint.position[lane] > shared_prefix) { checkpoint.valid[lane] = false; }
             }
         }
         // Every boundary the lineage can offer, deepest wins. Any of them is usable while the state
@@ -2576,43 +5311,45 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             }
             reuse         = position;
             reuse_slot    = slot;
-            reuse_source_ = source;
+            lane_state.reuse_source = source;
         };
         // The live GDN state is the deepest boundary a continued conversation can offer: it sits
         // exactly at the resident entry's frontier, and the device KV holds the whole history before
         // it. Reusing it copies nothing at all - but only a prompt that extends it has a column to
         // forward, and the final prompt token must still be forwarded to produce the logits that
         // drive the first sample.
-        if (live_state_valid_ && active_session_ != kNoSession) {
-            take(sessions_[active_session_].frontier, 0, ReuseSource::LiveState);
+        if (lane_state.live_state_valid && lane_state.active_session != kNoSession) {
+            take(sessions_[lane_state.active_session].frontier, 0, ReuseSource::LiveState);
         }
         for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
-            take(cached_boundaries_[slot], slot, ReuseSource::DeviceSnapshot);
+            take(lane_state.cached_boundaries[slot], slot, ReuseSource::DeviceSnapshot);
         }
         for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
             const auto& checkpoint = shard_a_.host_checkpoints[index];
-            if (checkpoint.valid) { take(checkpoint.position, index, ReuseSource::HostCheckpoint); }
+            if (checkpoint.valid[lane]) {
+                take(checkpoint.position[lane], index, ReuseSource::HostCheckpoint);
+            }
         }
     }
     if (prefill_trace) { scan_done = Clock::now(); }
     if (reuse_trace) {
         std::size_t valid_checkpoints = 0;
         for (const auto& checkpoint : shard_a_.host_checkpoints) {
-            valid_checkpoints += checkpoint.valid ? 1U : 0U;
+            valid_checkpoints += checkpoint.valid[lane] ? 1U : 0U;
         }
-        const char* source = reuse_source_ == ReuseSource::HostCheckpoint ? "host"
-                             : reuse_source_ == ReuseSource::LiveState    ? "live"
-                             : reuse_source_ == ReuseSource::DeviceSnapshot ? "device"
+        const char* source = lane_state.reuse_source == ReuseSource::HostCheckpoint ? "host"
+                             : lane_state.reuse_source == ReuseSource::LiveState    ? "live"
+                             : lane_state.reuse_source == ReuseSource::DeviceSnapshot ? "device"
                                                                             : "none";
         const std::uint32_t previous_prompt =
-            active_session_ != kNoSession ? sessions_[active_session_].prompt_end : 0;
+            lane_state.active_session != kNoSession ? sessions_[lane_state.active_session].prompt_end : 0;
         std::fprintf(stderr,
                      "[tp2-reuse] prompt=%u cached=%zu shared=%zu replay_split=%zu adopted=%d "
                      "prev_prompt=%u prefill_end=%u rewind=%u host=%zu/%zu stride=%u -> reuse=%u "
                      "slot=%zu src=%s\n",
-                     prompt_tokens, cached_prompt_tokens_.size(), shared_prefix,
+                     prompt_tokens, lane_state.cached_prompt_tokens.size(), shared_prefix,
                      adoption.divergence, adoption.adopted ? 1 : 0, previous_prompt,
-                     cached_boundaries_[0], cached_boundaries_[1], valid_checkpoints,
+                     lane_state.cached_boundaries[0], lane_state.cached_boundaries[1], valid_checkpoints,
                      shard_a_.host_checkpoints.size(), host_checkpoint_stride_, reuse, reuse_slot,
                      source);
     }
@@ -2620,7 +5357,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // Tag the checkpoints this walk leaves behind and start the ring at the first stride multiple
     // past the reused boundary: a checkpoint at the boundary itself would only duplicate the device
     // snapshot the walk starts from. The new checkpoints become usable when this prefill completes.
-    host_checkpoint_live_id_           = host_checkpoint_next_id_++;
+    lane_state.host_checkpoint_live_id           = host_checkpoint_next_id_++;
     std::uint32_t next_host_checkpoint = 0;
     if (host_checkpoint_stride_ != 0) {
         next_host_checkpoint = host_checkpoint_stride_;
@@ -2633,83 +5370,38 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // the suffix, and a request whose reused prefix covers every item (the common case for a chat
     // turn that carries an image in its history) runs with no session at all. Its chunks still bind
     // the prompt's 3-axis RoPE table, which is a property of the prompt rather than of the encoding.
+    // The plan must outlive the session, which binds it by reference.
     qwen::execution::VisionPrefillPlan vision_plan;
-    std::unique_ptr<qwen::execution::VisionPrefillSession> vision_session;
-    if (media) {
-        if (!vision_workspace_ || vision_arena_ == nullptr) {
-            throw std::invalid_argument("multimodal request without a Vision workspace plan");
-        }
-        const auto& vision_config = shard_b_.model->config().vision.value();
-        auto control_plan = std::make_shared<qwen::VisionControlPlan>(
-            qwen::plan_vision_control(data, vision_config));
-        std::size_t max_merged  = 0;
-        std::size_t first_item  = control_plan->items.size();
-        vision_plan.uses.reserve(control_plan->items.size());
-        for (std::size_t index = 0; index < control_plan->items.size(); ++index) {
-            const qwen::VisionItemControlPlan& item = control_plan->items[index];
-            if (item.merged_count > vision_workspace_->max_merged_tokens) {
-                throw std::invalid_argument(
-                    "image needs " + std::to_string(item.merged_count) +
-                    " vision tokens but this TP-2 route admitted only " +
-                    std::to_string(vision_workspace_->max_merged_tokens) +
-                    " at startup (see the [mem] vision ledger line)");
-            }
-            if (item.token_end <= reuse) {
-                // Already encoded by the prefill that owns the reused prefix; the patch payload is
-                // not needed again, so drop it instead of holding it for the request's lifetime.
-                data.media_payloads[index].reset();
-                continue;
-            }
-            if (first_item == control_plan->items.size()) { first_item = index; }
-            vision_plan.uses.push_back(qwen::execution::VisionUseSpan{
-                .begin               = item.token_begin,
-                .end                 = item.token_end,
-                .prepared_item_index = static_cast<std::uint32_t>(index),
-                .control_index       = 0,
-            });
-            max_merged = std::max(max_merged, item.merged_count);
-        }
-        if (!vision_plan.uses.empty()) {
-            const auto first = static_cast<std::uint32_t>(first_item);
-            vision_plan.max_merged_count = max_merged;
-            vision_plan.control          = std::make_shared<const qwen::VisionControl>(
-                qwen::build_vision_control(data, *control_plan, first));
-            for (qwen::execution::VisionUseSpan& use : vision_plan.uses) {
-                use.control_index = use.prepared_item_index - first;
-            }
-            shard_b_.device.bind_to_current_thread();
-            vision_session = std::make_unique<qwen::execution::VisionPrefillSession>(
-                shard_b_.device, *shard_b_.parameters,
-                DeviceSpan{vision_arena_->base(), vision_arena_->capacity()}, *vision_workspace_,
-                data, vision_plan, vision_handoff_peak_bytes_);
-        }
-    }
+    std::unique_ptr<qwen::execution::VisionPrefillSession> vision_session =
+        open_vision_session(data, reuse, vision_plan);
 
     // Reset per-request state on both shards. The KV pages and execution row 0 are materialized
     // once at startup (build_shard) and reused in place, so a reused prefix needs no KV work at
     // all; only the GDN state must be restored to (or reset at) the prefill frontier.
     auto begin_gdn_state = [&](Shard& shard) {
         shard.device.bind_to_current_thread();
-        switch (reuse_source_) {
+        switch (lane_state.reuse_source) {
         case ReuseSource::None:
-            CUDA_CHECK(cudaMemsetAsync(shard.state_backing.data, 0, shard.state_backing.bytes,
-                                       shard.device.stream));
+            // A lane only owns its own slot, so a reset must not touch its neighbours.
+            zero_lane_state(shard.lane_state_geometry, shard.state_backing.data,
+                            static_cast<std::int32_t>(lane), shard.device.stream);
             return;
         case ReuseSource::LiveState:
             // The device state already sits at this boundary: a restored session put it there, or
             // the conversation that just decoded left it exactly at its frontier. Nothing to copy.
             return;
         case ReuseSource::DeviceSnapshot:
-            CUDA_CHECK(cudaMemcpyAsync(shard.state_backing.data,
-                                       shard.state_snapshots[reuse_slot].data,
-                                       shard.state_backing.bytes, cudaMemcpyDeviceToDevice,
-                                       shard.device.stream));
+            copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
+                            static_cast<std::int32_t>(lane), shard.state_snapshots[reuse_slot].data,
+                            cudaMemcpyDeviceToDevice, shard.device.stream);
             return;
         case ReuseSource::HostCheckpoint:
-            CUDA_CHECK(cudaMemcpyAsync(shard.state_backing.data,
-                                       shard.host_checkpoints[reuse_slot].buffer->data(),
-                                       shard.state_backing.bytes, cudaMemcpyHostToDevice,
-                                       shard.device.stream));
+            copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
+                            static_cast<std::int32_t>(lane),
+                            static_cast<std::byte*>(
+                                shard.host_checkpoints[reuse_slot].buffer->data()) +
+                                static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
+                            cudaMemcpyHostToDevice, shard.device.stream);
             return;
         }
     };
@@ -2723,7 +5415,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     auto begin_dflash_state = [&](Shard& shard) {
         if (shard.dflash_round == nullptr) { return; }
         shard.device.bind_to_current_thread();
-        switch (reuse_source_) {
+        switch (lane_state.reuse_source) {
         case ReuseSource::None:
             shard.dflash_round->zero_context();
             return;
@@ -2731,27 +5423,33 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             // The live ring already reaches this boundary: a recall restored it, or the conversation
             // that just decoded left it flushed to its frontier at publish.
             return;
-        case ReuseSource::DeviceSnapshot:
-            shard.dflash_round->copy_context_from_device(shard.dflash_snapshots[reuse_slot],
-                                                         shard.device.stream);
+        case ReuseSource::DeviceSnapshot: {
+            const std::size_t lane_bytes = shard.dflash_round->lane_context_image_bytes();
+            shard.dflash_round->copy_context_from_device(
+                DeviceSpan{static_cast<std::byte*>(shard.dflash_snapshots[reuse_slot].data) +
+                               static_cast<std::size_t>(lane) * lane_bytes,
+                           lane_bytes},
+                shard.device.stream, static_cast<std::int32_t>(lane));
             return;
+        }
         case ReuseSource::HostCheckpoint: {
             const Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[reuse_slot];
             if (checkpoint.dflash_buffer == nullptr ||
-                checkpoint.dflash_frontier != checkpoint.position) {
+                checkpoint.dflash_frontier[lane] != checkpoint.position[lane]) {
                 throw std::logic_error(
                     "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
             }
             shard.dflash_round->copy_context_from_host(
-                static_cast<const std::byte*>(checkpoint.dflash_buffer->data()),
-                shard.device.stream);
+                static_cast<const std::byte*>(checkpoint.dflash_buffer->data()) +
+                    static_cast<std::size_t>(lane) * shard.dflash_round->lane_context_image_bytes(),
+                shard.device.stream, static_cast<std::int32_t>(lane));
             return;
         }
         }
     };
     begin_dflash_state(shard_a_);
     begin_dflash_state(shard_b_);
-    dflash_context_frontier_ = reuse;
+    lane_state.dflash_context_frontier = reuse;
     if (prefill_trace) {
         CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
         CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
@@ -2763,7 +5461,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     }
     result.reused_prompt_tokens   = reuse;
     result.prefix_reuse_path =
-        reuse_path(reuse, data.context_cache.leading_instruction_frontier.value_or(0));
+        reuse_path(reuse, data.context_cache.leading_instruction_frontier.value_or(0), lane);
 
     // Sampling config, device-resident, for ops::sample.
     ops::SamplingConfig sampling_config = make_sampling_config(request.sampling);
@@ -2849,7 +5547,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         }
     };
 
-    // Prefix-reuse snapshots are taken on the shard streams, so each one captures the GDN state
+    // The round scratch is the whole pool, because the fold restores it wholesale on the shard's
+    // own stream. Both kinds of copy are taken on that stream, so each one captures the GDN state
     // exactly at its boundary: the enclosing loop has enqueued every earlier token's forward and
     // none of the later ones yet.
     auto snapshot_state = [&](Shard& shard, std::size_t slot) {
@@ -2857,6 +5556,22 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         CUDA_CHECK(cudaMemcpyAsync(shard.state_snapshots[slot].data, shard.state_backing.data,
                                    shard.state_backing.bytes, cudaMemcpyDeviceToDevice,
                                    shard.device.stream));
+    };
+    // The prefix-reuse planes are shared by every lane (one plane per boundary), so a lane writes
+    // only its own slice. A whole-plane copy would overwrite the slice another lane's
+    // `cached_boundaries` still describes, and a DeviceSnapshot reuse would then restore a state
+    // deeper than the boundary it advertises (P2.3 Stage 2). The round scratch keeps the whole
+    // plane: the fold restores it wholesale on the shard's own stream.
+    auto snapshot_lane_state = [&](Shard& shard, std::size_t slot) {
+        shard.device.bind_to_current_thread();
+        // The device-to-device branch of copy_lane_state copies *into* its first device pointer, so
+        // the plane is the destination and the live pool is the source. Passing them the other way
+        // round reads the plane back into the pool instead of freezing the pool into the plane, and
+        // the plane is never zeroed at startup (only state_backing is), so the walk would then
+        // decode from whatever the arena happened to hold.
+        copy_lane_state(shard.lane_state_geometry, shard.state_snapshots[slot].data,
+                        static_cast<std::int32_t>(lane), shard.state_backing.data,
+                        cudaMemcpyDeviceToDevice, shard.device.stream);
     };
     // The draft's still-uncommitted verify window, committed before the target state it belongs to
     // is published. A round leaves the pending staging for the *next* round to commit (its first
@@ -2866,7 +5581,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // one, and it is the TP-2 form of the single-device commit's leading
     // enqueue_dflash_context_append (transactions/commit.cpp:305-319).
     auto flush_dflash_context = [&](std::uint32_t frontier) {
-        if (shard_a_.dflash_round == nullptr || dflash_context_frontier_ >= frontier) { return; }
+        if (shard_a_.dflash_round == nullptr || lane_state.dflash_context_frontier >= frontier) { return; }
         const qwen::execution::ExecutionCore dflash_execution{
             .device           = shard_a_.device,
             .parameters       = *shard_a_.parameters,
@@ -2878,67 +5593,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             .prefill_chunk    = options_.prefill_chunk,
             .proposal_head    = options_.speculative.proposal_head,
         };
-        shard_a_.dflash_round->append_pending(dflash_execution, dflash_context_frontier_, frontier);
-        dflash_context_frontier_ = frontier;
+        shard_a_.dflash_round->append_pending(dflash_execution, lane_state.dflash_context_frontier, frontier);
+        lane_state.dflash_context_frontier = frontier;
     };
-    // The same copy into the host ring, tagged with the frontier it captures. It rides the shard
-    // stream, so it sees exactly the tokens the enclosing loop has enqueued and none of the later
-    // ones, and the ring slot it lands in is only revisited by a later prefill's checkpoint at the
-    // same index.
-    // Which reserved group of the ring a checkpoint lands in. The grid and the tail anchors rotate
-    // through their own slots; the divergence anchor and the block anchor own a fixed slot each and
-    // are rewritten in place, so they advance no cursor and neither rotation can evict them.
-    enum class HostRing { Grid, Tail, Divergence, Block };
-    auto snapshot_host_checkpoint = [&](Shard& shard, std::uint32_t frontier, HostRing ring) {
-        if (shard.host_checkpoints.empty()) { return; }
-        ++prefill_host_writes;
-        const std::size_t grid = shard.host_checkpoint_grid_slots;
-        const std::size_t tail = host_checkpoint_tail_slots_;
-        std::size_t begin      = 0;
-        std::size_t count      = grid;
-        switch (ring) {
-            case HostRing::Grid: break;
-            case HostRing::Tail: begin = grid; count = tail; break;
-            case HostRing::Divergence:
-                begin = grid + tail;
-                count = host_checkpoint_divergence_slots_;
-                break;
-            case HostRing::Block:
-                begin = grid + tail + host_checkpoint_divergence_slots_;
-                count = host_checkpoint_block_slots_;
-                break;
-        }
-        if (count == 0 || begin + count > shard.host_checkpoints.size()) { return; }
-        const std::size_t index = ring == HostRing::Tail   ? shard.host_checkpoint_tail_next
-                                  : ring == HostRing::Grid ? shard.host_checkpoint_next
-                                                           : 0;
-        shard.device.bind_to_current_thread();
-        Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[begin + index];
-        // Overwriting the slot already destroys the checkpoint it held, so retire it before the copy
-        // is enqueued: a prefill that throws between here and the publish sweep must not leave a
-        // torn buffer behind a flag that still says the last completed prefill wrote it. Only the
-        // sweep below, which runs after the walk finished, makes a checkpoint usable again.
-        checkpoint.valid      = false;
-        checkpoint.position   = frontier;
-        checkpoint.prefill_id = host_checkpoint_live_id_;
-        CUDA_CHECK(cudaMemcpyAsync(checkpoint.buffer->data(), shard.state_backing.data,
-                                   shard.state_backing.bytes, cudaMemcpyDeviceToHost,
-                                   shard.device.stream));
-        // The masked draft's context at the same frontier rides the same slot. A chunk boundary is
-        // exactly where the prefill sink has finished committing that chunk, so the ring reaches
-        // this frontier; the frontier is recorded so a restore can refuse a checkpoint whose draft
-        // half does not describe the position it names.
-        if (shard.dflash_round != nullptr && checkpoint.dflash_buffer != nullptr) {
-            checkpoint.dflash_frontier = dflash_context_frontier_;
-            shard.dflash_round->copy_context_to_host(
-                static_cast<std::byte*>(checkpoint.dflash_buffer->data()), shard.device.stream);
-        }
-        if (ring == HostRing::Tail) {
-            shard.host_checkpoint_tail_next = (index + 1) % count;
-        } else if (ring == HostRing::Grid) {
-            shard.host_checkpoint_next = (index + 1) % count;
-        }
-    };
+    // The host checkpoint ring is written by snapshot_host_checkpoint, which the batch route calls
+    // with its own lane as well.
 
     // Prefill: batched forwards over chunk-sized slices of the prompt suffix, accumulating KV and
     // GDN state in place. A reused prefix starts the walk at its boundary; those positions keep
@@ -2975,10 +5634,10 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             // The restored state already sits exactly on this boundary, and the walk never revisits
             // its own starting point, so freeze it before the first chunk. The draft ring was
             // restored to the same boundary by begin_dflash_state.
-            snapshot_state(shard_a_, slot);
-            snapshot_state(shard_b_, slot);
-            snapshot_dflash_state(shard_a_, slot);
-            snapshot_dflash_state(shard_b_, slot);
+            snapshot_lane_state(shard_a_, slot);
+            snapshot_lane_state(shard_b_, slot);
+            snapshot_dflash_state(shard_a_, slot, lane);
+            snapshot_dflash_state(shard_b_, slot, lane);
         }
     }
     // Divergence anchor. shared_prefix is where this prompt stopped matching the lineage it
@@ -2991,9 +5650,10 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // strictly inside this walk is worth freezing: at or below reuse the walk's own starting state is
     // already checkpointed, and at the prompt end the device snapshot holds it. A checkpoint that
     // already sits there stays untouched, which is what keeps a reused stable prefix free of work.
-    const auto has_valid_host_checkpoint_at = [](const Shard& shard, std::uint32_t position) {
+    const auto has_valid_host_checkpoint_at = [](const Shard& shard, std::uint32_t position,
+                                                 std::uint32_t lane) {
         for (const auto& checkpoint : shard.host_checkpoints) {
-            if (checkpoint.valid && checkpoint.position == position) { return true; }
+            if (checkpoint.valid[lane] && checkpoint.position[lane] == position) { return true; }
         }
         return false;
     };
@@ -3006,7 +5666,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     std::uint32_t anchor_prefix = static_cast<std::uint32_t>(shared_prefix);
     for (std::size_t index = 0; index < sessions_.size(); ++index) {
         const SessionEntry& entry = sessions_[index];
-        if (index == anchor_session_ || entry.device_resident || entry.tokens.empty()) { continue; }
+        if (index == lane_state.anchor_session || entry.device_lane >= 0 || entry.tokens.empty()) {
+            continue;
+        }
         if (entry.host_shared_state[0] == nullptr || entry.host_shared_state[1] == nullptr) {
             continue;
         }
@@ -3019,15 +5681,26 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                                            : static_cast<std::uint32_t>(shared);
         if (position <= reuse || position > entry.host_kv_end) { continue; }
         anchor_prefix   = static_cast<std::uint32_t>(shared);
-        anchor_session_ = index;
+        lane_state.anchor_session = index;
     }
-    const std::uint32_t anchor_position = anchor_prefix > kReuseDivergenceMargin
-                                              ? anchor_prefix - kReuseDivergenceMargin
-                                              : anchor_prefix;
+    const std::uint32_t anchor_target = anchor_prefix > kReuseDivergenceMargin
+                                            ? anchor_prefix - kReuseDivergenceMargin
+                                            : anchor_prefix;
+    // The anchor only ever lands on the walk's own chunk grid, for the same reason the rewind
+    // snapshots do (see above): a chunk truncated to a target derived from engine history makes the
+    // same prompt prefill with different chunk widths from one walk to the next, and the last
+    // chunk's logits then differ by far more than a reduction-order change - enough to flip the
+    // first sample against a from-scratch oracle. Every clamp this walk applies already sits on the
+    // grid fixed by `reuse`, `prompt_tokens` and `prefill_chunk`, so rounding the anchor down costs
+    // only the part of a chunk behind it and never a split.
+    std::uint32_t anchor_position = anchor_target;
+    if (anchor_position > reuse) {
+        anchor_position = reuse + ((anchor_position - reuse) / prefill_chunk) * prefill_chunk;
+    }
     const bool anchor_divergence = host_checkpoint_stride_ != 0 && anchor_position > reuse &&
                                    anchor_position < prompt_tokens &&
-                                   !has_valid_host_checkpoint_at(shard_a_, anchor_position) &&
-                                   !has_valid_host_checkpoint_at(shard_b_, anchor_position);
+                                   !has_valid_host_checkpoint_at(shard_a_, anchor_position, lane) &&
+                                   !has_valid_host_checkpoint_at(shard_b_, anchor_position, lane);
     // The prompt names where its own leading instruction block ends, and this walk is the only one
     // that can freeze the state there: the block is what every conversation of the same agent
     // re-renders, but the first conversation that shares it is the one that has to walk it, so an
@@ -3048,18 +5721,18 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     }
     const bool block_anchor = host_checkpoint_stride_ != 0 && block_position > reuse &&
                               block_position < prompt_tokens &&
-                              !has_valid_host_checkpoint_at(shard_a_, block_position) &&
-                              !has_valid_host_checkpoint_at(shard_b_, block_position);
+                              !has_valid_host_checkpoint_at(shard_a_, block_position, lane) &&
+                              !has_valid_host_checkpoint_at(shard_b_, block_position, lane);
     // The conversation this prompt was compared against stopped matching it exactly where the walk
     // starts, so the device state sitting there right now is its state at that boundary too: freeze
     // it before the first chunk overwrites it. A later conversation opening with the same stable
     // block can then be recalled onto the owner's own slabs instead of prefilling the block again.
     // The device pools still hold it because the recall restored it, or because the eviction left
     // the device lineage standing on it, and nothing has run since.
-    if (anchor_session_ != kNoSession && reuse != 0 && reuse == shared_prefix) {
+    if (lane_state.anchor_session != kNoSession && reuse != 0 && reuse == shared_prefix) {
         // The device draft ring was restored to `reuse` by begin_dflash_state above, which is the
         // boundary the target state is at too, so this captures the two halves together.
-        session_capture_shared_state(anchor_session_, reuse, true, nullptr, nullptr);
+        session_capture_shared_state(lane_state.anchor_session, reuse, true, nullptr, nullptr, lane);
     }
     // Set when the prefill's own sample already ended the request: the first token can be a stop
     // token, or it can spend the whole output budget. Decode then has nothing left to do.
@@ -3073,13 +5746,13 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             // the recall's bookkeeping already describes the device pools, so that case leaves the
             // catalog exactly as the recall left it.
             if (t0 > 0) {
-                snapshot_state(shard_a_, 0);
-                snapshot_state(shard_b_, 0);
-                snapshot_dflash_state(shard_a_, 0);
-                snapshot_dflash_state(shard_b_, 0);
-                cached_boundaries_[0] = t0;
-                cached_boundaries_[1] = 0;
-                cached_state_valid_   = true;
+                snapshot_lane_state(shard_a_, 0);
+                snapshot_lane_state(shard_b_, 0);
+                snapshot_dflash_state(shard_a_, 0, lane);
+                snapshot_dflash_state(shard_b_, 0, lane);
+                lane_state.cached_boundaries[0] = t0;
+                lane_state.cached_boundaries[1] = 0;
+                lane_state.cached_state_valid   = true;
                 // A prefill chunk commits its own draft window inside the forward, so this is a
                 // no-op; it is here so the invariant is stated once: nothing is published with an
                 // uncommitted draft window.
@@ -3087,8 +5760,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 session_publish(
                     std::vector<TokenId>(token_ids.begin(),
                                          token_ids.begin() + static_cast<std::ptrdiff_t>(t0)),
-                    t0, data.context_cache);
-                if (active_session_ != kNoSession) { sessions_[active_session_].prompt_end = t0; }
+                    t0, data.context_cache, collect_media_spans(data, t0), lane);
+                if (lane_state.active_session != kNoSession) { sessions_[lane_state.active_session].prompt_end = t0; }
             }
             (void)request.output.preview_terminal(FinishReason::Cancelled);
             publish_preview(false);
@@ -3157,11 +5830,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                                   static_cast<std::int32_t>(t0), &logits_a, &logits_b,
                                   mtp_enabled_ ? &mtp_input_a : nullptr, nullptr, nullptr,
                                   qwen::TextPhase::Prefill, media_ptr,
-                                  dflash_sink ? &*dflash_sink : nullptr);
+                                  dflash_sink ? &*dflash_sink : nullptr, active_lane_);
         if (dflash_sink) {
             // The sink's consumer ran synchronously inside the forward and appended this chunk's
             // absolute positions to the draft ring, so the context frontier tracks the prefill.
-            dflash_context_frontier_ = t0 + length;
+            lane_state.dflash_context_frontier = t0 + length;
         }
         if (mtp_enabled_ && t0 + length != prompt_tokens) {
             mtp_prefill_priming(shard_a_, token_ids.data() + t0, length, t0, mtp_input_a, nullptr,
@@ -3169,10 +5842,10 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         }
         for (std::size_t slot = 1; slot < kReuseSnapshotCount; ++slot) {
             if (snapshot_at[slot] == t0 + length) {
-                snapshot_state(shard_a_, slot);
-                snapshot_state(shard_b_, slot);
-                snapshot_dflash_state(shard_a_, slot);
-                snapshot_dflash_state(shard_b_, slot);
+                snapshot_lane_state(shard_a_, slot);
+                snapshot_lane_state(shard_b_, slot);
+                snapshot_dflash_state(shard_a_, slot, lane);
+                snapshot_dflash_state(shard_b_, slot, lane);
             }
         }
         if (host_checkpoint_stride_ != 0) {
@@ -3185,25 +5858,25 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             const bool in_tail           = frontier != prompt_tokens &&
                                  static_cast<std::uint64_t>(frontier) + tail_span > prompt_tokens;
             if (on_grid) {
-                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Grid);
-                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Grid);
+                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Grid, lane);
+                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Grid, lane);
                 next_host_checkpoint =
                     (frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
             } else if (in_tail) {
-                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Tail);
-                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Tail);
+                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Tail, lane);
+                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Tail, lane);
             }
             if (anchor_divergence && frontier == anchor_position) {
-                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Divergence);
-                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Divergence);
+                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Divergence, lane);
+                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Divergence, lane);
             }
             if (block_anchor && frontier == block_position) {
-                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Block);
-                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Block);
+                snapshot_host_checkpoint(shard_a_, frontier, HostRing::Block, lane);
+                snapshot_host_checkpoint(shard_b_, frontier, HostRing::Block, lane);
                 // The id names the walk that wrote it, so the eviction can tell this conversation's
                 // own block state from a later conversation's rewrite of the same slot.
-                block_anchor_position_   = block_position;
-                block_anchor_prefill_id_ = host_checkpoint_live_id_;
+                lane_state.block_anchor_position   = block_position;
+                lane_state.block_anchor_prefill_id = lane_state.host_checkpoint_live_id;
             }
         }
         if (t0 + length == prompt_tokens) {
@@ -3273,15 +5946,15 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // as well. Copying it into that entry's own image pairs the state with the KV its slabs already
     // hold, and unlike the ring slot it survives the next evictions. It lands before
     // session_publish, which may erase the entry and shift every later index.
-    if (anchor_session_ != kNoSession && anchor_divergence) {
+    if (lane_state.anchor_session != kNoSession && anchor_divergence) {
         const PinnedHostBuffer* frozen[2]    = {nullptr, nullptr};
         const PinnedHostBuffer* frozen_draft = nullptr;
         bool complete                        = true;
         for (std::size_t shard_index = 0; shard_index < 2 && complete; ++shard_index) {
             Shard& shard = shard_index == 0 ? shard_a_ : shard_b_;
             for (const auto& checkpoint : shard.host_checkpoints) {
-                if (checkpoint.prefill_id == host_checkpoint_live_id_ &&
-                    checkpoint.position == anchor_position) {
+                if (checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id &&
+                    checkpoint.position[lane] == anchor_position) {
                     frozen[shard_index] = checkpoint.buffer.get();
                     // The draft half of the anchor lives in the same checkpoint slot, so a checkpoint
                     // without it cannot carry the boundary.
@@ -3300,8 +5973,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 shard->device.bind_to_current_thread();
                 CUDA_CHECK(cudaStreamSynchronize(shard->device.stream));
             }
-            session_capture_shared_state(anchor_session_, anchor_position, false, frozen,
-                                         frozen_draft);
+            session_capture_shared_state(lane_state.anchor_session, anchor_position, false, frozen,
+                                         frozen_draft, lane);
         }
     }
     if (prefill_trace) {
@@ -3321,29 +5994,37 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // prefill end the walk just reached; the rewind slots were captured at their chunk boundaries.
     // A slot is published only when this prefill actually reached its boundary, so a request that
     // fails mid-prefill leaves the previous request's boundaries and snapshots intact.
-    snapshot_state(shard_a_, 0);
-    snapshot_state(shard_b_, 0);
-    snapshot_dflash_state(shard_a_, 0);
-    snapshot_dflash_state(shard_b_, 0);
-    cached_prompt_tokens_.assign(token_ids.begin(), token_ids.end());
+    snapshot_lane_state(shard_a_, 0);
+    snapshot_lane_state(shard_b_, 0);
+    snapshot_dflash_state(shard_a_, 0, lane);
+    snapshot_dflash_state(shard_b_, 0, lane);
+    // Every lane keeps its own boundary bookkeeping and its own slice of the snapshot planes, so
+    // the walk publishes this lane's prompt into both (P2.3 Stage 2). The two must move together: a
+    // plane slice written at one boundary while `cached_boundaries` still names a shallower one would
+    // let a DeviceSnapshot reuse restore a state deeper than the boundary it advertises. A slot this
+    // walk never reached keeps its zero and is never taken.
+    lane_state.cached_prompt_tokens.assign(token_ids.begin(), token_ids.end());
+    lane_state.cached_media.assign(prompt_media.begin(), prompt_media.end());
     for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
-        cached_boundaries_[slot] = snapshot_at[slot];
+        lane_state.cached_boundaries[slot] = snapshot_at[slot];
     }
-    cached_state_valid_ = true;
+    lane_state.cached_state_valid = true;
     // The pools now hold exactly this prompt and the live GDN state sits at its end, so the
     // resident catalog entry describes what the walk just wrote. A conversation that had no entry
     // yet gets one here, before decode extends its history.
-    session_publish(token_ids, prompt_tokens, data.context_cache);
+    session_publish(token_ids, prompt_tokens, data.context_cache, prompt_media, lane);
     // The entry now describes the prompt the device pools were built from, which is what a later
     // request compares against to tell a later turn of this conversation from a switch away.
-    if (active_session_ != kNoSession) { sessions_[active_session_].prompt_end = prompt_tokens; }
+    if (lane_state.active_session != kNoSession) { sessions_[lane_state.active_session].prompt_end = prompt_tokens; }
     // Only now are this prefill's checkpoints usable: their state is one the walk reached and their
     // KV prefix is one the walk wrote.
     {
         Shard* const shards[2] = {&shard_a_, &shard_b_};
         for (Shard* shard : shards) {
             for (auto& checkpoint : shard->host_checkpoints) {
-                if (checkpoint.prefill_id == host_checkpoint_live_id_) { checkpoint.valid = true; }
+                if (checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id) {
+                    checkpoint.valid[lane] = true;
+                }
             }
         }
     }
@@ -3357,7 +6038,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                      "[tp2-prefill] reuse=%u suffix=%u chunks=%u host_writes=%llu | scan=%.2f "
                      "state=%.2f walk=%.2f post=%.2f total=%.2f ms\n",
                      reuse, prompt_tokens - reuse, prefill_chunks,
-                     static_cast<unsigned long long>(prefill_host_writes), millis(start, scan_done),
+                     static_cast<unsigned long long>(prefill_host_writes_), millis(start, scan_done),
                      millis(scan_done, state_done), millis(state_done, walk_done),
                      millis(walk_done, report), millis(start, report));
     }
@@ -3442,8 +6123,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             const std::uint32_t budget_remaining = request.budget.remaining();
             const std::uint32_t max_by_budget =
                 budget_remaining > 1 ? budget_remaining - 1U : 0U;
+            const std::uint32_t lane_window = lane_context_window();
             const std::uint32_t capacity_left =
-                position + 1U < options_.max_context ? options_.max_context - position - 1U : 0U;
+                position + 1U < lane_window ? lane_window - position - 1U : 0U;
             // The draft is never declined, whatever boundary the scan took: the ring beside an
             // unaligned boundary belongs to the walk that froze it, so the block it proposes is that
             // walk's, and the target verify licenses every emitted token either way. The proposal
@@ -3472,8 +6154,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 // Hand off the previous verify window: its columns [C, E) are the target residual
                 // the draft context is missing, exactly the prepare_ragged_prefix append the
                 // single-device route makes at the head of its round.
-                round.append_pending(dflash_execution, dflash_context_frontier_, position);
-                dflash_context_frontier_ = position;
+                round.append_pending(dflash_execution, lane_state.dflash_context_frontier, position);
+                lane_state.dflash_context_frontier = position;
                 qwen::DFlashDecodeIngress& ingress = round.ingress();
                 ingress                            = {};
                 ingress.anchors[0]                 = current;
@@ -3835,22 +6517,16 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                     fold_shard->state_backing.bytes, cudaMemcpyDeviceToDevice,
                     fold_shard->device.stream));
             }
-            const ops::GdnReplayFoldRow fold_row{
-                .source_state_slot      = 0,
-                .destination_state_slot = 0,
-                .commit_columns         = static_cast<std::int32_t>(committed)};
-            const std::span<const ops::GdnReplayFoldRow> fold_rows(&fold_row, 1);
-            shard_a_.device.bind_to_current_thread();
-            shard_a_.replay_fold->execute(fold_rows, shard_a_.device.stream);
-            shard_b_.device.bind_to_current_thread();
-            shard_b_.replay_fold->execute(fold_rows, shard_b_.device.stream);
+            const std::int32_t fold_slots[1]   = {static_cast<std::int32_t>(lane)};
+            const std::int32_t fold_columns[1] = {static_cast<std::int32_t>(committed)};
+            fold_verify_window(fold_slots, fold_columns, 1);
             // The target frontier advances by exactly the committed columns. The draft ring
             // stays one verify window behind, except when this round ends the request: then it
             // is caught up to the final frontier, which is the single-device rule.
             const std::uint32_t base         = position;
             position                         = base + committed;
             const bool dflash_finished       = decision.finished();
-            dflash_context_frontier_         = dflash_finished ? position : base;
+            lane_state.dflash_context_frontier         = dflash_finished ? position : base;
             if (dflash_finished && position > base) {
                 const qwen::execution::ExecutionCore dflash_execution{
                     .device           = shard_a_.device,
@@ -3884,14 +6560,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                                            shard->state_backing.bytes, cudaMemcpyDeviceToDevice,
                                            shard->device.stream));
             }
-            const ops::GdnReplayFoldRow fold_row{.source_state_slot      = 0,
-                                                 .destination_state_slot = 0,
-                                                 .commit_columns = static_cast<std::int32_t>(committed)};
-            const std::span<const ops::GdnReplayFoldRow> rows(&fold_row, 1);
-            shard_a_.device.bind_to_current_thread();
-            shard_a_.replay_fold->execute(rows, shard_a_.device.stream);
-            shard_b_.device.bind_to_current_thread();
-            shard_b_.replay_fold->execute(rows, shard_b_.device.stream);
+            const std::int32_t fold_slots[1]   = {static_cast<std::int32_t>(lane)};
+            const std::int32_t fold_columns[1] = {static_cast<std::int32_t>(committed)};
+            fold_verify_window(fold_slots, fold_columns, 1);
             // The next anchor is the last committed token; its own transition stays pending, so the
             // next bridge reads the final-norm hidden of the column before it.
             mtp_anchor   = static_cast<std::int32_t>(step[committed - 1]);
@@ -3929,8 +6600,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 prompt_tokens + static_cast<std::uint32_t>(request.generated.size()) - 1U;
             if (committed_frontier >= next_host_checkpoint) {
                 flush_dflash_context(committed_frontier);
-                snapshot_host_checkpoint(shard_a_, committed_frontier, HostRing::Grid);
-                snapshot_host_checkpoint(shard_b_, committed_frontier, HostRing::Grid);
+                snapshot_host_checkpoint(shard_a_, committed_frontier, HostRing::Grid, lane);
+                snapshot_host_checkpoint(shard_b_, committed_frontier, HostRing::Grid, lane);
                 next_host_checkpoint =
                     (committed_frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
             }
@@ -3954,7 +6625,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // entry names exactly the target frontier, and its draft image has to reach it, so commit the
         // remainder first. A finished round already did this itself.
         flush_dflash_context(frontier);
-        session_publish(history, frontier, data.context_cache);
+        session_publish(history, frontier, data.context_cache, prompt_media, lane);
     }
     // Only now are the checkpoints decode wrote usable, on the same terms as the prefill's: their
     // state is one this walk committed and their KV prefix is one it wrote. A walk that threw
@@ -3963,7 +6634,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         Shard* const shards[2] = {&shard_a_, &shard_b_};
         for (Shard* shard : shards) {
             for (auto& checkpoint : shard->host_checkpoints) {
-                if (checkpoint.prefill_id == host_checkpoint_live_id_) { checkpoint.valid = true; }
+                if (checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id) {
+                    checkpoint.valid[lane] = true;
+                }
             }
         }
     }

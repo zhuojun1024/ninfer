@@ -37,9 +37,13 @@ void add_linear_scratch(WorkspaceLayoutBuilder& layout, const LinearParameters& 
 
 DFlash2RoundSpec plan_dflash2_round(const DraftConfig& draft, const TextConfig& target,
                                     std::uint32_t feature_columns, std::uint32_t draft_window,
-                                    std::size_t proposal_workspace_bytes) {
+                                    std::size_t proposal_workspace_bytes,
+                                    std::uint32_t batch_capacity) {
     if (!draft.dflash2.has_value()) {
         throw std::invalid_argument("a TP-2 masked-draft round requires the DFlash2 layout");
+    }
+    if (batch_capacity == 0) {
+        throw std::invalid_argument("a DFlash2 round needs at least one resident lane");
     }
     DFlash2RoundSpec spec;
     spec.hidden          = dimension(target.hidden_size);
@@ -52,7 +56,7 @@ DFlash2RoundSpec plan_dflash2_round(const DraftConfig& draft, const TextConfig& 
     spec.local_window    = draft.sliding_window.value_or(0);
     spec.local_kv_heads  = dimension(draft.attention.num_key_value_heads);
     spec.local_head_dim  = dimension(draft.attention.head_dim);
-    spec.batch_capacity  = 1;
+    spec.batch_capacity  = batch_capacity;
     spec.draft_window    = draft_window;
     spec.proposal_workspace_bytes = proposal_workspace_bytes;
     spec.target_layer_ids         = draft.target_layer_ids;
@@ -170,12 +174,14 @@ DFlash2Round::DFlash2Round(DeviceContext& device, const DFlash2RoundSpec& spec)
         layout.prefill_positions =
             builder.add_tensor(DType::I32, {spec_.feature_columns}, kDFlash2RoundAlignment,
                                "DFlash2 round prefill target positions");
-        layout.pending_features =
-            builder.add_tensor(DType::BF16, {spec_.target_features, spec_.feature_lanes, 1},
-                               kDFlash2RoundAlignment, "DFlash2 round pending target features");
-        const CyclicKVCacheLayout ring_layout =
-            plan_cyclic_kv_cache(builder, spec_.local_layers, spec_.local_window,
-                                 spec_.local_kv_heads, spec_.local_head_dim, 1);
+        layout.pending_features = builder.add_tensor(
+            DType::BF16,
+            {spec_.target_features, spec_.feature_lanes,
+             static_cast<std::int32_t>(spec_.batch_capacity)},
+            kDFlash2RoundAlignment, "DFlash2 round pending target features");
+        const CyclicKVCacheLayout ring_layout = plan_cyclic_kv_cache(
+            builder, spec_.local_layers, spec_.local_window, spec_.local_kv_heads,
+            spec_.local_head_dim, static_cast<std::int32_t>(spec_.batch_capacity));
         context_bytes_      = builder.finish(kDFlash2RoundAlignment, "DFlash2 round context");
         ring_payload_bytes_ = ring_layout.payload_bytes();
         context_arena_      = std::make_unique<DeviceArena>(context_bytes_);
@@ -273,32 +279,36 @@ void transfer_ring_image(const CyclicKVCacheSlotView& view, std::byte* image, bo
 
 } // namespace
 
-void DFlash2Round::copy_context_to_host(std::byte* destination, cudaStream_t stream) const {
+void DFlash2Round::copy_context_to_host(std::byte* destination, cudaStream_t stream,
+                                          std::int32_t lane) const {
     device_->bind_to_current_thread();
-    transfer_ring_image(ring_->slot_view(0), destination, true, cudaMemcpyDeviceToHost, stream);
+    transfer_ring_image(ring_->slot_view(lane), destination, true, cudaMemcpyDeviceToHost, stream);
 }
 
-void DFlash2Round::copy_context_from_host(const std::byte* source, cudaStream_t stream) {
+void DFlash2Round::copy_context_from_host(const std::byte* source, cudaStream_t stream,
+                                          std::int32_t lane) {
     device_->bind_to_current_thread();
-    transfer_ring_image(ring_->slot_view(0), const_cast<std::byte*>(source), false,
+    transfer_ring_image(ring_->slot_view(lane), const_cast<std::byte*>(source), false,
                         cudaMemcpyHostToDevice, stream);
 }
 
-void DFlash2Round::copy_context_to_device(DeviceSpan destination, cudaStream_t stream) const {
-    if (destination.bytes < ring_payload_bytes_) {
-        throw std::invalid_argument("DFlash2 context image is smaller than the draft ring");
+void DFlash2Round::copy_context_to_device(DeviceSpan destination, cudaStream_t stream,
+                                          std::int32_t lane) const {
+    if (destination.bytes < lane_context_image_bytes()) {
+        throw std::invalid_argument("DFlash2 context image is smaller than one lane's draft ring");
     }
     device_->bind_to_current_thread();
-    transfer_ring_image(ring_->slot_view(0), static_cast<std::byte*>(destination.data), true,
+    transfer_ring_image(ring_->slot_view(lane), static_cast<std::byte*>(destination.data), true,
                         cudaMemcpyDeviceToDevice, stream);
 }
 
-void DFlash2Round::copy_context_from_device(DeviceSpan source, cudaStream_t stream) {
-    if (source.bytes < ring_payload_bytes_) {
-        throw std::invalid_argument("DFlash2 context image is smaller than the draft ring");
+void DFlash2Round::copy_context_from_device(DeviceSpan source, cudaStream_t stream,
+                                            std::int32_t lane) {
+    if (source.bytes < lane_context_image_bytes()) {
+        throw std::invalid_argument("DFlash2 context image is smaller than one lane's draft ring");
     }
     device_->bind_to_current_thread();
-    transfer_ring_image(ring_->slot_view(0), static_cast<std::byte*>(source.data), false,
+    transfer_ring_image(ring_->slot_view(lane), static_cast<std::byte*>(source.data), false,
                         cudaMemcpyDeviceToDevice, stream);
 }
 
@@ -317,15 +327,19 @@ ExecutionCore DFlash2Round::round_execution(const ExecutionCore& source, DeviceA
     };
 }
 
-DFlashFeatureSink DFlash2Round::make_prefill_sink(ExecutionCore execution) {
+DFlashFeatureSink DFlash2Round::make_prefill_sink(ExecutionCore execution, std::int32_t lane) {
+    if (lane < 0 || static_cast<std::uint32_t>(lane) >= spec_.batch_capacity) {
+        throw std::invalid_argument("DFlash2 prefill sink lane is outside the draft context");
+    }
     return DFlashFeatureSink{
         .features  = &state_->prefill_features,
         .positions = &state_->prefill_positions,
         .layers    = std::span<const std::uint32_t>(spec_.target_layer_ids),
         .consume_prefill =
-            [this, execution](const Tensor& features, const Tensor& positions, bool /*rewrite*/) {
+            [this, execution, lane](const Tensor& features, const Tensor& positions,
+                                    bool /*rewrite*/) {
                 append(execution, features, positions,
-                       static_cast<std::uint32_t>(features.ne[1]), 0);
+                       static_cast<std::uint32_t>(features.ne[1]), lane);
             }};
 }
 
@@ -346,61 +360,105 @@ void DFlash2Round::append(ExecutionCore execution, const Tensor& features, const
     dflash_append_context(append_state, features, positions, counts, lanes, counts, {exact, exact});
 }
 
-DFlashFeatureSink DFlash2Round::make_verify_sink() {
+DFlashFeatureSink DFlash2Round::make_verify_sink(std::int32_t batch) {
     // The window's residuals land in the pending staging buffer one column per absolute position;
     // the destination lane is the row's frame lane, and valid_columns limits the write to the
-    // columns the target actually forwarded (the physical tail holds the last valid column).
+    // columns the target actually forwarded (the physical tail holds the last valid column). Only the
+    // first `batch` rows are live in a round, and the staging columns those rows own are their frame
+    // lanes, so both bindings are sliced to the live row count.
+    if (batch < 1 || static_cast<std::uint32_t>(batch) > spec_.batch_capacity) {
+        throw std::invalid_argument("DFlash2 verify sink batch is outside the frame");
+    }
+    verify_lanes_ = frame_->active_lanes.slice(0, 0, batch);
+    verify_valid_ = frame_->target_valid_columns.slice(0, 0, batch);
     return DFlashFeatureSink{
         .batch_features      = &state_->pending_features,
-        .batch_lanes         = &frame_->active_lanes,
-        .batch_valid_columns = &frame_->target_valid_columns,
+        .batch_lanes         = &verify_lanes_,
+        .batch_valid_columns = &verify_valid_,
         .batch_width         = spec_.feature_lanes,
-        .batch_size          = static_cast<std::int32_t>(spec_.batch_capacity),
+        .batch_size          = batch,
         .layers              = std::span<const std::uint32_t>(spec_.target_layer_ids),
     };
 }
 
 void DFlash2Round::append_pending(ExecutionCore execution, std::uint32_t start, std::uint32_t end) {
-    if (end < start) {
-        throw std::invalid_argument("DFlash2 pending append has an inverted frontier");
+    const std::int32_t slots[1]  = {0};
+    const std::int32_t starts[1] = {static_cast<std::int32_t>(start)};
+    const std::int32_t ends[1]   = {static_cast<std::int32_t>(end)};
+    append_pending_batch(execution, slots, starts, ends, 1);
+}
+
+void DFlash2Round::append_pending_batch(ExecutionCore execution, const std::int32_t* slots,
+                                        const std::int32_t* starts, const std::int32_t* ends,
+                                        std::int32_t batch) {
+    if (batch < 1 || static_cast<std::uint32_t>(batch) > spec_.batch_capacity || slots == nullptr ||
+        starts == nullptr || ends == nullptr) {
+        throw std::invalid_argument("DFlash2 pending batch append needs one row per live lane");
     }
-    const std::uint32_t count = end - start;
-    if (count == 0) { return; }
-    if (count > static_cast<std::uint32_t>(spec_.feature_lanes)) {
-        throw std::invalid_argument("DFlash2 pending append exceeds the staging window");
+    std::vector<std::int32_t> counts(static_cast<std::size_t>(batch));
+    bool any = false;
+    for (std::int32_t lane = 0; lane < batch; ++lane) {
+        if (ends[lane] < starts[lane]) {
+            throw std::invalid_argument("DFlash2 pending append has an inverted frontier");
+        }
+        const std::int32_t count = ends[lane] - starts[lane];
+        if (count > spec_.feature_lanes) {
+            throw std::invalid_argument("DFlash2 pending append exceeds the staging window");
+        }
+        counts[static_cast<std::size_t>(lane)] = count;
+        any                                    = any || count > 0;
     }
+    if (!any) { return; }
     device_->bind_to_current_thread();
-    auto scratch = execution.work.scope();
-    // Compact the committed prefix of the pending window into the physical width the context
-    // materialization consumes. prepare_ragged_prefix is the same op the single-device route uses
-    // for this hand-off: it copies columns [start, end) and publishes the absolute positions and the
-    // per-lane count that drive both the context projection and the ring write.
+    const cudaStream_t stream = device_->stream;
+    auto scratch              = execution.work.scope();
+    // Compact the committed prefix of every lane's pending window into the physical width the
+    // context materialization consumes. prepare_ragged_prefix is the same op the single-device route
+    // uses for this hand-off: it copies columns [start, end) out of the lane's staging column and
+    // publishes the absolute positions and the per-lane count that drive both the context projection
+    // and the ring write. Zero-width lanes leave their destination untouched.
     Tensor compact = execution.work.alloc(
-        DType::BF16, {spec_.target_features, spec_.feature_lanes, 1});
-    Tensor positions = execution.work.alloc(DType::I32, {spec_.feature_lanes, 1});
-    Tensor counts    = execution.work.alloc(DType::I32, {1});
-    Tensor lanes     = execution.work.alloc(DType::I32, {1});
-    Tensor starts    = execution.work.alloc(DType::I32, {1});
-    Tensor ends      = execution.work.alloc(DType::I32, {1});
-    ops::set_i32_scalar(lanes, 0, device_->stream);
-    ops::set_i32_scalar(starts, static_cast<std::int32_t>(start), device_->stream);
-    ops::set_i32_scalar(ends, static_cast<std::int32_t>(end), device_->stream);
-    ops::prepare_ragged_prefix(state_->pending_features, lanes, starts, ends, compact, positions,
-                               counts, device_->stream);
+        DType::BF16, {spec_.target_features, spec_.feature_lanes, batch});
+    Tensor positions = execution.work.alloc(DType::I32, {spec_.feature_lanes, batch});
+    Tensor counts_dev = execution.work.alloc(DType::I32, {batch});
+    Tensor lanes_dev  = execution.work.alloc(DType::I32, {batch});
+    Tensor starts_dev = execution.work.alloc(DType::I32, {batch});
+    Tensor ends_dev   = execution.work.alloc(DType::I32, {batch});
+    const std::size_t rows = static_cast<std::size_t>(batch) * sizeof(std::int32_t);
+    CUDA_CHECK(cudaMemcpyAsync(lanes_dev.data, slots, rows, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(starts_dev.data, starts, rows, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ends_dev.data, ends, rows, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(counts_dev.data, counts.data(), rows, cudaMemcpyHostToDevice, stream));
+    ops::prepare_ragged_prefix(state_->pending_features, lanes_dev, starts_dev, ends_dev, compact,
+                               positions, counts_dev, stream);
     DFlashAppendContext append_state{
         .execution = round_execution(execution, execution.work),
         .dflash    = *state_,
     };
-    dflash_append_context(append_state, compact, positions, counts, lanes, counts, {count, count});
+    std::int32_t min_count = 0;
+    std::int32_t max_count = 0;
+    for (std::int32_t lane = 0; lane < batch; ++lane) {
+        const std::int32_t count = counts[static_cast<std::size_t>(lane)];
+        if (count == 0) { continue; }
+        min_count = min_count == 0 ? count : std::min(min_count, count);
+        max_count = std::max(max_count, count);
+    }
+    dflash_append_context(append_state, compact, positions, counts_dev, lanes_dev, counts_dev,
+                          {static_cast<std::uint32_t>(min_count),
+                           static_cast<std::uint32_t>(max_count)});
 }
 
 void DFlash2Round::propose(ExecutionCore execution, const qwen3_5::PagedKVCache& text_cache,
-                           TextContext* card, std::uint32_t k, DFlashEnvelopes envelopes) {
+                           TextContext* card, std::uint32_t k, DFlashEnvelopes envelopes,
+                           std::int32_t batch) {
     if (k == 0 || k > kDFlashDecodeMaximumDrafts) {
         throw std::invalid_argument("DFlash2 round proposal window is outside [1,15]");
     }
     if (k != spec_.draft_window) {
         throw std::invalid_argument("DFlash2 round proposal width disagrees with its frame");
+    }
+    if (batch < 1 || static_cast<std::uint32_t>(batch) > spec_.batch_capacity) {
+        throw std::invalid_argument("DFlash2 round proposal batch is outside its frame");
     }
     device_->bind_to_current_thread();
     CUDA_CHECK(cudaMemcpyAsync(frame_->ingress.data, &ingress_, sizeof(ingress_),
@@ -415,7 +473,7 @@ void DFlash2Round::propose(ExecutionCore execution, const qwen3_5::PagedKVCache&
         .continuation_hidden_store = continuation_hidden_,
         .tp_card                   = card,
     };
-    dflash_propose_batch(context, static_cast<std::int32_t>(spec_.batch_capacity), k, envelopes);
+    dflash_propose_batch(context, batch, k, envelopes);
 }
 
 } // namespace ninfer::models::qwen3_5::execution
