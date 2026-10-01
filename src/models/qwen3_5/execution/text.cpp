@@ -856,6 +856,11 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
                 "the matching half");
         }
         TextContext& peer                  = *peer_tp_;
+        // This branch is the one place a proposal head allocates on the peer's arena, so it needs
+        // the peer's scope as well: a captured CUDA Graph bakes the peer's watermark into its
+        // kernel arguments, and an unwound-only-locally call site makes that watermark depend on
+        // how many draft steps ran before the capture.
+        auto peer_scope = peer.work_.scope();
         tp::DevicePair& pair               = *pair_tp_;
         const std::int32_t hidden_size = dimension(config_.hidden_size);
         ctx_.bind_to_current_thread();
