@@ -676,7 +676,8 @@ void forward_tp2_decode_window_batch(TextContext& peer, tp::DevicePair& pair,
 - 删除 `src/runtime/engine/tp2_generation_core.cpp` 中临时的 `NINFER_TP2_LOGITS_PROBE` 探针块（原 `:5911-5945`，35 行；删除后 6746 → 6711 行），保留全部默认关闭的 `NINFER_TP2_*` 诊断开关。
 - 删除探针后复验（job pwsh-478，`_temp/p25_build.log`/`p25_gate.log`/`p25_forward.log`/`p25_load.log`）：`build.ps1 -Jobs 16` **exit 0**；`test.ps1 -Filter 'tp2|tp_device|engine_options|serve_options'` **11/11 通过**（68.55 s）；`ninfer_qwen3_5_tp2_forward_test.exe --artifact D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer` **exit 0**（唯一不匹配仍是 `two-lane verify window ... max_logit_diff=2.03125 argmax_mismatches=1 near_tie_flips=1`）；`ninfer_qwen3_5_tp2_load_test.exe --artifact …` **exit 0**。
 - `tests/models/qwen3_5/test_tp2_forward.cpp` 经核实**没有**临时诊断代码（`kTestLanes = 2`、`kTestPoolPages = kTestCachePages * kTestLanes`、`.kv_table_rows/.slot_count/.record_capacity = kTestLanes`、`for (lane < kTestLanes)` 都是双 lane verify window 测试的正常组成部分），无需改动。
-- 遗留（未做，可选）：把本文件移入 `docs/`、清理 `_temp/` 产物。
+- 收尾（2026-10-01 完成）：本文件已移入 `docs/`，源码中 16 处裸文件名引用（`include/ninfer/tp2_capacity.h` 1、`src/runtime/engine/model_instance.cpp` 1、`src/runtime/engine/tp2_generation_core.h` 4、`src/runtime/engine/tp2_generation_core.cpp` 9、`tests/test_engine_options.cpp` 1）同步指向 `docs/PLAN-tp2-concurrency.md`；`_temp/` 产物已清理。
+- 移动后复验：当时用户线上服务器（`C:\ninfer\infer-serve.exe`，pid 21000，`--max-concurrency 4`）在跑，`tools/win_port/build.ps1:164-173` 的护栏只按**进程名**判断就 `exit 4`（误判：它持有的是 `C:\ninfer\` 下的另一份 exe，不锁 `build-win/apps/ninfer-serve.exe`），故 dot-source `tools/win_port/vcvars.ps1` 后直接 `ninja -C build-win` —— **exit 0**；`test.ps1 -Filter 'tp2|tp_device|engine_options|serve_options'` **11/11 通过**（69.93 s，五个 artifact 驱动的 tp2 用例照旧 Skip）。
 ### 12.11 「`copy_lane_state` 跨 slot 步进」遗留项的核查与 host checkpoint target-state 镜像越界的修复（2026-10-01）
 
 #### 结论一：原遗留项是误报（NInfer 布局是 dim 0 最快）
