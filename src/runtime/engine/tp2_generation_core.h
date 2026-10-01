@@ -126,8 +126,10 @@ public:
 
 private:
     // One lane's GDN image inside a whole-pool state buffer (the live pool or a device snapshot).
-    // The pool keeps the slot as its outermost dimension, so a lane's image is one block per layer;
-    // the pinned image is those blocks back to back with no arena padding.
+    // NInfer tensors vary dim 0 fastest, so the slot -- the last dimension of both state shapes --
+    // varies slowest and is the pool's outermost dimension: a lane's image is one contiguous block
+    // per layer, the layers one pool pitch apart. The compact pinned image is those blocks back to
+    // back with no arena padding, and make_lane_state_geometry checks this against the pool.
     struct LaneStateGeometry {
         std::size_t image_bytes        = 0;
         std::size_t conv_bytes         = 0;

@@ -2334,14 +2334,13 @@ void TP2GenerationCore::restore_lane_gdn(std::uint32_t lane, const LaneReuse& re
                             shard->device.stream);
             break;
         case ReuseSource::HostCheckpoint:
-            // The slot's buffer holds one compact state image per lane, so this lane's slice is an
-            // offset into it; a whole-pool image would let one lane restore another's state.
+            // The slot belongs to this lane, so its buffer *is* the lane's compact state image:
+            // the lane is expressed by the slot index (begin + lane * slots_per_lane), never by
+            // a byte offset into the slot.
             copy_lane_state(shard->lane_state_geometry, shard->state_backing.data,
                             static_cast<std::int32_t>(lane),
                             static_cast<std::byte*>(
-                                shard->host_checkpoints[reuse.slot].buffer->data()) +
-                                static_cast<std::size_t>(lane) *
-                                    shard->lane_state_geometry.image_bytes,
+                                shard->host_checkpoints[reuse.slot].buffer->data()),
                             cudaMemcpyHostToDevice, shard->device.stream);
             break;
         }
@@ -3987,6 +3986,38 @@ TP2GenerationCore::LaneStateGeometry TP2GenerationCore::make_lane_state_geometry
     geometry.layers          = view.layers;
     geometry.image_bytes     = static_cast<std::size_t>(geometry.layers) *
                                (geometry.conv_bytes + geometry.recurrent_bytes);
+    // copy_lane_state derives a lane's device address arithmetically instead of asking the pool
+    // for it, so the geometry it assumes has to be the geometry the pool has. NInfer tensors vary
+    // dim 0 fastest, so the slot -- the last dimension of both state shapes -- varies slowest and a
+    // lane is one contiguous block per layer, with the layers one pitch apart. Check that against
+    // the pool once per shard: a pool that stopped satisfying it would otherwise let every lane
+    // but the first read and write a neighbour's state, silently.
+    if (geometry.image_bytes == 0) { return geometry; }
+    for (std::int32_t lane = 0; lane < shard.state->slot_count(); ++lane) {
+        const std::ptrdiff_t lane_conv =
+            static_cast<std::ptrdiff_t>(lane) * static_cast<std::ptrdiff_t>(geometry.conv_bytes);
+        const std::ptrdiff_t lane_recurrent = static_cast<std::ptrdiff_t>(lane) *
+                                              static_cast<std::ptrdiff_t>(geometry.recurrent_bytes);
+        for (std::uint32_t layer = 0; layer < geometry.layers; ++layer) {
+            const Tensor conv      = shard.state->conv_slot(layer, lane);
+            const Tensor recurrent = shard.state->recurrent_slot(layer, lane);
+            const std::ptrdiff_t layer_conv =
+                static_cast<std::ptrdiff_t>(layer) * geometry.conv_pitch;
+            const std::ptrdiff_t layer_recurrent =
+                static_cast<std::ptrdiff_t>(layer) * geometry.recurrent_pitch;
+            if (static_cast<const std::byte*>(conv.data) !=
+                    base + geometry.conv_base + lane_conv + layer_conv ||
+                static_cast<const std::byte*>(recurrent.data) !=
+                    base + geometry.recurrent_base + lane_recurrent + layer_recurrent ||
+                conv.bytes() != geometry.conv_bytes ||
+                recurrent.bytes() != geometry.recurrent_bytes) {
+                throw std::logic_error(
+                    "TP-2 lane state geometry disagrees with the linear-attention pool: lane " +
+                    std::to_string(lane) + " layer " + std::to_string(layer) +
+                    " is not one contiguous state image per layer at the pool's layer pitch");
+            }
+        }
+    }
     return geometry;
 }
 
@@ -5069,12 +5100,17 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     checkpoint.valid[lane] = false;
     checkpoint.position[lane]   = frontier;
     checkpoint.prefill_id[lane] = retention(lane).host_checkpoint_live_id;
-    // A slot holds one compact image per lane, so this lane writes its own slice: the ring is
-    // partitioned by lane and a whole-slot write would overwrite a neighbour's checkpoint.
+    // The slot belongs to this lane, so its buffer *is* the lane's compact state image: the lane
+    // is expressed by the slot index (begin + lane * slots_per_lane), never by a byte offset into
+    // the slot. The slot is sized for exactly one such image, so a mismatch here would mean the
+    // ring partition and the state geometry disagree and the copy would run off the allocation.
+    if (checkpoint.buffer->size() < shard.lane_state_geometry.image_bytes) {
+        throw std::logic_error(
+            "TP-2 host checkpoint slot is smaller than one compact lane state image");
+    }
     copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
                     static_cast<std::int32_t>(lane),
-                    static_cast<std::byte*>(checkpoint.buffer->data()) +
-                        static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
+                    static_cast<std::byte*>(checkpoint.buffer->data()),
                     cudaMemcpyDeviceToHost, shard.device.stream);
     // The masked draft's context at the same frontier rides the same slot. A chunk boundary is
     // exactly where the prefill sink has finished committing that chunk, so the ring reaches this
@@ -5396,11 +5432,12 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                             cudaMemcpyDeviceToDevice, shard.device.stream);
             return;
         case ReuseSource::HostCheckpoint:
+            // The slot belongs to this lane, so its buffer *is* the lane's compact state image:
+            // the lane is expressed by the slot index, never by a byte offset into the slot.
             copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
                             static_cast<std::int32_t>(lane),
                             static_cast<std::byte*>(
-                                shard.host_checkpoints[reuse_slot].buffer->data()) +
-                                static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
+                                shard.host_checkpoints[reuse_slot].buffer->data()),
                             cudaMemcpyHostToDevice, shard.device.stream);
             return;
         }
