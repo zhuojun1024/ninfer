@@ -4277,8 +4277,9 @@ void TP2GenerationCore::execute_spec_batch(
                     Tensor tool_mask_dev =
                         ws_a.alloc(DType::U8, {vocab, static_cast<std::int32_t>(window_live)});
                     shard_a_.device.bind_to_current_thread();
-                    CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_host.data(), window_live,
-                                               cudaMemcpyHostToDevice, shard_a_.device.stream));
+                    CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_host.data(),
+                                               tool_mask_dev.bytes(), cudaMemcpyHostToDevice,
+                                               shard_a_.device.stream));
                     ops::apply_token_mask(window_logits2d, tool_mask_dev, shard_a_.device.stream);
                     if (lane_trace_enabled()) {
                         std::fprintf(stderr, "[tp2-lane] grammar masked %d window columns of %d lanes\n",
@@ -4464,8 +4465,9 @@ void TP2GenerationCore::execute_spec_batch(
                 Tensor tool_mask_dev =
                     ws_a.alloc(DType::U8, {vocab, static_cast<std::int32_t>(window_live)});
                 shard_a_.device.bind_to_current_thread();
-                CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_host.data(), window_live,
-                                           cudaMemcpyHostToDevice, shard_a_.device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_host.data(),
+                                           tool_mask_dev.bytes(), cudaMemcpyHostToDevice,
+                                           shard_a_.device.stream));
                 ops::apply_token_mask(window_logits, tool_mask_dev, shard_a_.device.stream);
                 if (lane_trace_enabled()) {
                     std::fprintf(stderr, "[tp2-lane] grammar masked %d window columns of %d lanes\n",
