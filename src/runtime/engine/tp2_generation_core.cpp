@@ -1046,10 +1046,11 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                                   shard.dflash_snapshot_arena->capacity()));
         }
         // The checkpoint ring pairs each target state image with the draft ring at the same
-        // frontier. The ring is only allocated once the round exists, which is why it is a second
-        // pass over a ring sized above.
+        // frontier. A slot belongs to one lane, so its draft half is one compact image rather than
+        // the whole multi-lane ring - the shape the target half already has. The ring is only
+        // allocated once the round exists, which is why it is a second pass over a ring sized above.
         for (auto& checkpoint : shard.host_checkpoints) {
-            checkpoint.dflash_buffer = std::make_unique<PinnedHostBuffer>(dflash_image, true);
+            checkpoint.dflash_buffer = std::make_unique<PinnedHostBuffer>(dflash_lane_image, true);
         }
     }
     // One startup ledger line per shard: every resident block is allocated before the first
@@ -1075,8 +1076,8 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         if (!shard.host_checkpoints.empty()) {
             // The per-slot size is one compact single-lane target state image, not the whole pool:
             // each lane owns its own slice of the ring and a slot holds one lane's image. The masked
-            // draft adds one compact ring image per lane to each slot on the shard that owns it,
-            // which is the second pinned figure.
+            // draft adds one compact ring image to each slot on the shard that owns it, which is
+            // the second pinned figure.
             std::fprintf(stderr,
                          "[mem] host-checkpoints shard %d slots %zu (grid %zu + tail %u + "
                          "divergence %u + block %u + prompt-end %u) x %.1f MiB | stride %u tok | "
@@ -1086,8 +1087,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                          host_checkpoint_divergence_slots_, host_checkpoint_block_slots_, lanes_,
                          static_cast<double>(shard.lane_state_geometry.image_bytes) / 1048576.0,
                          host_checkpoint_stride_,
-                         static_cast<double>((shard.lane_state_geometry.image_bytes +
-                                              static_cast<std::size_t>(lanes_) * dflash_image_bytes) *
+                         static_cast<double>((shard.lane_state_geometry.image_bytes + dflash_image_bytes) *
                                              shard.host_checkpoints.size()) /
                              1048576.0);
         }
@@ -2494,10 +2494,11 @@ void TP2GenerationCore::restore_lane_dflash(std::uint32_t lane, const LaneReuse&
             throw std::logic_error(
                 "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
         }
+        // The slot carries this lane's image and not a slice of a multi-lane image: the lane that
+        // owns the slot is the one that wrote it, so the image starts at the buffer.
         shard.dflash_round->copy_context_from_host(
-            static_cast<const std::byte*>(checkpoint.dflash_buffer->data()) +
-                static_cast<std::size_t>(lane) * shard.dflash_round->lane_context_image_bytes(),
-            shard.device.stream, static_cast<std::int32_t>(lane));
+            static_cast<const std::byte*>(checkpoint.dflash_buffer->data()), shard.device.stream,
+            static_cast<std::int32_t>(lane));
         return;
     }
     }
@@ -5176,16 +5177,14 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
                             static_cast<std::size_t>(lane) * image_bytes,
                         checkpoint->buffer->data(), image_bytes);
         }
-        // Both sides are flat ring images, one compact image per lane: the checkpoint's draft buffer
-        // is one and so is the session slab, so the lane's slice is a straight offset.
+        // The checkpoint's draft half is one lane's compact image while the session slab holds one
+        // image per lane, so only the slab side is a straight offset.
         if (shard.dflash_round != nullptr && entry.host_dflash_prompt[index] != nullptr &&
             checkpoint->dflash_buffer != nullptr) {
             const std::size_t draft_lane_bytes = shard.dflash_round->lane_context_image_bytes();
             std::memcpy(static_cast<std::byte*>(entry.host_dflash_prompt[index]->data()) +
                             static_cast<std::size_t>(lane) * draft_lane_bytes,
-                        static_cast<const std::byte*>(checkpoint->dflash_buffer->data()) +
-                            static_cast<std::size_t>(lane) * draft_lane_bytes,
-                        draft_lane_bytes);
+                        checkpoint->dflash_buffer->data(), draft_lane_bytes);
         }
     }
 
@@ -5352,14 +5351,12 @@ void TP2GenerationCore::session_capture_shared_state(std::size_t index, std::uin
                         static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
                     frozen[shard_index]->data(), shard.lane_state_geometry.image_bytes);
         if (shard.dflash_round != nullptr) {
-            // Both sides are flat ring images, one compact image per lane: the checkpoint's draft
-            // buffer is one and so is the session slab, so the lane's slice is a straight offset.
+            // The frozen checkpoint's draft half is one lane's compact image while the session slab
+            // holds one image per lane, so only the slab side is a straight offset.
             const std::size_t draft_lane_bytes = shard.dflash_round->lane_context_image_bytes();
             std::memcpy(static_cast<std::byte*>(entry.host_dflash_shared[shard_index]->data()) +
                             static_cast<std::size_t>(lane) * draft_lane_bytes,
-                        static_cast<const std::byte*>(dflash_frozen->data()) +
-                            static_cast<std::size_t>(lane) * draft_lane_bytes,
-                        draft_lane_bytes);
+                        dflash_frozen->data(), draft_lane_bytes);
         }
     }
     entry.host_shared_end = position;
@@ -5469,9 +5466,9 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
         if (session_trace_enabled()) {
             std::fprintf(stderr,
                          "[tp2-session]   entry %zu tokens=%zu frontier=%u kv_end=%u prompt_end=%u "
-                         "shared_end=%u shared=%zu reach=%u via=%s resident=%d\n",
+                         "host_prompt_end=%u shared_end=%u shared=%zu reach=%u via=%s resident=%d\n",
                          index, entry.tokens.size(), entry.frontier, entry.host_kv_end,
-                         entry.prompt_end, entry.host_shared_end, shared, reach,
+                         entry.prompt_end, entry.host_prompt_end, entry.host_shared_end, shared, reach,
                          reach == 0 ? "none" : kReachName[static_cast<std::size_t>(via)],
                          entry.device_lane >= 0 ? 1 : 0);
         }
@@ -5871,11 +5868,15 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     // frontier; the frontier is recorded so a restore can refuse a checkpoint whose draft half does
     // not describe the position it names.
     if (shard.dflash_round != nullptr && checkpoint.dflash_buffer != nullptr) {
+        // The same partition check as the target half above: a slot that cannot hold one lane's
+        // draft ring would make the copy below run off the allocation.
+        if (checkpoint.dflash_buffer->size() < shard.dflash_round->lane_context_image_bytes()) {
+            throw std::logic_error("TP-2 host checkpoint slot is smaller than one lane's draft ring");
+        }
         checkpoint.dflash_frontier[lane] = retention(lane).dflash_context_frontier;
         shard.dflash_round->copy_context_to_host(
-            static_cast<std::byte*>(checkpoint.dflash_buffer->data()) +
-                static_cast<std::size_t>(lane) * shard.dflash_round->lane_context_image_bytes(),
-            shard.device.stream, static_cast<std::int32_t>(lane));
+            static_cast<std::byte*>(checkpoint.dflash_buffer->data()), shard.device.stream,
+            static_cast<std::int32_t>(lane));
     }
     if (ring == HostRing::Tail) {
         shard.host_checkpoint_tail_next[lane] = (index + 1) % count;
@@ -6249,9 +6250,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                     "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
             }
             shard.dflash_round->copy_context_from_host(
-                static_cast<const std::byte*>(checkpoint.dflash_buffer->data()) +
-                    static_cast<std::size_t>(lane) * shard.dflash_round->lane_context_image_bytes(),
-                shard.device.stream, static_cast<std::int32_t>(lane));
+                static_cast<const std::byte*>(checkpoint.dflash_buffer->data()), shard.device.stream,
+                static_cast<std::int32_t>(lane));
             return;
         }
         }

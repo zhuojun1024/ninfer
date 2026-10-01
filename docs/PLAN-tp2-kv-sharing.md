@@ -352,7 +352,7 @@
 - vision prompt 的 chunk 夹紧语义与纯文本不同（`:6490-6503` 的 vision cap 与 snapshot clamp 顺序），未构造 vision 复用用例。
 - 回退方式：常量改回 2 并重建（数组尺寸与槽循环自动跟随）。
 
-### 9.7 prompt 末态平面搬到主机环（未提交，m01955）
+### 9.7 prompt 末态平面搬到主机环（已提交 `87f1526d`，m01955）
 
 **动机**：§9.6 把设备端复用边界砍到只剩 prefill 末态（`state_snapshots[0]`，C=4 每 shard 293.6 MiB）之后，最后一份「只为一个消费者存在」的常驻平面就是它：读它的只有 `session_store_active`（会话 slab 的 prompt 末态镜像，`src/runtime/engine/tp2_generation_core.cpp:5079-5100`）与 C=1 的 in-lane prompt 末态复用（`scan_lane_reuse` 的 DeviceSnapshot 分支，`:2372-2374`）。而主机 checkpoint 环本来就逐边界存同一批状态（`snapshot_host_checkpoint`，`:5736`），只是**故意跳过 prompt 末态**（`frontier != prompt_tokens`：批量 `:3098`、walk `:6574`、decode `:7334`，注释都是「the device snapshot below holds that same state already」）。⇒ 新增一段专用环槽承载它，设备平面不再 carve。
 
@@ -409,8 +409,59 @@
 **未覆盖**
 - 环禁用路径（`--no-prefix-reuse` / `--host-state-slots 0`）未端到端实测，只有门禁覆盖；该分支下 `host_checkpoints` 为空 ⇒ `prompt_end_checkpoints` 恒为 null，自动走原来的设备平面 D2H，`prompt_end_captured` 恒 true。
 - 环布局在 `total <= 3*lanes_` 时的 lane slice 别名缺陷仍在（默认 `--host-state-slots 8` + C=4 即命中），本次不修。
-- 草稿 buffer 每槽按 `lanes*lane_image` 分配（C=4 每槽 160 MiB）而每个槽只被一个 lane 使用 ⇒ shard 0 每槽闲置 120 MiB（既有 32 槽即 3840 MiB，本次新增的 4 槽另 480 MiB）。可选优化：改成单 lane 镜像 + 偏移 0（`snapshot_host_checkpoint`、`restore_lane_dflash`、`begin_dflash_state`、`session_store_active` 四处），本次未做。
+- ~~草稿 buffer 每槽按 `lanes*lane_image` 分配（C=4 每槽 160 MiB）而每个槽只被一个 lane 使用 ⇒ shard 0 每槽闲置 120 MiB~~（**已做**，m02245）：每槽草稿半区改为单 lane 镜像 + 偏移 0，见 §9.8。
 - 回退：恢复 §9.6 的设备平面即 `first_state_plane`/`first_dflash_plane` 恒为 0（PromptEnd 槽变为冗余副本，无正确性影响），或直接 revert 本次提交。
+
+### 9.8 每槽草稿 buffer 收窄到单 lane 镜像（m02245，已提交）
+
+**动机**：§9.7 之后每个 checkpoint 槽只服务一个 lane（Grid/Tail/Divergence/Block 用 `lane * host_checkpoint_slots_per_lane_`，PromptEnd 用 `lanes_ * host_checkpoint_slots_per_lane_ + lane`），但草稿半区仍按 `lanes_ * dflash_lane_image` 分配（C=4 每槽 160 MiB，实际只写一张 40 MiB 镜像）⇒ 每槽闲置 120 MiB；`--host-state-slots 32`/C=4 下 shard 0 白占 `36 x 120 = 4320 MiB` pinned。
+
+**改动点**（`src/runtime/engine/tp2_generation_core.cpp` 11 处 + `src/runtime/engine/tp2_generation_core.h` 1 处）
+
+| 位置 | 改动 |
+|---|---|
+| `cpp:1053` | 每槽草稿半区改为 `std::make_unique<PinnedHostBuffer>(dflash_lane_image, true)`：一张单 lane 紧凑镜像 |
+| `cpp:5874`、`:5877` | `snapshot_host_checkpoint` 增加与目标半区对称的守卫（`checkpoint.dflash_buffer->size() < shard.dflash_round->lane_context_image_bytes()` ⇒ throw `"TP-2 host checkpoint slot is smaller than one lane's draft ring"`），`copy_context_to_host` 偏移归零 |
+| `cpp:2499-2501` | `restore_lane_dflash` 的 HostCheckpoint 分支读偏移归零 |
+| `cpp:6251-6254` | walk 的 `begin_dflash_state` HostCheckpoint 分支读偏移归零 |
+| `cpp:5185-5187` | `session_store_active` 的 prompt 末态草稿 memcpy 源偏移归零（会话 slab 侧仍是 `lane * draft_lane_bytes`） |
+| `cpp:5354-5362` | `session_capture_shared_state` 的 frozen 草稿 memcpy 源偏移归零（slab 侧不变） |
+| `cpp:1089-1090` | `[mem]` pinned 账目公式 `(image_bytes + lanes_ * dflash_image_bytes) * slots` → `(image_bytes + dflash_image_bytes) * slots` |
+| `h:188-192` | `HostCheckpoint::dflash_buffer` 注释改为「one compact ring image - for the lane that owns this slot」 |
+| `cpp:5469` | env-gated `[tp2-session] entry` trace 增 `host_prompt_end=%u`（永久诊断增强，随本次一起提交） |
+| 未改 | `cpp:1982`/`:1995` 的 `store_dflash_image`/`load_dflash_image`（会话 slab ↔ 设备环，slab 仍是每 lane 一镜像）；`restore_lane_dflash` 的 DeviceSnapshot 分支与 walk 的同名分支（设备快照平面仍 `lanes_ * lane_image`） |
+
+**正确性依据**：与目标半区（`checkpoint.buffer` 本来就是单 lane `image_bytes`）同一假设。既有别名缺陷（`total <= 3*lanes_`，默认 `--host-state-slots 8` + C=4 命中）下目标半区本来就被两个 lane 互相覆盖，收窄只让草稿半区同样如此，不新增缺陷类别。
+
+**验收**（`tools/win_port/build.ps1` BUILD_EXIT=0，29 s；门禁 `test.ps1 -Filter 'tp2|tp_device|engine_options|serve_options'` 11/11，70.83 s）
+
+| 项目 MiB | 收窄前（§9.7） | 本次 |
+|---|---|---|
+| C=4 shard 0 pinned | 8402.6 | **4082.6**（−4320.0 = 36 x 120） |
+| C=4 shard 1 pinned | 2642.6 | 2642.6 |
+| C=4 每槽 | 233.4 | **113.4**（73.4 state + 40 draft） |
+| C=1 shard 0/1 pinned | 3969.2/2569.2 | 3969.2/2569.2（`lanes_=1` 时收窄是恒等变换） |
+| C=4 设备 `free` shard 0/1 | 1634.0/2012.0 | 1634.0/2012.0（逐字不变） |
+
+⇒ 相对 count=2 基线（C=4 pinned 9817.6 = 7468.8 + 2348.8），现在 6725.2 ⇒ **pinned 净减 3092.4 MiB**，同时设备侧仍释放 1496 MiB。
+
+行为：
+
+| 场景 | 结果 |
+|---|---|
+| 双卡 artifact 链 `_temp/run_cnt1_artifact.ps1` | `tp2_forward_test`/`tp2_load_test` exit 0 且数值与基线逐字相同；`tp2_sessions_test` 唯一 FAIL 仍是既有 plain divergence |
+| `NINFER_TEST_ROUTE=dflash2` sessions | `replayed answer … reused 70 of 58 prompt tokens`、`unaligned dialogue` 通过；唯一 FAIL 是与 `docs/tp2-dual-5060ti-worklog.md:6550-6551` 逐 token 相同的既有 `a recalled conversation diverged` ⇒ 无回归 |
+| C=1 rewind 带（`_temp/cnt1_rewind.mjs`） | `cached=5120`（743 ms），trace 与收窄前逐字相同（`reuse=5120 slot=28 src=host`） |
+| C=4 双轮 recall（`_temp/s1_diag.mjs`） | `D2-replay cached=5749`（477 ms；收窄前 442、§9.6 470、基线 511 ⇒ 噪声内） |
+
+**坐实 `host_prompt_end`**（§9.7 的未覆盖项，`NINFER_TP2_SESSION_TRACE=1`）：`_temp/cnt1_c4diag.err:30` `[tp2-session] entry 0 tokens=5750 frontier=5749 kv_end=5749 prompt_end=5718 host_prompt_end=5718 shared_end=0 shared=5750 reach=5749 via=frontier resident=0`；`:34` 第二条 `… prompt_end=5772 host_prompt_end=5772 …`。⇒ C=4 下 prompt 末态镜像确实由环尾 checkpoint 经 host→host memcpy 落进会话 slab（`cpp:5203` 的 `prompt_end_images && prompt_end_captured` 为真）。
+
+**lane>0 覆盖**（探针 `_temp/m02245_lane1.mjs` + `_temp/run_m02245_lane1.ps1`，C=4 + dflash2 + 每轮 2 并发，日志 `_temp/m02245_lane1.err`）：
+- 写/store 路径有覆盖：三轮都是 `[tp2-lane] batch=2 capacity=4 path=batched`（`:28`、`:40`、`:55`），同一 batch 的两个成员必然占两个不同 lane；两条 entry 的 `host_prompt_end` 都非 0（`:41-42`、`:45-46`）⇒ 两个 lane 的 `snapshot_host_checkpoint(PromptEnd)` 与 `session_store_active` 的 state/草稿 host→host memcpy（草稿源偏移 0，`cpp:5185-5187`）都执行过。
+- 读侧在 lane>0 不可达：`restore_lane_dflash`/`restore_lane_gdn` 的 HostCheckpoint 分支只由 `scan_lane_reuse`（`cpp:2359`，需 `lane_state.cached_state_valid`）与 walk 路径进入；`cached_state_valid` 只由 prefill 发布置真（`:2517`），而 `release_lane_kv` 在 `lanes_ > 1` 时每次退休清零（`:2700`，早退在 `:2684`）⇒ C=4 下该分支不可达（与 §9.6「该平面在 C=4 是死分配」同一事实），walk 路径又只在 `lanes_ == 1` 可达 ⇒ 读侧收窄在 lane 0 是恒等变换、在 lane>0 不可达，无未覆盖的正确性风险。
+- 探针三轮 `cached=0` 与本次改动无关，是 `session_recall` 的候选规则（`cpp:5457-5458`：`offered != 0 && offered <= shared && offered < prompt_tokens.size() && offered <= host_kv_end`）：完全相同的 prompt 给出 `shared == prompt_end == prompt_tokens.size()`（`:45` entry 0 `shared=5718`），被 `offered >= prompt_tokens.size()` 按「必须留至少一个 token 前向」拒掉；重渲染助手轮的 prompt 又在 prompt 末 token 前一个位置就分叉（`shared=5717 < prompt_end=5718`，B 侧 `shared=5323 < 5346`）⇒ `offered > shared`。⇒ **服务端 chat template 渲染出的 prompt 落不进 `[prompt_end, frontier)` 这个带**，`via=prompt-end` 只能由逐字复现引擎 prompt 尾部的原始 token 输入触发（引擎级用例 `check_replayed_answer_keeps_prompt_end` 即如此），这也解释了 §9.7 里 C=4 召回为何总报 `via=frontier`；该带在本次改动前后同样不可达，行为无变化。
+
+**未覆盖/回退**：环禁用路径仍只有门禁覆盖（§9.7）；回退 = `cpp:1053` 改回 `lanes_ * dflash_lane_image` 并把 4 处读偏移恢复 `lane * lane_context_image_bytes()`（`cpp:1089-1090` 账目同步）。
 
 ---
 
@@ -421,5 +472,6 @@
 - 碎片化的量化（不同请求尺寸序列下可容纳的最大请求）尚未测量。
 - **已知代价（S1 引入）**：每个请求终态都会走 `retire_lane_session` → `session_store_active`，把该 lane 的 frontier KV + state 镜像 D2H 到 host slab（满上下文时约 73.4 MiB/shard），下一轮复用再经 `session_recall` → `session_restore` 拷回新页。这是「页可立即易主」的直接后果，多轮会话的吞吐代价待量化（R4）。
 - **已知代价（count=1，已提交 `371eded9`）**：设备端不再保留 rewind 边界（`kReuseSnapshotCount = 1`），C=1 落在「上一轮 prompt 末 chunk 内」的复用改由主机 checkpoint 环的 tail 子环提供边界，恢复走 H2D（73.4 + 40 MiB/lane）；复用深度实测不变。C=4 不受影响（该平面本就是死分配）。回退：`src/runtime/engine/tp2_generation_core.h:64` 常量改回 2。详见 §9.6。
-- **已知代价（prompt 末态平面搬到主机环，未提交，m01955）**：设备端不再常驻 prompt 末态平面（C=4 每 shard −293.7 MiB `state`，shard 0 另 −160.0 MiB `draft-snap`），改由环尾每 lane 一个不旋转的 `PromptEnd` 槽承载；代价是 pinned host +1227 MiB（`--host-state-slots 32`/C=4）。C=1 的 prompt 末态复用与 C>1 的会话 slab 镜像都改从 checkpoint 取。回退：`first_state_plane`/`first_dflash_plane` 恒 0。详见 §9.7。
+- **已知代价（prompt 末态平面搬到主机环，已提交 `87f1526d`，m01955）**：设备端不再常驻 prompt 末态平面（C=4 每 shard −293.7 MiB `state`，shard 0 另 −160.0 MiB `draft-snap`），改由环尾每 lane 一个不旋转的 `PromptEnd` 槽承载；代价是 pinned host +1227 MiB（`--host-state-slots 32`/C=4），已由 §9.8 的草稿半区收窄抵掉（相对 count=2 基线净 −3092.4 MiB）。C=1 的 prompt 末态复用与 C>1 的会话 slab 镜像都改从 checkpoint 取。回退：`first_state_plane`/`first_dflash_plane` 恒 0。详见 §9.7。
+- **已知代价（草稿 buffer 收窄到单 lane 镜像，m02245，已提交）**：每槽草稿半区从 `lanes_ * dflash_lane_image` 收到一张单 lane 镜像，C=4 shard 0 pinned −4320 MiB（相对 count=2 基线净 −3092.4 MiB），设备侧显存不变；lane>0 的读侧路径在 C=4 本不可达，写/store 侧由两 lane 并发探针覆盖。详见 §9.8。
 - **仍未验证**：单卡 `--devices 0` 半项（TP-2 artifact 是双 shard 布局，不适用）；碎片化的量化（不同请求尺寸序列下可容纳的最大请求）；R4 的多轮会话吞吐代价；vision prompt 的 rewind 复用用例。

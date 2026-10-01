@@ -188,7 +188,7 @@ private:
             // The masked draft's context at the same frontier, on the shard that owns the draft
             // (shard 0). The draft cannot be recomputed from the target state, so a checkpoint that
             // carries only the GDN image would leave the draft context describing the wrong tokens.
-            // Like buffer, it holds one compact ring image per lane.
+            // Like buffer, it holds one compact ring image - for the lane that owns this slot.
             std::unique_ptr<PinnedHostBuffer> dflash_buffer;
             std::array<std::uint32_t, kTp2GenerationMaxConcurrency> dflash_frontier{};
             std::array<std::uint32_t, kTp2GenerationMaxConcurrency> position{};
