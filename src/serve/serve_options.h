@@ -76,7 +76,8 @@ struct ServeOptions {
     std::vector<std::string> startup_argv;
 };
 
-// The Engine normalizes a TP-2 generation route to one active request and one queued request
+// The Engine normalizes a TP-2 generation route to `tp2_generation_concurrency(max_concurrency)`
+// active lanes (one to four) plus `max_pending_requests` queued requests
 // (normalize_engine_options). The service layer and the HTTP thread pool must size themselves from
 // the same numbers: otherwise a request the service accepted and counted is rejected by the Engine
 // as overloaded instead of waiting in its FIFO, and the thread pool admits work the FIFO cannot.

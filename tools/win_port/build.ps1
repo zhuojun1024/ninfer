@@ -131,6 +131,9 @@ function Repair-MsvcDepsPrefix([string] $BuildDir) {
     $bytes = [System.IO.File]::ReadAllBytes($rules)
     $text = [System.Text.Encoding]::UTF8.GetString($bytes)
     $current = [regex]::Match($text, "msvc_deps_prefix = (.*)").Groups[1].Value.TrimEnd([char]13)
+    # A healthy tree returns here: the repair below - which drops the dependency database and touches
+    # every C++ source - only ever runs when the recorded prefix really is the mis-decoded one, so the
+    # check itself never costs a rebuild (P3.2).
     if ($current -ceq $prefix) { return }
     Write-Host "build: repairing msvc_deps_prefix (ninja records no header deps otherwise)"
     $lines = $text -split "`r`n"

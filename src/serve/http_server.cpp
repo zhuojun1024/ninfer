@@ -220,6 +220,17 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
+    // Thread-pool sizing is an invariant, not a tuning knob (P3.3). Two facts make it safe:
+    //   * the thread that accepts connections is not a pool worker, so it never consumes a slot, and
+    //   * admission control refuses work before the pool can fill: GenerationService's
+    //     acquire_request_lifetime throws RequestError(Overloaded) as soon as the in-flight count
+    //     reaches max_concurrency + max_pending_requests, which is exactly `queued_requests`.
+    // Together they keep in-flight requests <= queued_requests, and the pool below has
+    // queued_requests + 1 workers plus queued_requests queue slots - a deliberate margin of one.
+    // That margin matters: this httplib's ThreadPool::enqueue returns false when the queue is full,
+    // and Server::listen_internal can only close such a socket (it records ResourceExhaustion and
+    // the client sees a dropped connection, not an HTTP 429). If a future change lets the pool be
+    // the first thing to overflow, clients lose the status code the contract promises.
     const EffectiveRequestCapacity capacity = effective_request_capacity(options_);
     const std::size_t queued_requests =
         static_cast<std::size_t>(capacity.max_concurrency) + capacity.max_pending_requests;

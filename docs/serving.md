@@ -67,17 +67,24 @@ RTX 5060 Ti cards but not one.
   fast at construction otherwise.
 - The TP-2 route queues requests in arrival order. `--max-pending-requests` bounds that queue and is
   kept as configured; `--max-concurrency` (1..4) is how many of the queued requests the core batches
-  into one decode round. The default `--max-concurrency 1` runs one request at a time. The lanes share
+  into one decode round. A request that arrives while a round is running joins a later round of the
+  same batch as soon as a lane retires, so a second conversation starts producing while the first one
+  is still decoding instead of waiting for it to finish. The default `--max-concurrency 1` runs one
+  request at a time. The lanes share
   one KV pool, so they partition the context ceiling instead of each reserving it, but the
   linear-attention state arena grows by about 294 MiB per card per lane: the shipped 262,144-token
   configuration keeps `--max-concurrency 1`, and two to four lanes need `--max-context 131072`.
 - Batched TP-2 decoding covers the plain route and both speculative rounds (`--spec dflash2` and
-  `--spec mtp`). Only the DFlash v1 backend still collapses a `--max-concurrency` above `1` back to
-  `1` at startup with a warning (that backend is rejected on this route regardless). The multi-lane
+  `--spec mtp`). The DFlash v1 backend is rejected at construction on this route, so no speculative
+  backend ever collapses a `--max-concurrency` above `1`. The multi-lane
   route keeps cross-session KV retention, with the checkpoint ring and the session catalog sliced by
-  lane, so each lane recalls its own previous conversation independently. Vision requests take part in
-  a batch, each lane encoding its own media on the Vision shard; only a tool-grammar request runs lane
-  by lane instead of as one round. A reused prefix must also match on media identity: a checkpoint
+  lane, so device-resident reuse depends on which lane a request lands on: a recall onto a different
+  lane falls back to the host-resident session. The position grid is spread over each lane's share of
+  the context, so at four lanes the grid checkpoints are roughly four times coarser; the tail ring
+  still covers the most recent tokens, which is where short prompts live. Vision requests take part in
+  a batch, each lane encoding its own media on the Vision shard. A tool-grammar request is batched as
+  well: its constraint is enforced per lane by masking that lane's own columns of the round's logits,
+  so a tool-calling request no longer falls back to a serial walk. A reused prefix must also match on media identity: a checkpoint
   carries the digest, grid, and consumer spans of every image or video item inside it, so a prompt
   whose media differs from the one that produced the cached KV is re-prefilled from that item's first
   token instead of being served the other image's answer. The batched round replays
@@ -89,6 +96,11 @@ RTX 5060 Ti cards but not one.
   `4`; with `--spec dflash2` 2.07x at four lanes, and with `--spec mtp --draft-tokens 5` 1.48x at two
   lanes and 2.26x at four. The aggregate gain depends on how evenly the batch members finish, because a
   round costs as much as its longest member: a pair whose two outputs differ two-fold measured 1.41x.
+  A round is also the unit of failure: when one lane's step fails, every request still running in that
+  round fails with the same error, and every lane's reusable state - the sessions it recalled and its
+  host checkpoints - is discarded, because the device state a failed round leaves behind cannot be
+  attributed to a single lane. An allreduce stall is the usual cause; the error names the stalled
+  rendezvous id.
 
   Batched lanes are not guaranteed to reproduce the text of the same request run alone. Every lane in a
   round shares one attention envelope, so the widest lane's window bounds the others and a shorter lane
