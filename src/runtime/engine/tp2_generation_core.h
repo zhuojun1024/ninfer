@@ -457,10 +457,12 @@ private:
     // slot; only the decode rounds are shared. Every admitted member is batched, including one that
     // carries a tool grammar (P2.1) or media (P2.4).
     void execute_plain_batch(std::vector<std::shared_ptr<PendingRequest>>& batch);
-    // P2.1c: the same shared-round shape as execute_plain_batch, but each round runs one masked-draft
-    // proposal over the whole batch and one batched target verify, then accepts and folds per lane.
-    // Reachable only for a DFlash2 group with no tool grammar and no media; the plain route keeps the
-    // function above, and MTP keeps the serial walk (its draft chain is still single-row).
+    // P2.1b/P2.1c: the same shared-round shape as execute_plain_batch, but each round runs one
+    // masked-draft proposal over the whole batch and one batched target verify, then accepts and
+    // folds per lane. It is the batched route for both speculative backends - MTP (P2.1b) and
+    // DFlash2 (P2.1c) - and carries every member the plain route does, including a per-lane tool
+    // grammar (P2.1) and per-lane media (P2.4). Only the single-lane route keeps execute_walk's own
+    // serial MTP draft chain.
     void execute_spec_batch(std::vector<std::shared_ptr<PendingRequest>>& batch);
 
     // The turn this lineage generated, adopted when the client's rendering of it is the same turn.
@@ -1075,7 +1077,10 @@ private:
     std::uint32_t lane_context_limit_ = 0;
     // The lane the batch member currently driving is bound to. It only reaches the non-batch windows,
     // which take it as an argument; the driver holds `execution_mutex_`, so there is exactly one
-    // writer and one reader at a time. It stays 0 on the single-lane route.
+    // writer and one reader at a time. It stays 0 on the single-lane route. On a multi-lane route
+    // each admit_lane() overwrites it with that lane, so once a batch is admitted it names the last
+    // lane admitted, not any one member's lane: a failure path that must not depend on which lane
+    // that was uses session_invalidate_all(), not session_invalidate_active(active_lane_).
     std::int32_t active_lane_ = 0;
 
     // Monotonic counters for runtime_stats().
