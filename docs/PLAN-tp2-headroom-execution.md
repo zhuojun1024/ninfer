@@ -15,7 +15,17 @@
 | 7 | TTFT/total 口径计入排队时间 | P1 | 代码完成，构建+测试通过 |
 | 8 | 修正 docs/serving.md 的 262,144/C=1 指导 | P2 | 完成（1/2/3/4/6/7 已在 docs/serving.md 说明） |
 | 9 | 输出预算按剩余量动态收缩/页回收 | P2 | 分析后**不改**（破坏 all-or-nothing 不变式），结论进报告 |
-| 10 | 投机批链改用每 lane envelope | P2 | 归因已确认（宽窗口入批接受率下降），修复落在 Ops 核，未做 |
+| 10 | 投机批链改用每 lane envelope | P2 | **已实施**：删除 batch 对 host split 数的截断 + 新增 batch/solo 逐位 parity 回归；A/B 显示 plain 中性、接受率收益未复现（噪声内）。见「项 C 实现与验证」 |
+
+### 用户第二轮增补（m01111）
+
+| 序 | 项 | 状态 |
+|----|-----|------|
+| A | spec/MTP 路线 prefill 交错（`pump_spec_round`） | 代码完成，构建通过，A/B 实测成立（见下） |
+| B | spec 路线 `round_ms`/`rest` 计时口径（A 的测量前提） | 代码完成，构建通过 |
+| C | 项 10 Ops 核按列 split（删除 batch 对 host split 数的截断） | 代码完成 + 新增 batch/solo 逐位 parity 回归测试；ops 测试通过（旧 ops 二进制该测试 FAIL）；A/B 实测完成——plain decode 中性、接受率收益未复现（见下） |
+| D | P3 批量 prefill（顺带消除 admission 位置差） | 设计完成（_temp/20261002-1800_item3_batched_prefill.md），**未实现**：收益受 width≤16 与 GDN record 约束（见下） |
+| E | 可分页 host checkpoint ring（报告 P3 行） | 代码完成（PinnedHostBuffer → HostBuffer(Pageable)），构建通过；模型测试（lanes 全过 / sessions 与旧基线逐字相同）；空指针回归已修；延迟实测完成——两卡省 5.29 GiB 页锁，recall 请求 +10 ms（噪声内） |
 
 ### 执行顺序说明
 
@@ -162,6 +172,155 @@ prompt：长 = longSys(160) = 15,310 token，短 = 54 token，max_output=24，re
 改签名要重捕获并用 FP32/FP64 oracle 验证逐 token 一致性。**本次不做**，已列入报告剩余空间。
 开放问题：触发者是「窗口绝对值宽」还是「lane 间位置差」——短窗口实验只能排除前者以外的批处理本身。
 
+## 项 A 实测结果（spec/MTP 路线交错，_temp/20261002-1745_specpump.ps1）
+
+配置：`--devices 0,1 --max-context 131072 --kv-dtype int8 --max-concurrency 4
+--spec mtp --draft-tokens 5 --host-state-slots 32 --host-kv-mib 20480`；长 = longSys(160) =
+15,310 token，短 = 54 token，max_output=64，reasoning=low。ARM C = 短先发、长 +400 ms；
+ARM B = 长先发、短 +400 ms。
+
+| 配置 | HEAD ARM C 短 lane | 交错 ARM C 短 lane | HEAD ARM C 长 lane | 交错 ARM C 长 lane |
+|------|--------------------|--------------------|--------------------|--------------------|
+| chunk 1024 | 总 8.8 s / decode 3.1 tok/s | **总 3.3 s / 8.9 tok/s** | 9.0 s | 9.5 s |
+| chunk 256 | 总 11.1 s / decode 2.5 tok/s | **总 2.0 s / 15.7 tok/s** | 11.4 s | 12.1 s |
+
+- ARM B（后到者）两边都不变：短 lane queue 7.6 s（chunk 1024）/ 10.0 s（chunk 256）。
+  这是「任何时刻只有一个 lane prefill」的固有代价，交错不改变 admission 顺序。
+- 长 lane 反而 +0.5-0.7 s（pump 开销 ~5%），总 GPU 工作量不变。
+- 机制证据：`[tp2-time] spec-batch … prefill_chunks=16 pump_rounds=6`（交汇的短 lane 在长 lane
+  的 16 个 chunk 之间被 pump 了 6 个 decode round）。
+- 实现与 plain 的差异：`pump_spec_round` 定义前必须**上移** `shard_[ab]_.round_base` 捕获、
+  `round`（dflash_round）、`dflash_execution`、`lane_extent`、`append_slots/starts/ends`、
+  `mtp_pack`、`mtp_step_host`、`mtp_selectors_h`（admit_lane 对这些零引用）；chunk 循环顶部
+  调用后要恢复 `set_linear_state_slots(active_lane_, active_lane_)`（spec 的 chunk 前向不自设 slot，
+  靠 admit 入口的绑定；一列 round 会经 text.cpp 的 `batch == 1` 路径重发标量 slot）。
+
+## 项 B 结论（spec 计时口径）
+
+spec 路线从不累加 `round_ms`，`[tp2-time] spec-batch` 的 `avg_round` 恒为 0.00，无法作为
+项 A 的轮成本证据。修正：
+
+- 删除死成员 `Tp2RoundTiming::fold_ms` 与 3 处 `timing.fold_ms += timing.elapsed(5, 6);`
+  （fold 在同步之后运行，round 内 `elapsed()` 读未完成的 event 对恒返回 0.00）；
+  `report()` 的该字段由 `fold=` 改为 `rest=`，值 = `(round_ms - mtp - verify - accept - copy) / n`。
+- `pump_spec_round` 加回合级 `round_start` 与 `timing.round_ms +=`（与 plain pump 同口径）。
+
+## 项 E 设计（可分页 host checkpoint ring）
+
+动机见 docs/tp2-concurrency-headroom.md:134-151 §2.5：C=4/262,144 时 ring = 36 槽 × 73.4 MiB =
+2,642.6 MiB/卡（两卡 5.1-8.2 GiB 页锁），而它是 host KV 之外最大的一块 pinned 内存。
+
+改动（沿用 `HostBuffer(HostPinning::Pageable)`，不留双路径）：
+
+- src/runtime/engine/tp2_generation_core.h:195/:200：`HostCheckpoint::buffer`/`dflash_buffer`
+  由 `unique_ptr<PinnedHostBuffer>` 改 `unique_ptr<HostBuffer>`。
+- src/runtime/engine/tp2_generation_core.cpp:929/:1117：改 `std::make_unique<HostBuffer>(bytes,
+  HostPinning::Pageable)`；`[mem]` 行加 `(pageable)`。
+- 镜像传递路径改回**裸映射 + 长度**（与既有 `copy_lane_state` 的约定一致）：
+  `store_dflash_image(Shard&, void*, std::size_t, lane)`、`load_dflash_image(Shard&, const void*,
+  std::size_t, lane)`、`session_capture_shared_state(..., const void* const* frozen,
+  const void* dflash_frozen, lane)`，相应的 `frozen[2]`/`frozen_draft`/`block_draft` 局部变量改
+  `const void*`，调用点传 `->data()`/`->size()`。理由：ring 槽（可分页）与 session slab
+  （pinned）共用同一条拷贝路径，PinnedHostBuffer 与 HostBuffer 无共同基类。
+- 正确性：ring 不在任何 CUDA Graph 捕获区；所有访问只经 `->data()/->size()`；
+  `copy_lane_state` 用 cudaMemcpy2DAsync（pageable 合法，代价是驱动内部 staging + 宿主线程阻塞，
+  即 store/recall 变慢，而非错误）。无测试断言 pin/槽数。
+- 验证口径：构建 + `tools/win_port/test.ps1 -Filter 'tp2|tp_device|engine_options|serve_options'`
+  + 实机（`--host-state-slots 32` 时 ring 35/36 槽）对比 prefill tok/s 与 store/recall 耗时。
+- 文档同步：docs/serving.md、docs/tp2-dual-5060ti.md、docs/tp2-concurrency-headroom.md:134-151/:383/:558；
+  docs/PLAN-tp2-concurrency.md:342 的「lanes=4 ⇒ 9.98 GiB/shard」是过时初稿。
+
+## 项 E 实现与验证
+
+已按上述设计落盘（不留双路径）：h:195/:200 改 `unique_ptr<HostBuffer>`；cpp:929/:1117 改
+`make_unique<HostBuffer>(bytes, HostPinning::Pageable)`；`store_dflash_image`/`load_dflash_image`/
+`session_capture_shared_state` 的镜像参数改「裸映射 + 长度」，`frozen[2]`/`frozen_draft`/`block_draft`
+改 `const void*`；`[mem]` 行加 `(pageable)`。构建 BUILD_EXIT=0（26-28 s，多次）。
+
+- 模型测试（`NINFER_TEST_ARTIFACT=D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer`）：
+  `ninfer_qwen3_5_tp2_lanes_test.exe` 全过（LANES_EXIT=0；mid-batch arrival 0.729842 s / 3.89515 s，
+  对照既有基线 0.59 s / 3.67 s，同量级）；`..._sessions_test.exe` 仍失败，但失败行与旧 pinned 基线
+  （_temp/cnt1_sessions_full.log）**逐字相同**，且两日志的 `^TP-2 ` 行 Compare-Object 无差异
+  ⇒ 无新增失败（该测试在首个 FAIL 处即停，旧日志亦然）。
+- **完整模型测试口径 + HEAD 基线对照（最终二进制）**：
+  `$env:NINFER_TEST_ARTIFACT='D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer'; & tools/win_port/test.ps1 -Filter 'qwen3_5_tp2'`
+  → 67% passed out of 6（load/forward Skipped、sessions Failed、dflash_solo Failed、
+  dflash_append Passed 47.51 s、lanes Passed 69.56 s）。把全部改动 stash 掉重建 HEAD（464 s）后同 filter 复测，
+  **两个失败逐字复现**：sessions 的 `got [2752 13 198 197 197 92 198 197] expected [467 419 538 13 198 197 197 92]`、
+  dflash_solo 的 `the recalled walk diverged from the from-scratch walk on its first sample:
+  [59399 475 327 363 62 16 15 15] vs [365 4577 62 16 15 15 15 15]`
+  ⇒ 均为**既有失败**，与本轮改动无关。证据 _temp/20261002-1745_modelverify_new.md。
+- 运行期证据：`[mem] host checkpoint ring 36 slots x 73.4 MiB/lane/shard (pageable)`、
+  `[mem] host-checkpoints shard 0/1 slots 36 (...) x 73.4 MiB | stride 43776 tok | pageable 2642.6 MiB`
+  （对照旧行 `... | pinned 734.1 MiB`，11 槽）。
+- **空指针回归（已修）**：把 `unique_ptr` 句柄改成「裸指针 + 长度」时，`checkpoint.dflash_buffer->data()`
+  在 `dflash_buffer == nullptr` 的 MTP 路线（`shard.dflash_round == nullptr`，dflash_buffer 只在
+  `if (dflash_round != nullptr)` 的循环里分配）变成无条件解引用 ⇒ 长 prompt prefill 收尾处
+  0xC0000005 访问违例（确定性，两次复现 wall 都是 9.9 s）。已改为判空后取值（cpp:2773/:5923），
+  并把 `checkpoint.buffer` 的判空显式化（:2768）。教训：`unique_ptr<T>` → 裸指针的每一处
+  `.get()` 都必须变成判空后的 `->data()`。
+- **延迟实测（pinned vs pageable，同 harness 同代，只差 ring 的 pinning）**：
+  `_temp/20261002-1700_ringio.ps1 -Tag pinned2|pageable2` + `_ringio.mjs`（13,559 token 前缀 +
+  4 条 98.2% 命中 recall 请求，`--max-context 131072 --host-state-slots 32`）。`[mem]` 行按实际
+  pinning 打印（`pinned 2642.6 MiB` / `pageable 2642.6 MiB`）。recall 请求（req#2..#5）total 均值：
+  pinned 495.5 ms、pageable 505.3 ms（+10 ms，2%）；TTFT 均值 pinned 296.5 ms、pageable 292.8 ms。
+  ⇒ 代价落在 run-to-run 噪声内。两臂 `[tp2-kv]` store/recall 计时相同（store 125.7-151.4 ms /
+  recall 67.9-80.1 ms）——它测的是 paged KV（HostKVArena，本来就可分页）而不是 ring 镜像，可作旁证。
+- `--host-kv-pinned` 控制的 HostKVArena 仍可 pin（该三元表达式未被本项改动）。
+
+## 项 C 实现与验证（删除 batch 对 host split 数的截断）
+
+机制（设计调研 subagent c0f16d5e，报告 _temp/20261002-1730_item10_ops_envelope.md）：设备侧
+`active_split_count = min(逐列自然 split 数, host 传入值)`（src/ops/softmax_attention/dense/causal_cache/small_t.cuh:119），
+而 host 传入值 `causal_attention_split_capacity` 在 `batch_size > 1` 时被 `grid_limit`/`page_limit` 截断
+（src/ops/softmax_attention/dense/causal_cache/small_t.cu:229-246）。于是批内每一列的归约树比该 lane 单跑时浅，
+数值逐位不同；窗口越宽、批越大，截断越狠（Int8/Scale=1/K=5：B=4 cap=10、B=2 cap=20）。
+
+改动：`causal_attention_split_capacity` 删除 `batch_size` 形参（launch.h:26-33），q_heads==24 分支直接
+`return capacity;`（capacity 本身已是 envelope 上界；device 侧仍按逐列自然数夹紧，短列多出的 split 立即 return），
+11 个调用点同步改 4 参。H12/H16 分支本来就直接 return capacity，不受影响。
+
+回归测试（新增）：tests/ops/softmax_attention/causal_cache.cpp 的 `run_batch_single_parity_case`——
+batch=4、width=4、visible=4104（>4096 使 BF16 旧代码必截断）、5 种 storage，把「批内第 b 列」与
+「该 lane 单独跑」的输出逐位比较。判据：修复后逐位相等。
+
+| 二进制 | `ninfer_softmax_attention_test` |
+|--------|----------------------------------|
+| 新 ops（修复后） | `PASS causal_softmax_attention public-contract correctness`，OPS_EXIT=0；容差 oracle 无回归（nvfp4 mae=0.00537 / k8v4 mae=0.00537） |
+| 旧 ops（stash 回退） | OPS_EXIT=1，`FAIL causal_softmax_attention public-contract correctness`，5 storage × 4 lane 全部出现 1-3 ULP 差异（例 bf16 lane=0 element 4 batched=0x3a20 solo=0x3a1f） |
+
+**A/B 实测（同 harness 同代，唯一差异 = src/ops 的 6 个文件）**：
+
+| 配置 | 旧 ops | 新 ops |
+|------|--------|--------|
+| plain decode C=1/C=2/C=3/C=4（每 lane tok/s） | 36.8 / 35.0·35.9 / 31.9·32.7·33.6 / 29.9·30.6·31.3·32.2 | 37.2 / 35.0·35.8 / 32.0·32.8·33.7 / 29.9·30.6·31.4·32.3 |
+| plain `[tp2-time] avg_round` C=1..4 | 27.15 / 13.89 / 9.97 / 7.84 ms | 26.85 / 13.92 / 9.92 / 7.85 ms |
+| spec 短臂 P4 每 lane 轮成本 mtp+verify | 21.05 ms | 23.57 ms |
+| spec 长臂四长 每 lane 轮成本 mtp+verify | 51.65 ms | 50.11 ms |
+| spec 接受率 短臂 P4 均值 | 50.1% | 51.4% |
+| spec 接受率 长臂四长均值 | 49.6% | 40.3% |
+| spec 接受率 **单长（控制项，代码路径无变化）** | **53.3%** | **41.0%** |
+
+⇒ plain decode 完全中性；接受率差异全在 run-to-run 噪声内（单跑控制项自己漂 12 个点），
+**不能证明**接受率收益。结论：本项保留，价值是**数值一致性**（parity 测试守住），不是吞吐优化。
+报告 §8.7 与 §6 的措辞已据此改写。
+
+## 项 D 结论（P3 批量 prefill，未实现）
+
+设计报告 _temp/20261002-1800_item3_batched_prefill.md（161 行）。可复用入口只有
+src/models/qwen3_5/execution/text.cpp:2939-3100 `forward_tp2_window_batch`（per-lane kv 行/状态槽/valid_columns
+都已是 [batch] 绑定，width=max(chunkLen)）。两条硬约束：
+
+- attention batch>1 时每 lane width≤16（causal_softmax_attention.cpp:241-243），且 batch>1 永不选 Prompt 路由
+  （:382）⇒ 大 T 批量 prompt 前向不支持，只能 width≤16 的小 chunk。
+- TP-2 GDN 非 record 路径 batch>1 强制 width==1（text.cpp:1748-1749、:1917-1918），只有
+  `GdnStateAction::RecordForReplay` 支持 width>1 ⇒ 批量 prefill 必须走 record+fold。
+
+收益判断：width≤16 下「减少 kernel 启动」相对单 lane 大 T prefill 不自动成立；确定收益是
+**admission 位置差被限制在 chunk 宽度内**（收敛投机批的单值 envelope）。且 `window_batch` 走非 overlap
+层循环（text.cpp:3076/3078），会丢掉 L2 AR‖MMA overlap 的 +11%（docs/tp2-decisions.md:281-285）。
+⇒ 本次不做；报告 §4 已记录该结论（与 §4.2「批量 prefill 提升不了长 prompt 聚合吞吐」一致）。
+
 ## 记录
 
 - 项 1/2/3/6/7：tools/win_port/build.ps1 全量重建 BUILD_EXIT=0（712 s，含 msvc_deps_prefix 修复）；
@@ -173,3 +332,8 @@ prompt：长 = longSys(160) = 15,310 token，短 = 54 token，max_output=24，re
 - 项 10：MTP 接受率归因实测（`_temp/20261002-1550_mtp.mjs`）：S=单条长跑，A=四长同 batch，
   B=长+短（位置不同）。注意 `--max-context 245760 --kv-dtype int8 --spec mtp` 启动即 OOM
   （`cudaMalloc failed`，39 s），必须回到文档口径 `--max-context 131072 --kv-dtype int8`。
+- **第二轮最终验证（本轮全部改动，工作树未提交）**：`tools/win_port/build.ps1` BUILD_EXIT=0（470 s，
+  全量重建——ops 头文件改动会触发全链）；`tools/win_port/test.ps1 -Filter 'tp2|tp_device|engine_options|serve_options|softmax_attention'`
+  **15/15 通过**（307.98 s，含 ninfer_softmax_attention_test 205.62 s 的 batch/solo parity 回归、
+  nvfp4 14.26 s、k8v4 15.23 s；6 个模型 TP-2 测试无 artifact 被 skip）；`git diff --check` 退出 0。
+  模型测试用 artifact 单跑的口径与 HEAD 基线对照见「项 E 实现与验证」。

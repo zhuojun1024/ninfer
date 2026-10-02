@@ -117,14 +117,20 @@ RTX 5060 Ti cards but not one.
   reverse order still pays, because a request admitted behind a prefill waits for that prefill to
   finish. Exactly one round runs per chunk, so the cadence - and the blocked lane's rate - follows
   the chunk size: smaller chunks smooth the decode stream and trade per-lane prefill rate (1.52k
-  against 1.94k tok/s). Only the plain route interleaves; the speculative routes prefill a lane to
-  completion.
+  against 1.94k tok/s). The speculative routes interleave the same way, one decode round per chunk
+  and only for lanes that already hold a token: with `--spec mtp --draft-tokens 5` the same pair
+  (54-token request admitted 400 ms before a 15,310-token one) finished in 2.0 s at 15.7 tok/s with
+  `--prefill-chunk 256` (3.3 s and 8.9 tok/s at the default 1024), against 11.1 s and 2.5 tok/s
+  before the change, while the long lane paid about 5% (9.0 s -> 9.5 s at chunk 1024). The order
+  still decides who waits: a request admitted behind a prefill waits for that prefill to finish.
   `NINFER_TP2_TIMING=1` prints one `[tp2-time]` line when a batch ends. The plain route prints
   `[tp2-time] plain-batch rounds=N committed=N avg_round=... decode=... grammar=... sample=...
   readback=... sync_wait=... prefill_chunks=... pump_rounds=...`, where `rounds` counts committed
   tokens (so `avg_round` is the per-lane share of a round) and `pump_rounds` counts the decode
-  rounds run inside another lane's prefill chunks; the speculative routes print `mtp`/`verify`/
-  `accept`/`copy` instead.
+  rounds run inside another lane's prefill chunks; the speculative routes print the same
+  `avg_round`/`rest`/`prefill_chunks`/`pump_rounds` with `mtp`/`verify`/`accept`/`copy`, where
+  `rest` is the round remainder (`round - mtp - verify - accept - copy`), which carries the fold
+  and any wait behind a prefill chunk.
   A round is also the unit of failure: when one lane's step fails, every request still running in that
   round fails with the same error, and every lane's reusable state - the sessions it recalled and its
   host checkpoints - is discarded, because the device state a failed round leaves behind cannot be
@@ -910,7 +916,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
-| `--host-state-slots N` | pinned Host StateImage capacity; on the TP-2 route it sizes the generation core's prefix-reuse checkpoint ring instead of a context cache, and the core adds one slot of its own for the divergence anchor | `8` |
+| `--host-state-slots N` | Host StateImage capacity; on the TP-2 route it sizes the generation core's prefix-reuse checkpoint ring instead of a context cache, that ring is pageable so it spends no page-lock budget, and the core adds one slot of its own for the divergence anchor | `8` |
 | `--host-kv-mib N` | shared Host Main/Backend KV byte capacity in MiB; the backing is pageable, so the OS may evict it | `8192` |
 | `--host-kv-pinned` | pin the Host KV backing for faster transfers; a refused pin falls back to pageable | off |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
@@ -945,7 +951,8 @@ request fields override process flags, and `--greedy` finally forces temperature
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`:
 `C` slots guarantee active requests and `H` is a global checkpoint pool. Host State and Host KV are
-independent startup-fixed pinned-memory capacities; Host KV is shared by Main and the selected
+independent startup-fixed host capacities - the Main route's state images are pinned while the
+TP-2 checkpoint ring is pageable; Host KV is shared by Main and the selected
 Backend pool and is consumed in physical page extents. `--no-prefix-reuse` selects root-only Engine
 mode and cannot be combined with any of the seven explicit context-cache capacity flags, including
 zero-valued flags.
