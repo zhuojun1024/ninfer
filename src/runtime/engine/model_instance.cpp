@@ -100,12 +100,20 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // operator's to set.
         //
         // The plain, MTP and DFlash2 rounds all carry a batch. `--spec dflash` has no TP-2 context
-        // layout and is rejected at the end of this normalization (see below), so no route discards
-        // lanes quietly and no startup warning is owed: the constant's DFlash rule is unreachable
-        // here, kept only so the shared capacity rule stays total over the backend enum.
+        // layout and is rejected at the end of this normalization (see below), so no route silently
+        // discards lanes: what is left is a straight clamp to the route's batch width, which the
+        // operator is told about below instead of inferring it from the accepted capacity.
         const std::uint32_t requested_concurrency = options.max_concurrency;
         options.max_concurrency =
             tp2_generation_concurrency(requested_concurrency, options.speculative.backend);
+        if (options.max_concurrency != requested_concurrency) {
+            std::fprintf(stderr,
+                         "[tp2] --max-concurrency %u exceeds the %u lanes the %s route batches; "
+                         "running %u lanes (--max-pending-requests is unchanged)\n",
+                         requested_concurrency, options.max_concurrency,
+                         product::speculative_backend_name(options.speculative.backend),
+                         options.max_concurrency);
+        }
         // `--lane-context` is a TP-2 policy knob: a ceiling wider than the logical context is
         // rejected rather than silently clamped, so the operator's number and the ceiling the core
         // advertises never disagree. 0 keeps the whole-pool ceiling (S1 of the kv-sharing plan).
