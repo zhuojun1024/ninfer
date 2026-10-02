@@ -2919,6 +2919,18 @@ std::shared_ptr<TP2GenerationCore::PendingRequest> TP2GenerationCore::try_pop_la
 // cannot cover it right now leaves nothing behind and the caller puts the request back at the head
 // of the queue. The admission ceiling already excludes the margin, so a request that fits the policy
 // always fits an empty pool: the wait is always for another lane to retire, never a deadlock.
+namespace {
+
+// Env-gated KV-pool trace: what each request reserves versus what it uses, the pool's own page
+// counters, and the run count and wall time of every session store/recall. Off by default; it exists
+// to quantify internal fragmentation and the cost of the S1 host-slab round trip.
+bool kv_trace_enabled() {
+    const char* env = std::getenv("NINFER_TP2_KV_TRACE");
+    return env != nullptr && env[0] == '1';
+}
+
+}  // namespace
+
 std::uint32_t TP2GenerationCore::lane_kv_pages(std::uint32_t need_tokens) const noexcept {
     return pages_for_tokens(need_tokens + lane_kv_margin());
 }
@@ -2988,6 +3000,19 @@ bool TP2GenerationCore::reserve_lane_kv(std::uint32_t lane, std::uint32_t need_t
         cache->execution_tables().publish(shard.mtp_rows[index].handle(), 0, handles,
                                           shard.device.stream);
     }
+    if (kv_trace_enabled()) {
+        const auto& pool_a = shard_a_.decoder->text_kv.page_pool();
+        const auto& pool_b = shard_b_.decoder->text_kv.page_pool();
+        std::fprintf(stderr,
+                     "[tp2-kv] reserve lane=%u pages=%u need=%u margin=%u runs=%u/%u "
+                     "capacity=%u/%u allocated=%u/%u reserved=%u/%u available=%u/%u\n",
+                     lane, pages, need_tokens, lane_kv_margin(),
+                     pool_a.contiguous_run_count(shard_a_.kv_lane_handles[index]),
+                     pool_b.contiguous_run_count(shard_b_.kv_lane_handles[index]),
+                     pool_a.capacity_pages(), pool_b.capacity_pages(), pool_a.allocated_pages(),
+                     pool_b.allocated_pages(), pool_a.reserved_pages(), pool_b.reserved_pages(),
+                     pool_a.available_pages(), pool_b.available_pages());
+    }
     return true;
 }
 
@@ -3005,6 +3030,16 @@ void TP2GenerationCore::release_lane_kv(std::uint32_t lane) noexcept {
     }
     if (index < shard_a_.mtp_lane_pages.size()) { shard_a_.mtp_lane_pages[index].clear(); }
     if (index < shard_a_.mtp_lane_handles.size()) { shard_a_.mtp_lane_handles[index].clear(); }
+    if (kv_trace_enabled()) {
+        const auto& pool_a = shard_a_.decoder->text_kv.page_pool();
+        const auto& pool_b = shard_b_.decoder->text_kv.page_pool();
+        std::fprintf(stderr,
+                     "[tp2-kv] release lane=%u capacity=%u/%u allocated=%u/%u reserved=%u/%u "
+                     "available=%u/%u\n",
+                     lane, pool_a.capacity_pages(), pool_b.capacity_pages(),
+                     pool_a.allocated_pages(), pool_b.allocated_pages(), pool_a.reserved_pages(),
+                     pool_b.reserved_pages(), pool_a.available_pages(), pool_b.available_pages());
+    }
     RetentionState& lane_state = retention(lane);
     lane_state.cached_prompt_tokens.clear();
     lane_state.cached_media.clear();
@@ -5510,6 +5545,7 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
     // ring exists, otherwise the device plane. The two are mutually exclusive - a plane the ring
     // serves is not carved - and the copies differ in direction, so the source is picked here and
     // consumed after the synchronize below.
+    const Clock::time_point store_start = kv_trace_enabled() ? Clock::now() : Clock::time_point{};
     const Shard::HostCheckpoint* prompt_end_checkpoints[2] = {nullptr, nullptr};
     bool prompt_end_captured                              = true;
     for (std::size_t index = 0; index < 2; ++index) {
@@ -5588,6 +5624,16 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
     for (std::size_t index = 0; index < 2; ++index) {
         shards[index]->device.bind_to_current_thread();
         CUDA_CHECK(cudaStreamSynchronize(shards[index]->device.stream));
+    }
+    if (kv_trace_enabled()) {
+        std::fprintf(
+            stderr, "[tp2-kv] store lane=%u pages=%u frontier=%u runs=%u/%u ms=%.1f\n", lane,
+            pages, entry.frontier,
+            shard_a_.decoder->text_kv.page_pool().contiguous_run_count(
+                shard_a_.kv_lane_handles[lane]),
+            shard_b_.decoder->text_kv.page_pool().contiguous_run_count(
+                shard_b_.kv_lane_handles[lane]),
+            std::chrono::duration<double, std::milli>(Clock::now() - store_start).count());
     }
     // The prompt-end image is a host checkpoint when the ring exists, and the D2H that filled it rode
     // the shard stream, so the synchronize above is what orders these host-to-host moves after it.
@@ -5669,6 +5715,7 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
         return;
     }
     Shard* const shards[2] = {&shard_a_, &shard_b_};
+    const Clock::time_point recall_start = kv_trace_enabled() ? Clock::now() : Clock::time_point{};
     for (std::size_t index = 0; index < 2; ++index) {
         Shard& shard = *shards[index];
         shard.device.bind_to_current_thread();
@@ -5714,6 +5761,19 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
     for (std::size_t index = 0; index < 2; ++index) {
         shards[index]->device.bind_to_current_thread();
         CUDA_CHECK(cudaStreamSynchronize(shards[index]->device.stream));
+    }
+    if (kv_trace_enabled()) {
+        const char* state_name = state == RecallState::Frontier  ? "frontier"
+                                 : state == RecallState::PromptEnd ? "prompt-end"
+                                                                   : "shared";
+        std::fprintf(
+            stderr, "[tp2-kv] recall lane=%u pages=%u boundary=%u state=%s runs=%u/%u ms=%.1f\n",
+            lane, pages, boundary, state_name,
+            shard_a_.decoder->text_kv.page_pool().contiguous_run_count(
+                shard_a_.kv_lane_handles[lane]),
+            shard_b_.decoder->text_kv.page_pool().contiguous_run_count(
+                shard_b_.kv_lane_handles[lane]),
+            std::chrono::duration<double, std::milli>(Clock::now() - recall_start).count());
     }
     shard_a_.device.bind_to_current_thread();
     // A prompt-end recall leaves the entry standing where that prompt ended: the device pools hold

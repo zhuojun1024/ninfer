@@ -38,6 +38,28 @@ void ensure_openai_request_id(const httplib::Request& request, httplib::Response
     }
 }
 
+// A plain-handler route has its body read by dispatch_request() through Server::read_content, which
+// rejects any application/x-www-form-urlencoded body larger than 8 KiB (httplib's
+// CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH) with a 413 that ignores --max-request-mib. That
+// check runs before any handler, so no route can correct it. The content-reader route form reads
+// through read_content_core, which enforces only the configured payload limit; buffering the body
+// here keeps the documented contract that a 413 means exactly "the raw request body exceeds
+// --max-request-mib".
+void buffer_request_body(const httplib::Request& request, httplib::Response& response,
+                         const httplib::ContentReader& content_reader,
+                         const httplib::Server::Handler& handler) {
+    httplib::Request buffered = request;
+    buffered.body.clear();
+    const bool complete = content_reader([&](const char* data, std::size_t length) {
+        buffered.body.append(data, length);
+        return true;
+    });
+    // An aborted read already carries httplib's own status (413 for the payload limit). Leaving it
+    // alone lets the unrendered-error handler render the documented payload-limit envelope.
+    if (!complete) { return; }
+    handler(buffered, response);
+}
+
 ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
                                         const ninfer::RuntimeStats& current,
                                         double interval_seconds) {
@@ -346,6 +368,22 @@ void HttpServer::stop_stats_reporter() {
     stats_thread_.join();
 }
 
+void HttpServer::register_post(const std::string& pattern, httplib::Server::Handler handler) {
+    server_.Post(pattern, [handler = std::move(handler)](const httplib::Request& request,
+                                                         httplib::Response& response,
+                                                         const httplib::ContentReader& reader) {
+        buffer_request_body(request, response, reader, handler);
+    });
+}
+
+void HttpServer::register_delete(const std::string& pattern, httplib::Server::Handler handler) {
+    server_.Delete(pattern, [handler = std::move(handler)](const httplib::Request& request,
+                                                           httplib::Response& response,
+                                                           const httplib::ContentReader& reader) {
+        buffer_request_body(request, response, reader, handler);
+    });
+}
+
 void HttpServer::register_routes() {
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         return handle_unrendered_http_error(options_, request, response);
@@ -451,22 +489,22 @@ void HttpServer::register_routes() {
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
     });
-    server_.Post("/v1/chat/completions",
+    register_post("/v1/chat/completions",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
-    server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
+    register_post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
     });
-    server_.Post("/v1/responses/input_tokens",
+    register_post("/v1/responses/input_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_input_tokens(req, res);
                  });
-    server_.Post("/v1/responses/compact",
+    register_post("/v1/responses/compact",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_compact(req, res);
                  });
-    server_.Post(R"(/v1/responses/([^/]+)/cancel)",
+    register_post(R"(/v1/responses/([^/]+)/cancel)",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_cancel(req, res);
                  });
@@ -478,15 +516,15 @@ void HttpServer::register_routes() {
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_response_get(req, res);
                 });
-    server_.Delete(R"(/v1/responses/([^/]+))",
+    register_delete(R"(/v1/responses/([^/]+))",
                    [this](const httplib::Request& req, httplib::Response& res) {
                        handle_response_delete(req, res);
                    });
-    server_.Post("/v1/messages/count_tokens",
+    register_post("/v1/messages/count_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_count_tokens(req, res);
                  });
-    server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
+    register_post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
 }

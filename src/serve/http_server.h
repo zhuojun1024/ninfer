@@ -75,6 +75,10 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context);
 
     void register_routes();
+    // Body-carrying routes are registered through httplib's content-reader form so that
+    // --max-request-mib stays the only source of a 413; see register_post's definition.
+    void register_post(const std::string& pattern, httplib::Server::Handler handler);
+    void register_delete(const std::string& pattern, httplib::Server::Handler handler);
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);

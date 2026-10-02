@@ -552,3 +552,75 @@ deadline 与取消都无法 signal 进 `lane_queue_cv_`（deadline 不是受锁�
 | C=1 回归（短请求两发） | 两个 200（379/325 ms） | 无 `publish tokens=0` |
 
 C=1 不经过该路径（`wait_lanes` 只在 `lanes_ > 1` 时由 `Submission::wait` 调用；C=1 直接在 `execution_mutex_` 上排队，无 deadline 强制，与改造前逐字节一致）。
+
+## 四项收尾：413 报文、KV 碎片化、S1 往返代价、C=1 vs C=4（m03963/m03964）
+
+### 1. HTTP 413 只应来自 `--max-request-mib`（已修）
+
+根因：`docs/serving.md:420-422` 的契约是「413 `request_too_large` 保留给 JSON 解析之前就超过 `--max-request-mib` 的裸请求体」，但 vendored cpp-httplib 对 `application/x-www-form-urlencoded` 另有一条 8192 字节上限：`CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH`（`third_party/cpp-httplib/httplib.h:133-134`）在普通 Handler 路由的 `Server::read_content`（`httplib.h:13326-13336`）里直接置 413 并 return false，与 `payload_max_length_` 无关，且发生在任何 handler 之前 ⇒ 应用层无法拦截，报文还会错误地宣称「超过了配置的上限」。
+
+修法：8 条带 body 的路由（7 个 POST + 1 个 DELETE，`src/serve/http_server.cpp:492-529`）改走 httplib 的 content-reader 路由（`HttpServer::register_post`/`register_delete`，`src/serve/http_server.h:77-81`；`buffer_request_body`，`src/serve/http_server.cpp:41-61`）。该路径经 `read_content_core`（`httplib.h:13350-13425`）只在 `:13409` 按 `payload_max_length_` 判超限，无 form 上限、不做 `parse_query_text`（无 DoS 放大）；`pre_routing_handler_`（鉴权，`httplib.h:13747`）仍在读 body 之前运行。`handle_unrendered_http_error` 与 `tests/test_http_error_handler.cpp` 未改。
+
+实测（`_temp/m04130_413.mjs`；双卡 `--max-request-mib 1`、`--spec dflash2`）：
+
+| 请求 | 修复前 `61F09142…` | 修复后 |
+|---|---|---|
+| 18,234 B、`application/json`（对照） | 200 / 2,538 ms | 200 / 2,427 ms |
+| 18,234 B、`application/x-www-form-urlencoded` | **413**「exceeds the configured payload limit of 1048576 bytes」（body 只有 18 KB） | **200** / 2,357 ms |
+| 2,097,202 B、`application/json` | 413 | 413「…1048576 bytes」 |
+| 2,097,181 B、`application/x-www-form-urlencoded` | 413 | 413「…1048576 bytes」 |
+
+流式回归：content-reader 路由下 SSE 照常（`STREAM http=200 dataLines=20/22 eventLines=20/22 completed=true`，C=1 与 C=4 各一次）。
+
+### 2. KV 池碎片化：外部碎片为 0，内部碎片 = 页取整 + 整个输出预算持有到退役
+
+结构上准入不可能因碎片失败：`DeviceKVPagePool::reserve` 只判断 `pages == 0 || pages > available_pages()`（`src/core/paged_kv_cache.cpp:266-270`），预留是纯计数器，不要求物理连续；物理连续性只影响 `contiguous_run_count`（`:253-264`）与 `materialize` 的相邻偏好（`:288-320`），即只影响 `copy_to_host`/`copy_from_host`（`:576-660`）的 `cudaMemcpy2D` 批次数。
+
+新增 env 门控 trace `NINFER_TP2_KV_TRACE=1`（`src/runtime/engine/tp2_generation_core.cpp:2922-2932`）在 `reserve_lane_kv`（`:3003-3015`）、`release_lane_kv`（`:3033-3042`）、`session_store_active`（`:5628-5637`）、`session_restore`（`:5765-5777`）打印池计数、该 lane 的 run 数与 store/recall 墙钟。
+
+实测（`_temp/m04130_kv.mjs` + `_temp/run_m04130_mix.ps1`；双卡用户配方、`--max-context 245760` ⇒ 池 3,840 页/卡、1,081,344 B/页 ≈ 3.96 GiB/卡）：34 次 reserve/release、18 次 store/recall，`runs` **全部为 1/1**（两卡都是单一连续 run），尺寸覆盖 1/44/60/86/107/171/234 页并含并发交错 ⇒ 未观测到物理碎片。
+
+内部碎片（预留页 vs 实际存储页）：
+
+| 请求 | 预留页 | store 页 | 闲置 |
+|---|---|---|---|
+| prompt 10,839 + budget 64 | 171 | 170（frontier 10,857/10,863） | 1 页 = 1.03 MiB/卡 |
+| prompt 5,418 + budget 64 | 86 | 85–86 | 0–1 页 |
+| prompt 2,738 + budget 64 | 44 | 44 | 0 |
+| prompt 10,836 + budget 4096（20 tok 即停） | 234 | 170 | **64 页 = 66.0 MiB/卡（132.0 MiB 两卡）** |
+| prompt 2,735 + budget 4096（25 tok 即停） | 107 | 44 | **63 页 = 65.0 MiB/卡** |
+
+并发峰值：两个 234 页请求同时持有 ⇒ `allocated 468/3840`（12.2%），`available` 最低 3,372/3,840（87.8%）。结论：浪费是内部的、且是既定策略（整份输出预算一次性预留、持有到退役、不缩容、不抢占，m01589/m01553），不是分配器碎片；它的可见代价是「本可容纳的请求因为整份预留而排队」，而不是失败或截断。
+
+### 3. S1 会话 host 往返的吞吐代价
+
+| 操作 | 页数 | KV 字节/卡 | ms | KV 单项下界（两卡合计） |
+|---|---|---|---|---|
+| store | 170 | 175.3 MiB | 8 次：79.0 / 中位 ≈108 / 133.8 | 3.13 GiB/s |
+| store | 86 / 85 | 88.7 / 87.7 MiB | 67.3 / 71.9 | 2.4–2.6 GiB/s |
+| recall（frontier） | 160 | 165.0 MiB | 6 次：60.9 / 中位 64.5 / 66.6 | 5.00 GiB/s |
+| recall（shared） | 160 / 80 | 165.0 / 82.5 MiB | 59.5 / 37.7 | 5.42 / 4.27 GiB/s |
+
+（KV 单项下界 = 只算 KV 页字节、不含同区间内的 lane state D2H/H2D 与 dflash 草稿镜像 ⇒ 实际带宽更高。store 只搬实际 frontier，不搬整份预留。）
+
+对照收益：10,845 token 冷 prefill 6.4 s（1.69k tok/s）→ 命中 10,240 token 后 TTFT 0.45–0.47 s（605 token @1.33–1.53k tok/s）。一次完整往返 store+recall ≈ 0.11 + 0.065 = **0.17 s**，即约 3% 的收益；代价固定且有界（每次退役 ~0.11 s，与之后是否复用无关）。
+
+### 4. C=1 vs C=4 单请求配对测量
+
+`_temp/m04140_pair.mjs` + `_temp/run_m04140_pair.ps1`；同一 prompt（10,845）、同一 `max_output_tokens 256`、同一用户配方，只改 `--max-concurrency`；每臂 3 次连发 + 1 次流式。
+
+| 指标 | C=1 | C=4 |
+|---|---|---|
+| R1 冷 TTFT | 6.4 s | 6.4 s |
+| R1 冷 prefill | 1.69k tok/s（10,845 tok） | 1.70k tok/s（10,845 tok） |
+| R1 冷 decode | 115.8 tok/s（dflash2 201/269） | 104.9 tok/s（198/283） |
+| R1 客户端总时长 | 8,676 ms | 9,215 ms |
+| R2 复用 TTFT | 406 ms（cache 10,240，long anchor） | 466 ms（cache 10,240，private endpoint） |
+| R2 prefill / 客户端 | 1.53k tok/s / 2,599 ms | 1.33k tok/s / 3,001 ms |
+| R3 复用 TTFT / 客户端 | 405 ms / 2,481 ms | 453 ms / 4,082 ms |
+| 设备占用（卡0/卡1） | 14,924 / 14,678 MiB | 15,512 / 15,134 MiB |
+| state arena（卡1） | 146.8 MiB | 587.2 MiB |
+| host checkpoint ring（卡1） | 35 槽 × 73.4 MiB，stride 10,240，pinned 2,569.2 MiB | 36 槽 × 73.4 MiB，stride 81,920，pinned 2,642.6 MiB |
+| 卡1 free | 620.0 MiB | 164.0 MiB |
+
+结论：多 lane 机制对「单独一个请求」的 prefill 吞吐没有影响（1.69k vs 1.70k tok/s，TTFT 都是 6.4 s）；冷启动端到端 +6%（decode 差异由 dflash2 接受率方差主导：74.7% vs 70.0%，n=3 不可分辨）。稳定的差异是复用路径（C≥2 走 host slab：TTFT +15%，406→466 ms）与显存（+588/+456 MiB 设备 + 73.4 MiB pinned，卡1 free 620→164 MiB）。C=4 R3 的 decode 80.1 tok/s（接受率 48.5%）说明单机 n=3 的 decode 对比不可控，只有 prefill 与显存两项可判读。
