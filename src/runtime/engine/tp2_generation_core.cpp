@@ -55,12 +55,24 @@ struct Tp2RoundTiming {
     double verify_ms  = 0.0;
     double accept_ms  = 0.0;
     double copy_ms    = 0.0;
+    // The plain batched route records the same five marks for its own phase split - 0-1 the batched
+    // decode step, 1-2 grammar masking, 2-3 sampling, 3-4 the logits readback - and keeps them in
+    // their own accumulators so its report names each phase for what it is.
+    double decode_ms   = 0.0;
+    double grammar_ms  = 0.0;
+    double sample_ms   = 0.0;
+    double readback_ms = 0.0;
     double sync_ms    = 0.0;
     double fold_ms    = 0.0;
     double round_ms   = 0.0;
     double prefill_ms = 0.0;
     std::uint64_t rounds    = 0;
     std::uint64_t committed = 0;
+    // Plain route only: how many prefill chunks were stepped, and how many of them ran a decode
+    // round for the lanes that already held a token. It is the direct evidence that a lane beside a
+    // long prefill is served once per chunk instead of once per prompt.
+    std::uint64_t prefill_chunks = 0;
+    std::uint64_t pump_rounds    = 0;
 
     // The events are recorded on shard A's stream only, so they must be created with shard A's
     // device current: an event from another device makes cudaEventRecord fail with
@@ -88,6 +100,9 @@ struct Tp2RoundTiming {
 
     void reset() {
         mtp_ms = verify_ms = accept_ms = copy_ms = sync_ms = fold_ms = round_ms = prefill_ms = 0.0;
+        decode_ms = grammar_ms = sample_ms = readback_ms = 0.0;
+        prefill_chunks = 0;
+        pump_rounds    = 0;
         rounds    = 0;
         committed = 0;
     }
@@ -120,6 +135,32 @@ struct Tp2RoundTiming {
         accept_ms += elapsed(2, 3);
         copy_ms += elapsed(3, 4);
         sync_ms += sync_wait_ms;
+    }
+
+    // The plain batched route's round split, in its own labels. It has no draft, verify or accept
+    // phase, so it reports none of them; the prefill of the lane each round served is reported per
+    // request by the serving layer instead.
+    void close_round_plain(double sync_wait_ms) {
+        if (!events_ready) { return; }
+        decode_ms += elapsed(0, 1);
+        grammar_ms += elapsed(1, 2);
+        sample_ms += elapsed(2, 3);
+        readback_ms += elapsed(3, 4);
+        sync_ms += sync_wait_ms;
+    }
+
+    void report_plain(const char* label) const {
+        if (!enabled || rounds == 0) { return; }
+        const double n = static_cast<double>(rounds);
+        std::fprintf(stderr,
+                     "[tp2-time] %s rounds=%llu committed=%llu avg_round=%.2fms decode=%.2f "
+                     "grammar=%.2f sample=%.2f readback=%.2f sync_wait=%.2f prefill_chunks=%llu "
+                     "pump_rounds=%llu\n",
+                     label, static_cast<unsigned long long>(rounds),
+                     static_cast<unsigned long long>(committed), round_ms / n, decode_ms / n,
+                     grammar_ms / n, sample_ms / n, readback_ms / n, sync_ms / n,
+                     static_cast<unsigned long long>(prefill_chunks),
+                     static_cast<unsigned long long>(pump_rounds));
     }
 
     void report(const char* label) const {
@@ -460,6 +501,18 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
             std::fprintf(stderr,
                          "[mem] TP-2 lane admission ceiling %u tokens (--lane-context %u)\n",
                          lane_context_limit_, options_.lane_context);
+        } else {
+            // No ceiling was given, so the pool's own limit stands and a lane that arrives first may
+            // reserve all of it: the requests queued behind it then cannot be admitted alongside it
+            // even though the route has the slots, which is what the whole pool looks like from the
+            // outside. Say so instead of silently applying a ceiling, because a hard default of
+            // pool/lanes_ would make submit() reject a prompt longer than one lane's share even when
+            // that lane is the only request in the system.
+            std::fprintf(stderr,
+                         "[mem] TP-2 lane admission ceiling %u tokens (the whole KV pool): one lane "
+                         "may reserve all of it, so --max-concurrency %u requests cannot be admitted "
+                         "together until it retires; set --lane-context to cap one lane\n",
+                         lane_context_limit_, lanes_);
         }
         // The batched executors stage their per-lane operands here, one section per operand with
         // the lane index as the stride. A captured batch step reads these addresses through memcpy
@@ -836,11 +889,19 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     // `state_planes * (state_bytes / lanes)`. The host checkpoint ring serves the prompt end and every
     // rewind boundary when it exists, so those planes are not carved at all and slot 0 stays empty;
     // without the ring the store path needs the prompt-end plane and every plane is carved.
+    //
+    // The round scratch is read only by the speculative routes: execute_spec_batch restores the
+    // pre-verify image out of it, and execute_walk's DFlash2 and MTP branches snapshot into it. The
+    // plain batch executor never touches it, so a plain-route configuration does not carve it and
+    // saves one whole-pool state image per lane (73.4 MiB x lanes per shard).
+    const bool scratch_needed = mtp_enabled_ || dflash2_enabled_;
     const std::size_t first_state_plane = host_checkpoint_stride_ != 0 ? 1U : 0U;
-    const std::size_t state_planes      = 1U + shard.state_snapshots.size() - first_state_plane;
+    const std::size_t state_planes =
+        (scratch_needed ? 1U : 0U) + shard.state_snapshots.size() - first_state_plane;
     shard.state_arena   = std::make_unique<DeviceArena>(state_planes * state_bytes);
     shard.state_backing = shard.state_arena->alloc_bytes(state_bytes, 256);
     for (std::size_t slot = first_state_plane; slot < shard.state_snapshots.size(); ++slot) {
+        if (slot == kRoundScratchSlot && !scratch_needed) { continue; }
         shard.state_snapshots[slot] = shard.state_arena->alloc_bytes(state_bytes, 256);
     }
     CUDA_CHECK(cudaMemset(shard.state_backing.data, 0, state_bytes));
@@ -2085,6 +2146,10 @@ TP2GenerationCore::Submission TP2GenerationCore::submit(
     // The FIFO wait is the only part of the deadline this core owns: preparation and media already
     // ran against it in the service layer, and an admitted request is no longer pending.
     request->pending_deadline = pending_deadline;
+    // Preparation is already behind us, so this instant is the same anchor the single-device route
+    // uses: the queue wait a lane measures from here excludes preparation, and prepare_seconds is
+    // added back exactly once when the result is assembled.
+    request->submitted = Clock::now();
     return Submission(*this, std::move(request));
 }
 
@@ -2249,6 +2314,14 @@ GenerationResult TP2GenerationCore::wait_lanes(std::unique_ptr<Request> request,
 // run for hundreds of milliseconds anyway.
 constexpr std::chrono::microseconds kBatchFormationWindow{3000};
 
+// Upper bound on the whole formation phase. The driver keeps the window open while the batch is
+// still short of the route's lane capacity and members keep arriving, so a burst whose submissions
+// are spread over more than one window lands in a single batch instead of splitting into a first
+// batch and stragglers that then wait a whole round for mid-batch admission. A lone request never
+// reaches this bound: the extension stops as soon as one window passes with an empty queue, so it
+// only ever pays the initial window.
+constexpr std::chrono::microseconds kBatchFormationMaximum{50000};
+
 // Retire one member. The result and any streamed preview are already in place when this is called,
 // so setting `complete` under the queue lock and waking the waiters is the whole hand-off.
 void TP2GenerationCore::publish_lane(PendingRequest& pending) {
@@ -2291,25 +2364,41 @@ void TP2GenerationCore::drive_lane_queue() {
                 lane_queue_cv_.wait_for(queue, kBatchFormationWindow);
             }
             batch.reserve(lanes_);
-            while (batch.size() < lanes_ && !lane_queue_.empty()) {
-                std::shared_ptr<PendingRequest> next = std::move(lane_queue_.front());
-                lane_queue_.pop_front();
-                // Take the member out of the submitter's hands first, whatever happens to it below:
-                // from here the driver owns its retirement.
-                next->admitted = true;
-                // Neither of these may take a lane, and the deadline outranks the cancellation, as it
-                // does in the single-GPU admission.
-                if (queued_deadline_passed(next->request->pending_deadline)) {
-                    expired_queued.push_back(std::move(next));
-                    continue;
+            // Drain what has already arrived. Taking the member out of the submitter's hands happens
+            // first, whatever happens to it below: from here the driver owns its retirement.
+            const auto take_from_queue = [&] {
+                while (batch.size() < lanes_ && !lane_queue_.empty()) {
+                    std::shared_ptr<PendingRequest> next = std::move(lane_queue_.front());
+                    lane_queue_.pop_front();
+                    next->admitted = true;
+                    // Neither of these may take a lane, and the deadline outranks the cancellation,
+                    // as it does in the single-GPU admission.
+                    if (queued_deadline_passed(next->request->pending_deadline)) {
+                        expired_queued.push_back(std::move(next));
+                        continue;
+                    }
+                    if (next->cancellation.requested()) {
+                        // The client disconnected while it waited. Do not spend a lane and a round on
+                        // a request that would abandon both at its first check.
+                        cancelled_queued.push_back(std::move(next));
+                        continue;
+                    }
+                    batch.push_back(std::move(next));
                 }
-                if (next->cancellation.requested()) {
-                    // The client disconnected while it waited. Do not spend a lane and a round on a
-                    // request that would abandon both at its first check.
-                    cancelled_queued.push_back(std::move(next));
-                    continue;
+            };
+            // One window for the rest of the burst, and then keep the window open while members keep
+            // arriving and the batch is still short of lane capacity. Each iteration drains the queue
+            // first, so a batch that fills stops immediately and the phase never waits longer than
+            // kBatchFormationMaximum.
+            const Clock::time_point formation_deadline = Clock::now() + kBatchFormationMaximum;
+            for (;;) {
+                take_from_queue();
+                if (batch.size() >= lanes_ || Clock::now() >= formation_deadline) { break; }
+                if (!lane_queue_cv_.wait_for(queue, kBatchFormationWindow,
+                                             [&] { return lane_driver_stop_ || !lane_queue_.empty(); }) ||
+                    lane_driver_stop_) {
+                    break;
                 }
-                batch.push_back(std::move(next));
             }
         }
         for (auto& pending : expired_queued) { drop_expired_lane(*pending); }
@@ -3299,21 +3388,30 @@ void TP2GenerationCore::execute_plain_batch(
         lane.result.matched_stop_string = request.output.matched_stop_string();
         lane.result.thinking            = request.output.thinking_stats();
         const double total = std::chrono::duration<double>(done - lane.begin).count();
+        // Both reported spans start where the core accepted the request, matching the single-device
+        // route: the serve layer adds prepare_seconds to the first-token span and subtracts it from
+        // the total, so a span that had already excluded preparation read back as zero whenever the
+        // generation was shorter than its own preparation. `prompt_wall_seconds` and
+        // `prefill_seconds` deliberately stay admission-relative: they define the prefill rate.
+        const double queue_wait = lane.result.engine_timing.queue_wait_seconds;
         if (lane.have_first) {
             const double decode =
                 std::chrono::duration<double>(done - lane.first_token).count();
             lane.result.timings.decode_seconds          = decode;
             lane.result.timings.generation_wall_seconds = decode;
             lane.result.timings.first_token_seconds =
-                lane.result.timings.prepare_seconds + lane.result.timings.prompt_wall_seconds;
-            lane.result.timings.total_seconds = total;
+                lane.result.timings.prepare_seconds + lane.result.timings.prompt_wall_seconds +
+                queue_wait;
+            lane.result.timings.total_seconds =
+                lane.result.timings.prepare_seconds + total + queue_wait;
         } else {
             lane.result.timings.decode_seconds          = 0.0;
             lane.result.timings.generation_wall_seconds = 0.0;
             lane.result.timings.prompt_wall_seconds     = total;
             lane.result.timings.first_token_seconds =
-                lane.result.timings.prepare_seconds + total;
-            lane.result.timings.total_seconds = total;
+                lane.result.timings.prepare_seconds + total + queue_wait;
+            lane.result.timings.total_seconds =
+                lane.result.timings.prepare_seconds + total + queue_wait;
         }
         lane.pending->result = std::move(lane.result);
         // S1: the pages this request held go back to the shared pool as it retires, so the next
@@ -3338,6 +3436,158 @@ void TP2GenerationCore::execute_plain_batch(
     std::vector<std::size_t> active;
     active.reserve(lane_capacity);
 
+    // The decode round, callable from the admission path as well as from the loop below. A lane
+    // that is already holding a token keeps publishing while another lane prefills: the prefill
+    // chunk loop pumps one round between two of its own chunks, so a newcomer's prompt no longer
+    // stalls every lane beside it for the prompt's whole duration. Exactly one lane ever prefills
+    // (admit_lane runs them one at a time), so the serial prefill order, every lane's TTFT and the
+    // single startup vision session all stay as they were; only the lanes' token stream changes.
+    // The round never retires or admits a lane, so it can never re-enter admit_lane.
+    auto pump_decode_round = [&]() {
+        if (active.empty()) { return; }
+        const std::int32_t columns = static_cast<std::int32_t>(active.size());
+        std::uint32_t max_position = 0;
+        for (std::size_t column = 0; column < active.size(); ++column) {
+            const LaneState& lane  = lanes[active[column]];
+            host_tokens[column]    = lane.current;
+            host_positions[column] = static_cast<std::int32_t>(lane.position);
+            host_kv_rows[column]   = static_cast<std::int32_t>(lane.slot);
+            host_slots[column]     = static_cast<std::int32_t>(lane.slot);
+            host_logical[column]   = static_cast<std::int32_t>(lane.position) + 1;
+            max_position           = std::max(max_position, lane.position);
+        }
+        position_arena(ws_a, shard_a_.round_base, shard_a_.round_base);
+        position_arena(ws_b, shard_b_.round_base, shard_b_.round_base);
+        auto scope_a = ws_a.scope();
+        auto scope_b = ws_b.scope();
+        shard_a_.device.bind_to_current_thread();
+        // The configs and the logical positions are restaged per round because a lane that left the
+        // batch no longer occupies its original column.
+        DeviceSpan round_configs =
+            ws_a.alloc_bytes(sizeof(ops::SamplingConfig) * static_cast<std::size_t>(columns), 256);
+        std::vector<ops::SamplingConfig> round_host(static_cast<std::size_t>(columns));
+        for (std::size_t column = 0; column < active.size(); ++column) {
+            round_host[column] = configs[lanes[active[column]].slot];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(round_configs.data, round_host.data(),
+                                   sizeof(ops::SamplingConfig) * static_cast<std::size_t>(columns),
+                                   cudaMemcpyHostToDevice, shard_a_.device.stream));
+        Tensor logical_positions = ws_a.alloc(DType::I32, {columns});
+        CUDA_CHECK(cudaMemcpyAsync(logical_positions.data, host_logical,
+                                   sizeof(std::int32_t) * static_cast<std::size_t>(columns),
+                                   cudaMemcpyHostToDevice, shard_a_.device.stream));
+        Tensor logits = ws_a.alloc(DType::BF16, {vocab, columns});
+        // The envelope is a launch/workspace promise over the batch maximum, not a mask: every
+        // column's own position still bounds its visible keys inside the kernel.
+        const ops::CausalAttentionExecutionEnvelope envelope{1, max_position + 1};
+        // Phase marks, matching the walk and the spec batch: 0 round start, 1 after the decode
+        // forward, 2 after the grammar mask, 3 after the sample, 4 after the token readback. The
+        // plain route has no proposal chain and no fold, so mtp and fold stay zero. `rounds` counts
+        // committed columns (as it does on the spec route), so every accumulated phase is the
+        // per-lane share of a round and avg_round is directly comparable with verify.
+        const Clock::time_point round_start = Clock::now();
+        timing.record(0, shard_a_.device.stream);
+        run_plain_decode_step_batch(host_tokens, host_positions, host_kv_rows, host_slots, columns,
+                                    envelope, logits);
+        timing.record(1, shard_a_.device.stream);
+        // P2.1: mask each live lane's own column with that lane's own declared-name grammar, after
+        // the decode forward that produced the logits and before the sample reads them. Column c of
+        // the round's logits belongs to lane active[c], so block c is that lane's mask.
+        if (any_grammar) {
+            std::fill(tool_mask_host.begin(), tool_mask_host.end(), std::uint8_t{1});
+            std::int32_t masked_columns = 0;
+            for (std::int32_t column = 0; column < columns; ++column) {
+                const std::size_t lane_index = active[static_cast<std::size_t>(column)];
+                LaneGrammar& lane_grammar    = grammar[lane_index];
+                const Request& lane_request  = *lanes[lane_index].pending->request;
+                if (!grammar_live(lane_grammar, lane_request)) {
+                    continue;
+                }
+                grammar_advance(lane_grammar, lane_request);
+                if (lane_grammar.constraint->build_mask(logits_domain, tool_mask_one)) {
+                    const std::size_t base =
+                        static_cast<std::size_t>(column) * static_cast<std::size_t>(vocab);
+                    std::copy(tool_mask_one.begin(), tool_mask_one.end(),
+                              tool_mask_host.begin() + static_cast<std::ptrdiff_t>(base));
+                    ++masked_columns;
+                }
+            }
+            if (masked_columns > 0) {
+                Tensor tool_mask_dev = ws_a.alloc(DType::U8, {vocab, columns});
+                shard_a_.device.bind_to_current_thread();
+                CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_host.data(),
+                                           sizeof(std::uint8_t) * static_cast<std::size_t>(vocab) *
+                                               static_cast<std::size_t>(columns),
+                                           cudaMemcpyHostToDevice, shard_a_.device.stream));
+                ops::apply_token_mask(logits, tool_mask_dev, shard_a_.device.stream);
+                if (lane_trace_enabled()) {
+                    std::fprintf(stderr, "[tp2-lane] grammar masked %d of %d columns\n",
+                                 static_cast<int>(masked_columns), static_cast<int>(columns));
+                }
+            }
+        }
+        timing.record(2, shard_a_.device.stream);
+        Tensor sampled = ws_a.alloc(DType::I32, {columns});
+        shard_a_.device.bind_to_current_thread();
+        ops::sample(logits, sampled, public_tokens,
+                    static_cast<const ops::SamplingConfig*>(round_configs.data), logical_positions,
+                    ops::kSamplePurposeDecode, ws_a, shard_a_.device.stream);
+        timing.record(3, shard_a_.device.stream);
+        std::vector<std::int32_t> next(static_cast<std::size_t>(columns), 0);
+        CUDA_CHECK(cudaMemcpyAsync(next.data(), sampled.data,
+                                   sizeof(std::int32_t) * static_cast<std::size_t>(columns),
+                                   cudaMemcpyDeviceToHost, shard_a_.device.stream));
+        timing.record(4, shard_a_.device.stream);
+        // The wait itself is timed on the host: the phase marks cover the GPU work, and this is the
+        // interval a scheduler could hide behind the next round's host work.
+        const Clock::time_point sync_start = Clock::now();
+        CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+        timing.close_round_plain(
+            std::chrono::duration<double, std::milli>(Clock::now() - sync_start).count());
+        abort_if_ar_stalled();
+
+        for (std::size_t column = 0; column < active.size(); ++column) {
+            LaneState& lane  = lanes[active[column]];
+            Request& request = *lane.pending->request;
+            std::vector<TokenId> step{static_cast<TokenId>(next[column])};
+            const std::uint32_t remaining = request.budget.remaining();
+            if (step.size() > remaining) { step.resize(remaining); }
+            const OutputDecision decision =
+                request.output.preview_model(step, remaining, request.budget.limit_reason());
+            if (decision.accepted_tokens == 0 || decision.accepted_tokens > step.size()) {
+                throw std::logic_error("TP-2 output policy returned an invalid licensed prefix");
+            }
+            request.generated.insert(request.generated.end(), step.begin(),
+                                     step.begin() + decision.accepted_tokens);
+            request.budget.commit(decision.accepted_tokens);
+            committed_decode_tokens_ += decision.accepted_tokens;
+            ++decode_rounds_;
+            publish_preview(lane, false);
+            lane.current = static_cast<std::int32_t>(step.back());
+            ++lane.position;
+            if (decision.finished()) {
+                lane.result.finish_reason = decision.finish_reason;
+                lane.finished             = true;
+                finalize(lane);
+            }
+            timing.committed += decision.accepted_tokens;
+            ++timing.rounds;
+        }
+        timing.round_ms +=
+            std::chrono::duration<double, std::milli>(Clock::now() - round_start).count();
+        std::vector<std::size_t> still;
+        still.reserve(active.size());
+        for (const std::size_t index : active) {
+            if (!lanes[index].finished) { still.push_back(index); }
+        }
+        active.swap(still);
+    };
+
+    // Round watermark. Prefill's chunk scopes have handed the arena back, so the decode rounds
+    // allocate above this point only and rewind to it every round.
+    shard_a_.round_base = ws_a.used();
+    shard_b_.round_base = ws_b.used();
+
     // P2.2: one lane's whole setup as a callable unit, so a slot a retired lane leaves free can take
     // the next queued request at any round boundary. The caller appends the member to `batch` before
     // this runs, so a throw here still reaches the driver's failure propagation and its publish
@@ -3349,6 +3599,11 @@ void TP2GenerationCore::execute_plain_batch(
         lane.slot        = static_cast<std::uint32_t>(index);
         lane.begin       = Clock::now();
         lane.first_token = lane.begin;
+        // The reported TTFT starts at the core's own acceptance, not at this admit: a request that
+        // waited in the FIFO paid that time before any compute ran. `prompt_wall_seconds` stays
+        // admission-relative because it defines the prefill rate this lane reports.
+        lane.result.engine_timing.queue_wait_seconds =
+            std::chrono::duration<double>(lane.begin - pending.request->submitted).count();
         // This lane's own sampler config and grammar, built here because a lane may be admitted long
         // after the batch was formed. The device copy of the configs is refreshed entry by entry.
         configs[index] = make_sampling_config(pending.request->sampling);
@@ -3469,6 +3724,21 @@ void TP2GenerationCore::execute_plain_batch(
             if (lane.pending->cancellation.requested()) {
                 cancelled = true;
                 break;
+            }
+            // Interleave one decode round for the lanes that already hold a token, so this lane's
+            // prompt does not stall every lane beside it for the prompt's whole duration. The
+            // previous chunk's scopes have handed the arena back, so the round starts at the same
+            // watermark it does from the main loop.
+            ++timing.prefill_chunks;
+            if (!active.empty()) {
+                ++timing.pump_rounds;
+                pump_decode_round();
+                // A one-column round republishes the scalar GDN slot pair; restore the binding this
+                // lane's prefill set up so the chunk that follows still runs on its own slot.
+                for (Shard* shard : {&shard_a_, &shard_b_}) {
+                    shard->device.bind_to_current_thread();
+                    shard->context->set_linear_state_slots(active_lane_, active_lane_);
+                }
             }
             std::uint32_t length = std::min(prefill_chunk, lane.prompt_tokens - t0);
             // A multimodal chunk is capped at the boundary of the item it overlaps, so the encoder
@@ -3658,11 +3928,6 @@ void TP2GenerationCore::execute_plain_batch(
         ++index;
     }
 
-    // Round watermark. Prefill's chunk scopes have handed the arena back, so the decode rounds
-    // allocate above this point only and rewind to it every round.
-    shard_a_.round_base = ws_a.used();
-    shard_b_.round_base = ws_b.used();
-
     for (;;) {
         // Retire the lanes that asked to stop before this round is formed. A cancelled or
         // budget-exhausted lane publishes its terminal preview and leaves; the remaining lanes keep
@@ -3725,126 +3990,9 @@ void TP2GenerationCore::execute_plain_batch(
         }
         if (active.empty()) { break; }
 
-        const std::int32_t columns = static_cast<std::int32_t>(active.size());
-        std::uint32_t max_position = 0;
-        for (std::size_t column = 0; column < active.size(); ++column) {
-            const LaneState& lane  = lanes[active[column]];
-            host_tokens[column]    = lane.current;
-            host_positions[column] = static_cast<std::int32_t>(lane.position);
-            host_kv_rows[column]   = static_cast<std::int32_t>(lane.slot);
-            host_slots[column]     = static_cast<std::int32_t>(lane.slot);
-            host_logical[column]   = static_cast<std::int32_t>(lane.position) + 1;
-            max_position           = std::max(max_position, lane.position);
-        }
-        position_arena(ws_a, shard_a_.round_base, shard_a_.round_base);
-        position_arena(ws_b, shard_b_.round_base, shard_b_.round_base);
-        auto scope_a = ws_a.scope();
-        auto scope_b = ws_b.scope();
-        shard_a_.device.bind_to_current_thread();
-        // The configs and the logical positions are restaged per round because a lane that left the
-        // batch no longer occupies its original column.
-        DeviceSpan round_configs =
-            ws_a.alloc_bytes(sizeof(ops::SamplingConfig) * static_cast<std::size_t>(columns), 256);
-        std::vector<ops::SamplingConfig> round_host(static_cast<std::size_t>(columns));
-        for (std::size_t column = 0; column < active.size(); ++column) {
-            round_host[column] = configs[lanes[active[column]].slot];
-        }
-        CUDA_CHECK(cudaMemcpyAsync(round_configs.data, round_host.data(),
-                                   sizeof(ops::SamplingConfig) * static_cast<std::size_t>(columns),
-                                   cudaMemcpyHostToDevice, shard_a_.device.stream));
-        Tensor logical_positions = ws_a.alloc(DType::I32, {columns});
-        CUDA_CHECK(cudaMemcpyAsync(logical_positions.data, host_logical,
-                                   sizeof(std::int32_t) * static_cast<std::size_t>(columns),
-                                   cudaMemcpyHostToDevice, shard_a_.device.stream));
-        Tensor logits = ws_a.alloc(DType::BF16, {vocab, columns});
-        // The envelope is a launch/workspace promise over the batch maximum, not a mask: every
-        // column's own position still bounds its visible keys inside the kernel.
-        const ops::CausalAttentionExecutionEnvelope envelope{1, max_position + 1};
-        run_plain_decode_step_batch(host_tokens, host_positions, host_kv_rows, host_slots, columns,
-                                    envelope, logits);
-        // P2.1: mask each live lane's own column with that lane's own declared-name grammar, after
-        // the decode forward that produced the logits and before the sample reads them. Column c of
-        // the round's logits belongs to lane active[c], so block c is that lane's mask.
-        if (any_grammar) {
-            std::fill(tool_mask_host.begin(), tool_mask_host.end(), std::uint8_t{1});
-            std::int32_t masked_columns = 0;
-            for (std::int32_t column = 0; column < columns; ++column) {
-                const std::size_t lane_index = active[static_cast<std::size_t>(column)];
-                LaneGrammar& lane_grammar    = grammar[lane_index];
-                const Request& lane_request  = *lanes[lane_index].pending->request;
-                if (!grammar_live(lane_grammar, lane_request)) {
-                    continue;
-                }
-                grammar_advance(lane_grammar, lane_request);
-                if (lane_grammar.constraint->build_mask(logits_domain, tool_mask_one)) {
-                    const std::size_t base =
-                        static_cast<std::size_t>(column) * static_cast<std::size_t>(vocab);
-                    std::copy(tool_mask_one.begin(), tool_mask_one.end(),
-                              tool_mask_host.begin() + static_cast<std::ptrdiff_t>(base));
-                    ++masked_columns;
-                }
-            }
-            if (masked_columns > 0) {
-                Tensor tool_mask_dev = ws_a.alloc(DType::U8, {vocab, columns});
-                shard_a_.device.bind_to_current_thread();
-                CUDA_CHECK(cudaMemcpyAsync(tool_mask_dev.data, tool_mask_host.data(),
-                                           sizeof(std::uint8_t) * static_cast<std::size_t>(vocab) *
-                                               static_cast<std::size_t>(columns),
-                                           cudaMemcpyHostToDevice, shard_a_.device.stream));
-                ops::apply_token_mask(logits, tool_mask_dev, shard_a_.device.stream);
-                if (lane_trace_enabled()) {
-                    std::fprintf(stderr, "[tp2-lane] grammar masked %d of %d columns\n",
-                                 static_cast<int>(masked_columns), static_cast<int>(columns));
-                }
-            }
-        }
-        Tensor sampled = ws_a.alloc(DType::I32, {columns});
-        shard_a_.device.bind_to_current_thread();
-        ops::sample(logits, sampled, public_tokens,
-                    static_cast<const ops::SamplingConfig*>(round_configs.data), logical_positions,
-                    ops::kSamplePurposeDecode, ws_a, shard_a_.device.stream);
-        std::vector<std::int32_t> next(static_cast<std::size_t>(columns), 0);
-        CUDA_CHECK(cudaMemcpyAsync(next.data(), sampled.data,
-                                   sizeof(std::int32_t) * static_cast<std::size_t>(columns),
-                                   cudaMemcpyDeviceToHost, shard_a_.device.stream));
-        CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
-        abort_if_ar_stalled();
-
-        for (std::size_t column = 0; column < active.size(); ++column) {
-            LaneState& lane  = lanes[active[column]];
-            Request& request = *lane.pending->request;
-            std::vector<TokenId> step{static_cast<TokenId>(next[column])};
-            const std::uint32_t remaining = request.budget.remaining();
-            if (step.size() > remaining) { step.resize(remaining); }
-            const OutputDecision decision =
-                request.output.preview_model(step, remaining, request.budget.limit_reason());
-            if (decision.accepted_tokens == 0 || decision.accepted_tokens > step.size()) {
-                throw std::logic_error("TP-2 output policy returned an invalid licensed prefix");
-            }
-            request.generated.insert(request.generated.end(), step.begin(),
-                                     step.begin() + decision.accepted_tokens);
-            request.budget.commit(decision.accepted_tokens);
-            committed_decode_tokens_ += decision.accepted_tokens;
-            ++decode_rounds_;
-            publish_preview(lane, false);
-            lane.current = static_cast<std::int32_t>(step.back());
-            ++lane.position;
-            if (decision.finished()) {
-                lane.result.finish_reason = decision.finish_reason;
-                lane.finished             = true;
-                finalize(lane);
-            }
-            timing.committed += decision.accepted_tokens;
-            ++timing.rounds;
-        }
-        std::vector<std::size_t> still;
-        still.reserve(active.size());
-        for (const std::size_t index : active) {
-            if (!lanes[index].finished) { still.push_back(index); }
-        }
-        active.swap(still);
+        pump_decode_round();
     }
-    timing.report("plain-batch");
+    timing.report_plain("plain-batch");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4038,20 +4186,27 @@ void TP2GenerationCore::execute_spec_batch(
         lane.result.matched_stop_string = request.output.matched_stop_string();
         lane.result.thinking            = request.output.thinking_stats();
         const double total = std::chrono::duration<double>(done - lane.begin).count();
+        // Same anchor and same reasoning as the plain batch: the reported first-token and total spans
+        // start where the core accepted the request, while `prompt_wall_seconds` stays
+        // admission-relative because it defines the prefill rate this lane reports.
+        const double queue_wait = lane.result.engine_timing.queue_wait_seconds;
         if (lane.have_first) {
             const double decode = std::chrono::duration<double>(done - lane.first_token).count();
             lane.result.timings.decode_seconds          = decode;
             lane.result.timings.generation_wall_seconds = decode;
             lane.result.timings.first_token_seconds =
-                lane.result.timings.prepare_seconds + lane.result.timings.prompt_wall_seconds;
-            lane.result.timings.total_seconds = total;
+                lane.result.timings.prepare_seconds + lane.result.timings.prompt_wall_seconds +
+                queue_wait;
+            lane.result.timings.total_seconds =
+                lane.result.timings.prepare_seconds + total + queue_wait;
         } else {
             lane.result.timings.decode_seconds          = 0.0;
             lane.result.timings.generation_wall_seconds = 0.0;
             lane.result.timings.prompt_wall_seconds     = total;
             lane.result.timings.first_token_seconds =
-                lane.result.timings.prepare_seconds + total;
-            lane.result.timings.total_seconds = total;
+                lane.result.timings.prepare_seconds + total + queue_wait;
+            lane.result.timings.total_seconds =
+                lane.result.timings.prepare_seconds + total + queue_wait;
         }
         lane.pending->result = std::move(lane.result);
         // S1: the pages this request held go back to the shared pool as it retires, so the next
@@ -4087,6 +4242,11 @@ void TP2GenerationCore::execute_spec_batch(
         lane.slot        = static_cast<std::uint32_t>(index);
         lane.begin       = Clock::now();
         lane.first_token = lane.begin;
+        // The reported TTFT starts at the core's own acceptance, not at this admit: a request that
+        // waited in the FIFO paid that time before any compute ran. `prompt_wall_seconds` stays
+        // admission-relative because it defines the prefill rate this lane reports.
+        lane.result.engine_timing.queue_wait_seconds =
+            std::chrono::duration<double>(lane.begin - pending.request->submitted).count();
         // This lane's own sampler config and grammar, built here because a lane may be admitted long
         // after the batch was formed. The device copy of the configs is refreshed entry by entry.
         configs[index] = make_sampling_config(pending.request->sampling);
@@ -7031,8 +7191,12 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             publish_preview(false);
             result.finish_reason = FinishReason::Cancelled;
             result.timings.total_seconds =
+                result.timings.prepare_seconds +
+                std::chrono::duration<double>(Clock::now() - request.submitted).count();
+            // Prompt wall stays admission-relative; the total above now carries preparation, so the
+            // two are no longer the same number.
+            result.timings.prompt_wall_seconds =
                 std::chrono::duration<double>(Clock::now() - start).count();
-            result.timings.prompt_wall_seconds = result.timings.total_seconds;
             return result;
         }
         std::uint32_t length = std::min(prefill_chunk, prompt_tokens - t0);
@@ -7897,7 +8061,12 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     result.timings.generation_wall_seconds = result.timings.decode_seconds;
     result.timings.first_token_seconds =
         result.timings.prepare_seconds + result.timings.prompt_wall_seconds;
-    result.timings.total_seconds = std::chrono::duration<double>(finished_at - start).count();
+    // The total span starts where the core accepted the request, matching the single-device route;
+    // the serve layer subtracts prepare_seconds from it, so a span that already excluded preparation
+    // read back as zero for any generation shorter than its own preparation.
+    result.timings.total_seconds =
+        result.timings.prepare_seconds +
+        std::chrono::duration<double>(finished_at - request.submitted).count();
     timing.prefill_ms = result.timings.prefill_seconds * 1000.0;
     timing.report("decode");
     return result;

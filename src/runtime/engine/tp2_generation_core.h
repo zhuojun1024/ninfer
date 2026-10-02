@@ -95,6 +95,11 @@ public:
         // The absolute deadline this request was submitted with (`--pending-timeout-ms`, measured
         // from request acquisition). Only the multi-lane route queues, so only it has to enforce it.
         std::chrono::steady_clock::time_point pending_deadline{};
+        // When this core accepted the request, after preparation ran - the same instant the
+        // single-device route records. The gap to a lane's own admit instant is the FIFO wait, and
+        // the reported first-token and total spans start here so a queued request is not reported as
+        // if it had been computing all along.
+        std::chrono::steady_clock::time_point submitted{};
     };
 
     class Submission {
