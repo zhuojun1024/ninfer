@@ -532,4 +532,23 @@ C=1 回归（`_temp/run_m03480_c1.ps1`，conc=1 / floor 4096 / prompt 2,738）�
 
 对外行为（回答原问题）：单个请求的 prompt 超过上限 ⇒ HTTP 400 `context_length_exceeded`；输出预算超过上限 ⇒ 不报错，clamp 输出预算（C=1 起即如此）；两个会话总量超过池 ⇒ 后到的请求留在 FIFO 队首等前一个 lane 退役（不截断、不报错；「卸载到内存」是另一套机制，即 S1 的会话级 host 留存）。修复前「输出预算被 clamp」在 C≥2 恰好落进上面的挂死分支。
 
-顺带记录两个尚未修的相邻缺口：(1) TP-2 路线的 `pending_deadline` 被忽略 ⇒ 排队阶段没有 `--pending-timeout-ms` 强制（`docs/serving.md:1039-1045` 的对外说法对 TP-2 不成立）；(2) 排队中的请求不检查 `cancellation`（只在 executor 内检查，`:3280`/\`:4020\`/\`:6781\`/\`:7105\`）⇒ 客户端断开后该请求仍占队并会被执行。
+顺带发现的两个相邻缺口（已在下一节修复）：(1) TP-2 路线的 `pending_deadline` 被忽略 ⇒ 排队阶段没有 `--pending-timeout-ms` 强制（`docs/serving.md:1039-1045` 的对外说法对 TP-2 不成立）；(2) 排队中的请求不检查 `cancellation`（只在 executor 内检查，`:3280`/\`:4020\`/\`:6781\`/\`:7105\`）⇒ 客户端断开后该请求仍占队并会被执行。
+
+### 排队阶段的超时与取消：提交者自己强制（m03710）
+
+背景：上一节末尾的两个相邻缺口。TP-2 路线的 `submit` 形参带 `pending_deadline` 但定义处未命名、被忽略，`wait_lanes` 只等自己的成员 `complete` ⇒ `--pending-timeout-ms` 对提交后的排队阶段完全不生效（`docs/serving.md:1039-1045` 的对外说法对 TP-2 不成立）；排队中的请求也不检查 `cancellation`（只有 executor 内的检查，`:3280`/`:4020`/`:6781`/`:7105`），客户端断开后仍占队、仍会被执行。
+
+机制：单卡路线的 admission（`src/runtime/engine/engine_core.h:1579-1597`）先查绝对 deadline 再查 `cancelled`：超时 ⇒ `RequestError(QueueTimeout, "inference request expired while waiting for admission")`（HTTP 503 `request_queue_timeout`，`src/serve/generation_service.cpp:69-74`），取消 ⇒ `complete_detached_cancelled`（499）。TP-2 把同一对检查搬到提交者：`admitted` 是唯一的交接位，只在 `lane_queue_mutex_` 下改——谁把成员从 FIFO 取出（驱动的批量形成，`src/runtime/engine/tp2_generation_core.cpp:2294-2313`；或批次中途的 `try_pop_lane_queue`，`:2889-2913`）就置位，`requeue_lane_front`（`:3044-3051`）放回队首时清零。`admitted == false` 期间由提交者强制 deadline 与取消；置位后交回 executor 既有检查。
+
+deadline 与取消都无法 signal 进 `lane_queue_cv_`（deadline 不是受锁保护的状态变化，取消标志是 HTTP 线程写的 atomic），故 `wait_lanes` 的等待上限 250 ms（`kQueuedCancelPollInterval`，`:2149`）并每轮复查；deadline 优先于取消，与单卡一致。退休方式与驱动自己的 pop 相同：`drop_expired_lane`（`:2172`）存下提交者要 rethrow 的 `QueueTimeout`（不发 preview），`drop_cancelled_lane`（`:2164`）发出与 executor 首个取消检查一致的 terminal Cancelled preview。驱动与 `try_pop_lane_queue` 也拒绝把 lane 交给已过期/已取消的成员，所以 requeue 的成员不会在提交者睡着时被抢先执行。
+
+实测（`_temp/m03720_queue.mjs` + `_temp/run_m03720_queue.ps1`；双卡 `--max-context 4096`（池 64 页）、`--spec dflash2`、prompt 2,748、`max_output_tokens 1024`（req1 长生成 18 s 占满池，req2 与它同尺寸 ⇒ 必然排队）；req2 在 req1 开始后 600 ms 发出）：
+
+| 臂 | 客户端 | 服务端 |
+|---|---|---|
+| timeout（C=2，`--pending-timeout-ms 2000`） | req2 **HTTP 503**，2016 ms，`inference request expired while waiting for admission`；req1 200 / 18.3 s / 1024 tok | `publish tokens=0` ⇒ `WARN req#2 failed during generation … HTTP 503 request queue timeout`（req1 仍在解码，证明 req2 从未拿到 lane） |
+| cancel（C=2，30000 ms，req2 在 2505 ms abort） | req2 客户端 AbortError；req1 200 / 18.5 s | `publish tokens=0` ⇒ `req#2 done … cancelled … prompt 0 / output 0` |
+| control（C=2，短请求两发，均能准入） | 两个 200（463/291 ms） | 无 `publish tokens=0` |
+| C=1 回归（短请求两发） | 两个 200（379/325 ms） | 无 `publish tokens=0` |
+
+C=1 不经过该路径（`wait_lanes` 只在 `lanes_ > 1` 时由 `Submission::wait` 调用；C=1 直接在 `execution_mutex_` 上排队，无 deadline 强制，与改造前逐字节一致）。

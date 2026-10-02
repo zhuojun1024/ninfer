@@ -92,6 +92,9 @@ public:
         ResolvedSamplingParameters sampling;
         std::vector<TokenId> generated;
         OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
+        // The absolute deadline this request was submitted with (`--pending-timeout-ms`, measured
+        // from request acquisition). Only the multi-lane route queues, so only it has to enforce it.
+        std::chrono::steady_clock::time_point pending_deadline{};
     };
 
     class Submission {
@@ -399,9 +402,22 @@ private:
         GenerationResult result;
         std::exception_ptr failure;
         bool complete = false;
+        // `admitted` is the hand-off and is only read and written under `lane_queue_mutex_`:
+        // whoever takes the member out of the FIFO sets it, and `requeue_lane_front` clears it when
+        // the pool cannot cover the member yet and it goes back to the head. While it is clear the
+        // submitter enforces the request's own `pending_deadline` and its client's cancellation;
+        // once it is set the executors' checks own the request.
+        bool admitted = false;
     };
     [[nodiscard]] GenerationResult wait_lanes(std::unique_ptr<Request> request, OutputSink* sink,
                                               const CancellationView& cancellation);
+    // Retire a queued member without giving it a lane, the way the single-GPU route retires a
+    // cancelled pending request: terminal preview, a Cancelled result, then `publish_lane`.
+    void drop_cancelled_lane(PendingRequest& pending);
+    // Retire a queued member whose absolute deadline passed before admission. It never runs, and the
+    // submitter rethrows the QueueTimeout this stores (HTTP 503), exactly as the single-GPU route's
+    // own admission does.
+    void drop_expired_lane(PendingRequest& pending);
     // P0.2: retire one member the moment its own lane finishes instead of publishing the whole batch
     // at once. Called by the batch executors' finalize, by the serial lane walk, and as a safety net
     // by the driver. It is the only place `complete` is set for a request that ran.

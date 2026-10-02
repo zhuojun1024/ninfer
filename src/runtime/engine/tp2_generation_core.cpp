@@ -2022,7 +2022,7 @@ void TP2GenerationCore::snapshot_dflash_state(Shard& shard, std::size_t slot,
 TP2GenerationCore::Submission TP2GenerationCore::submit(
     qwen::PreparedPrompt prompt, PromptSummary summary, double prepare_seconds,
     ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
-    GenerationObservationOptions, std::chrono::steady_clock::time_point) {
+    GenerationObservationOptions, std::chrono::steady_clock::time_point pending_deadline) {
     auto output = frontend_->make_output_session(prompt, options.stop, options.output,
                                                  options.execution.thinking);
     // Multi-lane (P1.4, S1): the KV pool is shared and handed out per request, so the ceiling here
@@ -2079,10 +2079,13 @@ TP2GenerationCore::Submission TP2GenerationCore::submit(
         throw RequestError(RequestErrorKind::ThinkingBudgetCapacityInsufficient, error.what());
     }
     GenerationBudget budget(effective, limit_reason);
-    return Submission(*this, std::make_unique<Request>(std::move(prompt), std::move(output),
-                                                       summary, prepare_seconds, std::move(budget),
-                                                       options.execution.sampling,
-                                                       consumer_mode));
+    auto request = std::make_unique<Request>(std::move(prompt), std::move(output), summary,
+                                             prepare_seconds, std::move(budget),
+                                             options.execution.sampling, consumer_mode);
+    // The FIFO wait is the only part of the deadline this core owns: preparation and media already
+    // ran against it in the service layer, and an admitted request is no longer pending.
+    request->pending_deadline = pending_deadline;
+    return Submission(*this, std::move(request));
 }
 
 GenerationResult TP2GenerationCore::Submission::wait(OutputSink* sink,
@@ -2130,20 +2133,64 @@ bool lane_trace_enabled() {
 // A submission to the multi-lane route never touches the device itself. It appends itself to the
 // FIFO and waits for the core's own driver thread to retire it. The driver forms batches of at most
 // `lanes_` from the queue head, so admission is FIFO and no lane is ever handed a request younger
-// than one still waiting. A request cancelled while queued is not skipped: it enters the walk, whose
-// first cancellation check returns a Cancelled result with the proper preview state.
+// than one still waiting.
 //
 // P0.2: the submitter is never the driver, and each member is retired the moment its own lane
 // finishes (publish_lane). Together those rules stop a finished request from waiting behind a batch
 // it does not depend on, which is what used to hold a 773 ms walk for four minutes until the client
 // disconnected first (HTTP 499).
+//
+// While the member is still queued the submitter owns two checks the executors cannot make yet: the
+// request's absolute deadline (`--pending-timeout-ms`, enforced here as the documented 503) and the
+// client's cancellation. Neither can be signalled into `lane_queue_cv_` - the deadline is not a
+// mutex-protected state change and the cancellation flag is an atomic set by the HTTP thread - so
+// the wait is bounded and re-checks them. Admission hands both over: `admitted` is set by whoever
+// takes the member out of the FIFO, and a member put back by `requeue_lane_front` clears it again.
+constexpr std::chrono::milliseconds kQueuedCancelPollInterval{250};
+
+// `--pending-timeout-ms` is measured from request acquisition, so a request can already be expired
+// when it reaches this FIFO. A default-constructed point and `time_point::max()`
+// (`DeadlinePolicy::UnboundedStartup`) both mean "no deadline".
+bool queued_deadline_passed(std::chrono::steady_clock::time_point deadline) {
+    return deadline != std::chrono::steady_clock::time_point{} &&
+           deadline != std::chrono::steady_clock::time_point::max() &&
+           std::chrono::steady_clock::now() >= deadline;
+}
+
+// A queued member whose client is gone never gets a lane: retire it here, the way the single-GPU
+// route retires a cancelled pending request. The terminal preview and the Cancelled finish reason
+// are the ones the executors' own first cancellation check produces, so the submitter sees the same
+// shape whether the disconnect was noticed before or after admission.
+void TP2GenerationCore::drop_cancelled_lane(PendingRequest& pending) {
+    (void)pending.request->output.preview_terminal(FinishReason::Cancelled);
+    pending.result.finish_reason = FinishReason::Cancelled;
+    publish_lane(pending);
+}
+
+// An expired queued member is an error, not a cancelled completion: no preview is emitted and the
+// stored failure is what the submitter rethrows.
+void TP2GenerationCore::drop_expired_lane(PendingRequest& pending) {
+    pending.failure = std::make_exception_ptr(RequestError(
+        RequestErrorKind::QueueTimeout, "inference request expired while waiting for admission"));
+    publish_lane(pending);
+}
+
 GenerationResult TP2GenerationCore::wait_lanes(std::unique_ptr<Request> request, OutputSink* sink,
                                                const CancellationView& cancellation) {
-    auto pending          = std::make_shared<PendingRequest>();
-    pending->request      = std::move(request);
-    pending->sink         = sink;
-    pending->cancellation = cancellation;
+    // `--pending-timeout-ms` is absolute and starts before preparation, so it can already be in the
+    // past by the time the request reaches this FIFO. A default-constructed point and
+    // `time_point::max()` (`DeadlinePolicy::UnboundedStartup`) both mean "no deadline".
+    const std::chrono::steady_clock::time_point deadline = request->pending_deadline;
+    const bool bounded =
+        deadline != std::chrono::steady_clock::time_point{} &&
+        deadline != std::chrono::steady_clock::time_point::max();
+    auto pending              = std::make_shared<PendingRequest>();
+    pending->request          = std::move(request);
+    pending->sink             = sink;
+    pending->cancellation     = cancellation;
     const std::shared_ptr<PendingRequest> mine = pending;
+    bool queued_timed_out                      = false;
+    bool queued_cancelled                      = false;
     {
         std::unique_lock<std::mutex> queue(lane_queue_mutex_);
         lane_queue_.push_back(std::move(pending));
@@ -2152,8 +2199,45 @@ GenerationResult TP2GenerationCore::wait_lanes(std::unique_ptr<Request> request,
         lane_queue_cv_.notify_all();
         // P0.2: the submitter never drives. It waits for its own member only, so a request whose
         // lane finishes early returns immediately even while the rest of its batch keeps decoding.
-        lane_queue_cv_.wait(queue, [&] { return mine->complete; });
+        for (;;) {
+            if (mine->complete) { break; }
+            if (mine->admitted) {
+                // The driver owns it now; a requeue clears `admitted` and wakes this thread, so this
+                // is not necessarily the end of the wait.
+                lane_queue_cv_.wait(queue, [&] { return mine->complete || !mine->admitted; });
+                continue;
+            }
+            // The deadline outranks the cancellation, the order the single-GPU admission uses.
+            if (queued_deadline_passed(deadline)) {
+                queued_timed_out = true;
+                break;
+            }
+            if (cancellation.requested()) {
+                queued_cancelled = true;
+                break;
+            }
+            const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+            if (!bounded) {
+                lane_queue_cv_.wait_for(queue, kQueuedCancelPollInterval);
+            } else {
+                lane_queue_cv_.wait_until(queue, std::min(deadline, now + kQueuedCancelPollInterval));
+            }
+        }
+        if (queued_cancelled || queued_timed_out) {
+            // Still in the FIFO: `admitted` is only ever set under this lock, together with the pop
+            // that takes the member out of the queue, and a requeue puts it back before clearing it.
+            lane_queue_.erase(std::remove_if(lane_queue_.begin(), lane_queue_.end(),
+                                             [&](const std::shared_ptr<PendingRequest>& queued) {
+                                                 return queued.get() == mine.get();
+                                             }),
+                              lane_queue_.end());
+        }
     }
+    // Both paths retire the member exactly as the driver's own pop does, so the submitter sees the
+    // same shape whichever thread noticed: HTTP 503 request_queue_timeout for the deadline
+    // (docs/serving.md, --pending-timeout-ms), 499 for a client that is already gone.
+    if (queued_timed_out) { drop_expired_lane(*mine); }
+    if (queued_cancelled) { drop_cancelled_lane(*mine); }
     if (mine->failure != nullptr) { std::rethrow_exception(mine->failure); }
     return std::move(mine->result);
 }
@@ -2193,6 +2277,8 @@ void TP2GenerationCore::publish_lane(PendingRequest& pending) {
 void TP2GenerationCore::drive_lane_queue() {
     for (;;) {
         std::vector<std::shared_ptr<PendingRequest>> batch;
+        std::vector<std::shared_ptr<PendingRequest>> cancelled_queued;
+        std::vector<std::shared_ptr<PendingRequest>> expired_queued;
         {
             std::unique_lock<std::mutex> queue(lane_queue_mutex_);
             if (lane_queue_.empty()) {
@@ -2206,10 +2292,28 @@ void TP2GenerationCore::drive_lane_queue() {
             }
             batch.reserve(lanes_);
             while (batch.size() < lanes_ && !lane_queue_.empty()) {
-                batch.push_back(std::move(lane_queue_.front()));
+                std::shared_ptr<PendingRequest> next = std::move(lane_queue_.front());
                 lane_queue_.pop_front();
+                // Take the member out of the submitter's hands first, whatever happens to it below:
+                // from here the driver owns its retirement.
+                next->admitted = true;
+                // Neither of these may take a lane, and the deadline outranks the cancellation, as it
+                // does in the single-GPU admission.
+                if (queued_deadline_passed(next->request->pending_deadline)) {
+                    expired_queued.push_back(std::move(next));
+                    continue;
+                }
+                if (next->cancellation.requested()) {
+                    // The client disconnected while it waited. Do not spend a lane and a round on a
+                    // request that would abandon both at its first check.
+                    cancelled_queued.push_back(std::move(next));
+                    continue;
+                }
+                batch.push_back(std::move(next));
             }
         }
+        for (auto& pending : expired_queued) { drop_expired_lane(*pending); }
+        for (auto& pending : cancelled_queued) { drop_cancelled_lane(*pending); }
         if (batch.empty()) {
             if (lane_driver_stop_) { return; }
             continue;
@@ -2783,11 +2887,29 @@ bool grammar_live(const LaneGrammar& grammar, const TP2GenerationCore::Request& 
 // (the driver takes it around every executor), so the lock order execution_mutex_ ->
 // lane_queue_mutex_ holds; the queue itself is only ever touched under its own lock.
 std::shared_ptr<TP2GenerationCore::PendingRequest> TP2GenerationCore::try_pop_lane_queue() {
-    std::unique_lock<std::mutex> queue(lane_queue_mutex_);
-    if (lane_queue_.empty()) { return nullptr; }
-    std::shared_ptr<PendingRequest> pending = std::move(lane_queue_.front());
-    lane_queue_.pop_front();
-    return pending;
+    for (;;) {
+        std::shared_ptr<PendingRequest> pending;
+        {
+            std::unique_lock<std::mutex> queue(lane_queue_mutex_);
+            if (lane_queue_.empty()) { return nullptr; }
+            pending = std::move(lane_queue_.front());
+            lane_queue_.pop_front();
+            // Same hand-off as the driver's own batch formation: the member belongs to the driver
+            // from here, so the submitter stops enforcing its deadline and its cancellation.
+            pending->admitted = true;
+            if (!queued_deadline_passed(pending->request->pending_deadline) &&
+                !pending->cancellation.requested()) {
+                return pending;
+            }
+        }
+        // Neither an expired deadline nor a gone client may take a lane, and the deadline outranks
+        // the cancellation, as it does in the single-GPU admission.
+        if (queued_deadline_passed(pending->request->pending_deadline)) {
+            drop_expired_lane(*pending);
+        } else {
+            drop_cancelled_lane(*pending);
+        }
+    }
 }
 
 // S1 (docs/PLAN-tp2-kv-sharing.md): one request's share of the shared KV pool. The request gets
@@ -2921,7 +3043,11 @@ void TP2GenerationCore::retire_lane_session(std::uint32_t lane) {
 // `execution_mutex_` around every executor, which is the order execution_mutex_ -> lane_queue_mutex_.
 void TP2GenerationCore::requeue_lane_front(std::shared_ptr<PendingRequest> pending) {
     std::unique_lock<std::mutex> queue(lane_queue_mutex_);
+    // Back in the submitter's hands: it enforces the deadline and the cancellation again, and this
+    // notify is what wakes it out of the admission wait it was parked in.
+    pending->admitted = false;
     lane_queue_.push_front(std::move(pending));
+    lane_queue_cv_.notify_all();
 }
 
 // The positions one request's own pages have to cover: its prompt plus the output budget it was
