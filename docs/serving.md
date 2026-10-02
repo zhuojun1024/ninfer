@@ -67,7 +67,10 @@ RTX 5060 Ti cards but not one.
   fast at construction otherwise.
 - The TP-2 route queues requests in arrival order. `--max-pending-requests` bounds that queue and is
   kept as configured; `--max-concurrency` (1..4) is how many of the queued requests the core batches
-  into one decode round. A request that arrives while a round is running joins a later round of the
+  into one decode round. The core takes that round's members from the head of the queue: a lone
+  request is admitted after one 3 ms formation window, and when another request arrives inside that
+  window the window stays open until the round is full or 50 ms have passed, so a burst that arrives
+  a few milliseconds apart shares one round instead of splitting into two waves. A request that arrives while a round is running joins a later round of the
   same batch as soon as a lane retires, so a second conversation starts producing while the first one
   is still decoding instead of waiting for it to finish. The default `--max-concurrency 1` runs one
   request at a time. The lanes share one KV
@@ -75,9 +78,12 @@ RTX 5060 Ti cards but not one.
   are free, so a lane that runs alone may use the whole context ceiling instead of a fixed 1/lanes
   slice, and a request the pool cannot cover right now keeps its place in the queue instead of
   failing - only a prompt longer than the pool's admission ceiling is rejected as
-  `context_length_exceeded`. What still grows per lane is the linear-attention state arena, about
-  294 MiB per card per lane: the shipped 262,144-token configuration keeps `--max-concurrency 1`,
-  and two to four lanes need `--max-context 131072`.
+  `context_length_exceeded`. What still grows per lane is the linear-attention state arena,
+  about 147 MiB per card per lane (two whole-pool state planes of 73.4 MiB). The round-scratch
+  plane is carved only on the speculative routes, so the shipped 262,144-token configuration
+  already runs up to four lanes: four concurrent requests at `--max-context 262144 --kv-dtype fp8`
+  with `--spec mtp --draft-tokens 2 --lm-head-draft` all completed with 829 MiB (shard 0) and
+  1,789 MiB (shard 1) free.
 - Batched TP-2 decoding covers the plain route and both speculative rounds (`--spec dflash2` and
   `--spec mtp`). The DFlash v1 backend is rejected at construction on this route, so no speculative
   backend ever collapses a `--max-concurrency` above `1`. The multi-lane
@@ -96,10 +102,29 @@ RTX 5060 Ti cards but not one.
   is no longer slower than on the one-lane route: plain `predicted_ms` measured 1233 at
   `--max-concurrency 4` against 1259 on the default route, and `--spec mtp` 711 ms at two lanes against
   810 ms at one. Measured aggregate decode throughput on two RTX 5060 Ti (16 GiB) cards with
-  `--max-context 131072 --kv-dtype int8 --spec none`: 1.76-1.91x at `--max-concurrency 2` and 2.80x at
+  `--max-context 131072 --kv-dtype int8` on the plain route (no `--spec`): 1.76-1.91x at `--max-concurrency 2` and 2.80x at
   `4`; with `--spec dflash2` 2.07x at four lanes, and with `--spec mtp --draft-tokens 5` 1.48x at two
   lanes and 2.26x at four. The aggregate gain depends on how evenly the batch members finish, because a
   round costs as much as its longest member: a pair whose two outputs differ two-fold measured 1.41x.
+  The round cost itself is what those aggregate figures hide, so they understate the ceiling: four
+  lanes of exactly equal length (243-token prompts, all four stopping at the output limit) measured
+  round 26.5 ms at one lane and 32.0 ms at four, i.e. 3.31x of the ideal 4x, and the per-column
+  marginal is only about 1.85 ms, or 7% of a one-lane round.
+  A lane that is prefilling does not stall the lanes beside it: after each of its prefill chunks the
+  core runs one decode round for the lanes that already hold a token. A 54-token request admitted
+  400 ms before a 15,310-token one finished in 2.8 s at 8.5 tok/s with `--prefill-chunk 256` (7.5 s
+  and 3.1 tok/s with the default 1024), against 6.0 s and 2.5 tok/s before the interleaving; the
+  reverse order still pays, because a request admitted behind a prefill waits for that prefill to
+  finish. Exactly one round runs per chunk, so the cadence - and the blocked lane's rate - follows
+  the chunk size: smaller chunks smooth the decode stream and trade per-lane prefill rate (1.52k
+  against 1.94k tok/s). Only the plain route interleaves; the speculative routes prefill a lane to
+  completion.
+  `NINFER_TP2_TIMING=1` prints one `[tp2-time]` line when a batch ends. The plain route prints
+  `[tp2-time] plain-batch rounds=N committed=N avg_round=... decode=... grammar=... sample=...
+  readback=... sync_wait=... prefill_chunks=... pump_rounds=...`, where `rounds` counts committed
+  tokens (so `avg_round` is the per-lane share of a round) and `pump_rounds` counts the decode
+  rounds run inside another lane's prefill chunks; the speculative routes print `mtp`/`verify`/
+  `accept`/`copy` instead.
   A round is also the unit of failure: when one lane's step fails, every request still running in that
   round fails with the same error, and every lane's reusable state - the sessions it recalled and its
   host checkpoints - is discarded, because the device state a failed round leaves behind cannot be
@@ -112,6 +137,11 @@ RTX 5060 Ti cards but not one.
   flipped one late token on the two shorter lanes on the plain route, while pairs whose positions
   differed by two tokens stayed byte-identical, and DFlash2 did not flip on those same prompts. Compare
   concurrent output to a single-request run with a near-tie criterion, not byte identity.
+- Batching a wide attention window lowers the speculative acceptance rate: with `--spec mtp --draft-tokens 5`
+  and a 15,310-token prompt, acceptance measured 65.7% alone against 34.7-54.2% for four such lanes in one
+  batch (tokens per lane-round 4.0 against 3.0), and a 54-token lane batched beside one measured 36.2%;
+  four short prompts admitted together kept their solo rate, so the loss follows the width of the batch's
+  shared envelope rather than batching itself.
 - `--spec mtp` and `--spec dflash2` are the speculative backends on this route (`--spec dflash`,
   the DFlash v1 masked draft, is rejected at construction), and `--vision` is supported. The DFlash2
   masked draft keeps its local context ring on shard 0; its budget-clamped verify columns are masked
@@ -967,7 +997,9 @@ stable text-fallback reason. Fallback reasons are `none`, `malformed_structure`,
 arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
-as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
+as full-precision JSON numbers. On the TP-2 route `ttft` and `total` are anchored at the core's own
+acceptance of the request, so both include the time it waited in the FIFO; `prefill` stays
+admission-relative because it measures the rate the lane actually prefilled at. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 
@@ -1060,7 +1092,11 @@ completion. A request remains queued until a legal resource plan can satisfy tha
 On the TP-2 route that entitlement comes from the pool the lanes share, so `--lane-context N`
 caps how much context one lane may reserve: `--lane-context 32768` with four lanes reproduces the
 old fixed per-lane slice, while `0` (the default) lets a lane that runs alone use the whole pool.
-A `--max-concurrency 1` route ignores the ceiling because its one lane already owns the context.
+A `--max-concurrency 1` route ignores the ceiling because its one lane already owns the context. At
+`0` with more than one lane the core prints a startup warning naming the ceiling and the lane count,
+because one lane may reserve the whole pool and hold every other lane in the queue until it retires;
+a ceiling of `pool / lanes` is what keeps a `--max-concurrency` above one admitting together, but it
+also rejects a single prompt longer than that share, so the default stays uncapped.
 
 Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
 finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas
