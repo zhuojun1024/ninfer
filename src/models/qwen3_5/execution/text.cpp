@@ -1317,6 +1317,14 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), width, batch},
                          "target verify batch logits");
     require_tensor_shape(target_tokens, DType::I32, {width, batch}, "target verify batch tokens");
+    // The verify window only records the GDN replay; the fold after acceptance is what advances the
+    // live state, which is why the caller binds the source slots only. Under any other action the
+    // gdn_mix layer would take its UpdateInPlace arm, which reads the destination slots this entry
+    // point does not bind - reject the mismatch here instead of dereferencing a null tensor deeper in
+    // the walk.
+    if (gdn_state_action_ != GdnStateAction::RecordForReplay) {
+        throw std::logic_error("target verify batch requires the RecordForReplay GDN action");
+    }
 
     cudaStream_t stream = ctx_.stream;
     work_.reset();
