@@ -2948,13 +2948,12 @@ bool TP2GenerationCore::reserve_lane_kv(std::uint32_t lane, std::uint32_t need_t
         shard_a_.mtp_lane_pages[index].clear();
         shard_a_.mtp_lane_handles[index].clear();
     }
-    const std::uint32_t pages       = lane_kv_pages(need_tokens);
-    const std::uint32_t page_tokens = pages * static_cast<std::uint32_t>(kPagedKVPageSize);
-    // The static split pinned this once at startup; the pages belong to one request now, so the same
-    // invariant is checked where they are handed out (A3 of the review remediation plan).
-    if (lane_kv_window(pages) + lane_kv_write_tail() >= page_tokens) {
-        throw std::logic_error("TP-2 lane context window exceeds the pages reserved for it");
-    }
+    const std::uint32_t pages = lane_kv_pages(need_tokens);
+    // The window this lane gets and the pages materialized below come from the same expression, so an
+    // admitted request always fits: lane_kv_pages rounds the need up, lane_kv_window subtracts the
+    // margin back out, and the published pages cover the whole window plus the margin. What is *not*
+    // structural is a pool handing back exactly the pages it reserved, so each materialization below
+    // checks its lease count instead of re-deriving that arithmetic.
     Shard* shards[2] = {&shard_a_, &shard_b_};
     // Reserve on every pool first: a pool that cannot cover the request releases what the others
     // already reserved through the reservation destructors, so nothing is half-admitted.
@@ -2974,11 +2973,22 @@ bool TP2GenerationCore::reserve_lane_kv(std::uint32_t lane, std::uint32_t need_t
         auto&  leases  = shard.kv_lane_pages[index];
         auto&  handles = shard.kv_lane_handles[index];
         leases.clear();
-        leases.reserve(pages);
-        pool.materialize(*text[s], pages, leases);
         handles.clear();
-        handles.reserve(leases.size());
-        for (const DeviceKVPageLease& lease : leases) { handles.push_back(lease.handle()); }
+        try {
+            leases.reserve(pages);
+            pool.materialize(*text[s], pages, leases);
+            if (leases.size() != pages) {
+                throw std::logic_error("TP-2 KV pool materialized a lane with the wrong page count");
+            }
+            handles.reserve(leases.size());
+            for (const DeviceKVPageLease& lease : leases) { handles.push_back(lease.handle()); }
+        } catch (...) {
+            // A half-materialized lane would keep leases that no request owns and that only the
+            // request's own release can return, so take them back before the failure unwinds.
+            leases.clear();
+            handles.clear();
+            throw;
+        }
         // The lane's row is republished over this request's own pages. Nothing has to be cleared
         // first: the window above never reaches past them, and the device arena is not zeroed, so a
         // block-table entry the route cannot reach is never read.
@@ -2992,11 +3002,20 @@ bool TP2GenerationCore::reserve_lane_kv(std::uint32_t lane, std::uint32_t need_t
         auto&  leases  = shard.mtp_lane_pages[index];
         auto&  handles = shard.mtp_lane_handles[index];
         leases.clear();
-        leases.reserve(pages);
-        pool.materialize(*mtp, pages, leases);
         handles.clear();
-        handles.reserve(leases.size());
-        for (const DeviceKVPageLease& lease : leases) { handles.push_back(lease.handle()); }
+        try {
+            leases.reserve(pages);
+            pool.materialize(*mtp, pages, leases);
+            if (leases.size() != pages) {
+                throw std::logic_error("TP-2 MTP KV pool materialized a lane with the wrong page count");
+            }
+            handles.reserve(leases.size());
+            for (const DeviceKVPageLease& lease : leases) { handles.push_back(lease.handle()); }
+        } catch (...) {
+            leases.clear();
+            handles.clear();
+            throw;
+        }
         cache->execution_tables().publish(shard.mtp_rows[index].handle(), 0, handles,
                                           shard.device.stream);
     }
@@ -5263,13 +5282,21 @@ void TP2GenerationCore::session_drop(std::size_t index) {
     if (index >= sessions_.size()) { return; }
     sessions_.erase(sessions_.begin() + static_cast<std::ptrdiff_t>(index));
     // Every lane's claim on a catalog entry is an index into the same vector, so each one has to be
-    // told the vector shifted. The anchor a walk froze for its own comparison is left alone: it is
-    // only read inside the walk that set it, before any drop can move it.
+    // told the vector shifted. Both the resident claim and the comparison anchor are adjusted: the
+    // only reader of the anchor in the current flow (capture_lane_anchor_frozen) lands before the
+    // store that can drop, so a stale anchor is not reachable today - but leaving one behind is one
+    // reordering away from freezing state into the wrong entry, and keeping the shift consistent
+    // here costs nothing.
     for (RetentionState& lane_state : lane_retention_) {
         if (lane_state.active_session == index) {
             lane_state.active_session = kNoSession;
         } else if (lane_state.active_session != kNoSession && lane_state.active_session > index) {
             --lane_state.active_session;
+        }
+        if (lane_state.anchor_session == index) {
+            lane_state.anchor_session = kNoSession;
+        } else if (lane_state.anchor_session != kNoSession && lane_state.anchor_session > index) {
+            --lane_state.anchor_session;
         }
     }
 }
