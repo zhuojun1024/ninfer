@@ -24,7 +24,7 @@
 | A | spec/MTP 路线 prefill 交错（`pump_spec_round`） | 代码完成，构建通过，A/B 实测成立（见下） |
 | B | spec 路线 `round_ms`/`rest` 计时口径（A 的测量前提） | 代码完成，构建通过 |
 | C | 项 10 Ops 核按列 split（删除 batch 对 host split 数的截断） | 代码完成 + 新增 batch/solo 逐位 parity 回归测试；ops 测试通过（旧 ops 二进制该测试 FAIL）；A/B 实测完成——plain decode 中性、接受率收益未复现（见下） |
-| D | P3 批量 prefill（顺带消除 admission 位置差） | 设计完成（_temp/20261002-1800_item3_batched_prefill.md），**未实现**：收益受 width≤16 与 GDN record 约束（见下） |
+| D | P3 批量 prefill（顺带消除 admission 位置差） | 设计完成（_temp/20261002-1800_item3_batched_prefill.md）+ **宽度代价实测**（批量窗口 1.24 vs 单 lane 0.587 ms/lane-token，**慢 2.1×**）⇒ **确认不做**，未实现（见下「项 D 追加实测」） |
 | E | 可分页 host checkpoint ring（报告 P3 行） | 代码完成（PinnedHostBuffer → HostBuffer(Pageable)），构建通过；模型测试（lanes 全过 / sessions 与旧基线逐字相同）；空指针回归已修；延迟实测完成——两卡省 5.29 GiB 页锁，recall 请求 +10 ms（噪声内） |
 
 ### 执行顺序说明
@@ -320,6 +320,29 @@ src/models/qwen3_5/execution/text.cpp:2939-3100 `forward_tp2_window_batch`（per
 **admission 位置差被限制在 chunk 宽度内**（收敛投机批的单值 envelope）。且 `window_batch` 走非 overlap
 层循环（text.cpp:3076/3078），会丢掉 L2 AR‖MMA overlap 的 +11%（docs/tp2-decisions.md:281-285）。
 ⇒ 本次不做；报告 §4 已记录该结论（与 §4.2「批量 prefill 提升不了长 prompt 聚合吞吐」一致）。
+
+### 项 D 追加实测（宽度代价，2026-10-02，决定最小切片是否值得写）
+
+在写切片之前先量出切片**唯一新增的那个 op**（一次 B lane × W 列的 `forward_tp2_window_batch`，含模型内的
+GDN record 路径）的真实成本：`[tp2-time] spec-batch` 的 `verify` = `close_round` 的 elapsed(1,2)，恰好
+包住该调用。配置：artifact D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer，TP-2 双卡，int8，131072，
+C=4，prefill-chunk 1024，`--spec dflash2 --draft-tokens 5|15`，ARM P4 四短同批（harness
+_temp/20261002-1925_w16probe2.ps1，客户端 _temp/20261002-1620_mtpshort.mjs）。注意 MTP 无法到 width 16
+（src/product/speculative_options.h:41-43 限制 draft-tokens≤5），只有 dflash2（≤15）能。
+
+口径：`++timing.rounds` 每提交一列 +1（tp2_generation_core.cpp:3590 与 :4815），一轮有 B 个 lane 各提交
+一列 ⇒ 每轮成本 = 报告值 × B（B=4）。
+
+| 配置 | 每轮 avg_round | 每轮 mtp | 每轮 verify | verify 每列 |
+|---|---|---|---|---|
+| W=6（drafts 5） | 80.9 ms | 17.4 ms | 58.8 ms | 2.45 ms |
+| W=16（drafts 15） | 108.6 ms | 24.0 ms | 79.6 ms | 1.24 ms |
+
+拟合 **verify(W,B=4) = 46.3 ms + 0.52 ms/列**；对照报告 §4.2 实测的单 lane prefill 拟合
+**39 ms/chunk + 0.549 ms/token**。⇒ 批量 prefill W=16,B=4 = **1.24 ms/lane-token**，现有单 lane 1024-chunk
+= **0.587 ms/lane-token**，**批量慢 2.1×**。机制：固定成本（~40 ms 的权重流）在批量轮只摊到 W×B=64 列，
+单 lane chunk 摊到 1024 列。打平需 W×B≈1216 列/轮（B=4 时 W≈300，是 ops 上限 16 的 19 倍 = 方案 B）。
+⇒ 最小切片（方案 A）的价值预期为负，唯一能赢的区间是 prompt < ~56 token（本就一个 chunk）。
 
 ## 记录
 

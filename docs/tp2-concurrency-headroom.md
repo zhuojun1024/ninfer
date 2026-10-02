@@ -26,8 +26,10 @@ TP-2 多并发的 **decode 聚合已经接近该实现的理想值**：4 lane �
 **执行状态**（2026-10-02，逐项执行见 §6 状态列、§8 与 §9 记录）：§6 清单里的 P0/P1 项已全部实现并实测；
 项 5 分析后判定无需改动；项 9 分析后判定不改（会破坏预留不变式）；第二轮增补的四项（投机路线
 prefill 交错、项 10 的 Ops 修复、P3 批量 prefill、可分页 host checkpoint ring）中三项已实施并实测
-——项 10 的价值是**数值一致性**（接受率收益未复现），P3 批量 prefill 调研后判定不做（ops 批量域
-width ≤ 16 是硬约束）。剩余空间只剩 P3 批量 prefill（需先放宽 ops 批量域）与硬件（卡 2 的 PCIe 槽位）。
+——项 10 的价值是**数值一致性**（接受率收益未复现）。P3 批量 prefill 先量后判：批量窗口
+`forward_tp2_window_batch` 在 W=16/B=4 下 1.24 ms/lane-token，而单 lane 1024-chunk 是
+0.587 ms/lane-token，**批量慢 2.1×** ⇒ 确定不做（打平需 W×B≈1216 列/轮，是 ops 上限 width ≤ 16 的
+19 倍）。剩余空间只剩「先放宽 ops 批量域再谈批量 prefill」与硬件（卡 2 的 PCIe 槽位）。
 
 ## 1. 实现现状（本报告用到的结构）
 
@@ -380,7 +382,7 @@ lane trace 显示 4 条几乎同时到达的请求只组成了 `batch=2 capacity
 | P2 | 输出预算按剩余量动态收缩 / 页回收 | 显存/并发 | 实测 64 页 = 66 MiB/卡 空闲占用 | 中 | **分析后不改**：破坏 all-or-nothing 预留不变式，会引入中途增长死锁。§8.6 |
 | P2 | 修正 docs/serving.md 的 262,144/C=1 指导 | 文档 | 避免误导部署 | 低 | **已实施**：并补齐 1/2/3/4/6/7 的说明。§8.9 |
 | P2 | 投机批链改用每 lane envelope（需先确认接受率归因） | 吞吐 | MTP C≥2 每 lane 接受率 | 中 | **已实施（数值一致性）**：批内每列与单独解码逐位一致（新增 parity 回归测试）；接受率收益未复现，plain decode 中性。§8.7 |
-| P3 | 批量 prefill（需新 ragged 大 T 多序列核 + 更大 workspace） | TTFT 均衡 | 只均衡 lane 完成时间，聚合吞吐上限 1.34× | 很高 | **调研后不做**：attention batch>1 每 lane width ≤ 16 且 GDN 须 record+fold，确定收益只到「admission 位置差 ≤ chunk 宽度」，还会丢 L2 overlap 的 +11%。§9.4 |
+| P3 | 批量 prefill（需新 ragged 大 T 多序列核 + 更大 workspace） | TTFT 均衡 | 只均衡 lane 完成时间，聚合吞吐上限 1.34× | 很高 | **实测确认不做**：attention batch>1 每 lane width ≤ 16 且 GDN 须 record+fold；实测批量窗口 W=16/B=4 = 1.24 ms/lane-token vs 单 lane 1024-chunk 0.587 ⇒ **慢 2.1×**（打平需 W≈300）。§9.4 |
 | P3 | host checkpoint ring 改可分页 / 减槽 | host 内存 | 省 GiB 级 pinned host | 低-中 | **已实施**：ring 槽改 pageable，两卡省 5.29 GiB 页锁；同 harness recall 请求 +10 ms（噪声内）。§9.5 |
 | — | 卡 2 挪到 CPU 直连 Gen5 x8 槽 | 硬件 | prefill 上限 + decode AR | 换硬件 | 未做 |
 
@@ -558,7 +560,8 @@ batch=4 / width=4 / context=4100 / EXACT envelope）钉死「批内 lane == 单�
 它不是接受率或吞吐优化。§0/§6 的措辞据此改写。
 
 - **开放问题**（未隔离）：触发 split 变化的是「窗口绝对值宽」还是「lane 间位置差」——短窗口实验
-  只能排除批处理本身；构造零位置差的宽窗口需要 admission 不再串行（即 P3 批量 prefill）或核内探针。
+  只能排除批处理本身；构造零位置差的宽窗口需要 admission 不再串行（即 P3 批量 prefill，但按 §9.4 的
+  实测它慢 2.1×）或核内探针。
 - envelope 注释位置（引用更正）：当前在 src/runtime/engine/tp2_generation_core.cpp:4436
   （原文「The envelope steers split policy only; the kernels take their visible set from the
   per-lane positions, and the widest lane bounds every lane's window.」）。
@@ -588,7 +591,7 @@ TTFT/total 口径（项 7）。校验：`git diff --check` 无空白错误。
   `TP2GenerationCore::Request` 加 `submitted` 时间戳）。
 - `src/runtime/engine/tp2_generation_core.h`、`docs/serving.md`、本报告、
   `docs/PLAN-tp2-headroom-execution.md`（逐项执行计划与记录）。
-- 未做（记录为剩余空间）：P3 批量 prefill（§9.4）、卡 2 换 PCIe 槽。
+- 未做（记录为剩余空间）：P3 批量 prefill（§9.4，实测慢 2.1×）、卡 2 换 PCIe 槽。
 
 ## 9. 第二轮执行记录（2026-10-02，用户增补四项）
 
@@ -634,7 +637,7 @@ A/B（同 harness `_temp/20261002-1745_specpump.ps1` + `_specpump.mjs`，二进�
 
 修复已实施（数值一致性：批内每列与单独解码逐位一致），接受率收益未复现；parity 测试钉住不变量。
 
-### 9.4 项 D：P3 批量 prefill——**调研完成，未实施**
+### 9.4 项 D：P3 批量 prefill——**调研 + 宽度代价实测后确认不做**
 
 设计调研（_temp/20261002-1800_item3_batched_prefill.md，161 行）结论：
 
@@ -651,7 +654,31 @@ A/B（同 harness `_temp/20261002-1745_specpump.ps1` + `_specpump.mjs`，二进�
 - 收益判断：width ≤ 16 时「减少 kernel 启动」不自动成立；**确定收益只是把 admission 位置差限制在
   chunk 宽度内**（收敛 MTP 的单值 envelope）。且 `forward_tp2_window_batch` 走非 overlap 层循环
   （text.cpp:3076/3078），会丢掉 L2 allreduce‖MMA overlap 的 +11%（docs/tp2-decisions.md:281-285）。
-  ⇒ 在 ops 批量域放宽之前，本项不值得做；保留为剩余空间。
+
+**宽度代价实测（决定最小切片是否值得写）**。写切片之前先量出切片**唯一新增的那个 op**——一次
+B lane × W 列的 `forward_tp2_window_batch`（含模型内的 GDN record 路径）——的真实成本。
+`[tp2-time] spec-batch` 的 `verify` = `close_round` 的 elapsed(1,2)，恰好包住该调用。配置：
+artifact D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer，TP-2 双卡，int8，131072，C=4，
+prefill-chunk 1024，`--spec dflash2 --draft-tokens 5|15`，ARM P4 四短同批（harness
+_temp/20261002-1925_w16probe2.ps1）。注意 MTP 无法到 width 16
+（src/product/speculative_options.h:41-43 限制 draft-tokens ≤ 5），只有 dflash2（≤15）能。
+口径：`++timing.rounds` 每提交一列 +1（src/runtime/engine/tp2_generation_core.cpp:3590 与 :4815），
+一轮有 B 个 lane 各提交一列 ⇒ 每轮成本 = 报告值 × B（B=4）。
+
+| 配置 | 每轮 avg_round | 每轮 mtp | 每轮 verify | verify 每列 |
+|---|---|---|---|---|
+| W=6（drafts 5） | 80.9 ms | 17.4 ms | 58.8 ms | 2.45 ms |
+| W=16（drafts 15） | 108.6 ms | 24.0 ms | 79.6 ms | 1.24 ms |
+
+拟合 **verify(W, B=4) = 46.3 ms 固定 + 0.52 ms/列**；对照 §4.2 实测的单 lane prefill 拟合
+**39 ms/chunk 固定 + 0.549 ms/token**。⇒ 批量 prefill W=16,B=4 = **1.24 ms/lane-token**，
+现有单 lane 1024-chunk = **0.587 ms/lane-token**，**批量慢 2.1×**。机制：固定成本（约 40 ms 的
+权重流）在批量轮只摊到 W×B=64 列，单 lane chunk 摊到 1024 列（16× 差距）。批量要打平需
+W×B ≈ 1216 列/轮，即 B=4 时 W≈300，是 ops 上限 `kMaximumVerifyTokens=16` 的 19 倍。
+⇒ 方案 A（engine 侧最小切片）的价值预期为负，唯一能赢的区间是 prompt < ~56 token（本就一个
+chunk）；要真正拿到批量 prefill 的收益必须先做方案 B（放宽 ops 批量域，400-800 行、风险最高），
+而 §4.2 已论证即便如此也提高不了长 prompt 的聚合吞吐（链路天花板）。**本项收口为不做**，
+保留为剩余空间。
 
 ### 9.5 项 E：可分页的 host checkpoint ring——**已实施并实测**
 
@@ -693,5 +720,5 @@ dflash_solo 的 `the recalled walk diverged from the from-scratch walk on its fi
   数的截断，`causal_attention_split_capacity` 去掉 batch 形参）。
 - `tests/ops/softmax_attention/causal_cache.cpp`：新增 batch/solo 逐位 parity 回归。
 - `docs/serving.md`：spec 路线交错、计时行口径、`--host-state-slots` 可分页。
-- 未做（剩余空间）：P3 批量 prefill（§9.4，需先放宽 ops 批量域）、卡 2 换 PCIe 槽。
+- 未做（剩余空间）：P3 批量 prefill（§9.4，实测慢 2.1×，需先放宽 ops 批量域）、卡 2 换 PCIe 槽。
 
