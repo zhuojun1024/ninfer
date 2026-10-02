@@ -507,3 +507,29 @@ GAP D 实测（`_temp/m03470_cancel.mjs` + `_temp/run_m03470_cancel.ps1`，promp
 - plain：部分进度 5120 ⇒ C2 `cache 5,120`、3872 ms；C3 `cache 10,240`、1269 ms。
 
 C=1 回归（`_temp/run_m03480_c1.ps1`，conc=1 / floor 4096 / prompt 2,738）：A1 `cache 0` 1933 ms，A2–B2 均 `cache 2,048`（686/719/694/810 ms）——walk 改用共享助手后行为不变。
+
+### 准入预算的 off-by-one：C≥2 下被 clamp 的请求永不准入（m03586）
+
+背景：用户问「开 2 个会话、总上下文超过 `--max-context` 时会发生什么：输出被截断？卸载到内存排队？还是直接报错？」。追源码时发现 `lane_need_tokens` 比真实 KV 需求多算一个 token，与 `submit` 的 `capacity_output = ceiling - prompt + 1`（有意为「最后一个被采样的 token 不再前向」留位）叠加后，预留页数比池页数多 1 ⇒ 请求永不准入。
+
+机制：池页数 `P = pages_for_tokens(max_context)`、池 token 数 `T = 64P`、`margin = lane_kv_margin()`；C≥2 且 `--lane-context 0` 时准入上限 `W = T - margin`。`submit`（`src/runtime/engine/tp2_generation_core.cpp:2035-2081`）在 `prompt > W` 时回 400，否则 `effective = min(requested, W - prompt + 1)`。预留 `pages_for_tokens(prompt + effective + margin)`（`:2800-2802`）：
+
+- `prompt + requested ≤ W`：不 clamp，`pages ≤ P` ✓；
+- `prompt + requested = W + 1`：不 clamp（`requested == capacity_output`），`prompt + effective = W + 1` ⇒ `pages = P + 1` ✗；
+- `prompt + requested ≥ W + 2`：clamp 到 `W - prompt + 1` ⇒ 同样 `W + 1` ⇒ `pages = P + 1` ✗。
+
+`reserve_lane_kv` 全有或全无（`:2804-2831`），失败即 `requeue_lane_front` 放回队首（`:2922-2926`）；驱动线程在队列非空时不等待（`:2198-2212`）⇒ 忙转、客户端无限等待。TP-2 路线的 `pending_deadline` 形参在定义处未命名、被忽略（`:2022-2026`），`--pending-timeout-ms` 对提交后的等待阶段不生效。`:2798-2799` 的注释（"a request that fits the policy always fits an empty pool … never a deadlock"）因此不成立。
+
+修复：`lane_need_tokens` 改为 `prompt + (budget == 0 ? 0 : budget - 1)`（`:2929-2936`），与单卡计划的 `reserved_context_tokens`（`src/models/qwen3_5/program/planning/request_plan.cpp:258-262`）一致——最后一个被采样的 token 不再前向，不需要槽位。C=1 不经过批量路线（`reserve_lane_kv` 在 `lanes_ <= 1U` 时直接返回 true，`:2805`；驱动线程仅在 `lanes_ > 1U` 时启动，`:721`），故单并发路径逐字节不变。
+
+实测（`_temp/m03620_cap.mjs` + `_temp/run_m03620_cap.ps1`，双卡 `--max-context 4096`、`--spec dflash2`、prompt 3,740、`max_output_tokens 4096`）：
+
+| 臂 | 修复前 | 修复后 |
+|---|---|---|
+| C=2 对照（`max_output_tokens 20`，不 clamp） | 200 / 2429 ms | 200 / 2517 ms |
+| C=2 clamp（`max_output_tokens 4096`） | **无响应**：客户端 30 s 超时（`http=0`），服务端 30 s 内 36,238 行 `[tp2-lane] batch=1 capacity=2 path=batched`、日志 1.52 MiB（忙转） | 200 / 2371 ms、`status=completed`、7 行 lane trace、日志 0 MiB；`[tp2-capacity] … clamped to 356` |
+| C=1 clamp（同一请求） | 200 / 2589 ms、clamped to 357 | 200 / 2451 ms、clamped to 357（不变） |
+
+对外行为（回答原问题）：单个请求的 prompt 超过上限 ⇒ HTTP 400 `context_length_exceeded`；输出预算超过上限 ⇒ 不报错，clamp 输出预算（C=1 起即如此）；两个会话总量超过池 ⇒ 后到的请求留在 FIFO 队首等前一个 lane 退役（不截断、不报错；「卸载到内存」是另一套机制，即 S1 的会话级 host 留存）。修复前「输出预算被 clamp」在 C≥2 恰好落进上面的挂死分支。
+
+顺带记录两个尚未修的相邻缺口：(1) TP-2 路线的 `pending_deadline` 被忽略 ⇒ 排队阶段没有 `--pending-timeout-ms` 强制（`docs/serving.md:1039-1045` 的对外说法对 TP-2 不成立）；(2) 排队中的请求不检查 `cancellation`（只在 executor 内检查，`:3280`/\`:4020\`/\`:6781\`/\`:7105\`）⇒ 客户端断开后该请求仍占队并会被执行。

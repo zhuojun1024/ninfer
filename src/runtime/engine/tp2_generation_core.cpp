@@ -2925,9 +2925,14 @@ void TP2GenerationCore::requeue_lane_front(std::shared_ptr<PendingRequest> pendi
 }
 
 // The positions one request's own pages have to cover: its prompt plus the output budget it was
-// admitted with (`budget.remaining()` is that budget at admission and only shrinks afterwards).
+// admitted with (`budget.remaining()` is that budget at admission and only shrinks afterwards). The
+// last sampled token is never forwarded, so its slot is never read: the reservation counts one
+// position less, exactly as the single-GPU plan's `reserved_context_tokens` does. Counting the whole
+// budget would ask for one page more than the pool holds whenever the budget was clamped to
+// `ceiling - prompt + 1`, and no lane could ever be admitted for such a request.
 std::uint32_t TP2GenerationCore::lane_need_tokens(const PendingRequest& pending) const noexcept {
-    return pending.request->summary.prompt_tokens + pending.request->budget.remaining();
+    const std::uint32_t budget = pending.request->budget.remaining();
+    return pending.request->summary.prompt_tokens + (budget == 0U ? 0U : budget - 1U);
 }
 
 // ---------------------------------------------------------------------------------------------
