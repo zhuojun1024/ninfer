@@ -96,8 +96,8 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
                                              Tensor& partial_acc, Tensor& partial_m,
                                              Tensor& partial_l, Tensor& out, cudaStream_t stream) {
     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto splits           = causal_attention_split_capacity(
-        Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
+    const auto splits = causal_attention_split_capacity(Geometry::QHeads, invocation.width,
+                                                        cache.storage, envelope);
 
     const auto launch_partial = [&]<int Tokens, bool MultiBatch, bool Masked>() {
         launch_fp8_partial<Geometry, Tokens, MultiBatch, Masked>(

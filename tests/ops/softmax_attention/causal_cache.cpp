@@ -2084,6 +2084,104 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
     return failures;
 }
 
+// A lane attended inside a batch must be numerically identical to the same lane attended alone.
+// The host split count is an envelope upper bound that the device clamps per column, so a
+// batch-only trim of that bound shortens one column's reduction tree and changes its rounding.
+// A window past the 4096-key tier keeps the bound above the trimmed value for every storage.
+int run_batch_single_parity_case(const Geometry& geometry, KvCacheStorage storage) {
+    constexpr int batch = 4, width = 4, context = 4100;
+    const int visible = context + width;
+    const ops::CausalAttentionExecutionEnvelope envelope{static_cast<unsigned>(visible),
+                                                        static_cast<unsigned>(visible)};
+    const std::size_t q_column_elements  = std::size_t(kHeadDim) * geometry.q_heads,
+                      kv_column_elements = std::size_t(kHeadDim) * geometry.kv_heads;
+    const std::size_t lane_q = q_column_elements * width, lane_kv = kv_column_elements * width;
+    auto q = make_bf16_values(lane_q * batch, 1901u, -.25f, .25f);
+    auto k = make_bf16_values(lane_kv * batch, 1902u, -.25f, .25f);
+    auto v = make_bf16_values(lane_kv * batch, 1903u, -1.f, 1.f);
+    inject_codec_edges(geometry, width * batch, k, v);
+    std::vector<HostCache> pristine;
+    for (int row = 0; row < batch; ++row)
+        pristine.push_back(make_cache(geometry, storage, visible + 3, 1904u + 3u * row));
+    std::vector<int> positions(width * batch);
+    for (int b = 0; b < batch; ++b)
+        for (int j = 0; j < width; ++j) positions[b * width + j] = context + j;
+    const std::vector<int> lanes{0, 1, 2, 3};
+
+    GuardedDeviceBuffer dq(q.size() * 2), dk(k.size() * 2), dv(v.size() * 2),
+        dp(positions.size() * 4), dlanes(batch * 4), dout(q.size() * 2);
+    const auto q_bits = to_bf16_bits(q), k_bits = to_bf16_bits(k), v_bits = to_bf16_bits(v);
+    dq.copy_from_host(q_bits.data(), q_bits.size() * 2);
+    dk.copy_from_host(k_bits.data(), k_bits.size() * 2);
+    dv.copy_from_host(v_bits.data(), v_bits.size() * 2);
+    dp.copy_from_host(positions.data(), positions.size() * 4);
+    dlanes.copy_from_host(lanes.data(), batch * 4);
+    const std::size_t capacity = std::max(
+        ops::causal_softmax_attention_workspace_capacity_bytes(op_geometry(geometry), storage,
+                                                              envelope, batch, width, width),
+        ops::causal_softmax_attention_workspace_capacity_bytes(op_geometry(geometry), storage,
+                                                              envelope, 1, width, width));
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    DeviceContext device;
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch}),
+        tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch});
+    Tensor tp(dp.data(), DType::I32, {width, batch}), tlanes(dlanes.data(), DType::I32, {batch}),
+        tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+    BatchDeviceCache batched_cache(pristine, MappingPattern::Identity);
+    dout.fill(0xff);
+    scratch.fill(0x5a);
+    cuda_synchronize();
+    ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, tlanes, op_geometry(geometry),
+                                  kAttentionScale, batched_cache.view(), envelope, workspace, tout,
+                                  device.stream);
+    cuda_synchronize(device.stream);
+    const auto batched = copy_from_guarded<std::uint16_t>(dout, q.size());
+
+    int failures = 0;
+    for (int b = 0; b < batch; ++b) {
+        const std::string label = std::string("causal batch/solo parity ") + geometry.name + " " +
+                                  cache_name(storage) + " lane=" + std::to_string(b);
+        GuardedDeviceBuffer sq(lane_q * 2), sk(lane_kv * 2), sv(lane_kv * 2), sp(width * 4),
+            slane(4), sout(lane_q * 2);
+        sq.copy_from_host(q_bits.data() + b * lane_q, lane_q * 2);
+        sk.copy_from_host(k_bits.data() + b * lane_kv, lane_kv * 2);
+        sv.copy_from_host(v_bits.data() + b * lane_kv, lane_kv * 2);
+        sp.copy_from_host(positions.data() + b * width, width * 4);
+        const int row = 0;
+        slane.copy_from_host(&row, 4);
+        Tensor q1(sq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, 1});
+        Tensor k1(sk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, 1}),
+            v1(sv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, 1});
+        Tensor p1(sp.data(), DType::I32, {width, 1}), lanes1(slane.data(), DType::I32, {1}),
+            out1(sout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, 1});
+        std::vector<HostCache> one{pristine[b]};
+        BatchDeviceCache solo_cache(one, MappingPattern::Identity);
+        sout.fill(0xff);
+        cuda_synchronize();
+        ops::causal_softmax_attention(q1, k1, v1, p1, Tensor{}, lanes1, op_geometry(geometry),
+                                      kAttentionScale, solo_cache.view(), envelope, workspace, out1,
+                                      device.stream);
+        cuda_synchronize(device.stream);
+        const auto single = copy_from_guarded<std::uint16_t>(sout, lane_q);
+        std::size_t first = lane_q;
+        for (std::size_t i = 0; i < lane_q; ++i)
+            if (single[i] != batched[b * lane_q + i]) { first = i; break; }
+        if (first != lane_q) {
+            std::cerr << label << ": element " << first << " batched=0x" << std::hex
+                      << batched[b * lane_q + first] << " solo=0x" << single[first] << std::dec
+                      << '\n';
+            ++failures;
+        }
+        failures += sq.verify_guards(label) + sk.verify_guards(label) + sv.verify_guards(label) +
+                    sout.verify_guards(label);
+    }
+    failures += dout.verify_guards("causal batch/solo parity output") +
+                scratch.verify_guards("causal batch/solo parity workspace");
+    return failures;
+}
+
 int report_quantization_quality(KvCacheStorage storage, std::uint32_t seed) {
     const Geometry& geometry       = kGeometries[0];
     constexpr std::int32_t tokens  = 6;
@@ -2222,6 +2320,7 @@ int run_batch_cases() {
                                    {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
         failures += run_batch_case(kGeometries[0], storage,
                                    {16, {0}, {1}, {0}, MappingPattern::Fragmented, 1502u});
+        failures += run_batch_single_parity_case(kGeometries[0], storage);
     }
     failures += run_batch_case(kGeometries[0], KvCacheStorage::Int8Group64,
                                {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});

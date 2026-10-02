@@ -216,8 +216,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
 
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                              KvCacheStorage cache_storage,
-                                             CausalAttentionExecutionEnvelope envelope,
-                                             std::int32_t batch_size) {
+                                             CausalAttentionExecutionEnvelope envelope) {
     if (tokens < 1 || tokens > (q_heads == 24 ? 8 : 6) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("causal_softmax_attention split capacity: invalid profile");
@@ -226,24 +225,11 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
     if (q_heads == CausalD256H24Kv4::QHeads) {
         const int capacity =
             causal_small_t_launch_capacity<CausalD256H24Kv4>(envelope, tokens, cache_storage);
-        if (batch_size > 1) {
-            // Keep complete grids within one or two 170-SM waves. Rounding from 160 CTAs
-            // leaves room for the indivisible 4*B group, including B=3/5/6/7.
-            const bool narrow = tokens <= 5;
-            int target_ctas   = 160;
-            if (cache_storage == KvCacheStorage::BFloat16)
-                target_ctas =
-                    narrow || batch_size >= 5 || envelope.max_visible_keys > 4096 ? 320 : 160;
-            else if (cache_storage == KvCacheStorage::Int8Group64)
-                target_ctas = narrow || envelope.max_visible_keys > 4096 ? 320 : 160;
-            else if (cache_storage == KvCacheStorage::Nvfp4Group16)
-                target_ctas = narrow ? 320 : 160;
-            const int grid_limit = div_up(target_ctas, 4 * batch_size);
-            // A split stages at most 64 physical-page IDs. Leave two 64-key pages for
-            // key-tile rounding and page alignment at the 262144-key resource limit.
-            const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
-            return std::min(capacity, std::max({4, grid_limit, page_limit}));
-        }
+        // Keep the host count at the envelope's upper bound rather than trimming the grid for a
+        // batch. The device clamps this against each column's own natural split count, so a
+        // smaller host value shortens that column's reduction tree and rounds differently from
+        // the same column decoded alone; keeping lanes numerically identical to solo needs the
+        // full bound, and the extra splits exit immediately when their column is short.
         return capacity;
     }
     if (q_heads == CausalD256H12Kv2::QHeads) {
@@ -265,8 +251,8 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
                                          Tensor& out, cudaStream_t stream) {
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto splits                = causal_attention_split_capacity(
-        Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
+    const auto splits = causal_attention_split_capacity(Geometry::QHeads, invocation.width,
+                                                        cache.storage, envelope);
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.

@@ -23,10 +23,13 @@ struct CausalSmallTInvocation {
     std::int32_t batch_size     = 1;
 };
 
+// The returned count is an upper bound for one column and must not depend on the batch:
+// the device clamps it against each column's own natural split count, so a smaller value
+// would truncate that column's reduction tree and round differently from the same column
+// decoded alone.
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                              KvCacheStorage cache_storage,
-                                             CausalAttentionExecutionEnvelope envelope,
-                                             std::int32_t batch_size = 1);
+                                             CausalAttentionExecutionEnvelope envelope);
 
 CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                                     std::int32_t batch_size, KvCacheStorage storage,
