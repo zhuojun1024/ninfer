@@ -840,6 +840,10 @@ private:
         std::uint32_t tokens               = 0;
         std::uint32_t slot                 = 0;
         std::uint32_t next_host_checkpoint = 0;
+        // The media-capped token count this prompt shares with the lineage the scan read. The
+        // divergence anchor is planned against it, so the prefill that follows the scan needs it
+        // without re-deriving the comparison.
+        std::uint32_t shared_prefix = 0;
     };
     // Scans this lane's own lineage for the deepest boundary at or before the shared prefix, tags
     // the checkpoints the coming prefill will write, and records the source in the lane's retention
@@ -848,6 +852,35 @@ private:
                                             std::span<const MediaSpan> media,
                                             std::uint32_t prompt_tokens, std::size_t replay_split,
                                             bool adopted, bool trace);
+    // The two boundaries a prefill freezes beyond its grid and tail checkpoints: the position a
+    // later conversation of this family is already known to want (the observed divergence, one
+    // margin token behind it) and the end of this prompt's own leading instruction block. Both sit
+    // on the chunk grid of the prefill that writes them and both are captured into the owning
+    // entry's shared image, so all three prefills plan them with this one arithmetic.
+    struct LaneAnchors {
+        std::uint32_t anchor_position = 0;
+        std::size_t anchor_session    = kNoSession;
+        bool anchor_divergence        = false;
+        std::uint32_t block_frontier  = 0;
+        std::uint32_t block_position  = 0;
+        bool block_anchor             = false;
+    };
+    // Plans the two anchors for one lane's prefill and records the entry the divergence anchor
+    // belongs to in that lane's retention state. `shared_prefix` is the token count this prompt
+    // shares with the lineage it inherited, `block_frontier` the prompt's own leading-instruction
+    // boundary; zero means the caller has none.
+    [[nodiscard]] LaneAnchors plan_lane_anchors(std::uint32_t lane, std::span<const TokenId> token_ids,
+                                                std::uint32_t prompt_tokens, std::uint32_t reuse,
+                                                std::uint32_t shared_prefix,
+                                                std::uint32_t prefill_chunk,
+                                                std::uint32_t block_frontier);
+    // Freezes the state the device pools still hold at the anchor, before the prefill's first chunk
+    // overwrites it. Only a prompt that starts exactly on the shared prefix has that state there.
+    void capture_lane_anchor_from_device(std::uint32_t lane, std::uint32_t reuse,
+                                         std::uint32_t shared_prefix);
+    // Copies the anchor's frozen checkpoint image into the owning entry's shared slabs. Must run
+    // before the prefill publishes the session, which can evict that entry and shift every index.
+    void capture_lane_anchor_frozen(std::uint32_t lane, std::uint32_t anchor_position);
     // The Vision identity of one prepared prompt: one span per item, in prompt-token coordinates,
     // ordered by `begin`. Empty for a text-only prompt.
     [[nodiscard]] static std::vector<MediaSpan> collect_media_spans(
@@ -873,6 +906,13 @@ private:
                               const std::vector<TokenId>& tokens,
                               std::span<const MediaSpan> media,
                               const models::qwen3_5::PreparedContextCache& cache_hints);
+    // Publishes the part of a cancelled lane prefill that did finish, the way execute_walk does: the
+    // catalog entry, the ring's prompt-end boundary and this lane's lineage, so the retry of the same
+    // prompt can stand on the last completed chunk instead of prefilling its whole history again.
+    // The caller retires the lineage with invalidate_lane_prefill instead when no chunk finished.
+    void publish_partial_prefill(std::uint32_t lane, std::uint32_t frontier,
+                                 const std::vector<TokenId>& tokens,
+                                 const models::qwen3_5::PreparedPromptData& data);
     // Retires this lane's lineage after a torn prefill, so the next request cannot stand on a state
     // this one left half written.
     void invalidate_lane_prefill(std::uint32_t lane);

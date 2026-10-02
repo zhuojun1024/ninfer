@@ -478,3 +478,32 @@ P2.2 实测（双卡 `--devices 0,1 --max-context 131072 --max-concurrency 4 --s
 - 归属：**既有缺陷**，不是本轮改动引入——`text.cpp` 在本次工作树里只有这一处新增，最后一次改它的是已提交的 `6a17bb2c`。同文件其他 peer 分配点（`:494`/`:932`/`:1050`/`:2137`/`:2814`）都有 `auto peer_scope = peer.work_.scope();`，只有 `:858` 漏了。
 - 修复：`:858` 之后补一行 `auto peer_scope = peer.work_.scope();`（含 4 行注释，共 +5 行）。
 - 验证：C=4 `--draft-tokens 2` 冒烟 warmup 通过（`listening on http://127.0.0.1:8099`），两条并发 `/v1/responses`（带 tools 的短请求 + 1729 token 长请求）均 HTTP 200，带 tools 的返回合法 `function_call`；C=1 仍 `mtp chain: graph`、channels 24、HTTP 200；gate 11/11、forward/load exit 0。
+
+### 会话缓存单/多并发一致性（m02934）
+
+背景：`m02832` 的 A/B 探针发现 C=1 能复用系统前缀（`cache 2,048 (74.8%, long anchor)`、TTFT 422 ms），而 C≥2 恒 `cache 0 (0.0%)`、TTFT 1.6 s。本轮逐条比对三条 prefill 路线——`execute_walk`（C=1）、`execute_plain_batch`、`execute_spec_batch`（C≥2）——的接线与共享辅助函数，结论：两处真实缺口（GAP A、GAP D）、一处架构限制（GAP B，只记录）、一处误报（GAP C）。
+
+| 项 | 状态 | 落盘位置 | 验证 |
+|---|---|---|---|
+| GAP A：两条批量路线没有 walk 的锚点机制，`entry.host_shared_end` 恒为 0，新会话的共享前缀在 `session_recall` 被 `offered > shared` 拒掉 | 已落盘 | 把 walk 的锚点规划与捕获抽成三个成员：`plan_lane_anchors`（`src/runtime/engine/tp2_generation_core.cpp:2435-2531`）、`capture_lane_anchor_from_device`（`:2533-2546`）、`capture_lane_anchor_frozen`（`:2548-2583`）；`LaneReuse` 增 `shared_prefix`；walk 改为调用（`:6761`/`:6771`/`:6991`）；plain 路线四处接线（plan `:3246`、from-device `:3259`、`reuse_path(reuse, anchors.block_frontier, …)` `:3262`、chunk clamp + Divergence/Block 写 `:3350-3351`、frozen `:3446`），spec 路线同构（`:3986`/`:4000`/`:4002`/`:4096-4097`/`:4200`） | 见下 |
+| GAP D：批量路线取消 prefill 时无条件 `invalidate_lane_prefill`，丢掉已完成 chunk 的部分进度（walk 会发布它） | 已落盘 | 新增 `publish_partial_prefill`（`:2701-2738`，镜像 walk 取消路径 `:6777-6812`）；两处取消分支改为 `prefilled > 0` 时发布、否则失效（`:3428-3437`、`:4182-4191`）；`prefilled` 提升到 chunk 循环之外（`:3282`、`:4019`） | 见下 |
+| GAP B：walk 在 decode 轮写 Grid 检查点（`:7616+`），批量路线不写 | 不实现（记录为架构限制） | C≥2 每次 `finalize` 都走 `release_lane_kv` → `invalidate_host_checkpoints(lane)`，ring 被清空；能跨请求存活的只有 catalog 的三类镜像（frontier / prompt-end / block-shared）。要让 decode 尾部的 grid 边界可用，需给 `SessionEntry` 再加一类镜像，而 host 预算 10240 MiB/shard 只装得下 2 个 3960 MiB 会话（`[tp2-session] host budget …`），收益（客户端重渲染答案时尾部重 prefill 的减少）不抵成本 | 分析结论 |
+| GAP C：两条路线发布的 frontier 语义不一致 | 误报 | plain `:3448` / spec `:4202` 的 `publish_lane_prefill(lane.prompt_tokens, …)` 与 walk `:7647-7655` 的 `frontier = prompt_tokens + sampled - 1` 在各自坐标系里是同一点（最后一个被采样的 token 不再前向） | 代码比对 |
+
+GAP A 实测（编译后；探针 `_temp/m03350_probe.mjs` + `_temp/run_m03350_probe.ps1` / `_temp/run_m03420_probe.ps1`，5 请求共享前 2,722 token；修复前 C=2/C=4 全 `cache 0`、TTFT 1.6 s）：
+
+| 臂 | A1 | A2/A3/B1/B2 |
+|---|---|---|
+| `floor0_c2`（spec dflash2，conc=2，`--session-retention-floor 0`，prompt 2,738） | `cache 0`，2043 ms | `cache 2,048`，869/963/937/883 ms |
+| `long_c2`（spec，floor 4096，prompt 10,839） | `cache 0`，7054 ms | `cache 10,240`，1043/976/964/926 ms |
+| `plain_c2`（无 `--spec`，floor 0，2,738） | `cache 0`，2249 ms | `cache 2,048`，1203/1229/1387/1276 ms |
+| `spec_c4`（conc=4，floor 0，2,738） | `cache 0`，2136 ms | `cache 2,048`，1063/1158/1251/1358 ms |
+
+长 prompt 臂正是用户真实场景（> retention floor）：命中 10,240/10,839 = 94.5%。`_temp/m03350_long_c2.err` 印证链路：A1 存下 `anchor entry=0 position=10240`；A2 候选 `… host_prompt_end=10839 shared_end=10240 shared=10823 reach=10240 via=shared` → recall → `reuse=10240 src=live`。短 prompt 臂必须先 `--session-retention-floor 0` 才建 entry：`session_publish` 在 `history.size() < session_retention_floor_tokens_` 时早退（`:5895`），4096 是用户配置而非代码缺陷。
+
+GAP D 实测（`_temp/m03470_cancel.mjs` + `_temp/run_m03470_cancel.ps1`，prompt 10,839，C1 在 2 s 时断开连接 ⇒ 服务端 `cancellation.requested()` 在 chunk 循环命中）：
+
+- spec：C1 取消后 `anchor entry=0 position=4096`；C2 重试同一 prompt `recall frontier=4096 … reuse=4096 src=live` ⇒ `cache 4,096`、4414 ms（修复前该重试为全量 prefill、`cache 0`）；C3 同族新会话仍 `cache 10,240`、966 ms。
+- plain：部分进度 5120 ⇒ C2 `cache 5,120`、3872 ms；C3 `cache 10,240`、1269 ms。
+
+C=1 回归（`_temp/run_m03480_c1.ps1`，conc=1 / floor 4096 / prompt 2,738）：A1 `cache 0` 1933 ms，A2–B2 均 `cache 2,048`（686/719/694/810 ms）——walk 改用共享助手后行为不变。

@@ -2428,7 +2428,158 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
             result.next_host_checkpoint += host_checkpoint_stride_;
         }
     }
+    result.shared_prefix = static_cast<std::uint32_t>(shared_prefix);
     return result;
+}
+
+TP2GenerationCore::LaneAnchors TP2GenerationCore::plan_lane_anchors(
+    std::uint32_t lane, std::span<const TokenId> token_ids, std::uint32_t prompt_tokens,
+    std::uint32_t reuse, std::uint32_t shared_prefix, std::uint32_t prefill_chunk,
+    std::uint32_t block_frontier) {
+    RetentionState& lane_state = retention(lane);
+    LaneAnchors anchors;
+    // A checkpoint that already sits on a boundary stays untouched, which is what keeps a reused
+    // stable prefix free of work: the state the anchor would freeze is one the ring already holds.
+    const auto has_valid_host_checkpoint_at = [](const Shard& shard, std::uint32_t position,
+                                                 std::uint32_t checkpoint_lane) {
+        for (const auto& checkpoint : shard.host_checkpoints) {
+            if (checkpoint.valid[checkpoint_lane] && checkpoint.position[checkpoint_lane] == position) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // Divergence anchor. shared_prefix is where this prompt stopped matching the lineage it
+    // inherited, and the next new session - or the next context compression - renders the same stable
+    // block and diverges in the same place, so it is the one position a later request is already
+    // known to want. Freezing the state there lets that request restart on the boundary instead of at
+    // the grid point behind it. The anchor sits kReuseDivergenceMargin tokens *before* the observed
+    // divergence rather than on it: the next pair can report a shared prefix a token or two shorter,
+    // and an anchor on the exact index would be pruned before it could ever be used. Only a frontier
+    // strictly inside this prefill is worth freezing: at or below reuse the prefill's own starting
+    // state is already checkpointed, and at the prompt end the device snapshot holds it.
+    //
+    // The anchor does not always belong to the conversation the prefill was recalled from. A prompt
+    // that only opens with a stable block is served by the shallowest image still reachable, while
+    // the entry whose history actually carries that block can share far more with it - and it offers
+    // no recall at all, because every boundary it holds sits past the shared prefix. The block's end
+    // still has to be frozen on it: that entry is the one the next conversation of the family is
+    // recalled from, and a ring slot does not survive the evictions a session slab does.
+    std::uint32_t anchor_prefix = shared_prefix;
+    for (std::size_t index = 0; index < sessions_.size(); ++index) {
+        const SessionEntry& entry = sessions_[index];
+        if (index == lane_state.anchor_session || entry.device_lane >= 0 || entry.tokens.empty()) {
+            continue;
+        }
+        if (entry.host_shared_state[0] == nullptr || entry.host_shared_state[1] == nullptr) {
+            continue;
+        }
+        const std::size_t common = std::min(entry.tokens.size(), token_ids.size());
+        std::size_t shared       = 0;
+        while (shared < common && entry.tokens[shared] == token_ids[shared]) { ++shared; }
+        if (shared <= anchor_prefix || shared >= prompt_tokens) { continue; }
+        const std::uint32_t position = shared > kReuseDivergenceMargin
+                                           ? static_cast<std::uint32_t>(shared) - kReuseDivergenceMargin
+                                           : static_cast<std::uint32_t>(shared);
+        if (position <= reuse || position > entry.host_kv_end) { continue; }
+        anchor_prefix             = static_cast<std::uint32_t>(shared);
+        lane_state.anchor_session = index;
+    }
+    const std::uint32_t anchor_target = anchor_prefix > kReuseDivergenceMargin
+                                            ? anchor_prefix - kReuseDivergenceMargin
+                                            : anchor_prefix;
+    // The anchor only ever lands on the prefill's own chunk grid, for the same reason the rewind
+    // snapshots do: a chunk truncated to a target derived from engine history makes the same prompt
+    // prefill with different chunk widths from one prefill to the next, and the last chunk's logits
+    // then differ by far more than a reduction-order change - enough to flip the first sample against
+    // a from-scratch oracle. Every clamp a prefill applies already sits on the grid fixed by `reuse`,
+    // `prompt_tokens` and `prefill_chunk`, so rounding the anchor down costs only the part of a
+    // chunk behind it and never a split.
+    anchors.anchor_position = anchor_target;
+    if (anchors.anchor_position > reuse) {
+        anchors.anchor_position =
+            reuse + ((anchors.anchor_position - reuse) / prefill_chunk) * prefill_chunk;
+    }
+    anchors.anchor_session    = lane_state.anchor_session;
+    anchors.anchor_divergence = host_checkpoint_stride_ != 0 && anchors.anchor_position > reuse &&
+                                anchors.anchor_position < prompt_tokens &&
+                                !has_valid_host_checkpoint_at(shard_a_, anchors.anchor_position, lane) &&
+                                !has_valid_host_checkpoint_at(shard_b_, anchors.anchor_position, lane);
+    // Block anchor. The prompt names where its own leading instruction block ends, and the prefill
+    // that walks it is the only one that can freeze the state there: the block is what every
+    // conversation of the same agent re-renders, but the first conversation that shares it is the one
+    // that has to walk it, so an observation always arrives too late for it. The boundary is kept for
+    // this conversation's own entry (see session_store_active), which is what lets the next one start
+    // on the block. The anchor sits on the prefill's own chunk grid, not a fixed distance behind the
+    // boundary: a boundary that coincides with a chunk end is the state the prefill committed there
+    // anyway, and a recall starting on it re-walks the chunks a from-scratch prefill of the same
+    // prompt would, so the recalled answer is the oracle's and not merely a plausible one. The margin
+    // keeps the anchor clear of the boundary the divergence may reach back to.
+    anchors.block_frontier = block_frontier;
+    const std::uint32_t block_target = block_frontier > kReuseDivergenceMargin
+                                           ? block_frontier - kReuseDivergenceMargin
+                                           : block_frontier;
+    anchors.block_position = block_target;
+    if (anchors.block_position > reuse) {
+        anchors.block_position = reuse + ((anchors.block_position - reuse) / prefill_chunk) * prefill_chunk;
+    }
+    anchors.block_anchor = host_checkpoint_stride_ != 0 && anchors.block_position > reuse &&
+                           anchors.block_position < prompt_tokens &&
+                           !has_valid_host_checkpoint_at(shard_a_, anchors.block_position, lane) &&
+                           !has_valid_host_checkpoint_at(shard_b_, anchors.block_position, lane);
+    return anchors;
+}
+
+void TP2GenerationCore::capture_lane_anchor_from_device(std::uint32_t lane, std::uint32_t reuse,
+                                                        std::uint32_t shared_prefix) {
+    // The conversation this prompt was compared against stopped matching it exactly where the prefill
+    // starts, so the device state sitting there right now is its state at that boundary too: freeze it
+    // before the first chunk overwrites it. A later conversation opening with the same stable block
+    // can then be recalled onto the owner's own slabs instead of prefilling the block again. The
+    // device pools still hold it because the recall restored it, or because the eviction left the
+    // device lineage standing on it, and nothing has run since. A draft ring the caller restored to
+    // `reuse` is at the same boundary, so this captures the two halves together.
+    RetentionState& lane_state = retention(lane);
+    if (lane_state.anchor_session != kNoSession && reuse != 0 && reuse == shared_prefix) {
+        session_capture_shared_state(lane_state.anchor_session, reuse, true, nullptr, nullptr, lane);
+    }
+}
+
+void TP2GenerationCore::capture_lane_anchor_frozen(std::uint32_t lane, std::uint32_t anchor_position) {
+    // The divergence anchor is the state of the block the two histories still agreed on: the entry
+    // whose history the scan compared this prompt against agrees with it up to the same token, so the
+    // anchor is its state there as well. Copying it into that entry's own image pairs the state with
+    // the KV its slabs already hold, and unlike the ring slot it survives the next evictions. It lands
+    // before session_publish, which may erase the entry and shift every later index.
+    RetentionState& lane_state = retention(lane);
+    if (lane_state.anchor_session == kNoSession) { return; }
+    const PinnedHostBuffer* frozen[2]    = {nullptr, nullptr};
+    const PinnedHostBuffer* frozen_draft = nullptr;
+    bool complete                        = true;
+    for (std::size_t shard_index = 0; shard_index < 2 && complete; ++shard_index) {
+        Shard& shard = shard_index == 0 ? shard_a_ : shard_b_;
+        for (const auto& checkpoint : shard.host_checkpoints) {
+            // The ring has not been published yet, so the search is by the id this prefill tagged its
+            // own writes with rather than by `valid`.
+            if (checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id &&
+                checkpoint.position[lane] == anchor_position) {
+                frozen[shard_index] = checkpoint.buffer.get();
+                // The draft half of the anchor lives in the same checkpoint slot, so a checkpoint
+                // without it cannot carry the boundary.
+                if (shard.dflash_round != nullptr) { frozen_draft = checkpoint.dflash_buffer.get(); }
+                break;
+            }
+        }
+        complete = frozen[shard_index] != nullptr &&
+                   (shard.dflash_round == nullptr || frozen_draft != nullptr);
+    }
+    if (!complete) { return; }
+    for (Shard* shard : {&shard_a_, &shard_b_}) {
+        shard->device.bind_to_current_thread();
+        CUDA_CHECK(cudaStreamSynchronize(shard->device.stream));
+    }
+    session_capture_shared_state(lane_state.anchor_session, anchor_position, false, frozen,
+                                 frozen_draft, lane);
 }
 
 void TP2GenerationCore::restore_lane_gdn(std::uint32_t lane, const LaneReuse& reuse) {
@@ -2545,6 +2696,45 @@ void TP2GenerationCore::publish_lane_prefill(
     // too, or the skipped prefix would leave a hole in the ring.
     if (shard_a_.dflash_round != nullptr) { snapshot_dflash_state(shard_a_, 0, lane); }
     lane_state.cached_boundaries[0] = prompt_tokens;
+}
+
+void TP2GenerationCore::publish_partial_prefill(std::uint32_t lane, std::uint32_t frontier,
+                                               const std::vector<TokenId>& tokens,
+                                               const models::qwen3_5::PreparedPromptData& data) {
+    RetentionState& lane_state = retention(lane);
+    // The chunks that finished wrote KV for tokens the prompt really has and left the GDN state at
+    // the end of the last one, so the catalog can name where the prefill stopped and the retry of the
+    // same prompt continues from there instead of prefilling its whole history again. This mirrors
+    // the walk's own cancel path; a batched lane reaches the same boundary one chunk at a time.
+    for (Shard* shard : {&shard_a_, &shard_b_}) {
+        if (shard->state_snapshots[0].data == nullptr) { continue; }
+        shard->device.bind_to_current_thread();
+        // See snapshot_lane_state in execute_walk: the device-to-device branch copies into its first
+        // device pointer, so the plane is the destination and the pool is the source.
+        copy_lane_state(shard->lane_state_geometry, shard->state_snapshots[0].data,
+                        static_cast<std::int32_t>(lane), shard->state_backing.data,
+                        cudaMemcpyDeviceToDevice, shard->device.stream);
+    }
+    if (shard_a_.dflash_round != nullptr) { snapshot_dflash_state(shard_a_, 0, lane); }
+    lane_state.cached_boundaries[0] = frontier;
+    // A cancelled prefill reached no rewind boundary, so every rewind slot this lane still carried
+    // is dropped: the slot above is where it stopped.
+    for (std::size_t slot = 1; slot < kReuseSnapshotCount; ++slot) {
+        lane_state.cached_boundaries[slot] = 0;
+    }
+    lane_state.cached_state_valid = true;
+    // The truncated prompt end is a boundary like a completed one, so it goes into the ring's
+    // prompt-end slot and the sweep makes it usable: that is what lets the retry of the same prompt
+    // stand on it.
+    snapshot_host_checkpoint(shard_a_, frontier, HostRing::PromptEnd, lane);
+    snapshot_host_checkpoint(shard_b_, frontier, HostRing::PromptEnd, lane);
+    publish_lane_checkpoints(lane);
+    session_publish(
+        std::vector<TokenId>(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(frontier)),
+        frontier, data.context_cache, collect_media_spans(data, frontier), lane);
+    if (lane_state.active_session != kNoSession) {
+        sessions_[lane_state.active_session].prompt_end = frontier;
+    }
 }
 
 void TP2GenerationCore::invalidate_lane_prefill(std::uint32_t lane) {
@@ -3049,13 +3239,27 @@ void TP2GenerationCore::execute_plain_batch(
                             adoption.adopted, reuse_trace);
         const std::uint32_t reuse          = lane_reuse.tokens;
         std::uint32_t next_host_checkpoint = lane_reuse.next_host_checkpoint;
+        // The two anchors the serial walk plans, on this lane's own chunk grid: the boundary a later
+        // conversation of this family is known to want, and the end of this prompt's own leading
+        // instruction block. Without them the batched route offers only the grid and tail
+        // checkpoints, which is why a new conversation sharing just the system block re-prefilled it.
+        const LaneAnchors anchors = plan_lane_anchors(
+            lane_id, token_ids, lane.prompt_tokens, reuse, lane_reuse.shared_prefix, prefill_chunk,
+            data.context_cache.leading_instruction_frontier.value_or(0));
+        const bool anchor_divergence        = anchors.anchor_divergence;
+        const std::uint32_t anchor_position = anchors.anchor_position;
+        const bool block_anchor             = anchors.block_anchor;
+        const std::uint32_t block_position  = anchors.block_position;
 
         // Restore this lane's GDN state to the boundary the scan accepted. A reused prefix needs no KV
         // work at all: the pages already hold it.
         restore_lane_gdn(lane_id, lane_reuse);
+        // The device state still stands on the boundary this lane inherited, so freeze it before the
+        // first chunk overwrites it.
+        capture_lane_anchor_from_device(lane_id, reuse, lane_reuse.shared_prefix);
 
         lane.result.reused_prompt_tokens = reuse;
-        lane.result.prefix_reuse_path    = reuse_path(reuse, 0, lane_id);
+        lane.result.prefix_reuse_path    = reuse_path(reuse, anchors.block_frontier, lane_id);
         if (lane.pending->sink != nullptr) {
             lane.pending->sink->start(
                 GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
@@ -3073,6 +3277,9 @@ void TP2GenerationCore::execute_plain_batch(
         // Prefill starts at the accepted boundary: the KV pages before it are the restored ones and
         // the GDN state was just brought to exactly that position, so re-forwarding the prefix would
         // both duplicate pages and advance the state twice.
+        // The chunk loop's own progress, hoisted out of its scope: the cancel path below publishes
+        // this lane's session up to the last chunk that really finished.
+        std::uint32_t prefilled = reuse;
         for (std::uint32_t t0 = reuse; !cancelled && t0 < lane.prompt_tokens;) {
             if (lane.pending->cancellation.requested()) {
                 cancelled = true;
@@ -3086,6 +3293,15 @@ void TP2GenerationCore::execute_plain_batch(
             if (vision_session) {
                 vision_chunk = vision_session->prepare_chunk(t0, length);
                 length       = static_cast<std::uint32_t>(vision_chunk.length);
+            }
+            // An anchor is a state this prefill must freeze exactly, so the chunk that would step
+            // over one ends on it - the same clamp the serial walk applies, and for the same reason:
+            // the anchor is only ever planned on this prefill's own chunk grid.
+            if (anchor_divergence && anchor_position > t0 && anchor_position < t0 + length) {
+                length = anchor_position - t0;
+            }
+            if (block_anchor && block_position > t0 && block_position < t0 + length) {
+                length = block_position - t0;
             }
             qwen::execution::Tp2VisionChunk media_chunk;
             const qwen::execution::Tp2VisionChunk* media_ptr = nullptr;
@@ -3121,6 +3337,19 @@ void TP2GenerationCore::execute_plain_batch(
                            static_cast<std::uint64_t>(frontier) + tail_span > lane.prompt_tokens) {
                     snapshot_host_checkpoint(shard_a_, frontier, HostRing::Tail, lane_id);
                     snapshot_host_checkpoint(shard_b_, frontier, HostRing::Tail, lane_id);
+                }
+                if (anchor_divergence && frontier == anchor_position) {
+                    snapshot_host_checkpoint(shard_a_, frontier, HostRing::Divergence, lane_id);
+                    snapshot_host_checkpoint(shard_b_, frontier, HostRing::Divergence, lane_id);
+                }
+                if (block_anchor && frontier == block_position) {
+                    snapshot_host_checkpoint(shard_a_, frontier, HostRing::Block, lane_id);
+                    snapshot_host_checkpoint(shard_b_, frontier, HostRing::Block, lane_id);
+                    // The id names the prefill that wrote it, so an eviction can tell this
+                    // conversation's own block state from a later conversation's rewrite of the slot.
+                    retention(lane_id).block_anchor_position   = block_position;
+                    retention(lane_id).block_anchor_prefill_id =
+                        retention(lane_id).host_checkpoint_live_id;
                 }
             }
             if (t0 + length == lane.prompt_tokens) {
@@ -3187,6 +3416,7 @@ void TP2GenerationCore::execute_plain_batch(
                 }
             }
             t0 += length;
+            prefilled = t0;
         }
         if (vision_session) {
             // Every item this lane's prefill overlapped is encoded and its embeddings are in the KV
@@ -3196,13 +3426,24 @@ void TP2GenerationCore::execute_plain_batch(
             vision_session->retire_handoff();
         }
         if (cancelled) {
-            invalidate_lane_prefill(lane_id);
+            // A prefill that completed at least one chunk published what it reached, the way the walk
+            // does: the retry of the same prompt then continues from there. Before the first chunk
+            // nothing moved, and the recall's bookkeeping already describes the device pools, so that
+            // case retires the lineage instead.
+            if (prefilled > 0) {
+                publish_partial_prefill(lane_id, prefilled, tokens, data);
+            } else {
+                invalidate_lane_prefill(lane_id);
+            }
             (void)request.output.preview_terminal(FinishReason::Cancelled);
             lane.result.finish_reason = FinishReason::Cancelled;
             publish_preview(lane, false);
             finalize(lane);
             return false;
         }
+        // The anchor goes into the owning entry's shared image before the publish below, which can
+        // evict that entry and shift every later index.
+        if (anchor_divergence) { capture_lane_anchor_frozen(lane_id, anchor_position); }
         computed_prefill_tokens_ += lane.prompt_tokens - reuse;
         publish_lane_prefill(lane_id, lane.prompt_tokens, tokens, prompt_media, data.context_cache);
         lane.prefilled = true;
@@ -3738,13 +3979,27 @@ void TP2GenerationCore::execute_spec_batch(
                             adoption.adopted, reuse_trace);
         const std::uint32_t reuse          = lane_reuse.tokens;
         std::uint32_t next_host_checkpoint = lane_reuse.next_host_checkpoint;
+        // The two anchors the serial walk plans, on this lane's own chunk grid: the boundary a later
+        // conversation of this family is known to want, and the end of this prompt's own leading
+        // instruction block. Without them the batched route offers only the grid and tail
+        // checkpoints, which is why a new conversation sharing just the system block re-prefilled it.
+        const LaneAnchors anchors = plan_lane_anchors(
+            lane_id, token_ids, lane.prompt_tokens, reuse, lane_reuse.shared_prefix, prefill_chunk,
+            data.context_cache.leading_instruction_frontier.value_or(0));
+        const bool anchor_divergence        = anchors.anchor_divergence;
+        const std::uint32_t anchor_position = anchors.anchor_position;
+        const bool block_anchor             = anchors.block_anchor;
+        const std::uint32_t block_position  = anchors.block_position;
         restore_lane_gdn(lane_id, lane_reuse);
         // The batched lane rebuilds its whole draft ring from its own prefill sink below, so there is
         // nothing to zero here: the ring is only read once this lane's prefill has primed it.
         restore_lane_dflash(lane_id, lane_reuse, false);
         retention(lane_id).dflash_context_frontier = reuse;
+        // The device state still stands on the boundary this lane inherited, so freeze it before the
+        // first chunk overwrites it.
+        capture_lane_anchor_from_device(lane_id, reuse, lane_reuse.shared_prefix);
         lane.result.reused_prompt_tokens           = reuse;
-        lane.result.prefix_reuse_path              = reuse_path(reuse, 0, lane_id);
+        lane.result.prefix_reuse_path              = reuse_path(reuse, anchors.block_frontier, lane_id);
         if (lane.pending->sink != nullptr) {
             lane.pending->sink->start(
                 GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
@@ -3759,6 +4014,9 @@ void TP2GenerationCore::execute_spec_batch(
             open_vision_session(data, reuse, vision_plan);
         bool cancelled                  = lane.pending->cancellation.requested();
         FinishReason first_token_finish = FinishReason::None;
+        // The chunk loop's own progress, hoisted out of its scope: the cancel path below publishes
+        // this lane's session up to the last chunk that really finished.
+        std::uint32_t prefilled = reuse;
         for (std::uint32_t t0 = reuse; !cancelled && t0 < lane.prompt_tokens;) {
             if (lane.pending->cancellation.requested()) {
                 cancelled = true;
@@ -3773,6 +4031,15 @@ void TP2GenerationCore::execute_spec_batch(
             if (vision_session) {
                 vision_chunk = vision_session->prepare_chunk(t0, length);
                 length       = static_cast<std::uint32_t>(vision_chunk.length);
+            }
+            // An anchor is a state this prefill must freeze exactly, so the chunk that would step
+            // over one ends on it - the same clamp the serial walk applies, and for the same reason:
+            // the anchor is only ever planned on this prefill's own chunk grid.
+            if (anchor_divergence && anchor_position > t0 && anchor_position < t0 + length) {
+                length = anchor_position - t0;
+            }
+            if (block_anchor && block_position > t0 && block_position < t0 + length) {
+                length = block_position - t0;
             }
             qwen::execution::Tp2VisionChunk media_chunk;
             const qwen::execution::Tp2VisionChunk* media_ptr = nullptr;
@@ -3816,6 +4083,19 @@ void TP2GenerationCore::execute_spec_batch(
                            static_cast<std::uint64_t>(frontier) + tail_span > lane.prompt_tokens) {
                     snapshot_host_checkpoint(shard_a_, frontier, HostRing::Tail, lane_id);
                     snapshot_host_checkpoint(shard_b_, frontier, HostRing::Tail, lane_id);
+                }
+                if (anchor_divergence && frontier == anchor_position) {
+                    snapshot_host_checkpoint(shard_a_, frontier, HostRing::Divergence, lane_id);
+                    snapshot_host_checkpoint(shard_b_, frontier, HostRing::Divergence, lane_id);
+                }
+                if (block_anchor && frontier == block_position) {
+                    snapshot_host_checkpoint(shard_a_, frontier, HostRing::Block, lane_id);
+                    snapshot_host_checkpoint(shard_b_, frontier, HostRing::Block, lane_id);
+                    // The id names the prefill that wrote it, so an eviction can tell this
+                    // conversation's own block state from a later conversation's rewrite of the slot.
+                    retention(lane_id).block_anchor_position   = block_position;
+                    retention(lane_id).block_anchor_prefill_id =
+                        retention(lane_id).host_checkpoint_live_id;
                 }
             }
             if (mtp_enabled_ && t0 + length != lane.prompt_tokens) {
@@ -3890,6 +4170,7 @@ void TP2GenerationCore::execute_spec_batch(
                 }
             }
             t0 += length;
+            prefilled = t0;
         }
         if (vision_session) {
             // Every item this lane's prefill overlapped is encoded and its embeddings are in the KV
@@ -3899,13 +4180,24 @@ void TP2GenerationCore::execute_spec_batch(
             vision_session->retire_handoff();
         }
         if (cancelled) {
-            invalidate_lane_prefill(lane_id);
+            // A prefill that completed at least one chunk published what it reached, the way the walk
+            // does: the retry of the same prompt then continues from there. Before the first chunk
+            // nothing moved, and the recall's bookkeeping already describes the device pools, so that
+            // case retires the lineage instead.
+            if (prefilled > 0) {
+                publish_partial_prefill(lane_id, prefilled, tokens, data);
+            } else {
+                invalidate_lane_prefill(lane_id);
+            }
             (void)request.output.preview_terminal(FinishReason::Cancelled);
             lane.result.finish_reason = FinishReason::Cancelled;
             publish_preview(lane, false);
             finalize(lane);
             return false;
         }
+        // The anchor goes into the owning entry's shared image before the publish below, which can
+        // evict that entry and shift every later index.
+        if (anchor_divergence) { capture_lane_anchor_frozen(lane_id, anchor_position); }
         computed_prefill_tokens_ += lane.prompt_tokens - reuse;
         publish_lane_prefill(lane_id, lane.prompt_tokens, tokens, prompt_media, data.context_cache);
         lane.prefilled = true;
@@ -6464,90 +6756,19 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // strictly inside this walk is worth freezing: at or below reuse the walk's own starting state is
     // already checkpointed, and at the prompt end the device snapshot holds it. A checkpoint that
     // already sits there stays untouched, which is what keeps a reused stable prefix free of work.
-    const auto has_valid_host_checkpoint_at = [](const Shard& shard, std::uint32_t position,
-                                                 std::uint32_t lane) {
-        for (const auto& checkpoint : shard.host_checkpoints) {
-            if (checkpoint.valid[lane] && checkpoint.position[lane] == position) { return true; }
-        }
-        return false;
-    };
-    // The anchor does not always belong to the conversation the walk was recalled from. A prompt that
-    // only opens with a stable block is served by the shallowest image still reachable, while the
-    // entry whose history actually carries that block can share far more with it - and it offers no
-    // recall at all, because every boundary it holds sits past the shared prefix. The block's end
-    // still has to be frozen on it: that entry is the one the next conversation of the family is
-    // recalled from, and a ring slot does not survive the evictions a session slab does.
-    std::uint32_t anchor_prefix = static_cast<std::uint32_t>(shared_prefix);
-    for (std::size_t index = 0; index < sessions_.size(); ++index) {
-        const SessionEntry& entry = sessions_[index];
-        if (index == lane_state.anchor_session || entry.device_lane >= 0 || entry.tokens.empty()) {
-            continue;
-        }
-        if (entry.host_shared_state[0] == nullptr || entry.host_shared_state[1] == nullptr) {
-            continue;
-        }
-        const std::size_t common = std::min(entry.tokens.size(), token_ids.size());
-        std::size_t shared       = 0;
-        while (shared < common && entry.tokens[shared] == token_ids[shared]) { ++shared; }
-        if (shared <= anchor_prefix || shared >= prompt_tokens) { continue; }
-        const std::uint32_t position = shared > kReuseDivergenceMargin
-                                           ? static_cast<std::uint32_t>(shared) - kReuseDivergenceMargin
-                                           : static_cast<std::uint32_t>(shared);
-        if (position <= reuse || position > entry.host_kv_end) { continue; }
-        anchor_prefix   = static_cast<std::uint32_t>(shared);
-        lane_state.anchor_session = index;
-    }
-    const std::uint32_t anchor_target = anchor_prefix > kReuseDivergenceMargin
-                                            ? anchor_prefix - kReuseDivergenceMargin
-                                            : anchor_prefix;
-    // The anchor only ever lands on the walk's own chunk grid, for the same reason the rewind
-    // snapshots do (see above): a chunk truncated to a target derived from engine history makes the
-    // same prompt prefill with different chunk widths from one walk to the next, and the last
-    // chunk's logits then differ by far more than a reduction-order change - enough to flip the
-    // first sample against a from-scratch oracle. Every clamp this walk applies already sits on the
-    // grid fixed by `reuse`, `prompt_tokens` and `prefill_chunk`, so rounding the anchor down costs
-    // only the part of a chunk behind it and never a split.
-    std::uint32_t anchor_position = anchor_target;
-    if (anchor_position > reuse) {
-        anchor_position = reuse + ((anchor_position - reuse) / prefill_chunk) * prefill_chunk;
-    }
-    const bool anchor_divergence = host_checkpoint_stride_ != 0 && anchor_position > reuse &&
-                                   anchor_position < prompt_tokens &&
-                                   !has_valid_host_checkpoint_at(shard_a_, anchor_position, lane) &&
-                                   !has_valid_host_checkpoint_at(shard_b_, anchor_position, lane);
-    // The prompt names where its own leading instruction block ends, and this walk is the only one
-    // that can freeze the state there: the block is what every conversation of the same agent
-    // re-renders, but the first conversation that shares it is the one that has to walk it, so an
-    // observation always arrives too late for it. The boundary is kept for this conversation's own
-    // entry (see session_store_active), which is what lets the next one start on the block.
-    const std::uint32_t block_frontier = data.context_cache.leading_instruction_frontier.value_or(0);
-    const std::uint32_t block_target   = block_frontier > kReuseDivergenceMargin
-                                             ? block_frontier - kReuseDivergenceMargin
-                                             : block_frontier;
-    // The anchor sits on this walk's own chunk grid, not a fixed distance behind the boundary: a
-    // boundary that coincides with a chunk end is the state the walk committed there anyway, and a
-    // recall starting on it re-walks the chunks a from-scratch walk of the same prompt would, so the
-    // recalled answer is the oracle's and not merely a plausible one. The margin keeps the anchor
-    // clear of the boundary the divergence may reach back to.
-    std::uint32_t block_position = block_target;
-    if (block_position > reuse) {
-        block_position = reuse + ((block_position - reuse) / prefill_chunk) * prefill_chunk;
-    }
-    const bool block_anchor = host_checkpoint_stride_ != 0 && block_position > reuse &&
-                              block_position < prompt_tokens &&
-                              !has_valid_host_checkpoint_at(shard_a_, block_position, lane) &&
-                              !has_valid_host_checkpoint_at(shard_b_, block_position, lane);
-    // The conversation this prompt was compared against stopped matching it exactly where the walk
-    // starts, so the device state sitting there right now is its state at that boundary too: freeze
-    // it before the first chunk overwrites it. A later conversation opening with the same stable
-    // block can then be recalled onto the owner's own slabs instead of prefilling the block again.
-    // The device pools still hold it because the recall restored it, or because the eviction left
-    // the device lineage standing on it, and nothing has run since.
-    if (lane_state.anchor_session != kNoSession && reuse != 0 && reuse == shared_prefix) {
-        // The device draft ring was restored to `reuse` by begin_dflash_state above, which is the
-        // boundary the target state is at too, so this captures the two halves together.
-        session_capture_shared_state(lane_state.anchor_session, reuse, true, nullptr, nullptr, lane);
-    }
+    // Both anchors and their device-side capture are planned by the shared helper, so this walk and
+    // the two batched prefills freeze exactly the same boundaries (P2.3).
+    const LaneAnchors anchors = plan_lane_anchors(
+        lane, token_ids, prompt_tokens, reuse, static_cast<std::uint32_t>(shared_prefix),
+        prefill_chunk, data.context_cache.leading_instruction_frontier.value_or(0));
+    const bool anchor_divergence        = anchors.anchor_divergence;
+    const std::uint32_t anchor_position = anchors.anchor_position;
+    const bool block_anchor             = anchors.block_anchor;
+    const std::uint32_t block_position  = anchors.block_position;
+    // The device state still stands on the boundary this prompt inherited, so freeze it before the
+    // first chunk overwrites it: a later conversation opening with the same stable block can then be
+    // recalled onto the owner's own slabs instead of prefilling the block again.
+    capture_lane_anchor_from_device(lane, reuse, static_cast<std::uint32_t>(shared_prefix));
     // Set when the prefill's own sample already ended the request: the first token can be a stop
     // token, or it can spend the whole output budget. Decode then has nothing left to do.
     FinishReason first_token_finish = FinishReason::None;
@@ -6765,43 +6986,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         ++prefill_chunks;
         t0 += length;
     }
-    // The divergence anchor is the state of the block the two histories still agreed on: the entry
-    // whose history the scan compared this prompt against - the recalled one, or the one the switch
-    // moved into its slabs - agrees with it up to the same token, so the anchor is its state there
-    // as well. Copying it into that entry's own image pairs the state with the KV its slabs already
-    // hold, and unlike the ring slot it survives the next evictions. It lands before
-    // session_publish, which may erase the entry and shift every later index.
-    if (lane_state.anchor_session != kNoSession && anchor_divergence) {
-        const PinnedHostBuffer* frozen[2]    = {nullptr, nullptr};
-        const PinnedHostBuffer* frozen_draft = nullptr;
-        bool complete                        = true;
-        for (std::size_t shard_index = 0; shard_index < 2 && complete; ++shard_index) {
-            Shard& shard = shard_index == 0 ? shard_a_ : shard_b_;
-            for (const auto& checkpoint : shard.host_checkpoints) {
-                if (checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id &&
-                    checkpoint.position[lane] == anchor_position) {
-                    frozen[shard_index] = checkpoint.buffer.get();
-                    // The draft half of the anchor lives in the same checkpoint slot, so a checkpoint
-                    // without it cannot carry the boundary.
-                    if (shard.dflash_round != nullptr) {
-                        frozen_draft = checkpoint.dflash_buffer.get();
-                    }
-                    break;
-                }
-            }
-            complete = frozen[shard_index] != nullptr &&
-                       (shard.dflash_round == nullptr || frozen_draft != nullptr);
-        }
-        if (complete) {
-            Shard* const anchor_shards[2] = {&shard_a_, &shard_b_};
-            for (Shard* shard : anchor_shards) {
-                shard->device.bind_to_current_thread();
-                CUDA_CHECK(cudaStreamSynchronize(shard->device.stream));
-            }
-            session_capture_shared_state(lane_state.anchor_session, anchor_position, false, frozen,
-                                         frozen_draft, lane);
-        }
-    }
+    // The divergence anchor goes into the owning entry's shared image before session_publish below,
+    // which may erase that entry and shift every later index.
+    if (anchor_divergence) { capture_lane_anchor_frozen(lane, anchor_position); }
     if (prefill_trace) {
         CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
         CUDA_CHECK(cudaStreamSynchronize(shard_b_.device.stream));
