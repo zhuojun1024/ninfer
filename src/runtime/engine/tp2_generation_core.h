@@ -181,23 +181,23 @@ private:
         // implementation), used to skip a shared prompt prefix on the next request. A plane the host
         // checkpoint ring serves is left empty instead of carved.
         std::array<DeviceSpan, kReuseSnapshotCount + 1> state_snapshots{};
-        // Prefix-reuse checkpoints in pinned host memory, one ring per shard. They carry the state
+        // Prefix-reuse checkpoints in pageable host memory, one ring per shard. They carry the state
         // of the frontier they were taken at, so a prompt whose shared prefix ends *inside* the
         // previous prompt restarts at the deepest checkpoint at or before that prefix instead of
         // recomputing from zero. The ring is sized from the host state-image budget
         // (--host-state-slots) and costs no device memory.
         //
         // A slot holds one compact single-lane image and belongs to the lane whose slice of the ring
-        // it is, so the pinned budget is the lanes=1 budget whatever the lane count; the prompt-end
+        // it is, so the host budget is the lanes=1 budget whatever the lane count; the prompt-end
         // slots are appended after every lane's slice, one per lane. The per-frontier fields are
         // indexed by lane to keep a stale claim from a re-partitioned ring readable.
         struct HostCheckpoint {
-            std::unique_ptr<PinnedHostBuffer> buffer;
+            std::unique_ptr<HostBuffer> buffer;
             // The masked draft's context at the same frontier, on the shard that owns the draft
             // (shard 0). The draft cannot be recomputed from the target state, so a checkpoint that
             // carries only the GDN image would leave the draft context describing the wrong tokens.
             // Like buffer, it holds one compact ring image - for the lane that owns this slot.
-            std::unique_ptr<PinnedHostBuffer> dflash_buffer;
+            std::unique_ptr<HostBuffer> dflash_buffer;
             std::array<std::uint32_t, kTp2GenerationMaxConcurrency> dflash_frontier{};
             std::array<std::uint32_t, kTp2GenerationMaxConcurrency> position{};
             // The prefill that wrote this lane's checkpoint. A prefill that never completed
@@ -554,9 +554,12 @@ private:
     // host image with a checkpoint or session slab, so the two are always copied and restored
     // together with the target state at the same absolute frontier; a boundary the host ring serves
     // has no device slot at all. Every image carries one compact ring image per lane and the lane
-    // index selects the slice, exactly like the target state image.
-    void store_dflash_image(Shard& shard, PinnedHostBuffer& image, std::uint32_t lane);
-    void load_dflash_image(Shard& shard, const PinnedHostBuffer& image, std::uint32_t lane);
+    // index selects the slice, exactly like the target state image. The mapping is passed as a raw
+    // pointer with its size so a pageable checkpoint slot and a pinned session slab share one path,
+    // and the size is checked against the lane's draft ring before the copy.
+    void store_dflash_image(Shard& shard, void* image, std::size_t image_bytes, std::uint32_t lane);
+    void load_dflash_image(Shard& shard, const void* image, std::size_t image_bytes,
+                           std::uint32_t lane);
     void snapshot_dflash_state(Shard& shard, std::size_t slot, std::uint32_t lane);
 
     // The Engine routes TP-2 submissions from the calling (HTTP) thread, so this core owns
@@ -798,12 +801,12 @@ private:
                         std::span<const MediaSpan> media);
     // Freezes the state at 'position' into an evicted entry's shared-prefix image. 'from_device'
     // takes it from the device pools, which still hold the state the walk is about to advance;
-    // otherwise the two pointers are pinned host images to copy from.
+    // otherwise the two pointers are host mappings to copy from, pageable or pinned.
     // 'dflash_frozen', when non-null, is the masked draft's context image at the same boundary, on
     // the shard that owns the draft; 'from_device' takes the live ring instead.
     void session_capture_shared_state(std::size_t index, std::uint32_t position, bool from_device,
-                                      const PinnedHostBuffer* const* frozen,
-                                      const PinnedHostBuffer* dflash_frozen, std::uint32_t lane);
+                                      const void* const* frozen, const void* dflash_frozen,
+                                      std::uint32_t lane);
     // Copies the resident session into its host slabs. Returns false when the host budget cannot
     // hold it, in which case the entry is dropped instead: the next prefill overwrites the device
     // pools, and an entry must never claim state that no longer exists.
