@@ -197,8 +197,9 @@ void forward_tp2_window_batch(TextContext& peer, tp::DevicePair& pair,
 - G2 文档：`docs/serving.md:68-69`、`docs/tp2-dual-5060ti.md:1-5/487`、`model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md:219`、`AGENTS.md` 产品执行模型段。
 
 ### H. 测试
-- H1 TP-2 现有一律单请求：`tests/models/qwen3_5/test_tp2_{forward,sessions,dflash_append,dflash_solo,load}.cpp`。
-- H2 新增：批内两两 oracle（同 lane 单跑 vs 批跑）、B 与 lane 组合、取消/批量失败、`tools/bench/ttft` 并发档。
+- H1 TP-2 原有测试一律单请求：`tests/models/qwen3_5/test_tp2_{forward,sessions,dflash_append,dflash_solo,load}.cpp`（`test_tp2_sessions.cpp:144` 与 `test_tp2_dflash_solo.cpp:62` 是仅有的两个设 `device_b` 的用例，都写 `max_concurrency = 1`）。
+- H2 **已落地（2026-10-02）**：`tests/models/qwen3_5/test_tp2_lanes.cpp`（`ninfer_qwen3_5_tp2_lanes_test`）经公开 `Engine::submit` + `--max-concurrency 4` 覆盖此前零自动化覆盖的调度路径——四 lane 同批的 per-lane 隔离（4 条不同 prompt 各自跑满预算；同 prompt ×4 且禁用前缀复用则逐 token 一致）、超额请求回插队首重排（6×600 token 争 32 页池）、排队过期（`RequestError(QueueTimeout)`）与排队取消（`FinishReason::Cancelled`、零 token）、批内动态入批（P2.2，短请求耗时 < 长请求一半）、带在途请求析构引擎（驱动线程停并 join 不挂起）。`--pending-timeout-ms`/取消的端到端 503 仍以 §12.12 的实机探测为准。
+- H3 批内两两 oracle 的**逐字节**判据不适用于批量路线（同批共享一个按最长 lane 定尺的 attention 包络，ulp 漂移会翻转近并列 token），故 H2 改用「同 prompt 批内一致」与近并列判据；逐字节 oracle 只用于单 lane 路线（§12.6）。`tools/bench/ttft` 并发档见 §3.4 与 §12.5 实测记录。
 
 ---
 
@@ -740,3 +741,24 @@ void forward_tp2_decode_window_batch(TextContext& peer, tp::DevicePair& pair,
 - MTP C=4 `--draft-tokens 2` 双卡冒烟：warmup 通过（`listening on http://127.0.0.1:8099`），两条并发 `/v1/responses`（带 tools 的短请求 + 1729 token 长请求）均 HTTP 200，带 tools 的返回合法 `function_call`；逐步 trace 显示 shard B 水位在链步间恒定（修复前 `81920 → 444416 → 847872`，修复后恒为 `81920`）。
 - MTP C=1 双卡冒烟：启动日志 `mtp chain: graph`、`rendezvous id channels reserved: 24`、HTTP 200 ⇒ P3.1 未破坏单 lane 路线。
 - 上述 P0/P1/P2.1/P2.2/P3 与本次 peer scope 修复均**未提交**，在 work tree（仓库约定：仅在用户要求时提交）。
+### 12.13 第二轮只读审查的 9 项修复与多 lane 调度测试（2026-10-02）
+
+对 P1–P3 之后的 TP-2 多并发工作树做第二次只读通读，得 9 项发现，无 P0/P1；15 条核心不变式（驱动发布协议、`execution_mutex_`→`lane_queue_mutex_` 锁序、无重复发布、无 UAF、KV 全有或全无、KV 算术、无队头饥饿、deadline 优先于取消、析构安全、per-lane 隔离、GDN 槽绑定、服务容量、413 来源、shard 1 的 MTP slab 为空、host checkpoint 有效性）逐条复核仍成立。编号沿用审查报告：#2（高）批处理路径零自动化覆盖；#5（中）TP-2 上 `--max-concurrency` 静默收敛；#1（中）`execute_spec_batch` 注释过期；#7（低）`reserve_lane_kv` 异常安全；#9（低）死断言；#3（低）`session_drop` 未平移 `anchor_session`；#6（低）`target_verify_batch_impl` 缺 GDN action 护栏；#8（低）`active_lane_` 语义注释。
+
+#### 修复
+- **#5**（`src/runtime/engine/model_instance.cpp:106-116`）：收敛后与请求值不等时向 stderr 打印 `[tp2] --max-concurrency %u exceeds the %u lanes the %s route batches; running %u lanes (--max-pending-requests is unchanged)`（backend 名取自 `product::speculative_backend_name`）。收敛值本身不变（`tp2_generation_concurrency`），只是不再静默。
+- **#1**（`src/runtime/engine/tp2_generation_core.h:460-464`）：`execute_spec_batch` 的注释改为「MTP（P2.1b）与 DFlash2（P2.1c）共用的批量路线，携带 per-lane tool grammar（P2.1）与 per-lane media（P2.4）；只有单 lane 路线保留 `execute_walk` 的串行 MTP draft 链」。
+- **#7 + #9**（`src/runtime/engine/tp2_generation_core.cpp:2951-2996`，MTP 段 `:2998-3011`）：删掉 `page_tokens` 局部量与不可达的 `lane_kv_window(pages) + lane_kv_write_tail() >= page_tokens` 断言（窗口算术是结构性的，改由注释说明）；文本池与 MTP 池的 `reserve`/`materialize`/句柄入表都包进 `try`/`catch (...)`，失败时清空该 lane 的 `leases`/`handles` 后重抛（半物化的 lease 没有请求会释放）；`materialize` 后加真实检查 `if (leases.size() != pages) throw std::logic_error("TP-2 KV pool materialized a lane with the wrong page count")`（MTP 文案为 `TP-2 MTP KV pool materialized a lane with the wrong page count`）。`publish` 仍在 `try` 之外。
+- **#3**（`src/runtime/engine/tp2_generation_core.cpp:5281-5292`）：`session_drop` 在 `sessions_.erase` 后同时平移每个 lane 的 `RetentionState::anchor_session`（`== index` → `kNoSession`，`> index` → `--`）。当前流程里 `capture_lane_anchor_frozen` 在可能 drop 的 store 之前读 anchor，故陈旧 anchor 不可达；这是防御性硬化。
+- **#6**（`src/models/qwen3_5/execution/text.cpp:1320-1327`）：`target_verify_batch_impl` 在张量形状校验后、取 stream 前加 `if (gdn_state_action_ != GdnStateAction::RecordForReplay) throw std::logic_error("target verify batch requires the RecordForReplay GDN action");`。唯一调用者 `target_verify_accept`（`src/models/qwen3_5/program/speculative/target_verification.cpp:14`）在调用前已绑定 `RecordForReplay`（`:16`/`:21` 两个调用点），故不改变可达行为；该入口不绑定 destination slots，`UpdateInPlace` 会在 `gdn_mix` 里解引用空张量。
+- **#8**（`src/runtime/engine/tp2_generation_core.h:1076-1079`）：`active_lane_` 注释补明「多 lane 的 `admit_lane()` 每 lane 覆写，入批完成后它只是最后入批的那条 lane；不依赖该值的失败路径用 `session_invalidate_all()`」。
+
+#### 新增测试（#2）
+- `tests/models/qwen3_5/test_tp2_lanes.cpp`（注册于 `tests/models/qwen3_5/tests.cmake`，`SKIP_RETURN_CODE 77`）：见 §H2；这是首个经 PUBLIC Engine 把 `max_concurrency` 设为 4 并真正压到 lane 队列的 TP-2 用例（此前 `test_tp2_sessions.cpp:144` 与 `test_tp2_dflash_solo.cpp:62` 两个 device_b 用例都是 C=1）。
+
+#### 验证（2026-10-02）
+- `tools/win_port/build.ps1 -Jobs 16`（build-win）**exit 0**，32 s；新用例编译 + 链接成功。
+- `ninfer_qwen3_5_tp2_lanes_test.exe`（`NINFER_TEST_ARTIFACT=D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer`，2×RTX 5060 Ti，plain C=4）**exit 0**，五个场景全过：批内 4 lane 各自隔离且同 prompt 逐 token 一致；6 个 600-token 请求争一个只放得下 3 lane 的 32 页池，全部经 requeue 完成；过期 deadline 与排队中的取消各按自身语义退休且队列保持健康；批运行中到达的短请求 0.586745 s vs 长请求 3.66691 s；在途请求下 `engine.reset()` 不挂起。启动日志 `[mem] shard N KV pool 32 pages (2048 tokens) shared by 4 lanes`。
+- `tools/win_port/test.ps1 -Filter 'engine_options|serve_options'` **2/2 通过**（#5 只加警告、收敛值未变）。
+- `ninfer_qwen3_5_tp2_sessions_test`（同 artifact，单 lane，三路线）：输出与基线 `_temp/fix_sessions.log` **逐字节相同**，仍停在既有的 artifact 敏感近并列失败 `FAIL (plain): a conversation behind a shared system prompt diverged from the oracle on its first sample: got [2752 13 198 197 197 92 198 197] expected [467 419 538 13 198 197 197 92]` ⇒ 非本次改动引入（单 lane 路线不进入 `reserve_lane_kv` 的多 lane 分支，#6 护栏只在非 `RecordForReplay` 时触发）。
+- 上述 9 项修复与新测试**未提交**，在 work tree（仓库约定：仅在用户要求时提交）。
