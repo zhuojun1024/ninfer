@@ -283,6 +283,10 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (!output.literal_spans.empty())
             output.literal_spans.back().end =
                 std::min(output.literal_spans.back().end, output.text.size());
+        // A collapsed boundary past the retained end no longer names a position in the prompt; the
+        // Tokenizer rejects a byte boundary beyond the text outright, so drop it here instead.
+        std::erase_if(output.boundary_mappings,
+                      [&](const auto& mapping) { return mapping.offset > output.text.size(); });
         layout = inspect_prompt_layout(output, media);
     }
     RenderedChat result;

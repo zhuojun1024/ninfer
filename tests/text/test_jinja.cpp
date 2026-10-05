@@ -103,6 +103,43 @@ int origins_and_requests() {
     failures += check(clipped.regions.size() == 1 && clipped.regions[0].source_offset == 1 &&
                           clipped.regions[0].end == 6,
                       "Unicode slice lost byte origin mapping");
+    const auto trimmed =
+        JinjaTemplate("{{ ('\u3000' ~ text ~ '\u3000').strip() }}", "trim-origin")
+            .render({{"text", "\u3000<|image_pad|>\u3000"}}, {.regions = regions});
+    failures += check(trimmed.text == "<|image_pad|>" && trimmed.regions.size() == 1 &&
+                          trimmed.regions[0].tag == 7 && trimmed.regions[0].begin == 0 &&
+                          trimmed.regions[0].end == trimmed.text.size() &&
+                          trimmed.regions[0].source_offset == 3 &&
+                          trimmed.literal_spans.size() == 1 &&
+                          trimmed.literal_spans[0].begin == 0 &&
+                          trimmed.literal_spans[0].end == trimmed.text.size(),
+                      "trim across string parts lost literal status or byte origin");
+    failures += check(
+        trimmed.boundary_mappings.size() == 2 && trimmed.boundary_mappings[0].tag == 7 &&
+            trimmed.boundary_mappings[0].source_begin == 0 &&
+            trimmed.boundary_mappings[0].source_end == 3 &&
+            trimmed.boundary_mappings[0].offset == 0 && trimmed.boundary_mappings[1].tag == 7 &&
+            trimmed.boundary_mappings[1].source_begin == 16 &&
+            trimmed.boundary_mappings[1].source_end == 19 &&
+            trimmed.boundary_mappings[1].offset == 13,
+        "trim did not map deleted Unicode source boundaries to the surviving content edges");
+
+    const auto empty = JinjaTemplate("before{{ text|trim }}after", "empty-trim-origin")
+                           .render({{"text", " \t"}}, {.regions = regions});
+    failures += check(
+        empty.text == "beforeafter" && empty.regions.empty() && empty.literal_spans.empty() &&
+            empty.boundary_mappings.size() == 1 && empty.boundary_mappings[0].tag == 7 &&
+            empty.boundary_mappings[0].source_begin == 0 &&
+            empty.boundary_mappings[0].source_end == 2 && empty.boundary_mappings[0].offset == 6,
+        "fully trimmed input lost its boundary or created literal output bytes");
+
+    const auto quoted = JinjaTemplate("{{ text|trim|tojson }}", "trim-json-origin")
+                            .render({{"text", " value\n"}}, {.regions = regions});
+    failures += check(
+        quoted.text == "\"value\"" && quoted.regions.size() == 1 && quoted.regions[0].tag == 7 &&
+            quoted.regions[0].begin == 0 && quoted.regions[0].end == quoted.text.size() &&
+            !quoted.regions[0].source_offset && quoted.boundary_mappings.empty(),
+        "JSON encoding of trimmed input lost its origin or retained exact boundaries");
     std::vector<std::future<bool>> workers;
     for (int worker = 0; worker < 8; ++worker) {
         workers.push_back(std::async(std::launch::async, [&] {
