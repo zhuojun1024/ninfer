@@ -2469,6 +2469,15 @@ void TP2GenerationCore::drive_lane_queue() {
             // round. Discarding every lane's recall claim and host checkpoints costs a re-prefill;
             // guessing which lanes are still sound would cost correctness (P3.4/B4, docs/serving.md).
             session_invalidate_all();
+            // The throw may have landed between a launch and its wait - a stalled collective returns
+            // from the kernel only on its own bounded expiry - so drain both streams before any
+            // resource goes back: a page handed to another lane while a kernel is still writing it is
+            // somebody else's tokens.
+            for (Shard* shard : {&shard_a_, &shard_b_}) {
+                shard->device.bind_to_current_thread();
+                CUDA_CHECK(cudaStreamSynchronize(shard->device.stream));
+            }
+            shard_a_.device.bind_to_current_thread();
             // S1: a round that threw can leave a lane's pages reserved with no request owning them.
             // They go back to the shared pool here, so a failed batch does not cost the pool the
             // capacity of every lane it touched.

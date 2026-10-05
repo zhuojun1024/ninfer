@@ -134,6 +134,80 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   graph, card-2 Gen5 slot). Re-assess only if `origin/master` moves past
   `e31bc99b` in a way that touches the trunk. (source-verified 2026-09-29)
 
+- **Upstream `origin/master` = `origin/dev` = `68c54356` (2026-10-05): the
+  cache-boundary trimming fix is ported; the rest is still reference-only.**
+  Re-assessed 2026-10-05 after the baseline moved (73 upstream commits from the
+  `e360c4c0` merge base, 270 local ones).
+  - *Ported - `68c54356` "fix(frontend): preserve cache boundaries through
+    template trimming".* A source byte range collapsed by `trim`/`strip` is now
+    retained through string composition (`string_part::collapsed_source_end`,
+    `cut_bytes(begin, end, collapse_removed)`, `append_boundary`), published as
+    `TemplateOutput::boundary_mappings`, and consulted by `source_boundary`.
+    Before it, every trimmed part lost its `source_offset`, so
+    `MessagePartBoundary` and `LeadingInstructionBoundary` markers resolved to
+    nothing and `prepare_context_cache` dropped them silently (`if (!resolved)
+    continue`). That is the common case, not an edge case: the production
+    templates (`tools/chat_templates/qwen3_{6,8}.jinja`) apply `|trim` to every
+    message's rendered content and to `reasoning_content`, so a system block or
+    `tool_result` ending in a newline lost its requested frontier - the caller's
+    `cache_control` had no effect and the span was re-prefilled. Genuinely
+    ambiguous frontiers (repeated text, non-exact transforms, slice endpoints)
+    still resolve to no boundary, and a boundary landing inside one BPE token is
+    still rejected, so a wrong-frontier reuse is not introduced. Local
+    deviations: `strip()` keeps the local manual Unicode trim (upstream
+    `a8e212ac`'s `trim_utf8` refactor is a separate item), `value.cpp` keeps the
+    local `_WIN32` `localtime_s` branch, and the continuation truncation in
+    `chat_template.cpp` also drops collapsed boundaries that fall past the
+    retained end (upstream leaves the new vector unclamped while
+    `Tokenizer::encode_with_boundaries` rejects a byte boundary beyond the text
+    outright). Evidence: upstream's 20-case regression (Unicode spaces, macros,
+    slices, `tojson`, an injected BPE merge `x`+`y`) added to
+    `test_frontend.cpp` plus three `boundary_mappings` assertions in
+    `test_jinja.cpp`; 13 of the 14 resolvable cases fail without the fix, and
+    `ninfer_jinja_test` / `ninfer_qwen3_5_frontend_test` /
+    `ninfer_prompt_input_test` / the OpenAI+Anthropic schema tests /
+    `ninfer_prepare_ragged_prefix_test` pass with it. `ninfer_chat_templates_test`
+    fails on its recorded host-side cause (worklog L7396), identically before and
+    after the port.
+  - *Ported - `75a89050` "fix(runtime): wait for compute before request cleanup".*
+    `ProgramImpl::abort` and the `start_request` rollback returned the lane's
+    buffers, pages and execution row to the pools without waiting for the compute
+    stream, so a cancel that arrived after activation but before the first prefill
+    unit had waited for its uploads and initialization could free memory an
+    in-flight kernel was still writing. Local placement differs from upstream in
+    one respect: the sync sits before `retain_aborted_continuation`, because
+    catalogueing the aborted continuation reads the same device buffers and
+    upstream has no retention branch at that point. The same class was audited and
+    closed on the production route: `TP2GenerationCore::drive_lane_queue`'s
+    whole-batch failure path returns every lane's KV pages right after a round
+    that threw, and a stalled collective only leaves its kernel on the bounded
+    in-kernel expiry, so both shard streams now drain before the pages go back. No
+    sync is needed at the other release sites: `finish` is reachable only from
+    `Lifecycle::Finishable` (set after the round's host-visible results were
+    consumed), `commit`'s cancelled row only bumps the lane revision while the
+    release happens in `finish`/`abort`, the materialization abort settles the
+    transfer stream through `context_completion_` under the same open context
+    transaction (so admission cannot interleave before the upload completes), and
+    `fail_all_cleanup` runs on the terminal `failed_` path where the pool is never
+    handed out again. Evidence: full build; `ninfer_qwen3_5_tp2_lanes_test`
+    (2xRTX 5060 Ti, `NINFER_TEST_ARTIFACT=D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer`,
+    five scenarios including queued cancellation and a driver stop with a request
+    in flight) and `ninfer_tp_device_pair_test` (in-kernel AR stall/give-up) exit
+    0, the materialization/resource-manager/engine-options/HTTP host tests pass,
+    and the frontend/jinja suites still pass. No deterministic reproduction of the
+    in-flight cancel race exists; the change is an ordering guarantee on a path
+    that is otherwise rare.
+  - *Everything else on the trunk remains reference-only.* `b9114396` replaces
+    the context cache and adds preemptive scheduling (176 files), a different
+    product contract; the SM-count refactor
+    (`a667efdd`/`417eb3d6`/`e621c7d6`) reaches this fork only as the
+    `device_sm_count()` numeric policy (rope/rmsnorm done 2026-09-26; the MoE
+    prefill grid cap and the attention split budgets still need a 5060 Ti A/B);
+    the attention/linear perf batch (`23b0997d`…`7f6aafed`) is half-geometry MMA
+    under the same no-gain argument as the 2026-09-29 assessment; `1cfdb4d6`/
+    `84cf93e4` are no-ops at the local CUDA 13.1 toolchain. Inventory in PLAN.md
+    3.8. (source-verified 2026-10-05)
+
 ## Withdrawn approaches (falsified by real traffic)
 
 - **"Continuation boundary" (reuse to the end of the last generation):
