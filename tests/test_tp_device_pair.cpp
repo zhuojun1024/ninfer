@@ -651,6 +651,151 @@ void set_env(const char* name, const char* value) {
 #endif
 }
 
+
+// The skew the rotating arrival banks exist for: one side falls a collective behind and must still
+// find the id it is waiting for. The engine produces that skew on its own - only shard A is drained
+// where a round reads its sample, so the mirror shard is routinely a call or two behind - and this
+// injection makes it deterministic: hold one side's arrival poll of the second queued collective for
+// 30 ms, so the other side completes that collective and publishes the next one before the held side
+// ever looks. With one arrival bank (the geometry the transport shipped with) that has to give up on
+// the deadline; with the rotating banks the whole queue must complete, and every call stays bit exact
+// on both shards, because the recovering side reads the staging of the collective it fell behind on.
+int check_ar_skew_case(int dev_a, int dev_b, int banks, bool hold_peer, bool expect_stall) {
+    constexpr std::size_t kCountBytes = 20480; // the 27B hidden allreduce: one slice, one block
+    constexpr int kCalls              = 4;
+    constexpr int kHeldCall           = 2;
+    constexpr unsigned long long kHoldNs = 30ULL * 1000000ULL;
+
+    const std::string banks_setting = std::to_string(banks);
+    set_env("NINFER_TP2_AR_BANKS", banks_setting.c_str());
+    // The deadline only has to be longer than the hold: a short one keeps a regression (the held side
+    // really missing the id) bounded instead of paying the production 10 s per case.
+    set_env("NINFER_TP2_AR_TIMEOUT_MS", "1000");
+    std::unique_ptr<ninfer::tp::DevicePair> pair =
+        std::make_unique<ninfer::tp::DevicePair>(dev_a, dev_b);
+    set_env("NINFER_TP2_AR_BANKS", nullptr);
+    set_env("NINFER_TP2_AR_TIMEOUT_MS", nullptr);
+    if (!pair->in_kernel_allreduce()) {
+        std::cout << "SKIP ar skew: the in-kernel transport is unavailable\n";
+        return 0;
+    }
+
+    const std::size_t elements = kCountBytes / 2;
+    cudaStream_t stream_a = nullptr, stream_b = nullptr;
+    pair->a().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
+    pair->b().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
+
+    std::mt19937 rng(0x5C3E1u + static_cast<unsigned>(banks) * 2u + (hold_peer ? 0u : 1u));
+    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
+    std::vector<__nv_bfloat16> host_a(elements), host_b(elements);
+    std::vector<std::vector<__nv_bfloat16>> operands_a, operands_b;
+    std::vector<std::unique_ptr<ninfer::DeviceBuffer>> buf_a, buf_b;
+    for (int call = 0; call < kCalls; ++call) {
+        for (std::size_t i = 0; i < elements; ++i) {
+            host_a[i] = __float2bfloat16(dist(rng));
+            host_b[i] = __float2bfloat16(dist(rng));
+        }
+        operands_a.push_back(host_a);
+        operands_b.push_back(host_b);
+        pair->a().bind_to_current_thread();
+        buf_a.push_back(std::make_unique<ninfer::DeviceBuffer>(kCountBytes));
+        buf_a.back()->copy_from_host(host_a.data(), kCountBytes);
+        pair->b().bind_to_current_thread();
+        buf_b.push_back(std::make_unique<ninfer::DeviceBuffer>(kCountBytes));
+        buf_b.back()->copy_from_host(host_b.data(), kCountBytes);
+    }
+
+    pair->set_ar_fault_hold_poll(kHeldCall, kHoldNs, hold_peer);
+    const auto start = std::chrono::steady_clock::now();
+    for (int call = 0; call < kCalls; ++call) {
+        pair->allreduce(buf_a[call]->p, buf_b[call]->p, kCountBytes, stream_a, stream_b);
+    }
+    pair->a().bind_to_current_thread();
+    cudaStreamSynchronize(stream_a);
+    pair->b().bind_to_current_thread();
+    cudaStreamSynchronize(stream_b);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+    const bool stalled = pair->ar_stalled();
+
+    int failures = 0;
+    const char* const side = hold_peer ? "b" : "a";
+    if (stalled != expect_stall) {
+        std::cerr << "ar skew[" << banks << " bank, " << side << " held]: the pair "
+                  << (stalled ? "gave up on the deadline" : "completed") << ", but "
+                  << (expect_stall ? "the pre-bank geometry had to give up" : "the banks had to carry it")
+                  << '\n';
+        ++failures;
+    }
+    if (expect_stall) {
+        if (elapsed_ms < 900) {
+            std::cerr << "ar skew[" << banks << " bank, " << side
+                      << " held]: gave up after only " << elapsed_ms << " ms\n";
+            ++failures;
+        }
+        std::cout << "ar skew[" << kCountBytes << " bytes, " << banks << " bank, " << side
+                  << " held]: gave up after " << elapsed_ms
+                  << " ms - the slot this side polls held the\n"
+                  << "  next collective's id, which is the miss one arrival bank cannot carry\n";
+        pair->clear_ar_stall();
+    } else {
+        if (elapsed_ms > 900) {
+            std::cerr << "ar skew[" << banks << " bank, " << side << " held]: completed but took "
+                      << elapsed_ms << " ms\n";
+            ++failures;
+        }
+        std::vector<__nv_bfloat16> got(elements);
+        for (int call = 0; call < kCalls; ++call) {
+            for (int which = 0; which < 2; ++which) {
+                if (which == 0) {
+                    pair->a().bind_to_current_thread();
+                    buf_a[call]->copy_to_host(got.data(), kCountBytes);
+                } else {
+                    pair->b().bind_to_current_thread();
+                    buf_b[call]->copy_to_host(got.data(), kCountBytes);
+                }
+                for (std::size_t i = 0; i < elements; ++i) {
+                    const __nv_bfloat16 expected =
+                        __float2bfloat16(__bfloat162float(operands_a[call][i]) +
+                                         __bfloat162float(operands_b[call][i]));
+                    if (bits_of(got[i]) != bits_of(expected)) {
+                        std::cerr << "ar skew[" << banks << " bank, " << side << " held]: call " << call
+                                  << " shard " << which << " element " << i
+                                  << " differs after the recovery\n";
+                        ++failures;
+                        break;
+                    }
+                }
+            }
+        }
+        std::cout << "ar skew[" << kCountBytes << " bytes, " << banks << " bank, " << side
+                  << " held]: " << kCalls << " queued collectives completed bit exact in " << elapsed_ms
+                  << " ms\n";
+    }
+
+    pair->set_ar_fault_hold_poll(0, 0, true);
+    pair->a().bind_to_current_thread();
+    cudaStreamDestroy(stream_a);
+    pair->b().bind_to_current_thread();
+    cudaStreamDestroy(stream_b);
+    return failures;
+}
+
+// One arrival bank is the pre-bank geometry, so the injection must still produce the give-up there:
+// that is the control which shows the skewed case below is the failure the banks remove, not an
+// injection that never created the skew. Both sides are held in turn, because either one may be the
+// side that falls behind.
+int check_ar_skew(int dev_a, int dev_b) {
+    int failures = 0;
+    failures += check_ar_skew_case(dev_a, dev_b, 1, true, true);
+    failures += check_ar_skew_case(dev_a, dev_b, 4, true, false);
+    failures += check_ar_skew_case(dev_a, dev_b, 4, false, false);
+    return failures;
+}
+
 // The host-staging reduction must reproduce the device transport's BF16 add bit for bit, including
 // the cases its rounding is *defined* on rather than merely close to: signed zeros, denormals, exact
 // ties in both directions, sums that round up into infinity, and NaN payloads, which
@@ -1086,6 +1231,9 @@ int main() {
         ninfer::tp::DevicePair reserved(dev_a, dev_b);
         failures += check_reserve_channels(reserved);
     }
+    // The one-collective skew the rotating arrival banks exist for, with the pre-bank geometry as its
+    // positive control.
+    failures += check_ar_skew(dev_a, dev_b);
     if (failures == 0) { std::cout << "PASS\n"; return 0; }
     std::cerr << failures << " failures\n";
     return 1;

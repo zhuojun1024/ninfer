@@ -297,6 +297,27 @@ Historical reference only: current state and remaining work live in `PLAN.md`
 - **Two low-frequency failures (r67 IllegalAddress req#14; r69 HTTP 503
   req#14) are the same event class.** Natural rate ≲1/1,500 requests; long runs
   (1,500 requests, watchdog on) have not caught the trigger. (PLAN §3.3, §3.6)
+- **The two low-frequency transport failures are a one-collective rendezvous skew
+  (settled 2026-10-06).** The in-kernel allreduce published one id per slice and spun
+  until the peer's slot equalled it, while the engine legitimately lets the mirror shard
+  run a call or two behind (only shard A is drained where a round reads its sample), so
+  whenever the fast side completed a collective and published the next one before the
+  slow side sampled, the wait became unsatisfiable and the 10 s bound turned it into the
+  usual 503. The natural dumps pin it: arrival slot 0 differs by exactly one id between
+  A and B with every other slot identical, and `last=352` - the `dflash_selector_tp2`
+  back exchange payload (`align16(5*4 + 16*5*4)`) - i.e. two `sendrecv`s with no
+  device work between them, the tightest handoff the transport ever sees. Fixed by
+  banking the arrival and write-order slots and rotating the bank with the id
+  (`NINFER_TP2_AR_BANKS`, power of two in 1..8, default 4; 1 is the pre-bank geometry),
+  so the bank still holds the id the slow side is waiting for. Acceptance: the
+  `check_ar_skew` case in `ninfer_tp_device_pair_test` (hold injection: 1 bank must
+  still give up, 4 banks must complete bit exact) and
+  `tools/tp_bootstrap/r89_skew_acceptance.ps1` (1 bank must fail - the warmup with a stall
+  message or a request with 503 and a watchdog dump - and 4 banks must start and serve).
+  Injection: `NINFER_TP2_AR_FAULT_HOLD_POLL=<eager serial>:<ns>[:self]` (0 = every eager
+  collective; captures are excluded, since a hold recorded into a captured graph would be
+  replayed by every launch of it); both fault hooks log `[ar-fault]` when they land.
+  (device_pair.{h,cu}; worklog §3.10)
 - **BF16-add allreduce is bit-safe only for BF16 payloads.** I32/FP32 ids can
   carry signaling-NaN bit patterns; use `DevicePair::sendrecv` for byte-exact
   cross-card exchange. DFlash2's equivalent paths are fixed; the MTP route at

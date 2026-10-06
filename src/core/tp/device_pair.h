@@ -87,12 +87,35 @@ public:
     // ever handed out twice. Call it immediately before launching the graph that owns the channel.
     void arm_round(ArChannel channel);
 
+    // Arrival-bank geometry (see the arrival_a_ member). One bank holds one rendezvous id per slice
+    // and is one cache line; a side's write-order chains follow its arrival banks, at the same banks.
+    // The kernel indexes 'arrival + (id & mask) * kArSliceSlots + blockIdx.x', so the stride is part
+    // of the kernel's contract and is asserted against kArMaxSlices in device_pair.cu.
+    static constexpr std::size_t kArSliceSlots = 8;
+    static constexpr std::size_t kArBankBytes = kArSliceSlots * sizeof(unsigned long long);
+
     // Fault injection for the bounded-spin test: skip the peer-side launch of the n-th in-kernel
     // collective issued after arming (1-based; 0 disarms). It desynchronizes the two sides exactly
     // like a divergent call sequence, which is the failure the bound exists for. Diagnostics only.
     void set_ar_fault_skip_peer_call(std::uint64_t serial) noexcept {
         ar_fault_skip_call_ = serial;
         ar_call_serial_     = 0;
+    }
+
+    // Fault injection for the skew the banks exist to survive: hold one side's arrival poll for
+    // 'nanos' after it has published its own arrival, so the other side completes that collective and
+    // publishes the next one before this side ever looks. 'serial' counts eager (non-capture)
+    // in-kernel collectives since arming, 1-based, or 0 for every one of them; 'nanos' 0 disarms.
+    // 'peer' picks the b-side launch (true) or the a-side one (false). Captures are excluded because a
+    // hold recorded into a captured graph would be replayed by every launch of that graph, and the
+    // skew this hook reproduces is the eager one the production dumps show. NINFER_TP2_AR_FAULT_HOLD_POLL
+    // ('<serial>:<nanos>[:self]') arms the same hook at construction. Diagnostics only: the payload and
+    // the arithmetic are untouched.
+    void set_ar_fault_hold_poll(std::uint64_t serial, std::uint64_t nanos, bool peer) noexcept {
+        ar_fault_hold_call_   = serial;
+        ar_fault_hold_ns_     = nanos;
+        ar_fault_hold_peer_   = peer;
+        ar_fault_hold_serial_ = 0;
     }
 
     // Sizes the rendezvous id space to hold `count` captured graphs. Must be called before the first
@@ -150,6 +173,14 @@ private:
     // Arrival ids, one per allreduce slice, in mapped pinned host memory (the caller decides which
     // shard drives a pair, so a device allocation could be dereferenced from the other device's
     // context). Each slice writes its id, publishes an arrival, then spins for the peer's.
+    //
+    // The ids live in banks: consecutive collectives publish under different banks (bank = id & mask),
+    // so one bank still holds the id a slow side is waiting for after the peer has published the next
+    // collective. The engine legitimately produces that one-collective skew - the mirror shard is a
+    // call or two behind wherever only shard A is drained (see TP2GenerationCore::abort_if_ar_stalled)
+    // - and without the rotation the waiting side spins out its whole deadline on an id the slot has
+    // already overwritten. NINFER_TP2_AR_BANKS selects the count (a power of two in 1..8, default 4;
+    // 1 is the pre-bank geometry the skew acceptance uses as its positive control).
     unsigned long long* arrival_a_ = nullptr; // device pointer (device a) for its arrival array
     unsigned long long* arrival_b_ = nullptr; // device pointer (device b) for its arrival array
     void* arrival_host_a_ = nullptr; // cudaFreeHost handle for arrival_a_
@@ -162,6 +193,15 @@ private:
     unsigned long long ar_timeout_ns_ = 0; // 0 disables the deadline
     std::uint64_t ar_call_serial_     = 0; // in-kernel collectives issued since the last arming
     std::uint64_t ar_fault_skip_call_ = 0; // fault injection, see set_ar_fault_skip_peer_call
+
+    std::uint64_t ar_fault_hold_call_   = 0; // fault injection, see set_ar_fault_hold_poll
+    std::uint64_t ar_fault_hold_serial_ = 0; // eager collectives seen since the hook was armed
+    unsigned long long ar_fault_hold_ns_ = 0;
+    bool ar_fault_hold_peer_             = true;
+    // Arrival banks this pair publishes under, as a mask (banks - 1). Read once at construction from
+    // NINFER_TP2_AR_BANKS; the kernel and the watchdog both index the banks through it, so the move
+    // operations carry it or a moved pair would index a geometry its reservations were not sized for.
+    unsigned int ar_bank_mask_ = 3U;
     // Diagnostics only: divides the bytes each in-kernel collective exchanges, without changing the
     // payload the caller passed or the staging decision. A run with a divisor above one is
     // numerically wrong by construction (the skipped region keeps whatever the destination held,
@@ -229,8 +269,26 @@ private:
     // dev_a_/dev_b_ holding it. Returns its capacity per parity slot, or 0 when no rung fits: the
     // pair then has no in-kernel transport and every collective takes the host-staging fallback.
     std::size_t reserve_in_kernel_staging();
-    // True when the injected collective is the one whose peer launch must be skipped.
-    bool fault_skip_peer();
+    // What one collective's diagnostics hooks ask for. Taken once per collective, so the shared
+    // serial counter advances exactly once whatever combination is armed.
+    struct ArFaults {
+        bool skip_peer                  = false;
+        unsigned long long hold_self_ns = 0;
+        unsigned long long hold_peer_ns = 0;
+    };
+    ArFaults ar_faults();
+    // Arrival banks this pair publishes under (a power of two).
+    [[nodiscard]] std::size_t ar_banks() const noexcept {
+        return static_cast<std::size_t>(ar_bank_mask_) + 1U;
+    }
+    // A side's write-order chain base: its arrival banks, then the chains at the same banks.
+    [[nodiscard]] unsigned long long* ar_order_base(unsigned long long* arrival) const noexcept {
+        return arrival + ar_banks() * kArSliceSlots;
+    }
+    // One side's token block: the arrival banks followed by their write-order chains.
+    [[nodiscard]] std::size_t ar_token_bytes() const noexcept {
+        return 2U * ar_banks() * kArBankBytes;
+    }
     // What one collective runs with: the ordinal baked at capture (0 for eager, where the host
     // writes the id itself) and the base cell each side's kernel reads. Recording the base memcpy
     // node for a captured collective happens here, on its first appearance per stream.

@@ -239,7 +239,8 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
                             unsigned long long* order_mine, const unsigned long long* base_dev,
                             unsigned int call_index, unsigned long long base_value, int slot_bytes,
                             int groups, int* stall_mine, int* stall_peer,
-                            unsigned long long timeout_ns) {
+                            unsigned long long timeout_ns, unsigned int bank_mask,
+                            unsigned long long hold_ns) {
     // The id is a device load of a cell the host filled before the launch, plus the ordinal this
     // kernel was captured with. It is fixed for the whole call, so one read per block, published
     // through shared memory, is enough.
@@ -275,6 +276,14 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     if (stalled != 0) { ar_abandon_output(out_groups, begin, end, stride, threadIdx.x); return; }
     const unsigned long long token = shared_token;
     const int tail   = groups * 8;
+    // This collective's arrival bank. Consecutive collectives rotate banks, so the id a slow side is
+    // waiting for is still in the bank it published under when it finally looks, even though the peer
+    // has already published the next collective into another bank.
+    const int bank = static_cast<int>(token & static_cast<unsigned long long>(bank_mask));
+    const auto bank_offset = static_cast<std::size_t>(bank) * DevicePair::kArSliceSlots;
+    auto* arrival_mine_bank        = arrival_mine + bank_offset;
+    const auto* arrival_other_bank = arrival_other + bank_offset;
+    auto* order_mine_bank          = order_mine + bank_offset;
     auto* host_mine        = reinterpret_cast<__nv_bfloat16*>(
         host_mine_base + static_cast<std::size_t>(token & 1) * static_cast<std::size_t>(slot_bytes));
     const auto* host_other = reinterpret_cast<const __nv_bfloat16*>(
@@ -283,7 +292,7 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     const auto* local_groups  = reinterpret_cast<const uint4*>(local);
     const auto* other_groups  = reinterpret_cast<const uint4*>(host_other);
     if (blocks > 1 && blockIdx.x > 0 && threadIdx.x == 0) {
-        while (*(const volatile unsigned long long*)(order_mine + blockIdx.x - 1) != token) {
+        while (*(const volatile unsigned long long*)(order_mine_bank + blockIdx.x - 1) != token) {
             if (ar_expired(deadline)) {
                 stalled    = 1;
                 *(volatile int*)stall_mine = 1;
@@ -303,10 +312,17 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
-        *(volatile unsigned long long*)(order_mine + blockIdx.x)  = token;
-        *(volatile unsigned long long*)(arrival_mine + blockIdx.x) = token;
+        *(volatile unsigned long long*)(order_mine_bank + blockIdx.x)  = token;
+        *(volatile unsigned long long*)(arrival_mine_bank + blockIdx.x) = token;
         __threadfence_system();
-        while (*(const volatile unsigned long long*)(arrival_other + blockIdx.x) != token) {
+        // Diagnostics: delay this side's arrival poll, so the peer completes this collective and
+        // publishes the next one before this side ever looks. That is the skew the banks survive, and
+        // the hold is taken after the arrival is published, so the peer can always finish this one.
+        if (hold_ns != 0ULL) {
+            const unsigned long long until = ar_now_ns() + hold_ns;
+            while (ar_now_ns() < until) { __nanosleep(1000); }
+        }
+        while (*(const volatile unsigned long long*)(arrival_other_bank + blockIdx.x) != token) {
             if (ar_expired(deadline)) {
                 stalled    = 1;
                 *(volatile int*)stall_mine = 1;
@@ -365,10 +381,14 @@ constexpr int kArThreads               = 1024;
 constexpr int kArMaxSlices             = 8;
 // A slot holds one rendezvous id as an unsigned long long: the ids are host-authored and never
 // repeat over the pair's lifetime, which is only expressible in 64 bits - a 32-bit slot would let a
-// stale value from one id range match a future id from another.
-constexpr std::size_t kArSlotBytes     = 128; // one cache line per slot array (kArMaxSlices ids)
-constexpr std::size_t kArTokenBytes    = 2 * kArSlotBytes; // arrival array, then write-order chain
-constexpr std::size_t kArSlotIds       = kArSlotBytes / sizeof(unsigned long long);
+// stale value from one id range match a future id from another. One bank is a cache line of slice
+// slots; the pair lays out its arrival banks and their write-order chains through ar_banks(),
+// ar_order_base() and ar_token_bytes(), and the kernel indexes them with the launch's bank mask.
+static_assert(DevicePair::kArSliceSlots == static_cast<std::size_t>(kArMaxSlices),
+              "the kernel's slice stride and the pair's arrival-bank geometry have to agree");
+static_assert(DevicePair::kArBankBytes ==
+                  static_cast<std::size_t>(kArMaxSlices) * sizeof(unsigned long long),
+              "one bank is a cache line of slice slots");
 // One cache line per side's bounded-spin flag: the mapped host path is not coherent between peers,
 // so two flags sharing one line would let a peer's line write-back drop the other's store.
 constexpr std::size_t kArTokenStrideBytes = 64;
@@ -412,6 +432,9 @@ struct DevicePair::ArWatchState {
     const int* stall = nullptr;
     const unsigned char* arrival_a = nullptr;
     const unsigned char* arrival_b = nullptr;
+    // Arrival banks the pair publishes under: the dump reports the newest bank's slots, so its
+    // one-line format keeps meaning what the interpreter reads it as.
+    unsigned int banks = 1;
     std::atomic<unsigned long long> calls      = 0;
     std::atomic<unsigned long long> last_bytes = 0;
     std::atomic<bool> stop = false;
@@ -428,13 +451,24 @@ void DevicePair::stop_ar_watchdog() {
 
 namespace {
 
-// One arrival/order slot: an id per slice at the front of the array, the write-order chain for the
-// same slices at byte kArSlotBytes (see the ar_exchange launch sites). Read with memcpy because the
-// devices write them while the watchdog thread reads.
+// One arrival/order slot: an id per slice at the front of the bank, the write-order chain for the
+// same slices at the same bank one bank-stride further in (see DevicePair::ar_order_base). Read with
+// memcpy because the devices write them while the watchdog thread reads.
 unsigned long long watch_slot(const unsigned char* base, int index) {
     unsigned long long value = 0;
     std::memcpy(&value, base + static_cast<std::size_t>(index) * sizeof(value), sizeof(value));
     return value;
+}
+
+// Slot index of the newest bank a side published into: the banks rotate per collective, so the one
+// whose slice-0 slot holds the largest id is the last one written.
+int newest_bank(const unsigned char* base, unsigned int banks) {
+    int head = 0;
+    for (unsigned int bank = 1; bank < banks; ++bank) {
+        const int candidate = static_cast<int>(bank) * kArMaxSlices;
+        if (watch_slot(base, candidate) > watch_slot(base, head)) { head = candidate; }
+    }
+    return head;
 }
 
 // Renders eight slots for the watchdog's single-line dump.
@@ -454,11 +488,38 @@ void DevicePair::note_ar_call(std::size_t count_bytes) {
     watch_->calls.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Fault injection: only the armed process counts collectives, so an unarmed process pays nothing.
-bool DevicePair::fault_skip_peer() {
-    if (ar_fault_skip_call_ == 0) { return false; }
-    ++ar_call_serial_;
-    return ar_call_serial_ == ar_fault_skip_call_;
+// Fault injection: only an armed process counts collectives, so an unarmed process pays nothing.
+// The skip hook counts every in-kernel collective, captures included, as it always has. The hold
+// counts eager collectives only: a hold recorded into a captured graph would be replayed by every
+// launch of that graph (the kernel carries no serial), and the skew it reproduces is the eager one
+// the production dumps show.
+DevicePair::ArFaults DevicePair::ar_faults() {
+    ArFaults out;
+    if (ar_fault_skip_call_ != 0) {
+        ++ar_call_serial_;
+        out.skip_peer = ar_call_serial_ == ar_fault_skip_call_;
+        if (out.skip_peer) {
+            std::fprintf(stderr, "[ar-fault] collective %llu: skipping the peer launch\n",
+                         ar_call_serial_);
+        }
+    }
+    if (ar_fault_hold_ns_ != 0 && !capturing_) {
+        ++ar_fault_hold_serial_;
+        if (ar_fault_hold_call_ == 0 || ar_fault_hold_serial_ == ar_fault_hold_call_) {
+            if (ar_fault_hold_peer_) {
+                out.hold_peer_ns = ar_fault_hold_ns_;
+            } else {
+                out.hold_self_ns = ar_fault_hold_ns_;
+            }
+            // The landing is otherwise invisible in a healthy arm, and the acceptance has to tell "the
+            // injection ran and the banks carried it" from "the injection never ran".
+            std::fprintf(stderr,
+                         "[ar-fault] eager collective %llu: holding the %s arrival poll for %llu ns\n",
+                         ar_fault_hold_serial_, ar_fault_hold_peer_ ? "peer" : "self",
+                         ar_fault_hold_ns_);
+        }
+    }
+    return out;
 }
 
 bool DevicePair::ar_stalled() const noexcept {
@@ -660,12 +721,18 @@ void DevicePair::start_ar_watchdog() {
                 continue;
             }
             const unsigned long long id = raw->id->load(std::memory_order_relaxed);
+            // The newest bank is the one whose slice-0 slot holds the largest id (consecutive
+            // collectives rotate banks), so that is the bank the dump reports: the interpreter reads
+            // slot 0 as the last id a side published, and it must keep meaning that.
+            const int stride = static_cast<int>(raw->banks) * kArMaxSlices;
             unsigned long long slots[4][8] = {};
+            const int head_a = newest_bank(raw->arrival_a, raw->banks);
+            const int head_b = newest_bank(raw->arrival_b, raw->banks);
             for (int i = 0; i < 8; ++i) {
-                slots[0][i] = watch_slot(raw->arrival_a, i);
-                slots[1][i] = watch_slot(raw->arrival_a, static_cast<int>(kArSlotIds) + i);
-                slots[2][i] = watch_slot(raw->arrival_b, i);
-                slots[3][i] = watch_slot(raw->arrival_b, static_cast<int>(kArSlotIds) + i);
+                slots[0][i] = watch_slot(raw->arrival_a, head_a + i);
+                slots[1][i] = watch_slot(raw->arrival_a, stride + head_a + i);
+                slots[2][i] = watch_slot(raw->arrival_b, head_b + i);
+                slots[3][i] = watch_slot(raw->arrival_b, stride + head_b + i);
             }
             char arr_a[160] = {}, ord_a[160] = {}, arr_b[160] = {}, ord_b[160] = {};
             format_slots(slots[0], arr_a, sizeof(arr_a));
@@ -754,6 +821,26 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
     if (const char* fault = std::getenv("NINFER_TP2_AR_FAULT_SKIP_PEER_CALL")) {
         ar_fault_skip_call_ = std::strtoull(fault, nullptr, 10);
     }
+    // Fault injection for the skew acceptance: hold one side's arrival poll of an eager collective
+    // (see set_ar_fault_hold_poll). "<eager serial>:<nanos>", with an optional ":self" for the a-side
+    // launch; serial 0 holds every eager collective.
+    if (const char* hold = std::getenv("NINFER_TP2_AR_FAULT_HOLD_POLL")) {
+        char* split                     = nullptr;
+        const unsigned long long serial = std::strtoull(hold, &split, 10);
+        unsigned long long nanos        = 0;
+        bool peer                       = true;
+        if (split != nullptr && *split == ':') {
+            char* end          = nullptr;
+            nanos              = std::strtoull(split + 1, &end, 10);
+            const char* suffix = end;
+            if (suffix != nullptr && std::strncmp(suffix, ":self", 5) == 0) { peer = false; }
+        }
+        if (nanos != 0) {
+            ar_fault_hold_call_ = serial;
+            ar_fault_hold_ns_   = nanos;
+            ar_fault_hold_peer_ = peer;
+        }
+    }
     // Diagnostics: exchange only 1/N of every in-kernel collective's partial (see the member).
     if (const char* divisor = std::getenv("NINFER_TP2_AR_PAYLOAD_DIVISOR")) {
         const long long requested = std::strtoll(divisor, nullptr, 10);
@@ -766,6 +853,16 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
     }
     if (const char* threads = std::getenv("NINFER_TP2_AR_ADD_THREADS")) {
         host_add_threads_ = static_cast<unsigned>(std::strtoul(threads, nullptr, 10));
+    }
+    // Arrival banks: a power of two in 1..8, so the kernel can index with a mask. One bank is the
+    // geometry the transport shipped with, which the skew acceptance uses as its positive control.
+    if (const char* banks = std::getenv("NINFER_TP2_AR_BANKS")) {
+        const long long requested = std::strtoll(banks, nullptr, 10);
+        unsigned int count        = 1;
+        while (count < 8U && static_cast<long long>(count) * 2 <= requested) { count *= 2U; }
+        ar_bank_mask_ = count - 1U;
+        std::fprintf(stderr, "[mem] TP-2 arrival banks: %u (NINFER_TP2_AR_BANKS=%lld)\n", count,
+                     requested);
     }
     int can_a_to_b = 0;
     int can_b_to_a = 0;
@@ -791,11 +888,11 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
         const std::size_t staging = reserve_in_kernel_staging();
         if (staging != 0) {
             a_.bind_to_current_thread();
-            if (cudaHostAlloc(&arrival_host_a_, kArTokenBytes, cudaHostAllocPortable |
+            if (cudaHostAlloc(&arrival_host_a_, ar_token_bytes(), cudaHostAllocPortable |
                                  cudaHostAllocMapped) == cudaSuccess &&
                 cudaHostGetDevicePointer((void**)&arrival_a_, arrival_host_a_, 0) == cudaSuccess) {
                 b_.bind_to_current_thread();
-                if (cudaHostAlloc(&arrival_host_b_, kArTokenBytes, cudaHostAllocPortable |
+                if (cudaHostAlloc(&arrival_host_b_, ar_token_bytes(), cudaHostAllocPortable |
                                      cudaHostAllocMapped) == cudaSuccess &&
                     cudaHostGetDevicePointer((void**)&arrival_b_, arrival_host_b_, 0) == cudaSuccess) {
                     // The rendezvous id cells and the bounded-spin flags. A channel cell is
@@ -836,8 +933,8 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
                         }
                     }
                     if (ids) {
-                        std::memset(arrival_host_a_, 0, kArTokenBytes);
-                        std::memset(arrival_host_b_, 0, kArTokenBytes);
+                        std::memset(arrival_host_a_, 0, ar_token_bytes());
+                        std::memset(arrival_host_b_, 0, ar_token_bytes());
                         in_kernel_bytes_ = staging;
                         in_kernel_available_ = true;
                         if (staging != kInKernelArBytes) {
@@ -902,6 +999,7 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
         watch_->id        = &ar_last_id_;
         watch_->arrival_a = static_cast<const unsigned char*>(arrival_host_a_);
         watch_->arrival_b = static_cast<const unsigned char*>(arrival_host_b_);
+        watch_->banks     = static_cast<unsigned int>(ar_banks());
         start_ar_watchdog();
     }
 }
@@ -943,6 +1041,8 @@ DevicePair::DevicePair(DevicePair&& other) noexcept
       stall_host_(other.stall_host_), stall_a_(other.stall_a_), stall_b_(other.stall_b_),
       ar_timeout_ns_(other.ar_timeout_ns_), ar_call_serial_(other.ar_call_serial_),
       ar_fault_skip_call_(other.ar_fault_skip_call_),
+      ar_fault_hold_call_(other.ar_fault_hold_call_), ar_fault_hold_ns_(other.ar_fault_hold_ns_),
+      ar_fault_hold_peer_(other.ar_fault_hold_peer_), ar_bank_mask_(other.ar_bank_mask_),
       ar_payload_divisor_(other.ar_payload_divisor_),
       ar_channel_capacity_(other.ar_channel_capacity_), base_host_(other.base_host_),
       base_dev_a_(other.base_dev_a_), base_dev_b_(other.base_dev_b_),
@@ -979,6 +1079,7 @@ DevicePair::DevicePair(DevicePair&& other) noexcept
         watch_->id        = &ar_last_id_;
         watch_->arrival_a = static_cast<const unsigned char*>(arrival_host_a_);
         watch_->arrival_b = static_cast<const unsigned char*>(arrival_host_b_);
+        watch_->banks     = static_cast<unsigned int>(ar_banks());
         watch_->stop.store(false, std::memory_order_relaxed);
         start_ar_watchdog();
     }
@@ -1028,6 +1129,10 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
     ar_timeout_ns_       = other.ar_timeout_ns_;
     ar_call_serial_      = other.ar_call_serial_;
     ar_fault_skip_call_  = other.ar_fault_skip_call_;
+    ar_fault_hold_call_  = other.ar_fault_hold_call_;
+    ar_fault_hold_ns_    = other.ar_fault_hold_ns_;
+    ar_fault_hold_peer_  = other.ar_fault_hold_peer_;
+    ar_bank_mask_        = other.ar_bank_mask_;
     base_host_           = other.base_host_;
     base_dev_a_          = other.base_dev_a_;
     base_dev_b_          = other.base_dev_b_;
@@ -1070,6 +1175,7 @@ DevicePair& DevicePair::operator=(DevicePair&& other) noexcept {
         watch_->id        = &ar_last_id_;
         watch_->arrival_a = static_cast<const unsigned char*>(arrival_host_a_);
         watch_->arrival_b = static_cast<const unsigned char*>(arrival_host_b_);
+        watch_->banks     = static_cast<unsigned int>(ar_banks());
         watch_->stop.store(false, std::memory_order_relaxed);
         start_ar_watchdog();
     }
@@ -1141,10 +1247,8 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
         // require_bytes already bounds the payload to whole 16-byte groups; the pointer check only
         // decides whether the vectorized group loops may be used.
         const int groups = (address % 16 == 0) ? count / 8 : 0;
-        auto* order_a = reinterpret_cast<unsigned long long*>(
-            reinterpret_cast<char*>(arrival_a_) + kArSlotBytes);
-        auto* order_b = reinterpret_cast<unsigned long long*>(
-            reinterpret_cast<char*>(arrival_b_) + kArSlotBytes);
+        auto* order_a = ar_order_base(arrival_a_);
+        auto* order_b = ar_order_base(arrival_b_);
         // Diagnostics may shrink the range a collective actually exchanges; the caller's payload and
         // the staging decision still describe the full size. See NINFER_TP2_AR_PAYLOAD_DIVISOR.
         int exchange_groups = groups;
@@ -1158,41 +1262,43 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
             // launch the retired token bump used to add was pure latency at this payload. The thread
             // count stays at kArThreads: a smaller block regressed, because the payload's cost is
             // the mapped-host round trip and the group loops want the parallelism.
-            const bool skip_peer = fault_skip_peer();
+            const ArFaults faults = ar_faults();
             a_.bind_to_current_thread();
             ar_exchange<true><<<1, kArThreads, 0, stream_a>>>(
                 reinterpret_cast<const __nv_bfloat16*>(data_a),
                 reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(small_dev_a_),
                 static_cast<const char*>(small_dev_b_), exchange_count, arrival_a_, arrival_b_, order_a,
                 id.base_a, id.call_index, id.value, static_cast<int>(kArSmallBytes), exchange_groups,
-                stall_a_, stall_b_, ar_timeout_ns_);
-            if (!skip_peer) {
+                stall_a_, stall_b_, ar_timeout_ns_, ar_bank_mask_, faults.hold_self_ns);
+            if (!faults.skip_peer) {
                 b_.bind_to_current_thread();
                 ar_exchange<true><<<1, kArThreads, 0, stream_b>>>(
                     reinterpret_cast<const __nv_bfloat16*>(data_b),
                     reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(small_dev_b_),
                     static_cast<const char*>(small_dev_a_), exchange_count, arrival_b_, arrival_a_, order_b,
                     id.base_b, id.call_index, id.value, static_cast<int>(kArSmallBytes), exchange_groups,
-                    stall_b_, stall_a_, ar_timeout_ns_);
+                    stall_b_, stall_a_, ar_timeout_ns_, ar_bank_mask_, faults.hold_peer_ns);
             }
             return;
         }
-        const int slices     = ar_slices(count_bytes);
-        const int slot_bytes = static_cast<int>(in_kernel_bytes_);
-        const bool skip_peer = fault_skip_peer();
+        const int slices      = ar_slices(count_bytes);
+        const int slot_bytes  = static_cast<int>(in_kernel_bytes_);
+        const ArFaults faults = ar_faults();
         a_.bind_to_current_thread();
         ar_exchange<true><<<slices, kArThreads, 0, stream_a>>>(
             reinterpret_cast<const __nv_bfloat16*>(data_a),
             reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(dev_a_),
             static_cast<const char*>(dev_b_), exchange_count, arrival_a_, arrival_b_, order_a, id.base_a,
-            id.call_index, id.value, slot_bytes, exchange_groups, stall_a_, stall_b_, ar_timeout_ns_);
-        if (!skip_peer) {
+            id.call_index, id.value, slot_bytes, exchange_groups, stall_a_, stall_b_, ar_timeout_ns_,
+            ar_bank_mask_, faults.hold_self_ns);
+        if (!faults.skip_peer) {
             b_.bind_to_current_thread();
             ar_exchange<true><<<slices, kArThreads, 0, stream_b>>>(
                 reinterpret_cast<const __nv_bfloat16*>(data_b),
                 reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(dev_b_),
                 static_cast<const char*>(dev_a_), exchange_count, arrival_b_, arrival_a_, order_b, id.base_b,
-                id.call_index, id.value, slot_bytes, exchange_groups, stall_b_, stall_a_, ar_timeout_ns_);
+                id.call_index, id.value, slot_bytes, exchange_groups, stall_b_, stall_a_, ar_timeout_ns_,
+                ar_bank_mask_, faults.hold_peer_ns);
         }
         return;
     }
@@ -1253,10 +1359,8 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
         // require_bytes already bounds the payload to whole 16-byte groups; the pointer check only
         // decides whether the vectorized group loops may be used.
         const int groups = (address % 16 == 0) ? count / 8 : 0;
-        auto* order_a = reinterpret_cast<unsigned long long*>(
-            reinterpret_cast<char*>(arrival_a_) + kArSlotBytes);
-        auto* order_b = reinterpret_cast<unsigned long long*>(
-            reinterpret_cast<char*>(arrival_b_) + kArSlotBytes);
+        auto* order_a = ar_order_base(arrival_a_);
+        auto* order_b = ar_order_base(arrival_b_);
         // Diagnostics may shrink the range a collective actually exchanges; the caller's payload and
         // the staging decision still describe the full size. See NINFER_TP2_AR_PAYLOAD_DIVISOR.
         int exchange_groups = groups;
@@ -1266,39 +1370,41 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
             exchange_count  = exchange_groups * 8;
         }
         if (small_available_ && count_bytes <= kArSmallBytes) {
-            const bool skip_peer = fault_skip_peer();
+            const ArFaults faults = ar_faults();
             a_.bind_to_current_thread();
             ar_exchange<false><<<1, kArThreads, 0, stream_a>>>(
                 static_cast<const __nv_bfloat16*>(send_a), static_cast<__nv_bfloat16*>(recv_a),
                 static_cast<char*>(small_dev_a_), static_cast<const char*>(small_dev_b_), exchange_count,
                 arrival_a_, arrival_b_, order_a, id.base_a, id.call_index, id.value,
-                static_cast<int>(kArSmallBytes), exchange_groups, stall_a_, stall_b_, ar_timeout_ns_);
-            if (!skip_peer) {
+                static_cast<int>(kArSmallBytes), exchange_groups, stall_a_, stall_b_, ar_timeout_ns_,
+                ar_bank_mask_, faults.hold_self_ns);
+            if (!faults.skip_peer) {
                 b_.bind_to_current_thread();
                 ar_exchange<false><<<1, kArThreads, 0, stream_b>>>(
                     static_cast<const __nv_bfloat16*>(send_b), static_cast<__nv_bfloat16*>(recv_b),
                     static_cast<char*>(small_dev_b_), static_cast<const char*>(small_dev_a_), exchange_count,
                     arrival_b_, arrival_a_, order_b, id.base_b, id.call_index, id.value,
-                    static_cast<int>(kArSmallBytes), exchange_groups, stall_b_, stall_a_, ar_timeout_ns_);
+                    static_cast<int>(kArSmallBytes), exchange_groups, stall_b_, stall_a_, ar_timeout_ns_,
+                    ar_bank_mask_, faults.hold_peer_ns);
             }
             return;
         }
-        const int slices     = ar_slices(count_bytes);
-        const int slot_bytes = static_cast<int>(in_kernel_bytes_);
-        const bool skip_peer = fault_skip_peer();
+        const int slices      = ar_slices(count_bytes);
+        const int slot_bytes  = static_cast<int>(in_kernel_bytes_);
+        const ArFaults faults = ar_faults();
         a_.bind_to_current_thread();
         ar_exchange<false><<<slices, kArThreads, 0, stream_a>>>(
             static_cast<const __nv_bfloat16*>(send_a), static_cast<__nv_bfloat16*>(recv_a),
             static_cast<char*>(dev_a_), static_cast<const char*>(dev_b_), exchange_count, arrival_a_,
             arrival_b_, order_a, id.base_a, id.call_index, id.value, slot_bytes, exchange_groups, stall_a_,
-            stall_b_, ar_timeout_ns_);
-        if (!skip_peer) {
+            stall_b_, ar_timeout_ns_, ar_bank_mask_, faults.hold_self_ns);
+        if (!faults.skip_peer) {
             b_.bind_to_current_thread();
             ar_exchange<false><<<slices, kArThreads, 0, stream_b>>>(
                 static_cast<const __nv_bfloat16*>(send_b), static_cast<__nv_bfloat16*>(recv_b),
                 static_cast<char*>(dev_b_), static_cast<const char*>(dev_a_), exchange_count, arrival_b_,
                 arrival_a_, order_b, id.base_b, id.call_index, id.value, slot_bytes, exchange_groups,
-                stall_b_, stall_a_, ar_timeout_ns_);
+                stall_b_, stall_a_, ar_timeout_ns_, ar_bank_mask_, faults.hold_peer_ns);
         }
         return;
     }
