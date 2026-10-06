@@ -1,7 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <span>
 #include <string_view>
+#include <vector>
+
+#include "ninfer/types.h"
 
 namespace ninfer::runtime {
 
@@ -77,6 +83,78 @@ inline constexpr std::string_view kAssistantThinkClose = "</think>";
     const std::size_t replayed_end  = replayed_close + kToolCallClose.size();
     return generated_body.substr(generated_open, generated_end - generated_open) ==
            replayed_body.substr(replayed_open, replayed_end - replayed_open);
+}
+
+// One history an incoming prompt could be continuing: the tokens a lineage committed, and where the
+// answer it wrote begins inside them.
+struct AdoptionSource {
+    std::span<const TokenId> history;
+    std::size_t turn_begin = 0;
+    // This lane's own KV still holds the history, so it is the state the lane really carries and it
+    // hides every other source.
+    bool resident = false;
+    // Host slabs carry the history, so a recall can bring it back onto any lane.
+    bool stored = false;
+    // Diagnostics: -1 for the lane's own lineage, otherwise the catalog index the history came from.
+    std::int64_t id = -1;
+};
+
+// A source that can describe the turn a client replayed, with the number of tokens it agrees with
+// the incoming prompt on.
+struct AdoptionCandidate {
+    // Index into the sources the candidate came from.
+    std::size_t source = 0;
+    std::size_t shared = 0;
+};
+
+// The histories an incoming prompt could be continuing, deepest agreement first.
+//
+// A lane that still holds its own lineage offers only that one: it is the state this lane's KV
+// actually carries, which is what a single-lane route has always run. A lane that has retired its
+// lineage - the batched route hands its pages back and drops the lineage when a request retires -
+// has nothing left but the catalog, and the replayed answer then has to be matched against the
+// stored conversations instead. That is the entry a recall is about to restore onto this lane
+// anyway, so agreeing with it is exactly what keeps the conversation resident.
+//
+// "divergence" accumulates the deepest agreement over the sources this call considers - the ones the
+// lane's own lineage does not hide and that have KV to restore - because it is the reuse measurement
+// a caller reports when nothing is adopted.
+[[nodiscard]] inline std::vector<AdoptionCandidate>
+adoption_candidates(std::span<const TokenId> incoming, std::span<const AdoptionSource> sources,
+                    std::size_t& divergence) {
+    bool have_resident = false;
+    for (const AdoptionSource& source : sources) {
+        if (source.resident) {
+            have_resident = true;
+            break;
+        }
+    }
+    std::vector<AdoptionCandidate> candidates;
+    for (std::size_t index = 0; index < sources.size(); ++index) {
+        const AdoptionSource& source = sources[index];
+        if (have_resident ? !source.resident : !source.stored) { continue; }
+        // The whole history in front of the turn has to match, or this is a different history and not
+        // a replay of the answer it wrote. An empty boundary means no completed prefill is in reach.
+        if (source.history.empty() || source.turn_begin == 0 ||
+            source.history.size() <= source.turn_begin || incoming.size() <= source.turn_begin) {
+            continue;
+        }
+        const std::size_t common = std::min(source.history.size(), incoming.size());
+        std::size_t shared       = 0;
+        while (shared < common && source.history[shared] == incoming[shared]) { ++shared; }
+        divergence = std::max(divergence, shared);
+        if (shared < source.turn_begin) { continue; }
+        candidates.push_back(AdoptionCandidate{index, shared});
+    }
+    // Deepest agreement first: that is the conversation this prompt is a later turn of. A history the
+    // client agrees with further is never a worse guess than one it parts from sooner.
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [&](const AdoptionCandidate& left, const AdoptionCandidate& right) {
+                         if (left.shared != right.shared) { return left.shared > right.shared; }
+                         return sources[left.source].history.size() >
+                                sources[right.source].history.size();
+                     });
+    return candidates;
 }
 
 } // namespace ninfer::runtime

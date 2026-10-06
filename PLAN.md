@@ -471,3 +471,27 @@ TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，
 
 **测试覆盖（本轮补齐）**：`tests/models/qwen3_5/test_tp2_sessions.cpp` 新增 `check_unaligned_dialogue`，用裸 token 路径构造「同开场 prompt、不同续写」的双会话（第一个 entry 失去 resident 且无 host 副本），再让第一个会话回来。**反向验证**：把 recall 封顶改回 `UINT32_MAX` 后，该测试以 `0xC0000005`（访问违例）终止——正是本节的崩溃；封顶在位时通过并与 oracle 一致。
 
+### 4.11 TP-2 多并发：重渲染答案的 adoption 失效（已修复）
+
+**范围**：本节只修原始报告的**第三个**症状（「自己 decode 的内容还要自己重新 prefill」）。第一、二个症状（系统提示词在两个会话之间没有复用、第二个会话重 prefill 系统提示词）**不在本节**：它们卡在 `session_recall` 对 `entry.device_lane >= 0` 的跳过（`tp2_generation_core.cpp:6157-6158`），也就是「第一条会话还在跑时，另一个会话共享同一段 stable block」这个**未实现特性**（§4.8 ③A，:368 标为未实施）。该跳过已在 `docs/PLAN-tp2-concurrency-review-remediation.md:251-259`（审查项 B5/R5）确认为「已确认不是正确性缺陷」，并在 `docs/serving.md:87-100` 写明「device-resident reuse depends on which lane a request lands on」。
+
+**现象（生产日志 `C:\ninfer\serve-win.log`，`--max-concurrency 2`）**：req#7–#10 的 cache **恒等于上一轮的 prompt 长度**（45,099 / 51,629 / 53,785）而不是上一轮的 frontier（51,387 / 51,896 / 54,065），差额精确等于上一轮的生成数（6,289 / 268 / 281）。req#5/#6 则拿到了上一轮 frontier（29,427 / 29,576）。
+
+**根因**：批量执行器在请求终态执行 `retire_lane_session(lane.slot); release_lane_kv(lane.slot);`（plain `tp2_generation_core.cpp:3438-3439`、spec `:4233-4234`）。`release_lane_kv` 在 `lanes_ > 1` 时清空该 lane 的 `cached_prompt_tokens`/`cached_boundaries`/`cached_state_valid`/`live_state_valid` 并 `invalidate_host_checkpoints`（`:3147-3184`）。而把「客户端回传的答案」对齐回「引擎自己采样的 token」的唯一机制 `adopt_generated_turn` 只读 lane 自己的 `cached_prompt_tokens`（原 `:6387` 的早退）⇒ 已被清空 ⇒ adoption 静默失效。于是 `session_recall` 只能按逐 token 公共前缀取边界，`offered[0] = entry.frontier` 被 `offered[kind] > shared` 挡掉（`:6178-6179`），只剩 `host_prompt_end`。req#5/#6 之所以没暴露，是因为客户端回传与生成 token 逐 token 一致（`shared == frontier`），根本不需要 adoption。
+
+**为什么不是「客户端丢了 reasoning」**：req#7 的 prompt 45,099 = 13,492（系统提示词）+ 31,314（回放）+ 293（新用户轮），回放总长与 req#4 的生成数（31,314）精确相等 ⇒ 回放的 token 数没有缩水，分歧只在生成段开头。
+
+**分歧机制**：`src/models/qwen3_5/frontend/output_session.cpp:260-289` 把 reasoning 通道原样送出（content 通道在 `:246-258` 按 `strip_content_leading` 去掉前导空白，reasoning 没有），`src/runtime/engine/engine_core.h:709-724` 直接累加 delta，所以引擎返回的 `reasoning` 可以以换行开头；而模板 `D:/LLM/chat_template.jinja:331` 写 `reasoning_content = reasoning_content | trim` 把它去掉 ⇒ 生成段第 0 个 token 就分歧。这正是 `same_rendered_turn` 容忍（`src/runtime/engine/turn_replay.h:56` 比较 `trim(generated_head)` 与 `trim(replayed_head)`）而 `adopt_generated_turn` 应当消除的分歧。
+
+**修复**：把候选选择抽成 `src/runtime/engine/turn_replay.h` 的纯函数 `adoption_candidates(incoming, sources, divergence)`；`adopt_generated_turn` 在 lane 自己的 lineage 为空时改用 catalog：只取 `entry.device_lane < 0 && entry.host_kv_end != 0`（recall 能恢复的那些）的 `(entry.tokens, entry.prompt_end)` 作候选，按 `shared` 降序（同则 `history.size()` 降序）稳定排序，逐个走原来的 `same_rendered_turn` + 拼接逻辑。lane lineage 非空时行为逐字节不变（只产生一个候选，且它遮蔽 catalog）。这条路径同时覆盖「跨 lane 续接」（req#7：上一轮在 lane1，本轮落 lane0）与「同 lane 续接」（req#8–#10）。
+
+
+**实测**：`ninfer_turn_replay_test` 通过（含新增的 `check_adoption_candidates` 断言）；两车道 `check_replayed_answer_across_lanes`（lanes=2）通过（`reused 242 tokens, past the 168-token prompt it was built from`）；单车道 `check_replayed_answer_keeps_prompt_end` 仍 `reused 70 of 58`，与 §4.9 一致，说明单车道行为未变。回归（`NINFER_TEST_ROUTE=plain`，`_temp/20261002-2129_tp2final.ps1`）：`ninfer_qwen3_5_tp2_lanes_test` 5/5 通过；`ninfer_qwen3_5_tp2_sessions_test` 在三条 passed 之后停在 §3.3 既有的「shared system prompt 首采样分叉」（`got [2752 13 198 197 197 92 198 197] expected [467 419 538 13 198 197 197 92]`），该行与改动前的 `_temp/20261002-1541_tp2model_sessions.log` 逐字节相同 ⇒ 本次改动无新增失败（该失败已在 :195-197 记为既有）。**生产日志的指纹（req#7–#10 的 cache == 上一轮 prompt 长度）本轮未做服务端重放复核**：重现它需要原会话的 systemPrompt + 工具集；本次交付的依据是日志数字自洽性（回放 token 数与生成数精确相等）与分歧机制的代码定位。
+
+**测试覆盖**
+
+- `ninfer_turn_replay_test` 新增 `check_adoption_candidates`：catalog 回退、lane lineage 优先并遮蔽 catalog、既非 resident 又非 stored 的来源被忽略、按 agreement 排序与同分按更长历史排序、四类边界守卫（`turn_begin == 0`、`history.size() <= turn_begin`、`incoming.size() <= turn_begin`、空 history）、`shared < turn_begin` 拒绝。**这是本次修复的回归保护**：修复前「lineage 为空」这一分支根本不产生任何候选。
+- `tests/models/qwen3_5/test_tp2_sessions.cpp` 新增 `check_replayed_answer_across_lanes`（lanes=2，thinking 开启，客户端回传 reasoning + content）。**但它不隔离本次修复**：实测 trace 为 `[tp2-reuse] ... shared == cached ... adopted=0 ... src=live`，客户端回放与引擎 token 逐 token 一致，`session_recall` 直接取 `entry.frontier`，修复前后同值。原因同 §4.9：客户端 prompt 的 token 来自模板渲染，渲染是规范化的，客户端造不出 token 分歧；分歧只能来自模型自己采样出的非规范字节。故它只作多车道路线的回放守卫，注释已写明。**试过并放弃的隔离手法**（本轮验证）：给回放的 assistant 正文注入前导空白——无效，`D:/LLM/chat_template.jinja:244` 对 assistant 正文写 `render_content(...) | trim`（`:331` 对 reasoning 同样 `| trim`），前导/尾随空白在渲染时就被去掉；能存活的只有正文**内部**的空白改动，而那会让 `same_rendered_turn`（`src/runtime/engine/turn_replay.h:56` 比较 trim 后的 head/body）判定为不同的轮次 ⇒ 客户端可构造的分歧与 `same_rendered_turn` 的容忍域互斥，端到端强制分歧在此题下不可行。
+
+**未做**：`release_lane_kv` 保持原样。catalog 已覆盖真实场景；保留 lane lineage 只在 `session_capacity_ == 0` 时有意义，而那时页已释放、本就无法复用。
+

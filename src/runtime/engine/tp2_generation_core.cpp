@@ -6393,117 +6393,144 @@ TP2GenerationCore::adopt_generated_turn(models::qwen3_5::PreparedPromptData& dat
     const RetentionState& lane_state = retention(lane);
     TurnAdoption adoption;
     adoption.prompt_tokens = prompt_tokens;
-    if (lane_state.cached_prompt_tokens.empty()) { return adoption; }
-    // Where the client's rendering and this lineage's history part. Taken before anything is
-    // replaced: it is both the reuse decision the scan would have made and, for the trace, the only
-    // measurement of a re-rendered answer that survives the adoption itself.
-    const std::size_t common = std::min(lane_state.cached_prompt_tokens.size(), data.token_ids.size());
-    std::size_t shared        = 0;
-    while (shared < common && lane_state.cached_prompt_tokens[shared] == data.token_ids[shared]) { ++shared; }
-    adoption.divergence = shared;
-    // A multimodal request is left alone: its token array carries vision runs whose positions a
-    // replacement would have to keep, and a media turn never comes back as pure text.
-    if (data.has_media()) { return adoption; }
-    // Where the answer this lineage generated begins. The slot-0 snapshot is the boundary the cached
-    // lineage's last prefill ended on, which is exactly the position the answer starts at, and it
-    // survives the catalog letting the conversation go. The session field is chunk-start bookkeeping,
-    // so it is only the fallback for a walk that left no snapshot of its own.
-    std::size_t turn_begin = lane_state.cached_boundaries[0];
-    if (turn_begin == 0 && lane_state.active_session != kNoSession) {
-        turn_begin = sessions_[lane_state.active_session].prompt_end;
-    }
-    const std::size_t turn_end = lane_state.cached_prompt_tokens.size();
-    // The whole history in front of the turn has to match, or this is a different history and not a
-    // replay of the answer this lineage wrote. An empty ring means no completed prefill is in reach.
-    if (turn_begin == 0 || turn_end <= turn_begin || data.token_ids.size() <= turn_begin ||
-        shared < turn_begin) {
-        return adoption;
-    }
-    // An adoption only pays while it deepens the prefix the scan can reach. It charges for that in
-    // the client's coordinates: the walk runs the tokens this lineage generated in place of the
-    // replayed ones, so the prompt stops agreeing with the client's own rendering at the divergence,
-    // and every later turn of the conversation is measured from there. When the client's rendering
-    // already agrees with the whole history this entry recorded, the live frontier sits inside that
-    // agreement and the scan takes it with no replacement at all: the splice could only trade
-    // positions the client will keep reproducing for ones it never will. A tool-calling conversation
-    // hits that exactly - the template closes the turn with framing the raw sampled tokens do not
-    // carry - and the replacement shortened its prompt behind the answer it had already paid for, so
-    // every following turn matched only up to the divergence and restarted on a host checkpoint.
-    if (shared + 1 >= turn_end) { return adoption; }
-    // The replay ends where the message after the turn begins. A prompt without that boundary - an
-    // encoded token stream, or a turn the template folds into a neighbouring message - cannot be
-    // compared here and keeps today's behaviour.
-    std::size_t replay_end = 0;
-    for (const auto& boundary : data.message_boundaries) {
-        if (boundary.has_value() && *boundary > turn_begin) {
-            replay_end = *boundary;
-            break;
+    // The histories this prompt could be continuing, each paired with the position the answer it
+    // wrote begins at.
+    //
+    // The lane's own lineage is the only candidate while it is alive: it is the state this lane's KV
+    // actually holds, and this is exactly what a single-lane route has always run. The catalog is the
+    // fallback the batched route leaves behind - a lane hands its pages back and drops its lineage
+    // when a request retires (release_lane_kv), so the lane that serves the next turn of a
+    // conversation is routinely not the lane that served the last one, and the entry left in the
+    // catalog is then the only copy of that turn, and the very entry session_recall() is about to
+    // restore. Only entries recall can restore are worth adopting: one still resident on another lane
+    // is skipped there (a live session must not be stolen), and one with no host slab has nothing to
+    // restore.
+    std::vector<AdoptionSource> sources;
+    if (!lane_state.cached_prompt_tokens.empty()) {
+        // Where the answer this lineage generated begins. The slot-0 snapshot is the boundary the
+        // cached lineage's last prefill ended on, which is exactly the position the answer starts at,
+        // and it survives the catalog letting the conversation go. The session field is chunk-start
+        // bookkeeping, so it is only the fallback for a walk that left no snapshot of its own.
+        std::size_t turn_begin = lane_state.cached_boundaries[0];
+        if (turn_begin == 0 && lane_state.active_session != kNoSession) {
+            turn_begin = sessions_[lane_state.active_session].prompt_end;
+        }
+        sources.push_back(
+            AdoptionSource{lane_state.cached_prompt_tokens, turn_begin, true, false, -1});
+    } else {
+        for (std::size_t index = 0; index < sessions_.size(); ++index) {
+            const SessionEntry& entry = sessions_[index];
+            if (entry.device_lane >= 0 || entry.host_kv_end == 0) { continue; }
+            sources.push_back(AdoptionSource{entry.tokens, entry.prompt_end, false, true,
+                                             static_cast<std::int64_t>(index)});
         }
     }
-    if (replay_end <= turn_begin || replay_end > data.token_ids.size()) { return adoption; }
-    const std::span<const TokenId> generated_span =
-        std::span<const TokenId>(lane_state.cached_prompt_tokens)
-            .subspan(turn_begin, turn_end - turn_begin);
-    const std::span<const TokenId> replayed_span =
-        std::span<const TokenId>(data.token_ids).subspan(turn_begin, replay_end - turn_begin);
-    const std::string generated = frontend().decode_tokens(generated_span, true);
-    const std::string replayed  = frontend().decode_tokens(replayed_span, true);
-    const bool same_turn        = same_rendered_turn(generated, replayed);
-    if (trace) {
-        // The case that decides the whole reuse story: the prompt matched past the previous prompt
-        // end and then stopped, because the client re-rendered the turn this lineage generated.
-        // Where the bytes part decides whether the turn is the same one, so print both sides.
-        std::fprintf(stderr,
-                     "[tp2-diverge] prompt=%u cached=%zu prev_prompt=%zu shared=%zu in_turn=%zu "
-                     "to_turn_end=%zu replay=%zu same_turn=%d",
-                     prompt_tokens, lane_state.cached_prompt_tokens.size(), turn_begin, shared,
-                     shared > turn_begin ? shared - turn_begin : 0, turn_end - shared,
-                     replayed_span.size(), same_turn ? 1 : 0);
-        // Where the two texts part, in bytes: the prefixes below are capped, and a divergence deep
-        // inside a long turn is invisible in them.
-        std::size_t difference = 0;
-        const std::size_t common = std::min(generated.size(), replayed.size());
-        while (difference < common && generated[difference] == replayed[difference]) { ++difference; }
-        std::fprintf(stderr, " diff_at=%zu", difference);
-        print_reuse_span("generated", *this, generated_span);
-        print_reuse_span("replayed", *this, replayed_span);
-        const std::size_t window = difference > 24 ? difference - 24 : 0;
-        std::fputs(" around_generated=\"", stderr);
-        print_escaped_bytes(generated, window, 48);
-        std::fputs("\" around_replayed=\"", stderr);
-        print_escaped_bytes(replayed, window, 48);
-        std::fputs("\"", stderr);
-        std::fprintf(stderr, "\n");
-    }
-    if (!same_turn) { return adoption; }
-    // An exact replay needs nothing replaced: the scan below already reads this lineage's tokens.
-    if (generated_span.size() == replayed_span.size() &&
-        std::equal(generated_span.begin(), generated_span.end(), replayed_span.begin())) {
+    // Where the client's rendering and each history part, deepest first. Measured before anything is
+    // replaced: it is both the reuse decision the scan would have made and, for the trace, the only
+    // measurement of a re-rendered answer that survives the adoption itself.
+    std::size_t divergence = 0;
+    const std::vector<AdoptionCandidate> candidates =
+        adoption_candidates(data.token_ids, sources, divergence);
+    adoption.divergence = divergence;
+    // A multimodal request is left alone: its token array carries vision runs whose positions a
+    // replacement would have to keep, and a media turn never comes back as pure text. Its divergence
+    // is measured above all the same, because the reuse trace reports it.
+    if (data.has_media()) { return adoption; }
+    for (const AdoptionCandidate& candidate : candidates) {
+        const std::span<const TokenId> history = sources[candidate.source].history;
+        const std::size_t turn_begin           = sources[candidate.source].turn_begin;
+        const std::size_t turn_end             = history.size();
+        // An adoption only pays while it deepens the prefix the scan can reach. It charges for that
+        // in the client's coordinates: the walk runs the tokens this history generated in place of
+        // the replayed ones, so the prompt stops agreeing with the client's own rendering at the
+        // divergence, and every later turn of the conversation is measured from there. When the
+        // client's rendering already agrees with the whole history this entry recorded, the live
+        // frontier sits inside that agreement and the scan takes it with no replacement at all: the
+        // splice could only trade positions the client will keep reproducing for ones it never will.
+        // A tool-calling conversation hits that exactly - the template closes the turn with framing
+        // the raw sampled tokens do not carry - and the replacement shortened its prompt behind the
+        // answer it had already paid for, so every following turn matched only up to the divergence
+        // and restarted on a host checkpoint.
+        if (candidate.shared + 1 >= turn_end) { continue; }
+        // The replay ends where the message after the turn begins. A prompt without that boundary -
+        // an encoded token stream, or a turn the template folds into a neighbouring message - cannot
+        // be compared here and keeps today's behaviour.
+        std::size_t replay_end = 0;
+        for (const auto& boundary : data.message_boundaries) {
+            if (boundary.has_value() && *boundary > turn_begin) {
+                replay_end = *boundary;
+                break;
+            }
+        }
+        if (replay_end <= turn_begin || replay_end > data.token_ids.size()) { continue; }
+        const std::span<const TokenId> generated_span =
+            std::span<const TokenId>(history).subspan(turn_begin, turn_end - turn_begin);
+        const std::span<const TokenId> replayed_span =
+            std::span<const TokenId>(data.token_ids).subspan(turn_begin, replay_end - turn_begin);
+        const std::string generated = frontend().decode_tokens(generated_span, true);
+        const std::string replayed  = frontend().decode_tokens(replayed_span, true);
+        const bool same_turn        = same_rendered_turn(generated, replayed);
+        if (trace) {
+            // The case that decides the whole reuse story: the prompt matched past the previous prompt
+            // end and then stopped, because the client re-rendered the turn this history generated.
+            // Where the bytes part decides whether the turn is the same one, so print both sides. The
+            // source says which history this candidate was: -1 is the lane's own lineage, anything
+            // else is the catalog entry at that index.
+            std::fprintf(stderr,
+                         "[tp2-diverge] prompt=%u cached=%zu prev_prompt=%zu shared=%zu in_turn=%zu "
+                         "to_turn_end=%zu replay=%zu same_turn=%d source=%lld",
+                         prompt_tokens, history.size(), turn_begin, candidate.shared,
+                         candidate.shared > turn_begin ? candidate.shared - turn_begin : 0,
+                         turn_end - candidate.shared, replayed_span.size(), same_turn ? 1 : 0,
+                         static_cast<long long>(sources[candidate.source].id));
+            // Where the two texts part, in bytes: the prefixes below are capped, and a divergence deep
+            // inside a long turn is invisible in them.
+            std::size_t difference = 0;
+            const std::size_t common = std::min(generated.size(), replayed.size());
+            while (difference < common && generated[difference] == replayed[difference]) {
+                ++difference;
+            }
+            std::fprintf(stderr, " diff_at=%zu", difference);
+            print_reuse_span("generated", *this, generated_span);
+            print_reuse_span("replayed", *this, replayed_span);
+            const std::size_t window = difference > 24 ? difference - 24 : 0;
+            std::fputs(" around_generated=\"", stderr);
+            print_escaped_bytes(generated, window, 48);
+            std::fputs("\" around_replayed=\"", stderr);
+            print_escaped_bytes(replayed, window, 48);
+            std::fputs("\"", stderr);
+            std::fprintf(stderr, "\n");
+        }
+        if (!same_turn) { continue; }
+        // An exact replay needs nothing replaced: the scan below already reads this history's tokens.
+        if (generated_span.size() == replayed_span.size() &&
+            std::equal(generated_span.begin(), generated_span.end(), replayed_span.begin())) {
+            return adoption;
+        }
+        // Same turn, so the tokens this history owns are the ones its KV holds; replacing the replay
+        // with them lets the prefix scan below take the deepest boundary of this lineage - normally
+        // its own frontier - instead of re-prefilling the whole answer. The replacement is allowed to
+        // be a few tokens longer than the replay, so it still has to fit the context the request was
+        // admitted against. token_types and positions stay as prepared because only the media route
+        // fills them, and that route never reaches this point.
+        if (data.token_ids.size() - replayed_span.size() + generated_span.size() >
+            options_.max_context) {
+            continue;
+        }
+        std::vector<TokenId> spliced;
+        spliced.reserve(data.token_ids.size() - (replay_end - turn_begin) + (turn_end - turn_begin));
+        spliced.insert(spliced.end(), data.token_ids.begin(),
+                       data.token_ids.begin() + static_cast<std::ptrdiff_t>(turn_begin));
+        spliced.insert(spliced.end(),
+                       history.begin() + static_cast<std::ptrdiff_t>(turn_begin), history.end());
+        spliced.insert(spliced.end(),
+                       data.token_ids.begin() + static_cast<std::ptrdiff_t>(replay_end),
+                       data.token_ids.end());
+        data.token_ids = std::move(spliced);
+        adoption.adopted       = true;
+        adoption.prompt_tokens = static_cast<std::uint32_t>(data.token_ids.size());
         return adoption;
     }
-    // Same turn, so the tokens this lineage owns are the ones its KV holds; replacing the replay
-    // with them lets the prefix scan below take the deepest boundary of this lineage - normally its
-    // own frontier - instead of re-prefilling the whole answer. The replacement is allowed to be a
-    // few tokens longer than the replay, so it still has to fit the context the request was
-    // admitted against. token_types and positions stay as prepared because only the media route
-    // fills them, and that route never reaches this point.
-    if (data.token_ids.size() - replayed_span.size() + generated_span.size() >
-        options_.max_context) {
-        return adoption;
-    }
-    std::vector<TokenId> spliced;
-    spliced.reserve(data.token_ids.size() - (replay_end - turn_begin) + (turn_end - turn_begin));
-    spliced.insert(spliced.end(), data.token_ids.begin(),
-                   data.token_ids.begin() + static_cast<std::ptrdiff_t>(turn_begin));
-    spliced.insert(spliced.end(),
-                   lane_state.cached_prompt_tokens.begin() + static_cast<std::ptrdiff_t>(turn_begin),
-                   lane_state.cached_prompt_tokens.end());
-    spliced.insert(spliced.end(),
-                   data.token_ids.begin() + static_cast<std::ptrdiff_t>(replay_end),
-                   data.token_ids.end());
-    data.token_ids = std::move(spliced);
-    adoption.adopted       = true;
-    adoption.prompt_tokens = static_cast<std::uint32_t>(data.token_ids.size());
     return adoption;
 }
 

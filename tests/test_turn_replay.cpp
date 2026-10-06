@@ -10,6 +10,7 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -34,6 +35,112 @@ std::string turn(std::string_view reasoning, std::string_view content, std::stri
     }
     out += "<|im_end|>\n";
     return out;
+}
+
+// Which histories a replayed answer may be matched against.
+//
+// The batched route retires a lane's own lineage with its pages (release_lane_kv), so the lane that
+// serves the next turn of a conversation is routinely not the lane that served the last one. The
+// catalog entry the recall is about to restore is then the only history left, and a replayed answer
+// that is not matched against it is prefilled again from the last prompt end - the regression this
+// selection exists to prevent.
+int check_adoption_candidates() {
+    using ninfer::runtime::AdoptionCandidate;
+    using ninfer::runtime::AdoptionSource;
+    using ninfer::runtime::adoption_candidates;
+    int failures = 0;
+
+    const std::vector<ninfer::TokenId> incoming = {1, 2, 3, 4, 5, 6};
+
+    // A retired lane, with the conversation sitting in the catalog.
+    {
+        const std::vector<ninfer::TokenId> history   = {1, 2, 3, 4, 5, 6, 7, 8};
+        const AdoptionSource sources[]               = {{history, 4, false, true, 7}};
+        std::size_t divergence                       = 0;
+        const std::vector<AdoptionCandidate> found   = adoption_candidates(incoming, sources, divergence);
+        failures += check(found.size() == 1 && found[0].source == 0 && found[0].shared == 6,
+                          "a stored catalog entry was not offered to a retired lane");
+        failures += check(divergence == 6, "the agreement of a considered source was not recorded");
+    }
+
+    // A lane that still holds its own lineage offers that one and nothing else, even when a catalog
+    // entry agrees further: the lineage is the state this lane's KV really carries.
+    {
+        const std::vector<ninfer::TokenId> lineage = {1, 2, 3, 4, 5};
+        const std::vector<ninfer::TokenId> entry   = {1, 2, 3, 4, 5, 6, 7};
+        const AdoptionSource sources[]             = {{lineage, 2, true, false, -1},
+                                                      {entry, 2, false, true, 3}};
+        std::size_t divergence                     = 0;
+        const std::vector<AdoptionCandidate> found = adoption_candidates(incoming, sources, divergence);
+        failures += check(found.size() == 1 && found[0].source == 0 && found[0].shared == 5,
+                          "a live lineage did not hide the catalog");
+        // Only the offered source is measured: the trace reports the decision the scan can act on.
+        failures += check(divergence == 5, "a hidden source was measured instead of the live lineage");
+    }
+
+    // Neither resident nor stored: nothing to restore, so nothing to adopt.
+    {
+        const std::vector<ninfer::TokenId> history = {1, 2, 3, 4, 5, 6, 7, 8};
+        const AdoptionSource sources[]             = {{history, 4, false, false, 0}};
+        std::size_t divergence                     = 0;
+        failures += check(adoption_candidates(incoming, sources, divergence).empty(),
+                          "a source with no KV to restore was offered");
+        failures += check(divergence == 0, "a source with no KV to restore was measured");
+    }
+
+    // Deepest agreement first, and a tie goes to the longer history.
+    {
+        const std::vector<ninfer::TokenId> deep   = {1, 2, 3, 4, 5, 6, 7};
+        const std::vector<ninfer::TokenId> shallow = {1, 2, 3, 9};
+        const std::vector<ninfer::TokenId> longer  = {1, 2, 3, 4, 5, 6, 7, 8};
+        const std::vector<ninfer::TokenId> tied    = {1, 2, 3, 4, 5, 6};
+        const AdoptionSource order[]               = {{deep, 2, false, true, 0},
+                                                      {shallow, 2, false, true, 1}};
+        const AdoptionSource ties[]                = {{tied, 2, false, true, 0},
+                                                      {longer, 2, false, true, 1}};
+        std::size_t divergence                     = 0;
+        const std::vector<AdoptionCandidate> found = adoption_candidates(incoming, order, divergence);
+        failures += check(found.size() == 2 && found[0].source == 0 && found[1].source == 1,
+                          "the candidates were not ordered by agreement");
+        divergence                                 = 0;
+        const std::vector<AdoptionCandidate> same  = adoption_candidates(incoming, ties, divergence);
+        failures += check(same.size() == 2 && same[0].source == 1 && same[1].source == 0,
+                          "a tie was not broken by the longer history");
+    }
+
+    // The boundaries a history has to carry to be worth anything: a turn that starts at zero, one
+    // that starts past its own end, one the prompt never reaches, and one with no tokens at all.
+    {
+        const std::vector<ninfer::TokenId> history = {1, 2, 3, 4, 5, 6, 7, 8};
+        const std::vector<ninfer::TokenId> empty;
+        const std::vector<ninfer::TokenId> short_prompt = {1, 2, 3};
+        const AdoptionSource no_begin[]     = {{history, 0, false, true, 0}};
+        const AdoptionSource past_end[]     = {{history, 9, false, true, 0}};
+        const AdoptionSource beyond_prompt[] = {{history, 5, false, true, 0}};
+        const AdoptionSource nothing[]      = {{empty, 2, false, true, 0}};
+        std::size_t divergence              = 0;
+        failures += check(adoption_candidates(incoming, no_begin, divergence).empty(),
+                          "a history with no turn boundary was offered");
+        failures += check(adoption_candidates(incoming, past_end, divergence).empty(),
+                          "a turn starting past the end of its own history was offered");
+        failures += check(adoption_candidates(short_prompt, beyond_prompt, divergence).empty(),
+                          "a turn the incoming prompt never reaches was offered");
+        failures += check(adoption_candidates(incoming, nothing, divergence).empty(),
+                          "an empty history was offered");
+    }
+
+    // The prompt parts from the history before the turn even starts: a different conversation, which
+    // must not be adopted however far the turn itself might line up.
+    {
+        const std::vector<ninfer::TokenId> history = {9, 9, 9, 9, 9, 9};
+        const AdoptionSource sources[]             = {{history, 3, false, true, 0}};
+        std::size_t divergence                     = 0;
+        failures += check(adoption_candidates(incoming, sources, divergence).empty(),
+                          "a history the prompt parts from before the turn was offered");
+        failures += check(divergence == 0, "the agreement with a rejected history was not recorded");
+    }
+
+    return failures;
 }
 
 } // namespace
@@ -109,6 +216,8 @@ int main() {
     const std::string other_reasoning = turn("I will write another file.", "Here it is:", "app.js");
     failures += check(!same_rendered_turn(generated, other_reasoning),
                       "an edited reasoning byte was accepted as the same turn");
+
+    failures += check_adoption_candidates();
 
     if (failures == 0) { std::cout << "turn replay guard ok\n"; }
     return failures == 0 ? 0 : 1;

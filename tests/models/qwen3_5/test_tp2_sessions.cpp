@@ -130,7 +130,7 @@ bool boundary_on_grid(std::uint32_t boundary) {
 }
 
 ninfer::EngineOptions engine_options(const char* artifact, int device_a, int device_b,
-                                     bool retention, Route route) {
+                                     bool retention, Route route, std::uint32_t lanes = 1) {
     ninfer::EngineOptions options;
     options.artifact_path                        = artifact;
     options.device                               = device_a;
@@ -141,8 +141,11 @@ ninfer::EngineOptions engine_options(const char* artifact, int device_a, int dev
     // The chunk plan and the recall alignment share this width: the host checkpoint boundaries a
     // recall may reuse are multiples of it, so changing it also moves which conversations can be
     // reused and how far a recall has to re-prefill.
-    options.max_concurrency                     = 1;
-    options.max_pending_requests                = 1;
+    // One lane runs the single-lane walk, which keeps the lane's own lineage. Two or more hand the
+    // request to the lane queue instead, where a retiring request drops that lineage and the session
+    // catalog is all that is left of the turn it generated.
+    options.max_concurrency                     = lanes;
+    options.max_pending_requests                = lanes == 1 ? 1 : 4;
     if (route == Route::Mtp) {
         options.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 2;
@@ -921,6 +924,95 @@ int check_replayed_answer_keeps_prompt_end(const char* artifact, int device_a, i
     return 0;
 }
 
+// The same re-rendered answer, on the lane-batched route. A retiring request hands its pages back and
+// drops its lane's lineage, so the lane that serves a conversation's next turn is routinely not the
+// lane that served the one before it, and the turn that was just generated survives only in the
+// session catalog. The adoption has to read that catalog: with the lane's own lineage alone it sees
+// nothing, and the turn after a re-rendered answer restarts behind the prompt it had already paid
+// for instead of standing on the answer it holds.
+//
+// What this does not do is force the divergence the adoption exists for. The client's prompt is
+// rendered by the same template that rendered the history, and that rendering is canonical - it trims
+// the reasoning and the content and writes its own separators - so a replay built from the answer the
+// model wrote comes back token for token, the scan reaches the live frontier with no replacement at
+// all, and this check passes unchanged. The divergence has to come from the model's own framing bytes
+// (a reasoning channel that starts on a newline, which the template trims away), which no request can
+// ask for: the whitespace a client could inject is exactly what the template trims before tokenizing
+// the content and the reasoning, and a difference inside the text would make it another turn. The
+// catalog fallback itself is pinned by check_adoption_candidates in ninfer_turn_replay_test.
+int check_replayed_answer_across_lanes(const char* artifact, int device_a, int device_b,
+                                       Route route) {
+    const std::string label = std::string("replayed answer, two lanes (") + route_name(route) + ")";
+    ninfer::Engine engine(engine_options(artifact, device_a, device_b, true, route, 2));
+
+    ninfer::RequestOptions request            = greedy_request();
+    // Thinking is on, so the budget has to cover a full think block plus the answer.
+    request.execution.requested_output_tokens = 256;
+    // The model's own stop token ends the answer the way the template renders it ending, which is what
+    // lets the client's replay reach the tail of the history this lineage recorded.
+    request.stop.include_model_defaults = true;
+
+    auto ask = [](const char* text) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        ninfer::MessagePart part;
+        part.kind = ninfer::MessagePartKind::Text;
+        part.text = text;
+        message.parts.push_back(std::move(part));
+        return message;
+    };
+    auto answer = [](const std::string& reasoning, const std::string& text) {
+        ninfer::ChatMessage message;
+        message.role                = ninfer::ChatRole::Assistant;
+        message.reasoning_content   = reasoning;
+        ninfer::MessagePart part;
+        part.kind = ninfer::MessagePartKind::Text;
+        part.text = text;
+        message.parts.push_back(std::move(part));
+        return message;
+    };
+    auto prepare = [&engine](const std::vector<ninfer::ChatMessage>& messages) {
+        ninfer::PromptInput input;
+        input.options.enable_thinking = true;
+        input.messages                = messages;
+        return engine.prepare(std::move(input));
+    };
+
+    std::vector<ninfer::ChatMessage> history;
+    history.push_back(ask("Name the three primary colours in one short sentence."));
+    const ninfer::GenerationResult first = engine.generate(prepare(history), request);
+    if (first.content.empty()) {
+        return fail(label, "the first turn published no answer to replay");
+    }
+    if (first.reasoning.empty()) {
+        return fail(label, "the first turn published no reasoning to re-render");
+    }
+    history.push_back(answer(first.reasoning, first.content));
+    history.push_back(ask("Now name the three secondary colours the same way."));
+    const ninfer::GenerationResult second = engine.generate(prepare(history), request);
+    if (second.content.empty() || second.reasoning.empty()) {
+        return fail(label, "the replayed turn published no answer");
+    }
+    history.push_back(answer(second.reasoning, second.content));
+    history.push_back(ask("Which of the six is closest to grey?"));
+    const ninfer::GenerationResult third = engine.generate(prepare(history), request);
+
+    // Strictly deeper than the prompt the replayed turn was built from: the reuse has to reach into
+    // the answer that turn generated. Equality is the regression - the walk stopped at the previous
+    // prompt end because it could not see the turn the catalog still held.
+    if (third.reused_prompt_tokens <= second.prompt.prompt_tokens) {
+        return fail(label, "the turn after a re-rendered answer reused " +
+                               std::to_string(third.reused_prompt_tokens) + " of the " +
+                               std::to_string(second.prompt.prompt_tokens) +
+                               " prompt tokens it had just paid for, and none of the answer");
+    }
+    std::cout << "TP-2 replayed answer (" << label << ") passed: the turn after a re-rendered answer"
+                 " reused "
+              << third.reused_prompt_tokens << " tokens, past the " << second.prompt.prompt_tokens
+              << "-token prompt it was built from\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -967,6 +1059,11 @@ int main() {
             }
             if (const int status = check_replayed_answer_keeps_prompt_end(
                     artifact, devices.first, devices.second, route);
+                status != 0) {
+                return status;
+            }
+            if (const int status = check_replayed_answer_across_lanes(artifact, devices.first,
+                                                                     devices.second, route);
                 status != 0) {
                 return status;
             }
