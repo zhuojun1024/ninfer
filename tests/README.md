@@ -17,8 +17,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
   Linear and fused Linear suites are separated by their supported weight/activation paths;
 - root C++ tests — core storage, runtime admission/resource policy, public API, serving protocols,
   logging, benchmark reports and causal-scoring evaluation;
-- `test_serve_corpus.py` — agreement between the serving request-log schema and its measurement
-  consumer.
+- `test_serve_corpus.py`, `test_serve_spec_ab.py` — agreement between the serving request-log
+  schema and its measurement consumers, and the speculative-acceptance A/B aggregation rules.
 
 Tests are grouped by observable risk, not by mirroring every source file or class.
 `CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, `models/qwen3_5/`
@@ -102,7 +102,7 @@ Run the native Python suites with the project Python environment:
 ```bash
 python3 -m pytest \
   tests/artifact tests/convert \
-  tests/test_serve_corpus.py
+  tests/test_serve_corpus.py tests/test_serve_spec_ab.py
 ```
 
 The Python suites exercise conversion and encoded output, without running model inference.

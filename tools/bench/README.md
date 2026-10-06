@@ -192,3 +192,47 @@ python3 tools/bench/run_serve_concurrency.py \
 Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
 pool. A point is intentionally not resumable: combining fragments from separate server processes
 would not preserve either a steady interval or one continuous makespan.
+
+## Speculative acceptance A/B
+
+`run_serve_spec_ab.py` replays one fixed fixture and seed plan against one persistent
+`ninfer-serve` and records the complete speculative counters from every `request_done` event,
+including `accepted_per_position`. Its `compare` subcommand reports the two aggregations the
+[serving methodology](../../docs/performance/methodology.md#metrics-and-statistics) keeps apart
+(the ratio of summed tokens, and the mean of the per-request ratios), the per-position
+decomposition, and the paired per-request difference with a confidence interval.
+
+It is an attribution instrument, not a published workload: hold everything except the changed
+dimension equal - draft width, proposal head, sampling profile, concurrency, KV dtype, context
+ceiling, build and rendered prompt - then read the paired delta rather than the two pooled rates.
+
+```bash
+python3 tools/bench/run_serve_spec_ab.py run \
+  --artifact out/baseline.ninfer --label baseline \
+  --spec dflash2 --draft-tokens 7 --lm-head-draft \
+  --fixture scenario_code_cuda --fixture scenario_structured_jsonl --seeds 5 \
+  --pad-chars 140000 --prefix-reuse --outdir profiles/bench/spec-ab-baseline
+
+python3 tools/bench/run_serve_spec_ab.py run \
+  --artifact out/candidate.ninfer --label candidate \
+  --spec dflash2 --draft-tokens 7 --lm-head-draft \
+  --fixture scenario_code_cuda --fixture scenario_structured_jsonl --seeds 5 \
+  --pad-chars 140000 --prefix-reuse --outdir profiles/bench/spec-ab-candidate
+
+python3 tools/bench/run_serve_spec_ab.py compare \
+  --a profiles/bench/spec-ab-baseline/summary.json \
+  --b profiles/bench/spec-ab-candidate/summary.json --label-a baseline --label-b candidate
+```
+
+`--fixture` defaults to every scenario fixture, and `--seeds N` takes the first N of the five
+campaign seeds so plans stay comparable across runs. `--pad-chars` prepends that many characters
+of the `long_niah_64k` document, which is how a deep-context prompt is built without synthetic
+filler. `--sampling greedy` measures the proposal against the target's own argmax; the default
+stochastic route pins the profile the methodology publishes. `--devices A,B` selects the TP-2
+pair and is omitted on a single-device route. `--keep-text` stores response text for stream
+comparisons; the default stores only its hash.
+
+Each run directory holds `summary.json` (records plus the resolved server facts), `requests.jsonl`
+(the raw server request log), `server_argv.json`, and `server.out.log`/`server.err.log`. A worked
+deep-context comparison is in
+[tp2-dual-5060ti.md](../../docs/tp2-dual-5060ti.md#draft-precision-and-the-selector-codebooks).
