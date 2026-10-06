@@ -413,3 +413,36 @@ support is checked by consumers during preparation, resource queries, warmup or 
 valid file may need additional Op support before its chosen combination can run. Exercise the
 phases and optional components you intend to use through the normal [CLI](cli.md) or
 [serving](serving.md) route.
+
+## Combine existing artifacts
+
+Two converted artifacts can be combined without re-converting from source weights, because a v3
+binding names the packed object that holds its bytes: nothing is decoded, re-quantized or
+re-laid out.
+
+[`graft_components.py`](../tools/convert/graft_components.py) copies whole components from one
+artifact into another and keeps the base document, so it is the cheap route when the difference
+lives in one component and both artifacts store those objects identically:
+
+```bash
+python3 tools/convert/graft_components.py \
+  --base models/my_qwen.ninfer --donor models/official.ninfer \
+  --components vision,mtp,dflash2 --name my_qwen_official_parts --out models/mixed.ninfer
+```
+
+[`graft_bindings.py`](../tools/convert/graft_bindings.py) rebuilds the document and replaces
+individual bindings, so it also serves when the formats, byte lengths or view topology differ -
+for example keeping an artifact's own BF16 selector codebooks while taking the draft's other
+weights from another conversion:
+
+```bash
+python3 -m tools.convert.graft_bindings \
+  --source models/grafted.ninfer --override models/base.ninfer \
+  --binding dflash2/candidate_selector/predecessor_codebook \
+  --binding dflash2/candidate_selector/successor_codebook \
+  --name my_qwen_bf16_codebooks --out models/mixed.ninfer
+```
+
+`--binding` accepts shell-style patterns, and `--dry-run` prints the plan without writing. Both
+tools record their sources in the artifact's provenance; `graft_bindings.py` also reopens the
+published file and checks every binding against its declared source before the command succeeds.
