@@ -446,3 +446,24 @@ python3 -m tools.convert.graft_bindings \
 `--binding` accepts shell-style patterns, and `--dry-run` prints the plan without writing. Both
 tools record their sources in the artifact's provenance; `graft_bindings.py` also reopens the
 published file and checks every binding against its declared source before the command succeeds.
+
+[`merge_parts.py`](../tools/convert/merge_parts.py) extracts a set of components from one artifact
+into a small reusable parts file, then merges that parts file into any base artifact that has the
+text component. Unlike `graft_components.py` it does not require the base to already contain the
+selected components: a base with only text gains vision, mtp, and dflash2 in one step. Colliding
+object ids are renamed and every reference is rewritten. The merged output is verified byte-for-
+byte against both sources before the command reports success:
+
+```bash
+python3 tools/convert/merge_parts.py extract \
+  --source models/vision_full.ninfer --out models/parts.ninfer \
+  --name my_parts --components mtp,dflash2,vision
+
+python3 tools/convert/merge_parts.py merge \
+  --base models/my_text.ninfer --parts models/parts.ninfer \
+  --out models/my_full.ninfer --name my_full
+```
+
+The parts file is a normal v3 artifact: it can be shared, inspected, and re-merged into any
+compatible base. `--components` defaults to `mtp,dflash2,vision`; `--no-verify` skips the
+byte-for-byte check for a faster but unverified write.
