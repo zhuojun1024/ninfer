@@ -22,13 +22,16 @@
   （K=5/7，K=7 为二进制默认）或 `--spec mtp`（K=2、`--lm-head-draft`）；`--spec dflash`（v1）在构造期拒绝。
 - **现状**：交付目标 ①–⑤ 全部完成；vision、Windows 移植、多会话 KV 池、decode graph + AR 策略均已落地实测；
   DFlash2 已在 TP-2 放行（未对齐复用不再弃稿）；TP-2 会合协议重构完成（host 权威 id + 有界自旋 +
-  超时失败语义）；DFlash2 草稿 Q4 全集合已升入官方配方（r69，用户确认，最终件可发布）；verify graph
-  B7 验收通过（聚合 +5.2%）。
+  超时失败语义）；DFlash2 草稿投影的 Q4 集合已升入官方配方（r69）；其中 selector codebook 已回退为
+  未量化（33k 上下文实测约 −2 pp 接受率，且其 178.09 MiB 落在 selector 所在 shard，不构成上下文容量瓶颈；
+  证据见 [tp2-dual-5060ti.md](docs/tp2-dual-5060ti.md#draft-precision-and-the-selector-codebooks)）；
+  verify graph B7 验收通过（聚合 +5.2%）。
 - **关键数字**（262,144 配置，WSL）：prefill 1,588 tok/s；decode 59.0 tok/s（MTP K=2）；Windows 131,072 配置
   decode 56.9 tok/s（与 Linux 持平）。DFlash2 K=7 在 4096 上下文贪心档约 71 tok/s；245,760/k8v4（draftall 件）
   扫描 K=5 96.4 / K=7 96.1 tok/s（交错复核 93.3 / 96.9）；roofline 修正上限 ≈108 tok/s（原归档 90–180 的
-  180 不可达）。r69 最终件相对 r66 省 257.77 MiB（−1.08%），接受率无可测代价（≤1σ），轮时代价 ~+0.4%
-  （proposal 步 +0.19 ms）。
+  180 不可达）。r69 最终件相对 r66 省 257.77 MiB（−1.08%），接受率无可测代价（≤1σ，短上下文 A/B；长上下文
+  33k 复核显示 codebook 那一半约 −2 pp），轮时代价 ~+0.4%（proposal 步 +0.19 ms）。codebook 回退为 BF16 后
+  该差值回到 ≈79.7 MiB（换算值，未重测吞吐）。
 
 **推荐运行配置**（WSL 8088 / Windows 8099 同配方，Windows 侧 `--max-context 131072`）：
 

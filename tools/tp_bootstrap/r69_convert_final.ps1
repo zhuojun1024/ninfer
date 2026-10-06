@@ -3,8 +3,10 @@ Set-Location 'D:\Documents\workbench\ninfer'
 $out = 'D:/LLM/qwen3_8_27b_w4a4_w8a8_dflash2_final.ninfer'
 if (Test-Path $out) { throw "output already exists: $out" }
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-# No --override: the draft Q4 set (r62-r66) plus the fused-QKV (r67) and codebook (r68) levers now
-# live in the official recipe's _optional, which this recipe imports.
+# No --override: the draft Q4 set (r62-r66) plus the fused-QKV lever (r67) live in the official
+# recipe's _optional, which this recipe imports. The codebook lever (r68) was reverted from the
+# official recipe, so reproducing that artifact now needs
+# --override tools/tp_bootstrap/r68_draft_codebook_q4.py.
 python -m tools.convert `
   --model 'D:/LLM/W4A16/NVFP4/W4A4+W8A8' `
   --recipe 'D:/LLM/w4a4_family_recipe.py' `

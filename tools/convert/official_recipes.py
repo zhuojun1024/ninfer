@@ -9,6 +9,7 @@ Q5 = "q5_g64_fp16"
 Q6 = "q6_g64_fp16"
 Q8 = "q8_g32_fp16"
 FP8 = "fp8_e4m3fn_row_bf16"
+BF16 = "bf16"
 
 
 def _assign(recipe, name, format, *, source=None):
@@ -17,11 +18,18 @@ def _assign(recipe, name, format, *, source=None):
 
 
 # The masked DFlash2 draft runs entirely on Q4_G64_FP16 projections. Every entry below was
-# qualified by the section 8 / section 3.9 campaigns (r62-r68): the draft MLP, attention output and
-# dynamic-conv kernels, the fused QKV parent through its row views, and the selector codebooks. The
-# QKV parent is one [6144, 5120] object per layer shared with context_key/context_value; the native
-# Q8-only fused consumers are bypassed when it is quantized (see
+# qualified by the section 8 / section 3.9 campaigns (r62-r67): the draft MLP, attention output and
+# dynamic-conv kernels, and the fused QKV parent through its row views. The QKV parent is one
+# [6144, 5120] object per layer shared with context_key/context_value; the native Q8-only fused
+# consumers are bypassed when it is quantized (see
 # src/models/qwen3_5/execution/draft.cpp). DFlash v1 and MTP keep Q8.
+#
+# The selector codebooks keep their source BF16 representation. The r68 Q4_G64 conversion saved
+# 178.09 MiB but measured about 2 pp less long-context acceptance (33k-token prompt, K=7), and those
+# bytes land on the TP-2 shard that holds the selector rather than on the masked draft's shard, which
+# is the shard that bounds context capacity, so the saving does not buy context. A recipe that wants
+# the quantized codebook back can still assign Q4 itself
+# (tools/tp_bootstrap/r68_draft_codebook_q4.py).
 DFLASH2_Q4_NAMES = ("dflash2/feature_projection",)
 DFLASH2_Q4_ROLES = (
     "/attention/query",
@@ -41,19 +49,23 @@ DFLASH2_CODEBOOKS = (
 
 
 def assign_dflash_formats(model, recipe):
-    """The qualified draft formats: Q4_G64_FP16 on the roles the r62-r68 campaigns covered.
+    """The qualified draft formats: Q4_G64_FP16 on the projection roles, BF16 on the codebooks.
 
-    The masked DFlash2 draft runs its projections and its selector codebooks on Q4; DFlash v1 and
-    MTP keep Q8. Every recipe that carries a draft shares this policy, so the formats an artifact
-    is built with are the ones the campaign qualified rather than a per-recipe choice.
+    The masked DFlash2 draft runs its projections on Q4 and keeps its selector codebooks
+    unquantized; DFlash v1 and MTP keep Q8. Every recipe that carries a draft shares this policy, so
+    the formats an artifact is built with are the ones the campaign qualified rather than a
+    per-recipe choice.
     """
 
-    # The selector codebooks are direct [vocab, rank] parents rather than projections, so they are
-    # assigned before the projection filter below.
+    # The selector codebooks are direct [vocab, rank] parents rather than projections. They are
+    # assigned here and skipped below, so their representation does not depend on whether the model
+    # happens to declare an input for them.
     for name in DFLASH2_CODEBOOKS:
         if name in model.parameters:
-            _assign(recipe, name, Q4)
+            _assign(recipe, name, BF16)
     for name, parameter in model.parameters.items():
+        if name in DFLASH2_CODEBOOKS:
+            continue
         if not parameter.projection or not name.startswith(("mtp/", "dflash/", "dflash2/")):
             continue
         if name.endswith(

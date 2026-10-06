@@ -329,6 +329,60 @@ stays in its 66-72 tok/s band (67.9/64.8), so the wiring costs neither route. Th
 delta matches the MTP window's -4.3 ms; the smaller throughput gain than MTP's +16.6% is the
 synthetic text's low acceptance, which leaves less output per round to speed up.
 
+### Draft precision and the selector codebooks
+
+The masked draft's projections run Q4_G64_FP16; its selector codebooks (predecessor and successor,
+[248320, 256] each) keep the stored BF16 representation. That split is measured, not inherited:
+quantizing the codebooks to Q4 saves 178.09 MiB and costs long-context acceptance.
+
+The comparison ran three artifacts over the same ~32,948-token prompts (a scenario fixture with
+140,000 characters of NIAH document prepended, 512 output tokens, stochastic
+0.6/0.95/20/0/1.0/0, C=1, K=7, fp8 KV, 4 fixtures x 5 seeds = 20 requests per arm):
+
+| Draft representation | Pooled acceptance | Paired delta vs Q4 (95%) |
+|---|---:|---:|
+| Stored BF16 draft (baseline) | 27.89% | +2.13 +/- 2.10 pp |
+| Q4 projections + Q4 codebooks | 26.00% | - |
+| Q4 projections + BF16 codebooks | 28.38% | +2.49 +/- 1.71 pp |
+| BF16 feature_projection and context K/V, Q4 codebooks | 27.52% | +1.90 +/- 1.39 pp |
+
+Restoring the two codebooks alone returns acceptance to the stored artifact's level (28.38% against
+27.89%, a difference inside the interval); restoring the context-conditioning path (feature_projection
+plus the ten context K/V views) does the same. The two do not add: doing both measured 27.75%. Q8 is
+not a middle option the Engine offers - SelectorCodebook accepts BF16 or Q4_G64_FP16 and rejects any
+other representation at load - and it would not buy much: storing Q8-quantized values in a BF16
+codebook (relRMS 0.0057 against the BF16 values, where Q4 is 0.110) measured -0.29 +/- 0.51 pp.
+
+The 178.09 MiB lands on shard 1, which holds the selector, not on shard 0, which holds the masked
+draft. At 65,536 tokens the Q4 artifact's shards hold 11976.6 and 11132.6 MiB of weights+context;
+BF16 codebooks move the second to 11310.6 and leave the first unchanged, so the precision costs no
+context on the shard that bounds it (free 2848 against 2922 MiB with the vision arena enabled). The
+context-conditioning restore is the one that does cost: its 119 MiB belongs to shard 0, about 7.6k
+tokens of fp8 KV at 16.1 KiB per token.
+
+The draft's Q4 conversion is a pure quantization of the same weights: every changed tensor correlates
+0.9938-0.9944 with the stored representation (relRMS 0.109-0.112, the noise a 4-bit group-64 scale
+predicts), and restoring all 88 changed tensors reproduced the baseline artifact's per-request
+counters exactly, so the acceptance differences above are not an artifact of how the mixed artifact
+was built. The delivered artifact is `rloo351-mixed-mtp-dflash2-vision.ninfer` (21.14 GiB, metadata
+name `rloo351-mixed-mtp-dflash2-vision`), text+mtp+dflash2+vision with the codebooks restored. Its
+source is the Q4 draft plus vision artifact, which is not retained under a separate name - the
+campaign graft builds it from the stored draft and the W4A4 donor:
+
+```bash
+python -m tools.convert.graft_bindings \
+  --source <Q4-draft+vision artifact>.ninfer \
+  --override rloo351-mixed-mtp-dflash2.ninfer \
+  --binding dflash2/candidate_selector/predecessor_codebook \
+  --binding dflash2/candidate_selector/successor_codebook \
+  --name rloo351-mixed-mtp-dflash2-vision \
+  --out rloo351-mixed-mtp-dflash2-vision.ninfer
+```
+
+The acceptance comparison itself ran through `tools/bench/run_serve_spec_ab.py` (its `run`
+subcommand per artifact, then `compare` over the two summaries) with the fixtures, seeds, padding
+and sampling profile listed above.
+
 ## MTP draft-chain CUDA graph
 
 The MTP chain (split embedding, MTP-layer stem, the autoregressive hidden relay, the two draft

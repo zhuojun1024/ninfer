@@ -8,6 +8,9 @@ The selector codebooks are one complete [vocab, rank] parent each, so the two as
 exactly two stored objects. The loader binds whichever representation the artifact carries (see
 src/models/qwen3_5/execution/parameters.cpp and selector.h).
 
+Status: the codebook lever was reverted from the official recipe, so this override is now the only
+way to build the quantized-codebook artifact; the default recipe keeps the codebooks BF16.
+
 Apply with: tools.convert --override tools/tp_bootstrap/r68_draft_codebook_q4.py
 """
 
