@@ -1,0 +1,129 @@
+schema_version: 1
+
+# NIAH (needle-in-a-haystack) sweep for KV-cache format comparison.
+#
+# The served model is the TP-2 vision artifact on the two RTX 5060 Ti cards:
+#   ninfer-serve D:\LLM\Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision.ninfer \
+#     --devices 0,1 --max-context 262144 --kv-capacity auto --kv-dtype <arm> \
+#     --model-id qwen38-tp2 --port 18080 --greedy
+# Only the --kv-dtype flag changes between arms; this config stays fixed.
+
+targets:
+  qwen38_tp2:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen38-tp2
+    max_concurrency: 1
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  smoke:
+    jobs:
+      - id: needle_haystack_smoke
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_tp2
+        max_concurrency: 1
+        limit: 1
+        generation: &retrieval_generation
+          temperature: 0
+          max_tokens: 512
+          seed: 42
+          extra_body:
+            enable_thinking: false
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            # No local_path: evalscope resolves AI-ModelScope/Needle-in-a-Haystack-Corpus itself and
+            # downloads it on first use. Point this at a pre-downloaded snapshot to run offline.
+            extra_params:
+              context_lengths_min: 8192
+              context_lengths_max: 8192
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 50
+              document_depth_percent_max: 50
+              document_depth_percent_intervals: 1
+              tokenizer_path: D:/LLM/Qwen3.8-27B-NVFP4
+              show_score: true
+
+  native_long:
+    jobs:
+      - id: needle_haystack_64k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_tp2
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args:
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            # No local_path: evalscope resolves AI-ModelScope/Needle-in-a-Haystack-Corpus itself and
+            # downloads it on first use. Point this at a pre-downloaded snapshot to run offline.
+            extra_params:
+              context_lengths_min: 65536
+              context_lengths_max: 65536
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 0
+              document_depth_percent_max: 100
+              document_depth_percent_intervals: 11
+              tokenizer_path: D:/LLM/Qwen3.8-27B-NVFP4
+              show_score: true
+
+      - id: needle_haystack_128k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_tp2
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args:
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            # No local_path: evalscope resolves AI-ModelScope/Needle-in-a-Haystack-Corpus itself and
+            # downloads it on first use. Point this at a pre-downloaded snapshot to run offline.
+            extra_params:
+              context_lengths_min: 131072
+              context_lengths_max: 131072
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 0
+              document_depth_percent_max: 100
+              document_depth_percent_intervals: 11
+              tokenizer_path: D:/LLM/Qwen3.8-27B-NVFP4
+              show_score: true
+
+      - id: needle_haystack_260k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_tp2
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args:
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            # No local_path: evalscope resolves AI-ModelScope/Needle-in-a-Haystack-Corpus itself and
+            # downloads it on first use. Point this at a pre-downloaded snapshot to run offline.
+            extra_params:
+              context_lengths_min: 260000
+              context_lengths_max: 260000
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 0
+              document_depth_percent_max: 100
+              document_depth_percent_intervals: 11
+              tokenizer_path: D:/LLM/Qwen3.8-27B-NVFP4
+              show_score: true
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs/niah-tp2
+  progress:
+    enabled: true
+    refresh_seconds: 2
+    heartbeat_seconds: 30
+  samples:
+    retention: all

@@ -38,6 +38,15 @@ Artifact 必须提供 Text；Vision、MTP、DFlash 和 DFlash2 的私有权重�
 checkpoint 或 cache replica，也不进入 Scheduler/ResourceManager。Generation 与 CausalScoring
 不在运行期切换，评分专用 staging 只在 CausalScoring 启动时分配。
 
+CausalScoring 有两条实现，对外合同相同：一次一个 prompt，没有 session、checkpoint ring 和投机轮，
+返回值按 target 顺序给出 log-probability。单 device 路线用 `CausalScoreCore` 串行调用 Program；
+`EngineOptions::device_b >= 0` 时改用 TP-2 的 `TP2GenerationCore::score`，它复用自己的两个 shard 与
+已验证的 `forward_tp2_prefill`，以 `kScoreTile` 宽的 prefill chunk 走完整段 prompt 并逐列取 logits，
+每个 chunk 前把两个 shard 的 GDN recurrent state 归零。两条路线并非逐位一致：TP-2 的 head 把词表切到
+两块卡上，每个 logit 是两个半 K 部分和的和，同一 artifact 同一 KV 格式在自然文本上相差约 1e-3 的
+`mean_nll`。评分路线还需要额外的 arena：`[vocab, kScoreTile]` 的逐列 logits tile 在 chunk forward
+期间一直存活，两个 shard 各按 `kScoreWorkspaceTiles` 个 tile 加宽。
+
 `max_concurrency` 限制同时激活的请求数，不把共享 KV 容量平均切分给 lane。请求只有在 Program
 证明其完整执行资源已经得到保障后才会进入 Active；进入 Active 后，它不会因为另一个请求或
 inactive cache 的保留而丢失完成能力。

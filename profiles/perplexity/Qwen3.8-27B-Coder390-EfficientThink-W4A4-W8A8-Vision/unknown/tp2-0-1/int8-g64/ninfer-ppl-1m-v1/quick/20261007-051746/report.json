@@ -1,0 +1,188 @@
+{
+  "artifact": {
+    "architecture": "Qwen3_5ForCausalLM",
+    "formats": [
+      "bf16",
+      "fp32",
+      "fp8_e4m3fn_row_bf16",
+      "nvfp4"
+    ],
+    "name": "Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision",
+    "path": "D:\\LLM\\Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision.ninfer",
+    "prefill_signature": ""
+  },
+  "corpus": {
+    "id": "ninfer-ppl-1m-v1",
+    "mode": "quick",
+    "source": "D:\\Documents\\workbench\\ninfer\\eval\\corpora\\perplexity-1m\\manifest.json",
+    "stream_count": 4
+  },
+  "domains": [
+    {
+      "domain": "chinese_reference",
+      "mean_nll": 1.5691987827933875,
+      "perplexity": 4.8027985669357625,
+      "scored_tokens": 65513,
+      "total_nll": 102802.91985714319
+    },
+    {
+      "domain": "english_long_form",
+      "mean_nll": 1.9113873000699042,
+      "perplexity": 6.762463860602087,
+      "scored_tokens": 65484,
+      "total_nll": 125165.28595777761
+    },
+    {
+      "domain": "english_reference",
+      "mean_nll": 1.7355381159885956,
+      "perplexity": 5.671979165414005,
+      "scored_tokens": 65328,
+      "total_nll": 113379.23404130297
+    },
+    {
+      "domain": "ninfer_code",
+      "mean_nll": 0.42824591491962916,
+      "perplexity": 1.5345634066074776,
+      "scored_tokens": 64898,
+      "total_nll": 27792.303386454092
+    }
+  ],
+  "execution": {
+    "context_tokens": 65536,
+    "device": 0,
+    "device_b": 1,
+    "kv_dtype": "int8-g64",
+    "prefill_chunk_tokens": 1024,
+    "purpose": "causal_scoring",
+    "score_tile_tokens": 1024,
+    "stride_tokens": 32768
+  },
+  "metric": {
+    "log_base": "natural",
+    "name": "fixed-window truncated-context causal perplexity"
+  },
+  "overall": {
+    "mean_nll": 1.413121138807371,
+    "perplexity": 4.10875942059832,
+    "scored_tokens": 261223,
+    "total_nll": 369139.7432426779
+  },
+  "schema_version": 2,
+  "streams": [
+    {
+      "domain": "english_reference",
+      "id": "wikitext-00",
+      "input_tokens": 65329,
+      "mean_nll": 1.7355381159885956,
+      "path": "data\\wikitext\\00.txt",
+      "perplexity": 5.671979165414005,
+      "scored_tokens": 65328,
+      "seconds": 69.1533289,
+      "total_nll": 113379.23404130297,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 65329,
+          "mean_nll": 1.7355381159885956,
+          "perplexity": 5.671979165414005,
+          "scored_tokens": 65328,
+          "seconds": 69.1532806,
+          "target_begin": 1,
+          "target_end": 65329,
+          "total_nll": 113379.23404130297
+        }
+      ]
+    },
+    {
+      "domain": "english_long_form",
+      "id": "pg19-00",
+      "input_tokens": 65485,
+      "mean_nll": 1.9113873000699042,
+      "path": "data\\pg19\\00.txt",
+      "perplexity": 6.762463860602087,
+      "scored_tokens": 65484,
+      "seconds": 68.1654338,
+      "total_nll": 125165.28595777761,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 65485,
+          "mean_nll": 1.9113873000699042,
+          "perplexity": 6.762463860602087,
+          "scored_tokens": 65484,
+          "seconds": 68.1653917,
+          "target_begin": 1,
+          "target_end": 65485,
+          "total_nll": 125165.28595777761
+        }
+      ]
+    },
+    {
+      "domain": "chinese_reference",
+      "id": "zhwiki-00",
+      "input_tokens": 65514,
+      "mean_nll": 1.5691987827933875,
+      "path": "data\\zhwiki\\00.txt",
+      "perplexity": 4.8027985669357625,
+      "scored_tokens": 65513,
+      "seconds": 68.2230061,
+      "total_nll": 102802.91985714319,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 65514,
+          "mean_nll": 1.5691987827933875,
+          "perplexity": 4.8027985669357625,
+          "scored_tokens": 65513,
+          "seconds": 68.2229583,
+          "target_begin": 1,
+          "target_end": 65514,
+          "total_nll": 102802.91985714319
+        }
+      ]
+    },
+    {
+      "domain": "ninfer_code",
+      "id": "ninfer-00",
+      "input_tokens": 64899,
+      "mean_nll": 0.42824591491962916,
+      "path": "data\\ninfer\\00.txt",
+      "perplexity": 1.5345634066074776,
+      "scored_tokens": 64898,
+      "seconds": 67.4516324,
+      "total_nll": 27792.303386454092,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 64899,
+          "mean_nll": 0.42824591491962916,
+          "perplexity": 1.5345634066074776,
+          "scored_tokens": 64898,
+          "seconds": 67.4515696,
+          "target_begin": 1,
+          "target_end": 64899,
+          "total_nll": 27792.303386454092
+        }
+      ]
+    }
+  ],
+  "timing": {
+    "load_seconds": 26.5400121,
+    "read_and_tokenize_seconds": 0.101926,
+    "score_seconds": 272.9934553,
+    "scored_tokens_per_second": 956.8837454836962,
+    "total_seconds": 299.7687944
+  }
+}

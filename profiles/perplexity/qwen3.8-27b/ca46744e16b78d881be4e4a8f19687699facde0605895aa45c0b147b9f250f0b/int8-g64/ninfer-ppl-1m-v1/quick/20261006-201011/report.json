@@ -1,0 +1,507 @@
+{
+  "artifact": {
+    "architecture": "Qwen3_5ForCausalLM",
+    "formats": [
+      "bf16",
+      "fp32",
+      "gguf_iq1_m",
+      "gguf_iq2_s",
+      "gguf_iq2_xs",
+      "gguf_iq2_xxs",
+      "gguf_iq3_s",
+      "gguf_iq3_xxs",
+      "gguf_iq4_xs",
+      "gguf_q2_k",
+      "gguf_q4_k",
+      "int32"
+    ],
+    "name": "qwen3.8-27b",
+    "path": "D:\\LLM\\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer",
+    "prefill_signature": "ca46744e16b78d881be4e4a8f19687699facde0605895aa45c0b147b9f250f0b"
+  },
+  "corpus": {
+    "id": "ninfer-ppl-1m-v1",
+    "mode": "quick",
+    "source": "D:\\Documents\\workbench\\ninfer\\eval\\corpora\\perplexity-1m\\manifest.json",
+    "stream_count": 4
+  },
+  "domains": [
+    {
+      "domain": "chinese_reference",
+      "mean_nll": 1.6350262964229214,
+      "perplexity": 5.129592885197539,
+      "scored_tokens": 65513,
+      "total_nll": 107115.47775755485
+    },
+    {
+      "domain": "english_long_form",
+      "mean_nll": 1.9372012102854905,
+      "perplexity": 6.939302119312941,
+      "scored_tokens": 65484,
+      "total_nll": 126855.68405433506
+    },
+    {
+      "domain": "english_reference",
+      "mean_nll": 1.7774989625956417,
+      "perplexity": 5.915044156617518,
+      "scored_tokens": 65328,
+      "total_nll": 116120.45222844808
+    },
+    {
+      "domain": "ninfer_code",
+      "mean_nll": 0.4875793649419309,
+      "perplexity": 1.6283697564884283,
+      "scored_tokens": 64898,
+      "total_nll": 31642.92562600143
+    }
+  ],
+  "execution": {
+    "context_tokens": 16384,
+    "device": 0,
+    "kv_dtype": "int8-g64",
+    "prefill_chunk_tokens": 1024,
+    "purpose": "causal_scoring",
+    "score_tile_tokens": 1024,
+    "stride_tokens": 8192
+  },
+  "metric": {
+    "log_base": "natural",
+    "name": "fixed-window truncated-context causal perplexity"
+  },
+  "overall": {
+    "mean_nll": 1.4613358688413327,
+    "perplexity": 4.311715569313058,
+    "scored_tokens": 261223,
+    "total_nll": 381734.53966633946
+  },
+  "schema_version": 2,
+  "streams": [
+    {
+      "domain": "english_reference",
+      "id": "wikitext-00",
+      "input_tokens": 65329,
+      "mean_nll": 1.7774989625956417,
+      "path": "data\\wikitext\\00.txt",
+      "perplexity": 5.915044156617518,
+      "scored_tokens": 65328,
+      "seconds": 110.380784,
+      "total_nll": 116120.45222844808,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 16384,
+          "mean_nll": 1.5880144367217464,
+          "perplexity": 4.894021884554928,
+          "scored_tokens": 16383,
+          "seconds": 16.8746734,
+          "target_begin": 1,
+          "target_end": 16384,
+          "total_nll": 26016.44051681237
+        },
+        {
+          "first_target": 8192,
+          "index": 1,
+          "input_begin": 8192,
+          "input_end": 24576,
+          "mean_nll": 1.820174422672393,
+          "perplexity": 6.1729350558175256,
+          "scored_tokens": 8192,
+          "seconds": 15.5841524,
+          "target_begin": 16384,
+          "target_end": 24576,
+          "total_nll": 14910.868870532244
+        },
+        {
+          "first_target": 8192,
+          "index": 2,
+          "input_begin": 16384,
+          "input_end": 32768,
+          "mean_nll": 1.9358602180580118,
+          "perplexity": 6.930002805654033,
+          "scored_tokens": 8192,
+          "seconds": 15.5870915,
+          "target_begin": 24576,
+          "target_end": 32768,
+          "total_nll": 15858.566906331233
+        },
+        {
+          "first_target": 8192,
+          "index": 3,
+          "input_begin": 24576,
+          "input_end": 40960,
+          "mean_nll": 1.7269874186813883,
+          "perplexity": 5.623686550444356,
+          "scored_tokens": 8192,
+          "seconds": 15.5850103,
+          "target_begin": 32768,
+          "target_end": 40960,
+          "total_nll": 14147.480933837933
+        },
+        {
+          "first_target": 8192,
+          "index": 4,
+          "input_begin": 32768,
+          "input_end": 49152,
+          "mean_nll": 1.8110023433678362,
+          "perplexity": 6.116575269274178,
+          "scored_tokens": 8192,
+          "seconds": 15.5851383,
+          "target_begin": 40960,
+          "target_end": 49152,
+          "total_nll": 14835.731196869314
+        },
+        {
+          "first_target": 8192,
+          "index": 5,
+          "input_begin": 40960,
+          "input_end": 57344,
+          "mean_nll": 2.066752546742194,
+          "perplexity": 7.899129367405102,
+          "scored_tokens": 8192,
+          "seconds": 15.5858818,
+          "target_begin": 49152,
+          "target_end": 57344,
+          "total_nll": 16930.836862912052
+        },
+        {
+          "first_target": 8399,
+          "index": 6,
+          "input_begin": 48945,
+          "input_end": 65329,
+          "mean_nll": 1.6807172124174,
+          "perplexity": 5.36940559482466,
+          "scored_tokens": 7985,
+          "seconds": 15.5780662,
+          "target_begin": 57344,
+          "target_end": 65329,
+          "total_nll": 13420.526941152939
+        }
+      ]
+    },
+    {
+      "domain": "english_long_form",
+      "id": "pg19-00",
+      "input_tokens": 65485,
+      "mean_nll": 1.9372012102854905,
+      "path": "data\\pg19\\00.txt",
+      "perplexity": 6.939302119312941,
+      "scored_tokens": 65484,
+      "seconds": 109.4494205,
+      "total_nll": 126855.68405433506,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 16384,
+          "mean_nll": 1.8309787703826215,
+          "perplexity": 6.23999118913424,
+          "scored_tokens": 16383,
+          "seconds": 15.9413856,
+          "target_begin": 1,
+          "target_end": 16384,
+          "total_nll": 29996.925195178486
+        },
+        {
+          "first_target": 8192,
+          "index": 1,
+          "input_begin": 8192,
+          "input_end": 24576,
+          "mean_nll": 1.8999990869304337,
+          "perplexity": 6.685888337595318,
+          "scored_tokens": 8192,
+          "seconds": 15.5838231,
+          "target_begin": 16384,
+          "target_end": 24576,
+          "total_nll": 15564.792520134113
+        },
+        {
+          "first_target": 8192,
+          "index": 2,
+          "input_begin": 16384,
+          "input_end": 32768,
+          "mean_nll": 1.9122802783701787,
+          "perplexity": 6.768505291117713,
+          "scored_tokens": 8192,
+          "seconds": 15.5847954,
+          "target_begin": 24576,
+          "target_end": 32768,
+          "total_nll": 15665.400040408504
+        },
+        {
+          "first_target": 8192,
+          "index": 3,
+          "input_begin": 24576,
+          "input_end": 40960,
+          "mean_nll": 1.9692281721231932,
+          "perplexity": 7.165144095639448,
+          "scored_tokens": 8192,
+          "seconds": 15.5841607,
+          "target_begin": 32768,
+          "target_end": 40960,
+          "total_nll": 16131.917186033199
+        },
+        {
+          "first_target": 8192,
+          "index": 4,
+          "input_begin": 32768,
+          "input_end": 49152,
+          "mean_nll": 1.8780248184852086,
+          "perplexity": 6.5405732758496145,
+          "scored_tokens": 8192,
+          "seconds": 15.5852232,
+          "target_begin": 40960,
+          "target_end": 49152,
+          "total_nll": 15384.77931303083
+        },
+        {
+          "first_target": 8192,
+          "index": 5,
+          "input_begin": 40960,
+          "input_end": 57344,
+          "mean_nll": 2.050631659666115,
+          "perplexity": 7.7728093261250475,
+          "scored_tokens": 8192,
+          "seconds": 15.5841145,
+          "target_begin": 49152,
+          "target_end": 57344,
+          "total_nll": 16798.774555984815
+        },
+        {
+          "first_target": 8243,
+          "index": 6,
+          "input_begin": 49101,
+          "input_end": 65485,
+          "mean_nll": 2.126654617806794,
+          "perplexity": 8.386762901221935,
+          "scored_tokens": 8141,
+          "seconds": 15.585238,
+          "target_begin": 57344,
+          "target_end": 65485,
+          "total_nll": 17313.09524356511
+        }
+      ]
+    },
+    {
+      "domain": "chinese_reference",
+      "id": "zhwiki-00",
+      "input_tokens": 65514,
+      "mean_nll": 1.6350262964229214,
+      "path": "data\\zhwiki\\00.txt",
+      "perplexity": 5.129592885197539,
+      "scored_tokens": 65513,
+      "seconds": 109.4569201,
+      "total_nll": 107115.47775755485,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 16384,
+          "mean_nll": 1.8757212217780166,
+          "perplexity": 6.525523773435409,
+          "scored_tokens": 16383,
+          "seconds": 15.940237,
+          "target_begin": 1,
+          "target_end": 16384,
+          "total_nll": 30729.940776389245
+        },
+        {
+          "first_target": 8192,
+          "index": 1,
+          "input_begin": 8192,
+          "input_end": 24576,
+          "mean_nll": 1.9326603262615543,
+          "perplexity": 6.907862987928715,
+          "scored_tokens": 8192,
+          "seconds": 15.5835716,
+          "target_begin": 16384,
+          "target_end": 24576,
+          "total_nll": 15832.353392734653
+        },
+        {
+          "first_target": 8192,
+          "index": 2,
+          "input_begin": 16384,
+          "input_end": 32768,
+          "mean_nll": 1.505612864289882,
+          "perplexity": 4.506914911263454,
+          "scored_tokens": 8192,
+          "seconds": 15.5851657,
+          "target_begin": 24576,
+          "target_end": 32768,
+          "total_nll": 12333.980584262714
+        },
+        {
+          "first_target": 8192,
+          "index": 3,
+          "input_begin": 24576,
+          "input_end": 40960,
+          "mean_nll": 1.2531081283700378,
+          "perplexity": 3.501208268072177,
+          "scored_tokens": 8192,
+          "seconds": 15.5886752,
+          "target_begin": 32768,
+          "target_end": 40960,
+          "total_nll": 10265.46178760735
+        },
+        {
+          "first_target": 8192,
+          "index": 4,
+          "input_begin": 32768,
+          "input_end": 49152,
+          "mean_nll": 1.1427489254874241,
+          "perplexity": 3.135375443126435,
+          "scored_tokens": 8192,
+          "seconds": 15.5863353,
+          "target_begin": 40960,
+          "target_end": 49152,
+          "total_nll": 9361.399197592978
+        },
+        {
+          "first_target": 8192,
+          "index": 5,
+          "input_begin": 40960,
+          "input_end": 57344,
+          "mean_nll": 1.498688395953527,
+          "perplexity": 4.475814722069995,
+          "scored_tokens": 8192,
+          "seconds": 15.5866689,
+          "target_begin": 49152,
+          "target_end": 57344,
+          "total_nll": 12277.255339651294
+        },
+        {
+          "first_target": 8214,
+          "index": 6,
+          "input_begin": 49130,
+          "input_end": 65514,
+          "mean_nll": 1.9969506339432832,
+          "perplexity": 7.366558481240355,
+          "scored_tokens": 8170,
+          "seconds": 15.5854529,
+          "target_begin": 57344,
+          "target_end": 65514,
+          "total_nll": 16315.086679316624
+        }
+      ]
+    },
+    {
+      "domain": "ninfer_code",
+      "id": "ninfer-00",
+      "input_tokens": 64899,
+      "mean_nll": 0.4875793649419309,
+      "path": "data\\ninfer\\00.txt",
+      "perplexity": 1.6283697564884283,
+      "scored_tokens": 64898,
+      "seconds": 109.429177,
+      "total_nll": 31642.92562600143,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 16384,
+          "mean_nll": 0.463477628008161,
+          "perplexity": 1.5895923949786697,
+          "scored_tokens": 16383,
+          "seconds": 15.9392235,
+          "target_begin": 1,
+          "target_end": 16384,
+          "total_nll": 7593.153979657702
+        },
+        {
+          "first_target": 8192,
+          "index": 1,
+          "input_begin": 8192,
+          "input_end": 24576,
+          "mean_nll": 0.39898118012028505,
+          "perplexity": 1.4903055709718926,
+          "scored_tokens": 8192,
+          "seconds": 15.5845005,
+          "target_begin": 16384,
+          "target_end": 24576,
+          "total_nll": 3268.453827545375
+        },
+        {
+          "first_target": 8192,
+          "index": 2,
+          "input_begin": 16384,
+          "input_end": 32768,
+          "mean_nll": 0.40647962569871543,
+          "perplexity": 1.5015225485813959,
+          "scored_tokens": 8192,
+          "seconds": 15.585235,
+          "target_begin": 24576,
+          "target_end": 32768,
+          "total_nll": 3329.881093723877
+        },
+        {
+          "first_target": 8192,
+          "index": 3,
+          "input_begin": 24576,
+          "input_end": 40960,
+          "mean_nll": 0.5823525596449357,
+          "perplexity": 1.7902451390124268,
+          "scored_tokens": 8192,
+          "seconds": 15.5851467,
+          "target_begin": 32768,
+          "target_end": 40960,
+          "total_nll": 4770.632168611313
+        },
+        {
+          "first_target": 8192,
+          "index": 4,
+          "input_begin": 32768,
+          "input_end": 49152,
+          "mean_nll": 0.5144471844978188,
+          "perplexity": 1.6727135441777,
+          "scored_tokens": 8192,
+          "seconds": 15.5855021,
+          "target_begin": 40960,
+          "target_end": 49152,
+          "total_nll": 4214.3513354061315
+        },
+        {
+          "first_target": 8192,
+          "index": 5,
+          "input_begin": 40960,
+          "input_end": 57344,
+          "mean_nll": 0.6098797834256129,
+          "perplexity": 1.8402101617219286,
+          "scored_tokens": 8192,
+          "seconds": 15.585869,
+          "target_begin": 49152,
+          "target_end": 57344,
+          "total_nll": 4996.135185822621
+        },
+        {
+          "first_target": 8829,
+          "index": 6,
+          "input_begin": 48515,
+          "input_end": 64899,
+          "mean_nll": 0.4593405738232173,
+          "perplexity": 1.5830297494787726,
+          "scored_tokens": 7555,
+          "seconds": 15.5630702,
+          "target_begin": 57344,
+          "target_end": 64899,
+          "total_nll": 3470.3180352344066
+        }
+      ]
+    }
+  ],
+  "timing": {
+    "load_seconds": 6.2120604,
+    "read_and_tokenize_seconds": 0.0642534,
+    "score_seconds": 438.7164431,
+    "scored_tokens_per_second": 595.4255968939315,
+    "total_seconds": 445.0662337
+  }
+}

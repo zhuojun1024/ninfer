@@ -19,6 +19,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/target_logprobs.h"
 #include "ninfer/ops/token_mask.h"
 
 #include <algorithm>
@@ -194,6 +195,24 @@ Tp2RoundTiming& tp2_timing() {
 // exactly: at 262,144 tokens the 128 MiB a 384 MiB arena would hold is the difference between
 // fitting the card and not, and the oversized arena overflow is a reported error, not corruption.
 constexpr std::size_t kWorkspaceBytes = 192ULL << 20;
+// Causal scoring adds buffers the generation route never holds at once, because the forward writes
+// every position's logits instead of only the last one. Three of them scale with the tile, i.e. the
+// forward's chunk width, and at the packed 248,320-token vocabulary they are large:
+//   * the caller's per-column logits tile, [vocab, T] BF16                  = 2 * vocab * T
+//   * the vocabulary-split head's own partial block, [vocab/2, T] BF16      = 1 * vocab * T
+//   * that projection's activation workspace, an FP32 [vocab/2, T] scratch  = 2 * vocab * T
+// The peer shard holds the same three (the forward allocates the peer's logits mirror itself), so
+// both arenas pay 5 * vocab * T. At 1024 columns that is 1.2 GiB per shard -- far beyond the whole
+// generation arena -- and 512 columns already needs 606 MiB. 256 columns needs 303 MiB, which fits
+// beside the 262,144-token KV pool (~1 GiB per shard) with room to spare, and it keeps the walk at
+// four forwards per 1024 tokens. The arena is sized from this same constant, so tile and arena move
+// together.
+constexpr std::uint32_t kScoreTile = 256;
+// Arena headroom for the three buffers above, in units of one [vocab, kScoreTile] BF16 tile. They
+// total 5 * vocab * T / (2 * vocab * T) = 2.5 such tiles; two whole tiles of extra extent leaves the
+// four-way split head and its workspace slack, and the arena keeps kWorkspaceBytes underneath so a
+// nested scope inside the forward can still reach the generation allowance.
+constexpr std::size_t kScoreWorkspaceTiles = 2;
 // Smallest Vision item ceiling the route will fall back to when the full envelope does not fit
 // beside the KV pool: below this an ordinary photo would no longer fit in one item, so the route
 // reports the failure instead of silently admitting only thumbnails.
@@ -998,9 +1017,17 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     }
 
     // Workspace arena: ample for the single-token forward (full-vocab logits plus a handful of
-    // [N,1] activations) and the sampling workspace.
+    // [N,1] activations) and the sampling workspace. Causal scoring keeps a [vocab, kScoreTile] BF16
+    // per-column logits tile alive across the whole forward, on this shard and (allocated by the
+    // forward) on the peer, so it takes that extra extent on top of the generation allowance.
     shard.device.bind_to_current_thread();
-    shard.workspace = std::make_unique<DeviceArena>(kWorkspaceBytes);
+    workspace_bytes_ = kWorkspaceBytes;
+    if (options_.purpose == EnginePurpose::CausalScoring) {
+        workspace_bytes_ += kScoreWorkspaceTiles *
+                            static_cast<std::size_t>(qwen::execution::dimension(config.vocab_size)) *
+                            kScoreTile * sizeof(std::uint16_t);
+    }
+    shard.workspace = std::make_unique<DeviceArena>(workspace_bytes_);
     shard.prefill_hidden = shard.workspace->alloc(DType::BF16,
                                                   {2 * qwen::execution::dimension(config.hidden_size), lanes});
     if (mtp_shard) {
@@ -1141,7 +1168,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
                      static_cast<double>(record_bytes) / 1048576.0,
                      static_cast<double>(dflash_planes * lanes_ * dflash_image_bytes) / 1048576.0,
                      static_cast<double>(round_bytes) / 1048576.0,
-                     static_cast<unsigned>(kWorkspaceBytes >> 20),
+                     static_cast<unsigned>(workspace_bytes_ >> 20),
                      static_cast<double>(vision_bytes) / 1048576.0,
                      static_cast<double>(free_bytes) / 1048576.0,
                      static_cast<double>(total_bytes) / 1048576.0);
@@ -8185,9 +8212,133 @@ MemorySummary TP2GenerationCore::memory_summary() const {
     summary.max_context   = options_.max_context;
     summary.kv_capacity   = options_.max_context;
     summary.kv_cache      = options_.kv_cache;
-    summary.workspace     = {.capacity_bytes = kWorkspaceBytes, .used_bytes = 0,
+    summary.workspace     = {.capacity_bytes = workspace_bytes_, .used_bytes = 0,
                              .peak_used_bytes = shard_a_.workspace->peak_used()};
     return summary;
+}
+
+std::vector<float> TP2GenerationCore::score(qwen::PreparedPrompt&& prompt,
+                                           std::uint32_t first_target) {
+    const qwen::PreparedPromptData data = qwen::PreparedPromptAccess::take(std::move(prompt));
+    const std::vector<TokenId>& tokens  = data.token_ids;
+    if (tokens.size() < 2) {
+        throw std::invalid_argument("TP-2 causal score needs at least two tokens");
+    }
+    if (first_target == 0 || static_cast<std::size_t>(first_target) >= tokens.size()) {
+        throw std::invalid_argument("TP-2 causal score first_target must be in [1,token_count-1]");
+    }
+    if (tokens.size() > options_.max_context) {
+        throw std::invalid_argument("TP-2 causal score token count exceeds max_context");
+    }
+    if (data.has_media()) {
+        throw std::invalid_argument("TP-2 causal score accepts text tokens only");
+    }
+
+    // The shards, the paged KV pool and the DevicePair belong to one walk at a time, and the
+    // workspaces are not thread-safe; scoring serializes against generation through the same mutex
+    // the request queue uses.
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+
+    const std::uint32_t token_count     = static_cast<std::uint32_t>(tokens.size());
+    const std::uint32_t predictor_count = token_count - 1U;
+    // Token i's logits predict token i+1, so the scored range of predictor columns starts one
+    // before the first target -- the mapping the single-device Program::causal_score walk uses.
+    const std::uint32_t first_predictor = first_target - 1U;
+    const std::int32_t vocab = qwen::execution::dimension(shard_a_.model->config().text.vocab_size);
+    const std::int32_t public_tokens =
+        static_cast<std::int32_t>(shard_a_.model->resources().public_token_count);
+    const std::uint32_t tile =
+        std::min<std::uint32_t>(kScoreTile, prefill_chunk_width(shard_a_.model->config().text));
+    if (tile == 0) { throw std::logic_error("TP-2 causal score has no prefill chunk width"); }
+
+    // A walk starts from zeroed linear-attention state; the recurrent state is the only thing that
+    // carries across positions without being rewritten, so it is the only thing that must be reset.
+    // The paged KV needs no reset: every chunk writes positions [first_position, first_position +
+    // chunk) before its attention reads them, and the envelope the forward binds ends at the chunk,
+    // so an earlier walk's stale tail is never inside this walk's causal window. Both memsets are
+    // enqueued on their own device's stream, so the forward that follows is ordered after them.
+    shard_a_.device.bind_to_current_thread();
+    CUDA_CHECK(cudaMemsetAsync(shard_a_.state_backing.data, 0, shard_a_.state_backing.bytes,
+                               shard_a_.device.stream));
+    shard_b_.device.bind_to_current_thread();
+    CUDA_CHECK(cudaMemsetAsync(shard_b_.state_backing.data, 0, shard_b_.state_backing.bytes,
+                               shard_b_.device.stream));
+    shard_a_.device.bind_to_current_thread();
+
+    std::vector<float> output;
+    output.reserve(token_count - first_target);
+    std::vector<std::int32_t> targets;
+    targets.reserve(tile);
+    std::vector<float> host(tile, 0.0F);
+
+    for (std::uint32_t cursor = 0; cursor < predictor_count;) {
+        const std::uint32_t chunk = std::min(tile, predictor_count - cursor);
+        // The caller owns the per-column logits buffer, so it is allocated inside this iteration's
+        // arena scope: the forward allocates its internals above it and the scope reclaims both. The
+        // peer allocates its own copy of the same tile in its arena, which is why build_shard sizes
+        // both workspaces for the scoring route.
+        auto scope_a = shard_a_.workspace->scope();
+        auto scope_b = shard_b_.workspace->scope();
+        Tensor logits =
+            shard_a_.workspace->alloc(DType::BF16, {vocab, static_cast<std::int32_t>(chunk)});
+        try {
+            shard_a_.context->forward_tp2_prefill(
+                *shard_b_.context, pair_,
+                std::span<const int>(tokens.data() + cursor, static_cast<std::size_t>(chunk)),
+                static_cast<std::int32_t>(cursor), nullptr, nullptr, nullptr, &logits, nullptr,
+                qwen::TextPhase::Prefill, nullptr, nullptr, active_lane_);
+        } catch (const std::bad_alloc&) {
+            std::fprintf(stderr,
+                         "[score] FORWARD OVERFLOW chunk=%u peak_a=%zu used_a=%zu cap_a=%zu | "
+                         "peak_b=%zu used_b=%zu cap_b=%zu\n",
+                         chunk, shard_a_.workspace->peak_used(), shard_a_.workspace->used(),
+                         shard_a_.workspace->capacity(), shard_b_.workspace->peak_used(),
+                         shard_b_.workspace->used(), shard_b_.workspace->capacity());
+            throw;
+        }
+
+        // A predictor column scores only when its target is in the request's range: chunks that end at
+        // or before first_target contribute nothing (the prefill that first_predictor does not move),
+        // and the chunk holding the last token has one column fewer than chunk. This walk's tile is
+        // narrower than the single-device walk's 1024-token chunk, so a request can start several
+        // tiles in and leave whole chunks with no scored column at all.
+        const std::uint32_t selected   = std::max(cursor, first_predictor);
+        const std::uint32_t scored_end = cursor + chunk;
+        const std::uint32_t count      = scored_end > selected ? scored_end - selected : 0U;
+        std::int32_t scored_columns    = 0;
+        if (count != 0) {
+            scored_columns = static_cast<std::int32_t>(count);
+            Tensor target_ids = shard_a_.workspace->alloc(DType::I32, {scored_columns});
+            Tensor logprobs   = shard_a_.workspace->alloc(DType::FP32, {scored_columns});
+            targets.assign(tokens.begin() + selected + 1U, tokens.begin() + selected + 1U + count);
+            shard_a_.device.bind_to_current_thread();
+            CUDA_CHECK(cudaMemcpyAsync(target_ids.data, targets.data(), target_ids.bytes(),
+                                       cudaMemcpyHostToDevice, shard_a_.device.stream));
+            // Slicing the tile along the column axis keeps the block contiguous, which is what the
+            // op's contract requires; the columns before `selected - cursor` belong to a window the
+            // chunk shares with the previous stride and are deliberately not scored twice.
+            ops::target_logprobs(
+                logits.slice(1, static_cast<std::int32_t>(selected - cursor), scored_columns),
+                target_ids, public_tokens, logprobs, shard_a_.device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(host.data(), logprobs.data, logprobs.bytes(),
+                                       cudaMemcpyDeviceToHost, shard_a_.device.stream));
+        }
+        // The forward's trailing all-reduce runs on the peer's stream, so draining the driver stream
+        // is what retires this chunk: it makes both arenas safe to reuse for the next one and it
+        // completes the log-probability copy read back below. A chunk that scores nothing still has
+        // to drain, because the next chunk reuses the peer tile this one left in flight.
+        CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
+        abort_if_ar_stalled();
+        if (scored_columns != 0) {
+            output.insert(output.end(), host.begin(), host.begin() + scored_columns);
+        }
+        cursor += chunk;
+    }
+
+    if (output.size() != static_cast<std::size_t>(token_count - first_target)) {
+        throw std::logic_error("TP-2 causal score produced the wrong number of logprobs");
+    }
+    return output;
 }
 
 RuntimeStats TP2GenerationCore::runtime_stats() const {

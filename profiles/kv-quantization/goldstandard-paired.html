@@ -1,0 +1,799 @@
+<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<title>KV 量化与上下文深度 — 固定文本金标准对照</title><style>
+body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#f9fafb;color:#111827}
+.wrap{max-width:1120px;margin:0 auto;padding:28px 20px 60px}
+h1{font-size:24px;margin:0 0 6px}h2{font-size:18px;margin:34px 0 10px;padding-bottom:6px;border-bottom:1px solid #e5e7eb}
+h3{font-size:15px;margin:22px 0 8px}p,li{font-size:14px;line-height:1.65}
+.sub{color:#6b7280;font-size:13px;margin-bottom:18px}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px 18px;margin:14px 0}
+table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{border:1px solid #e5e7eb;padding:6px 9px;text-align:right}
+th{background:#f3f4f6;font-weight:600}td:first-child,th:first-child{text-align:left}
+.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.good{color:#059669;font-weight:600}.bad{color:#dc2626;font-weight:600}.nodata{color:#dc2626}
+svg{display:block;max-width:100%}ul{margin:8px 0 8px 18px;padding:0}
+</style></head><body><div class="wrap">
+<h1>KV cache 量化与上下文深度：固定文本金标准对照</h1>
+<div class="sub">Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision · TP-2 <span class="mono">--devices 0,1</span> · 被打分的文本固定为源流最后 1024 个 token · 每次运行只改"能看到多长的前文"</div>
+<div class="card"><h3 style="margin-top:0">为什么这个设计能回答"上下文变长会不会变差"</h3><p>上一版把一条 257K 的自然流一次跑完，逐 token 看 NLL —— 深度和文本内容是绑死的（越深的 token 越属于后面的书），所以"模型随上下文变差"分不清是深度还是文本。</p><p>这一版把<b>被打分的文本钉死</b>：目标块恒为源流最后 1024 个 token，第 K 次运行只暴露它前面 K 个 token。K ≥ 1 时目标块的紧邻前文每次都是同一段文字，<b>连拼接接缝都不存在</b>，唯一变量是历史能看到多远。横轴是某个 token 的实际历史长度；同一横轴位置各条臂打的是<b>同一个 token</b>，所以臂间差与深度间差都是严格配对的。</p><p>已校验：13 条输入流的末尾 3000 字符逐字节相同（每条都是源流的字符后缀），所以被打分的 1008 个 token 在每次运行里严格是同一段文本。</p><p><b>唯一的残留混淆</b>：历史的<b>内容</b>随 K 变化 —— 源流是 pg19 四本书顺序拼接，可见窗口跨过书边界时，前文换成了另一本书。所以"相邻深度配对差"同时混了"更多历史"与"不同历史"两个因素，逐点因果不能下；能下的是<b>长期趋势</b>。</p></div>
+<h2>结论</h2><div class="card">
+<h3 style="margin-top:0">问题一：同一段文本，历史越长，模型是变好还是变差？</h3>
+<p>把被打分的文本钉死之后，<b>所有臂</b>的 NLL 随可见历史的斜率都是<b>负</b>的：bf16 -0.168795 ± +0.032161 nats/十倍程（t=-5.25）；int8 -0.109210 ± +0.021811 nats/十倍程（t=-5.01）；fp8 -0.119033 ± +0.021986 nats/十倍程（t=-5.41）；nvfp4 -0.119770 ± +0.023345 nats/十倍程（t=-5.13）；k8v4 -0.116536 ± +0.022157 nats/十倍程（t=-5.26）。最平的一条（int8）也达到 t=-5.01，也就是说"历史越长，这段固定的文本越好预测"是统计上确定的，方向与"随上下文劣化"相反。</p>
+<p>相邻深度配对差里只有 13 个区间为正（历史变长后该文本略难），最大的是 int8 的 +0.008138 ± +0.005589（t=+1.46）—— <b>测不出与零的差别</b>。其余全部为负且多数显著。</p>
+<p><b>所以"上下文越长模型越差"在本模型 + 本语料上不成立。</b>上一版把一条 257K 的自然流一次跑完、看到深层 PPL 升高，那是<b>文本内容</b>造成的（越深的 token 越属于后面那本书），不是深度本身。</p>
+<p>注意这条曲线的形状：从 0 到 ~1K 历史收益极陡，之后趋缓；在约 60,517 个 token 处有一次大的台阶（紫线"book 02|03"），那是可见窗口第一次够到目标块所属那本书的开头。此后继续加长历史（包括加进完全不相关的书 01、00）都没有让结果变差。</p>
+<h3>问题二：KV 量化的代价会不会随上下文增长而放大？</h3>
+<p>配对差值本身随历史的斜率（正 = 量化代价随上下文放大）：</p><ul><li>bf16 − fp8：+0.005919 ± +0.007586 nats/十倍程（t=+0.78）</li><li>fp8 − bf16：-0.005919 ± +0.007586 nats/十倍程（t=-0.78）</li><li>int8 − bf16：+0.007940 ± +0.007351 nats/十倍程（t=+1.08）</li><li>int8 − fp8：+0.009823 ± +0.004649 nats/十倍程（t=+2.11）</li><li>k8v4 − bf16：-0.002792 ± +0.007226 nats/十倍程（t=-0.39）</li><li>k8v4 − fp8：+0.002498 ± +0.004798 nats/十倍程（t=+0.52）</li><li>nvfp4 − bf16：-0.006089 ± +0.008548 nats/十倍程（t=-0.71）</li><li>nvfp4 − fp8：+0.004786 ± +0.005693 nats/十倍程（t=+0.84）</li></ul>
+<p>这些斜率即使为正也只有 ~1e-3 nats/十倍程量级，而绝对差值本身在 1e-2 nats 量级 —— <b>量化代价基本上是一个与上下文长度无关的常数</b>，没有出现"短上下文无损、长上下文崩溃"的拐点。</p>
+</div>
+<h2>1. 固定文本的 NLL 随可见历史长度变化</h2>
+<p>每个点是一次运行：该次运行中目标块 1008 个 token 的 NLL 均值（丢掉块首 16 个 token 以避开分词边界），误差棒为块内标准误。内容完全固定。</p>
+<p class="sub">紫色虚线是源流里的书边界（pg19 的 00/01/02/03 顺序拼接），横轴从右往左读：点越靠右，历史越短。跨过一条紫线表示可见窗口已经伸进更早的那本书。</p>
+<div class="card"><svg viewBox="0 0 1040 470" width="100%" role="img">
+<rect x="0" y="0" width="1040" height="470" fill="#ffffff"/>
+<text x="92" y="24" font-size="15" font-weight="600" fill="#111827">fixed target block: NLL vs visible history</text>
+<line x1="92" y1="410.0" x2="772" y2="410.0" stroke="#e5e7eb"/>
+<text x="84" y="414.0" font-size="11" fill="#6b7280" text-anchor="end">1.3590</text>
+<line x1="92" y1="319.5" x2="772" y2="319.5" stroke="#e5e7eb"/>
+<text x="84" y="323.5" font-size="11" fill="#6b7280" text-anchor="end">1.5065</text>
+<line x1="92" y1="229.0" x2="772" y2="229.0" stroke="#e5e7eb"/>
+<text x="84" y="233.0" font-size="11" fill="#6b7280" text-anchor="end">1.6540</text>
+<line x1="92" y1="138.5" x2="772" y2="138.5" stroke="#e5e7eb"/>
+<text x="84" y="142.5" font-size="11" fill="#6b7280" text-anchor="end">1.8015</text>
+<line x1="92" y1="48.0" x2="772" y2="48.0" stroke="#e5e7eb"/>
+<text x="84" y="52.0" font-size="11" fill="#6b7280" text-anchor="end">1.9490</text>
+<line x1="164.9" y1="48" x2="164.9" y2="410" stroke="#e5e7eb"/>
+<text x="164.9" y="428" font-size="11" fill="#6b7280" text-anchor="middle">1,000</text>
+<line x1="416.9" y1="48" x2="416.9" y2="410" stroke="#e5e7eb"/>
+<text x="416.9" y="428" font-size="11" fill="#6b7280" text-anchor="middle">10,000</text>
+<line x1="668.8" y1="48" x2="668.8" y2="410" stroke="#e5e7eb"/>
+<text x="668.8" y="428" font-size="11" fill="#6b7280" text-anchor="middle">100,000</text>
+<line x1="613.9" y1="48" x2="613.9" y2="410" stroke="#c084fc" stroke-dasharray="3,3"/>
+<text x="613.9" y="59" font-size="9.5" fill="#7e22ce" text-anchor="middle">02|03</text>
+<line x1="696.1" y1="48" x2="696.1" y2="410" stroke="#c084fc" stroke-dasharray="3,3"/>
+<text x="696.1" y="70" font-size="9.5" fill="#7e22ce" text-anchor="middle">01|02</text>
+<line x1="740.3" y1="48" x2="740.3" y2="410" stroke="#c084fc" stroke-dasharray="3,3"/>
+<text x="740.3" y="81" font-size="9.5" fill="#7e22ce" text-anchor="middle">00|01</text>
+<line x1="92" y1="410" x2="772" y2="410" stroke="#9ca3af"/>
+<text x="432" y="456" font-size="12" fill="#374151" text-anchor="middle">visible history (tokens)</text>
+<text x="18" y="229" font-size="12" fill="#374151" text-anchor="middle" transform="rotate(-90 18 229)">mean NLL of the fixed block (nats)</text>
+<line x1="92.0" y1="125.6" x2="92.0" y2="38.4" stroke="#111827" opacity="0.55"/>
+<line x1="137.8" y1="212.6" x2="137.8" y2="130.8" stroke="#111827" opacity="0.55"/>
+<line x1="211.8" y1="279.6" x2="211.8" y2="200.6" stroke="#111827" opacity="0.55"/>
+<line x1="329.5" y1="333.2" x2="329.5" y2="256.5" stroke="#111827" opacity="0.55"/>
+<line x1="473.3" y1="342.4" x2="473.3" y2="265.8" stroke="#111827" opacity="0.55"/>
+<line x1="544.2" y1="339.3" x2="544.2" y2="262.9" stroke="#111827" opacity="0.55"/>
+<line x1="624.2" y1="417.0" x2="624.2" y2="342.2" stroke="#111827" opacity="0.55"/>
+<line x1="666.2" y1="413.0" x2="666.2" y2="338.2" stroke="#111827" opacity="0.55"/>
+<line x1="696.3" y1="416.1" x2="696.3" y2="341.3" stroke="#111827" opacity="0.55"/>
+<path d="M92.0,82.0 L137.8,171.7 L211.8,240.1 L329.5,294.8 L473.3,304.1 L544.2,301.1 L624.2,379.6 L666.2,375.6 L696.3,378.7" fill="none" stroke="#111827" stroke-width="2.2"/>
+<circle cx="92.0" cy="82.0" r="3.4" fill="#111827"/>
+<circle cx="137.8" cy="171.7" r="3.4" fill="#111827"/>
+<circle cx="211.8" cy="240.1" r="3.4" fill="#111827"/>
+<circle cx="329.5" cy="294.8" r="3.4" fill="#111827"/>
+<circle cx="473.3" cy="304.1" r="3.4" fill="#111827"/>
+<circle cx="544.2" cy="301.1" r="3.4" fill="#111827"/>
+<circle cx="624.2" cy="379.6" r="3.4" fill="#111827"/>
+<circle cx="666.2" cy="375.6" r="3.4" fill="#111827"/>
+<circle cx="696.3" cy="378.7" r="3.4" fill="#111827"/>
+<line x1="92.0" y1="124.4" x2="92.0" y2="37.5" stroke="#2563eb" opacity="0.55"/>
+<line x1="137.8" y1="211.2" x2="137.8" y2="129.6" stroke="#2563eb" opacity="0.55"/>
+<line x1="211.8" y1="288.5" x2="211.8" y2="209.9" stroke="#2563eb" opacity="0.55"/>
+<line x1="329.5" y1="333.2" x2="329.5" y2="256.8" stroke="#2563eb" opacity="0.55"/>
+<line x1="473.3" y1="344.1" x2="473.3" y2="267.8" stroke="#2563eb" opacity="0.55"/>
+<line x1="544.2" y1="340.0" x2="544.2" y2="263.8" stroke="#2563eb" opacity="0.55"/>
+<line x1="624.2" y1="413.6" x2="624.2" y2="338.8" stroke="#2563eb" opacity="0.55"/>
+<line x1="666.2" y1="415.4" x2="666.2" y2="340.8" stroke="#2563eb" opacity="0.55"/>
+<line x1="696.3" y1="413.1" x2="696.3" y2="338.0" stroke="#2563eb" opacity="0.55"/>
+<line x1="722.5" y1="413.3" x2="722.5" y2="338.2" stroke="#2563eb" opacity="0.55"/>
+<line x1="742.8" y1="413.4" x2="742.8" y2="338.2" stroke="#2563eb" opacity="0.55"/>
+<line x1="759.6" y1="416.5" x2="759.6" y2="341.8" stroke="#2563eb" opacity="0.55"/>
+<line x1="772.0" y1="411.6" x2="772.0" y2="336.7" stroke="#2563eb" opacity="0.55"/>
+<path d="M92.0,81.0 L137.8,170.4 L211.8,249.2 L329.5,295.0 L473.3,305.9 L544.2,301.9 L624.2,376.2 L666.2,378.1 L696.3,375.5 L722.5,375.7 L742.8,375.8 L759.6,379.1 L772.0,374.2" fill="none" stroke="#2563eb" stroke-width="2.2" stroke-dasharray="10,5"/>
+<circle cx="92.0" cy="81.0" r="3.4" fill="#2563eb"/>
+<circle cx="137.8" cy="170.4" r="3.4" fill="#2563eb"/>
+<circle cx="211.8" cy="249.2" r="3.4" fill="#2563eb"/>
+<circle cx="329.5" cy="295.0" r="3.4" fill="#2563eb"/>
+<circle cx="473.3" cy="305.9" r="3.4" fill="#2563eb"/>
+<circle cx="544.2" cy="301.9" r="3.4" fill="#2563eb"/>
+<circle cx="624.2" cy="376.2" r="3.4" fill="#2563eb"/>
+<circle cx="666.2" cy="378.1" r="3.4" fill="#2563eb"/>
+<circle cx="696.3" cy="375.5" r="3.4" fill="#2563eb"/>
+<circle cx="722.5" cy="375.7" r="3.4" fill="#2563eb"/>
+<circle cx="742.8" cy="375.8" r="3.4" fill="#2563eb"/>
+<circle cx="759.6" cy="379.1" r="3.4" fill="#2563eb"/>
+<circle cx="772.0" cy="374.2" r="3.4" fill="#2563eb"/>
+<line x1="92.0" y1="122.0" x2="92.0" y2="34.6" stroke="#059669" opacity="0.55"/>
+<line x1="137.8" y1="215.8" x2="137.8" y2="134.6" stroke="#059669" opacity="0.55"/>
+<line x1="211.8" y1="289.2" x2="211.8" y2="210.5" stroke="#059669" opacity="0.55"/>
+<line x1="329.5" y1="330.7" x2="329.5" y2="253.9" stroke="#059669" opacity="0.55"/>
+<line x1="473.3" y1="340.0" x2="473.3" y2="263.4" stroke="#059669" opacity="0.55"/>
+<line x1="544.2" y1="338.9" x2="544.2" y2="262.3" stroke="#059669" opacity="0.55"/>
+<line x1="624.2" y1="415.0" x2="624.2" y2="340.0" stroke="#059669" opacity="0.55"/>
+<line x1="666.2" y1="414.3" x2="666.2" y2="339.4" stroke="#059669" opacity="0.55"/>
+<line x1="696.3" y1="414.3" x2="696.3" y2="339.4" stroke="#059669" opacity="0.55"/>
+<line x1="722.5" y1="415.4" x2="722.5" y2="340.5" stroke="#059669" opacity="0.55"/>
+<line x1="742.8" y1="413.6" x2="742.8" y2="338.5" stroke="#059669" opacity="0.55"/>
+<line x1="759.6" y1="414.9" x2="759.6" y2="339.8" stroke="#059669" opacity="0.55"/>
+<line x1="772.0" y1="415.5" x2="772.0" y2="341.0" stroke="#059669" opacity="0.55"/>
+<path d="M92.0,78.3 L137.8,175.2 L211.8,249.8 L329.5,292.3 L473.3,301.7 L544.2,300.6 L624.2,377.5 L666.2,376.8 L696.3,376.9 L722.5,377.9 L742.8,376.0 L759.6,377.3 L772.0,378.2" fill="none" stroke="#059669" stroke-width="2.2"/>
+<circle cx="92.0" cy="78.3" r="3.4" fill="#059669"/>
+<circle cx="137.8" cy="175.2" r="3.4" fill="#059669"/>
+<circle cx="211.8" cy="249.8" r="3.4" fill="#059669"/>
+<circle cx="329.5" cy="292.3" r="3.4" fill="#059669"/>
+<circle cx="473.3" cy="301.7" r="3.4" fill="#059669"/>
+<circle cx="544.2" cy="300.6" r="3.4" fill="#059669"/>
+<circle cx="624.2" cy="377.5" r="3.4" fill="#059669"/>
+<circle cx="666.2" cy="376.8" r="3.4" fill="#059669"/>
+<circle cx="696.3" cy="376.9" r="3.4" fill="#059669"/>
+<circle cx="722.5" cy="377.9" r="3.4" fill="#059669"/>
+<circle cx="742.8" cy="376.0" r="3.4" fill="#059669"/>
+<circle cx="759.6" cy="377.3" r="3.4" fill="#059669"/>
+<circle cx="772.0" cy="378.2" r="3.4" fill="#059669"/>
+<line x1="92.0" y1="121.9" x2="92.0" y2="34.4" stroke="#dc2626" opacity="0.55"/>
+<line x1="137.8" y1="213.5" x2="137.8" y2="132.4" stroke="#dc2626" opacity="0.55"/>
+<line x1="211.8" y1="288.6" x2="211.8" y2="210.4" stroke="#dc2626" opacity="0.55"/>
+<line x1="329.5" y1="334.8" x2="329.5" y2="258.4" stroke="#dc2626" opacity="0.55"/>
+<line x1="473.3" y1="340.1" x2="473.3" y2="263.9" stroke="#dc2626" opacity="0.55"/>
+<line x1="544.2" y1="340.3" x2="544.2" y2="263.7" stroke="#dc2626" opacity="0.55"/>
+<line x1="624.2" y1="417.1" x2="624.2" y2="342.5" stroke="#dc2626" opacity="0.55"/>
+<line x1="666.2" y1="414.2" x2="666.2" y2="339.3" stroke="#dc2626" opacity="0.55"/>
+<line x1="696.3" y1="416.6" x2="696.3" y2="342.0" stroke="#dc2626" opacity="0.55"/>
+<line x1="742.8" y1="412.8" x2="742.8" y2="337.6" stroke="#dc2626" opacity="0.55"/>
+<line x1="772.0" y1="412.0" x2="772.0" y2="336.8" stroke="#dc2626" opacity="0.55"/>
+<path d="M92.0,78.2 L137.8,173.0 L211.8,249.5 L329.5,296.6 L473.3,302.0 L544.2,302.0 L624.2,379.8 L666.2,376.8 L696.3,379.3 L742.8,375.2 L772.0,374.4" fill="none" stroke="#dc2626" stroke-width="4.2"/>
+<circle cx="92.0" cy="78.2" r="3.4" fill="#dc2626"/>
+<circle cx="137.8" cy="173.0" r="3.4" fill="#dc2626"/>
+<circle cx="211.8" cy="249.5" r="3.4" fill="#dc2626"/>
+<circle cx="329.5" cy="296.6" r="3.4" fill="#dc2626"/>
+<circle cx="473.3" cy="302.0" r="3.4" fill="#dc2626"/>
+<circle cx="544.2" cy="302.0" r="3.4" fill="#dc2626"/>
+<circle cx="624.2" cy="379.8" r="3.4" fill="#dc2626"/>
+<circle cx="666.2" cy="376.8" r="3.4" fill="#dc2626"/>
+<circle cx="696.3" cy="379.3" r="3.4" fill="#dc2626"/>
+<circle cx="742.8" cy="375.2" r="3.4" fill="#dc2626"/>
+<circle cx="772.0" cy="374.4" r="3.4" fill="#dc2626"/>
+<line x1="92.0" y1="123.2" x2="92.0" y2="36.1" stroke="#d97706" opacity="0.55"/>
+<line x1="137.8" y1="214.6" x2="137.8" y2="133.2" stroke="#d97706" opacity="0.55"/>
+<line x1="211.8" y1="284.8" x2="211.8" y2="205.9" stroke="#d97706" opacity="0.55"/>
+<line x1="329.5" y1="332.4" x2="329.5" y2="255.9" stroke="#d97706" opacity="0.55"/>
+<line x1="473.3" y1="339.8" x2="473.3" y2="263.3" stroke="#d97706" opacity="0.55"/>
+<line x1="544.2" y1="336.8" x2="544.2" y2="260.0" stroke="#d97706" opacity="0.55"/>
+<line x1="624.2" y1="414.0" x2="624.2" y2="338.8" stroke="#d97706" opacity="0.55"/>
+<line x1="666.2" y1="413.5" x2="666.2" y2="338.9" stroke="#d97706" opacity="0.55"/>
+<line x1="696.3" y1="413.8" x2="696.3" y2="339.1" stroke="#d97706" opacity="0.55"/>
+<line x1="722.5" y1="412.6" x2="722.5" y2="337.4" stroke="#d97706" opacity="0.55"/>
+<line x1="742.8" y1="414.4" x2="742.8" y2="338.9" stroke="#d97706" opacity="0.55"/>
+<line x1="759.6" y1="411.7" x2="759.6" y2="336.5" stroke="#d97706" opacity="0.55"/>
+<line x1="772.0" y1="414.4" x2="772.0" y2="339.5" stroke="#d97706" opacity="0.55"/>
+<path d="M92.0,79.6 L137.8,173.9 L211.8,245.3 L329.5,294.1 L473.3,301.6 L544.2,298.4 L624.2,376.4 L666.2,376.2 L696.3,376.5 L722.5,375.0 L742.8,376.7 L759.6,374.1 L772.0,376.9" fill="none" stroke="#d97706" stroke-width="2.6" stroke-dasharray="1,6"/>
+<circle cx="92.0" cy="79.6" r="3.4" fill="#d97706"/>
+<circle cx="137.8" cy="173.9" r="3.4" fill="#d97706"/>
+<circle cx="211.8" cy="245.3" r="3.4" fill="#d97706"/>
+<circle cx="329.5" cy="294.1" r="3.4" fill="#d97706"/>
+<circle cx="473.3" cy="301.6" r="3.4" fill="#d97706"/>
+<circle cx="544.2" cy="298.4" r="3.4" fill="#d97706"/>
+<circle cx="624.2" cy="376.4" r="3.4" fill="#d97706"/>
+<circle cx="666.2" cy="376.2" r="3.4" fill="#d97706"/>
+<circle cx="696.3" cy="376.5" r="3.4" fill="#d97706"/>
+<circle cx="722.5" cy="375.0" r="3.4" fill="#d97706"/>
+<circle cx="742.8" cy="376.7" r="3.4" fill="#d97706"/>
+<circle cx="759.6" cy="374.1" r="3.4" fill="#d97706"/>
+<circle cx="772.0" cy="376.9" r="3.4" fill="#d97706"/>
+<line x1="788" y1="54" x2="810" y2="54" stroke="#111827" stroke-width="2.2"/>
+<text x="816" y="58" font-size="11" fill="#374151">bf16</text>
+<line x1="788" y1="74" x2="810" y2="74" stroke="#2563eb" stroke-width="2.2" stroke-dasharray="10,5"/>
+<text x="816" y="78" font-size="11" fill="#374151">int8</text>
+<line x1="788" y1="94" x2="810" y2="94" stroke="#059669" stroke-width="2.2"/>
+<text x="816" y="98" font-size="11" fill="#374151">fp8</text>
+<line x1="788" y1="114" x2="810" y2="114" stroke="#dc2626" stroke-width="4.2"/>
+<text x="816" y="118" font-size="11" fill="#374151">nvfp4</text>
+<line x1="788" y1="134" x2="810" y2="134" stroke="#d97706" stroke-width="2.6" stroke-dasharray="1,6"/>
+<text x="816" y="138" font-size="11" fill="#374151">k8v4</text>
+<text x="788" y="168" font-size="10.5" fill="#6b7280">same 1008 tokens scored in every run</text>
+</svg></div>
+<h2>2. 相邻深度之间的配对 ΔNLL —— 最直接的答案</h2>
+<p>每一行取相邻两次运行，对<b>同一个 token</b> 求 NLL 之差再平均。<b>正值 = 历史变长以后这个 token 变得更难预测</b>，负值 = 变得更容易。这是没有函数形式假设的检验。</p>
+<div class="card"><svg viewBox="0 0 1040 470" width="100%" role="img">
+<rect x="0" y="0" width="1040" height="470" fill="#ffffff"/>
+<text x="92" y="24" font-size="15" font-weight="600" fill="#111827">paired delta NLL between neighbouring depths</text>
+<line x1="92" y1="410.0" x2="772" y2="410.0" stroke="#e5e7eb"/>
+<text x="84" y="414.0" font-size="11" fill="#6b7280" text-anchor="end">-0.0960</text>
+<line x1="92" y1="319.5" x2="772" y2="319.5" stroke="#e5e7eb"/>
+<text x="84" y="323.5" font-size="11" fill="#6b7280" text-anchor="end">-0.0480</text>
+<line x1="92" y1="229.0" x2="772" y2="229.0" stroke="#e5e7eb"/>
+<text x="84" y="233.0" font-size="11" fill="#6b7280" text-anchor="end">0</text>
+<line x1="92" y1="138.5" x2="772" y2="138.5" stroke="#e5e7eb"/>
+<text x="84" y="142.5" font-size="11" fill="#6b7280" text-anchor="end">0.0480</text>
+<line x1="92" y1="48.0" x2="772" y2="48.0" stroke="#e5e7eb"/>
+<text x="84" y="52.0" font-size="11" fill="#6b7280" text-anchor="end">0.0960</text>
+<line x1="121.1" y1="48" x2="121.1" y2="410" stroke="#e5e7eb"/>
+<text x="121.1" y="428" font-size="11" fill="#6b7280" text-anchor="middle">1,000</text>
+<line x1="391.2" y1="48" x2="391.2" y2="410" stroke="#e5e7eb"/>
+<text x="391.2" y="428" font-size="11" fill="#6b7280" text-anchor="middle">10,000</text>
+<line x1="661.4" y1="48" x2="661.4" y2="410" stroke="#e5e7eb"/>
+<text x="661.4" y="428" font-size="11" fill="#6b7280" text-anchor="middle">100,000</text>
+<line x1="92" y1="229.0" x2="772" y2="229.0" stroke="#9ca3af" stroke-dasharray="4,4"/>
+<text x="96" y="225.0" font-size="10" fill="#6b7280">zero</text>
+<line x1="602.4" y1="48" x2="602.4" y2="410" stroke="#c084fc" stroke-dasharray="3,3"/>
+<text x="602.4" y="59" font-size="9.5" fill="#7e22ce" text-anchor="middle">02|03</text>
+<line x1="690.6" y1="48" x2="690.6" y2="410" stroke="#c084fc" stroke-dasharray="3,3"/>
+<text x="690.6" y="70" font-size="9.5" fill="#7e22ce" text-anchor="middle">01|02</text>
+<line x1="738.0" y1="48" x2="738.0" y2="410" stroke="#c084fc" stroke-dasharray="3,3"/>
+<text x="738.0" y="81" font-size="9.5" fill="#7e22ce" text-anchor="middle">00|01</text>
+<line x1="92" y1="410" x2="772" y2="410" stroke="#9ca3af"/>
+<text x="432" y="456" font-size="12" fill="#374151" text-anchor="middle">history of the deeper run (tokens)</text>
+<text x="18" y="229" font-size="12" fill="#374151" text-anchor="middle" transform="rotate(-90 18 229)">delta NLL (nats)</text>
+<line x1="92.0" y1="559.0" x2="92.0" y2="450.1" stroke="#111827" opacity="0.55"/>
+<line x1="171.3" y1="483.8" x2="171.3" y2="394.6" stroke="#111827" opacity="0.55"/>
+<line x1="297.5" y1="427.6" x2="297.5" y2="366.9" stroke="#111827" opacity="0.55"/>
+<line x1="451.7" y1="272.7" x2="451.7" y2="241.9" stroke="#111827" opacity="0.55"/>
+<line x1="527.8" y1="230.6" x2="527.8" y2="209.4" stroke="#111827" opacity="0.55"/>
+<line x1="613.6" y1="514.0" x2="613.6" y2="426.3" stroke="#111827" opacity="0.55"/>
+<line x1="658.6" y1="226.1" x2="658.6" y2="207.3" stroke="#111827" opacity="0.55"/>
+<line x1="690.8" y1="248.0" x2="690.8" y2="229.1" stroke="#111827" opacity="0.55"/>
+<path d="M92.0,504.5 L171.3,439.2 L297.5,397.2 L451.7,257.3 L527.8,220.0 L613.6,470.1 L658.6,216.7 L690.8,238.6" fill="none" stroke="#111827" stroke-width="2.2"/>
+<circle cx="92.0" cy="504.5" r="3.4" fill="#111827"/>
+<circle cx="171.3" cy="439.2" r="3.4" fill="#111827"/>
+<circle cx="297.5" cy="397.2" r="3.4" fill="#111827"/>
+<circle cx="451.7" cy="257.3" r="3.4" fill="#111827"/>
+<circle cx="527.8" cy="220.0" r="3.4" fill="#111827"/>
+<circle cx="613.6" cy="470.1" r="3.4" fill="#111827"/>
+<circle cx="658.6" cy="216.7" r="3.4" fill="#111827"/>
+<circle cx="690.8" cy="238.6" r="3.4" fill="#111827"/>
+<line x1="92.0" y1="557.8" x2="92.0" y2="450.1" stroke="#2563eb" opacity="0.55"/>
+<line x1="171.3" y1="516.8" x2="171.3" y2="425.1" stroke="#2563eb" opacity="0.55"/>
+<line x1="297.5" y1="398.0" x2="297.5" y2="341.6" stroke="#2563eb" opacity="0.55"/>
+<line x1="451.7" y1="278.2" x2="451.7" y2="247.0" stroke="#2563eb" opacity="0.55"/>
+<line x1="527.8" y1="228.7" x2="527.8" y2="204.5" stroke="#2563eb" opacity="0.55"/>
+<line x1="613.6" y1="501.8" x2="613.6" y2="412.8" stroke="#2563eb" opacity="0.55"/>
+<line x1="658.6" y1="244.8" x2="658.6" y2="224.8" stroke="#2563eb" opacity="0.55"/>
+<line x1="690.8" y1="230.7" x2="690.8" y2="211.6" stroke="#2563eb" opacity="0.55"/>
+<line x1="718.9" y1="239.3" x2="718.9" y2="220.0" stroke="#2563eb" opacity="0.55"/>
+<line x1="740.7" y1="238.1" x2="740.7" y2="220.6" stroke="#2563eb" opacity="0.55"/>
+<line x1="758.7" y1="248.9" x2="758.7" y2="229.5" stroke="#2563eb" opacity="0.55"/>
+<line x1="772.0" y1="224.2" x2="772.0" y2="203.1" stroke="#2563eb" opacity="0.55"/>
+<path d="M92.0,504.0 L171.3,470.9 L297.5,369.8 L451.7,262.6 L527.8,216.6 L613.6,457.3 L658.6,234.8 L690.8,221.1 L718.9,229.7 L740.7,229.3 L758.7,239.2 L772.0,213.7" fill="none" stroke="#2563eb" stroke-width="2.2" stroke-dasharray="10,5"/>
+<circle cx="92.0" cy="504.0" r="3.4" fill="#2563eb"/>
+<circle cx="171.3" cy="470.9" r="3.4" fill="#2563eb"/>
+<circle cx="297.5" cy="369.8" r="3.4" fill="#2563eb"/>
+<circle cx="451.7" cy="262.6" r="3.4" fill="#2563eb"/>
+<circle cx="527.8" cy="216.6" r="3.4" fill="#2563eb"/>
+<circle cx="613.6" cy="457.3" r="3.4" fill="#2563eb"/>
+<circle cx="658.6" cy="234.8" r="3.4" fill="#2563eb"/>
+<circle cx="690.8" cy="221.1" r="3.4" fill="#2563eb"/>
+<circle cx="718.9" cy="229.7" r="3.4" fill="#2563eb"/>
+<circle cx="740.7" cy="229.3" r="3.4" fill="#2563eb"/>
+<circle cx="758.7" cy="239.2" r="3.4" fill="#2563eb"/>
+<circle cx="772.0" cy="213.7" r="3.4" fill="#2563eb"/>
+<line x1="92.0" y1="581.9" x2="92.0" y2="471.4" stroke="#059669" opacity="0.55"/>
+<line x1="171.3" y1="502.6" x2="171.3" y2="414.3" stroke="#059669" opacity="0.55"/>
+<line x1="297.5" y1="389.0" x2="297.5" y2="330.1" stroke="#059669" opacity="0.55"/>
+<line x1="451.7" y1="274.2" x2="451.7" y2="241.5" stroke="#059669" opacity="0.55"/>
+<line x1="527.8" y1="235.9" x2="527.8" y2="215.5" stroke="#059669" opacity="0.55"/>
+<line x1="613.6" y1="509.1" x2="613.6" y2="421.3" stroke="#059669" opacity="0.55"/>
+<line x1="658.6" y1="237.0" x2="658.6" y2="217.1" stroke="#059669" opacity="0.55"/>
+<line x1="690.8" y1="238.8" x2="690.8" y2="219.5" stroke="#059669" opacity="0.55"/>
+<line x1="718.9" y1="242.4" x2="718.9" y2="222.1" stroke="#059669" opacity="0.55"/>
+<line x1="740.7" y1="232.1" x2="740.7" y2="214.2" stroke="#059669" opacity="0.55"/>
+<line x1="758.7" y1="243.0" x2="758.7" y2="223.1" stroke="#059669" opacity="0.55"/>
+<line x1="772.0" y1="241.5" x2="772.0" y2="222.0" stroke="#059669" opacity="0.55"/>
+<path d="M92.0,526.7 L171.3,458.4 L297.5,359.5 L451.7,257.8 L527.8,225.7 L613.6,465.2 L658.6,227.0 L690.8,229.1 L718.9,232.2 L740.7,223.1 L758.7,233.0 L772.0,231.8" fill="none" stroke="#059669" stroke-width="2.2"/>
+<circle cx="92.0" cy="526.7" r="3.4" fill="#059669"/>
+<circle cx="171.3" cy="458.4" r="3.4" fill="#059669"/>
+<circle cx="297.5" cy="359.5" r="3.4" fill="#059669"/>
+<circle cx="451.7" cy="257.8" r="3.4" fill="#059669"/>
+<circle cx="527.8" cy="225.7" r="3.4" fill="#059669"/>
+<circle cx="613.6" cy="465.2" r="3.4" fill="#059669"/>
+<circle cx="658.6" cy="227.0" r="3.4" fill="#059669"/>
+<circle cx="690.8" cy="229.1" r="3.4" fill="#059669"/>
+<circle cx="718.9" cy="232.2" r="3.4" fill="#059669"/>
+<circle cx="740.7" cy="223.1" r="3.4" fill="#059669"/>
+<circle cx="758.7" cy="233.0" r="3.4" fill="#059669"/>
+<circle cx="772.0" cy="231.8" r="3.4" fill="#059669"/>
+<line x1="92.0" y1="575.6" x2="92.0" y2="465.0" stroke="#dc2626" opacity="0.55"/>
+<line x1="171.3" y1="509.1" x2="171.3" y2="419.3" stroke="#dc2626" opacity="0.55"/>
+<line x1="297.5" y1="402.8" x2="297.5" y2="344.8" stroke="#dc2626" opacity="0.55"/>
+<line x1="451.7" y1="261.1" x2="451.7" y2="229.9" stroke="#dc2626" opacity="0.55"/>
+<line x1="527.8" y1="241.3" x2="527.8" y2="216.8" stroke="#dc2626" opacity="0.55"/>
+<line x1="613.6" y1="512.5" x2="613.6" y2="423.9" stroke="#dc2626" opacity="0.55"/>
+<line x1="658.6" y1="229.9" x2="658.6" y2="209.2" stroke="#dc2626" opacity="0.55"/>
+<line x1="690.8" y1="247.6" x2="690.8" y2="226.1" stroke="#dc2626" opacity="0.55"/>
+<path d="M92.0,520.3 L171.3,464.2 L297.5,373.8 L451.7,245.5 L527.8,229.1 L613.6,468.2 L658.6,219.5 L690.8,236.9" fill="none" stroke="#dc2626" stroke-width="4.2"/>
+<circle cx="92.0" cy="520.3" r="3.4" fill="#dc2626"/>
+<circle cx="171.3" cy="464.2" r="3.4" fill="#dc2626"/>
+<circle cx="297.5" cy="373.8" r="3.4" fill="#dc2626"/>
+<circle cx="451.7" cy="245.5" r="3.4" fill="#dc2626"/>
+<circle cx="527.8" cy="229.1" r="3.4" fill="#dc2626"/>
+<circle cx="613.6" cy="468.2" r="3.4" fill="#dc2626"/>
+<circle cx="658.6" cy="219.5" r="3.4" fill="#dc2626"/>
+<circle cx="690.8" cy="236.9" r="3.4" fill="#dc2626"/>
+<line x1="92.0" y1="573.3" x2="92.0" y2="464.0" stroke="#d97706" opacity="0.55"/>
+<line x1="171.3" y1="492.9" x2="171.3" y2="404.2" stroke="#d97706" opacity="0.55"/>
+<line x1="297.5" y1="407.7" x2="297.5" y2="350.2" stroke="#d97706" opacity="0.55"/>
+<line x1="451.7" y1="266.9" x2="451.7" y2="236.6" stroke="#d97706" opacity="0.55"/>
+<line x1="527.8" y1="230.2" x2="527.8" y2="208.3" stroke="#d97706" opacity="0.55"/>
+<line x1="613.6" y1="514.2" x2="613.6" y2="423.2" stroke="#d97706" opacity="0.55"/>
+<line x1="658.6" y1="238.9" x2="658.6" y2="218.1" stroke="#d97706" opacity="0.55"/>
+<line x1="690.8" y1="238.9" x2="690.8" y2="220.7" stroke="#d97706" opacity="0.55"/>
+<line x1="718.9" y1="234.4" x2="718.9" y2="214.8" stroke="#d97706" opacity="0.55"/>
+<line x1="740.7" y1="244.6" x2="740.7" y2="223.3" stroke="#d97706" opacity="0.55"/>
+<line x1="758.7" y1="231.5" x2="758.7" y2="210.7" stroke="#d97706" opacity="0.55"/>
+<line x1="772.0" y1="247.7" x2="772.0" y2="227.7" stroke="#d97706" opacity="0.55"/>
+<path d="M92.0,518.7 L171.3,448.6 L297.5,378.9 L451.7,251.8 L527.8,219.3 L613.6,468.7 L658.6,228.5 L690.8,229.8 L718.9,224.6 L740.7,234.0 L758.7,221.1 L772.0,237.7" fill="none" stroke="#d97706" stroke-width="2.6" stroke-dasharray="1,6"/>
+<circle cx="92.0" cy="518.7" r="3.4" fill="#d97706"/>
+<circle cx="171.3" cy="448.6" r="3.4" fill="#d97706"/>
+<circle cx="297.5" cy="378.9" r="3.4" fill="#d97706"/>
+<circle cx="451.7" cy="251.8" r="3.4" fill="#d97706"/>
+<circle cx="527.8" cy="219.3" r="3.4" fill="#d97706"/>
+<circle cx="613.6" cy="468.7" r="3.4" fill="#d97706"/>
+<circle cx="658.6" cy="228.5" r="3.4" fill="#d97706"/>
+<circle cx="690.8" cy="229.8" r="3.4" fill="#d97706"/>
+<circle cx="718.9" cy="224.6" r="3.4" fill="#d97706"/>
+<circle cx="740.7" cy="234.0" r="3.4" fill="#d97706"/>
+<circle cx="758.7" cy="221.1" r="3.4" fill="#d97706"/>
+<circle cx="772.0" cy="237.7" r="3.4" fill="#d97706"/>
+<line x1="788" y1="54" x2="810" y2="54" stroke="#111827" stroke-width="2.2"/>
+<text x="816" y="58" font-size="11" fill="#374151">bf16</text>
+<line x1="788" y1="74" x2="810" y2="74" stroke="#2563eb" stroke-width="2.2" stroke-dasharray="10,5"/>
+<text x="816" y="78" font-size="11" fill="#374151">int8</text>
+<line x1="788" y1="94" x2="810" y2="94" stroke="#059669" stroke-width="2.2"/>
+<text x="816" y="98" font-size="11" fill="#374151">fp8</text>
+<line x1="788" y1="114" x2="810" y2="114" stroke="#dc2626" stroke-width="4.2"/>
+<text x="816" y="118" font-size="11" fill="#374151">nvfp4</text>
+<line x1="788" y1="134" x2="810" y2="134" stroke="#d97706" stroke-width="2.6" stroke-dasharray="1,6"/>
+<text x="816" y="138" font-size="11" fill="#374151">k8v4</text>
+<text x="788" y="168" font-size="10.5" fill="#6b7280">positive = deeper context makes this same text harder</text>
+</svg></div>
+<div class="card"><table><thead><tr><th>arm</th><th>history lo -&gt; hi</th><th>delta NLL</th><th>se</th><th>t</th></tr></thead><tbody>
+<tr><td>bf16</td><td>514 &rarr; 780</td><td>-0.146132</td><td>0.028869</td><td><span class="bad">-5.06</span></td></tr>
+<tr><td>bf16</td><td>780 &rarr; 1,534</td><td>-0.111503</td><td>0.023647</td><td><span class="bad">-4.72</span></td></tr>
+<tr><td>bf16</td><td>1,534 &rarr; 4,498</td><td>-0.089235</td><td>0.016092</td><td><span class="bad">-5.55</span></td></tr>
+<tr><td>bf16</td><td>4,498 &rarr; 16,748</td><td>-0.015014</td><td>0.008174</td><td><span class="good">-1.84</span></td></tr>
+<tr><td>bf16</td><td>16,748 &rarr; 32,024</td><td>+0.004786</td><td>0.005634</td><td><span class="good">+0.85</span></td></tr>
+<tr><td>bf16</td><td>32,024 &rarr; 66,538</td><td>-0.127901</td><td>0.023248</td><td><span class="bad">-5.50</span></td></tr>
+<tr><td>bf16</td><td>66,538 &rarr; 97,664</td><td>+0.006525</td><td>0.004992</td><td><span class="good">+1.31</span></td></tr>
+<tr><td>bf16</td><td>97,664 &rarr; 128,522</td><td>-0.005087</td><td>0.005015</td><td><span class="good">-1.01</span></td></tr>
+<tr><td>int8</td><td>514 &rarr; 780</td><td>-0.145836</td><td>0.028570</td><td><span class="bad">-5.10</span></td></tr>
+<tr><td>int8</td><td>780 &rarr; 1,534</td><td>-0.128324</td><td>0.024297</td><td><span class="bad">-5.28</span></td></tr>
+<tr><td>int8</td><td>1,534 &rarr; 4,498</td><td>-0.074693</td><td>0.014951</td><td><span class="bad">-5.00</span></td></tr>
+<tr><td>int8</td><td>4,498 &rarr; 16,748</td><td>-0.017819</td><td>0.008288</td><td><span class="bad">-2.15</span></td></tr>
+<tr><td>int8</td><td>16,748 &rarr; 32,024</td><td>+0.006565</td><td>0.006426</td><td><span class="good">+1.02</span></td></tr>
+<tr><td>int8</td><td>32,024 &rarr; 66,538</td><td>-0.121073</td><td>0.023592</td><td><span class="bad">-5.13</span></td></tr>
+<tr><td>int8</td><td>66,538 &rarr; 97,664</td><td>-0.003072</td><td>0.005281</td><td><span class="good">-0.58</span></td></tr>
+<tr><td>int8</td><td>97,664 &rarr; 128,522</td><td>+0.004171</td><td>0.005081</td><td><span class="good">+0.82</span></td></tr>
+<tr><td>int8</td><td>128,522 &rarr; 163,302</td><td>-0.000345</td><td>0.005094</td><td><span class="good">-0.07</span></td></tr>
+<tr><td>int8</td><td>163,302 &rarr; 196,628</td><td>-0.000180</td><td>0.004652</td><td><span class="good">-0.04</span></td></tr>
+<tr><td>int8</td><td>196,628 &rarr; 229,348</td><td>-0.005399</td><td>0.005139</td><td><span class="good">-1.05</span></td></tr>
+<tr><td>int8</td><td>229,348 &rarr; 256,772</td><td>+0.008138</td><td>0.005589</td><td><span class="good">+1.46</span></td></tr>
+<tr><td>fp8</td><td>514 &rarr; 780</td><td>-0.157883</td><td>0.029303</td><td><span class="bad">-5.39</span></td></tr>
+<tr><td>fp8</td><td>780 &rarr; 1,534</td><td>-0.121693</td><td>0.023434</td><td><span class="bad">-5.19</span></td></tr>
+<tr><td>fp8</td><td>1,534 &rarr; 4,498</td><td>-0.069226</td><td>0.015615</td><td><span class="bad">-4.43</span></td></tr>
+<tr><td>fp8</td><td>4,498 &rarr; 16,748</td><td>-0.015291</td><td>0.008670</td><td><span class="good">-1.76</span></td></tr>
+<tr><td>fp8</td><td>16,748 &rarr; 32,024</td><td>+0.001769</td><td>0.005403</td><td><span class="good">+0.33</span></td></tr>
+<tr><td>fp8</td><td>32,024 &rarr; 66,538</td><td>-0.125297</td><td>0.023280</td><td><span class="bad">-5.38</span></td></tr>
+<tr><td>fp8</td><td>66,538 &rarr; 97,664</td><td>+0.001041</td><td>0.005268</td><td><span class="good">+0.20</span></td></tr>
+<tr><td>fp8</td><td>97,664 &rarr; 128,522</td><td>-0.000069</td><td>0.005105</td><td><span class="good">-0.01</span></td></tr>
+<tr><td>fp8</td><td>128,522 &rarr; 163,302</td><td>-0.001722</td><td>0.005399</td><td><span class="good">-0.32</span></td></tr>
+<tr><td>fp8</td><td>163,302 &rarr; 196,628</td><td>+0.003114</td><td>0.004738</td><td><span class="good">+0.66</span></td></tr>
+<tr><td>fp8</td><td>196,628 &rarr; 229,348</td><td>-0.002144</td><td>0.005256</td><td><span class="good">-0.41</span></td></tr>
+<tr><td>fp8</td><td>229,348 &rarr; 256,772</td><td>-0.001471</td><td>0.005173</td><td><span class="good">-0.28</span></td></tr>
+<tr><td>nvfp4</td><td>514 &rarr; 780</td><td>-0.154511</td><td>0.029339</td><td><span class="bad">-5.27</span></td></tr>
+<tr><td>nvfp4</td><td>780 &rarr; 1,534</td><td>-0.124752</td><td>0.023820</td><td><span class="bad">-5.24</span></td></tr>
+<tr><td>nvfp4</td><td>1,534 &rarr; 4,498</td><td>-0.076799</td><td>0.015384</td><td><span class="bad">-4.99</span></td></tr>
+<tr><td>nvfp4</td><td>4,498 &rarr; 16,748</td><td>-0.008757</td><td>0.008276</td><td><span class="good">-1.06</span></td></tr>
+<tr><td>nvfp4</td><td>16,748 &rarr; 32,024</td><td>-0.000028</td><td>0.006475</td><td><span class="good">-0.00</span></td></tr>
+<tr><td>nvfp4</td><td>32,024 &rarr; 66,538</td><td>-0.126850</td><td>0.023490</td><td><span class="bad">-5.40</span></td></tr>
+<tr><td>nvfp4</td><td>66,538 &rarr; 97,664</td><td>+0.005014</td><td>0.005501</td><td><span class="good">+0.91</span></td></tr>
+<tr><td>nvfp4</td><td>97,664 &rarr; 128,522</td><td>-0.004170</td><td>0.005706</td><td><span class="good">-0.73</span></td></tr>
+<tr><td>k8v4</td><td>514 &rarr; 780</td><td>-0.153627</td><td>0.028977</td><td><span class="bad">-5.30</span></td></tr>
+<tr><td>k8v4</td><td>780 &rarr; 1,534</td><td>-0.116470</td><td>0.023525</td><td><span class="bad">-4.95</span></td></tr>
+<tr><td>k8v4</td><td>1,534 &rarr; 4,498</td><td>-0.079526</td><td>0.015252</td><td><span class="bad">-5.21</span></td></tr>
+<tr><td>k8v4</td><td>4,498 &rarr; 16,748</td><td>-0.012090</td><td>0.008036</td><td><span class="good">-1.50</span></td></tr>
+<tr><td>k8v4</td><td>16,748 &rarr; 32,024</td><td>+0.005166</td><td>0.005812</td><td><span class="good">+0.89</span></td></tr>
+<tr><td>k8v4</td><td>32,024 &rarr; 66,538</td><td>-0.127143</td><td>0.024118</td><td><span class="bad">-5.27</span></td></tr>
+<tr><td>k8v4</td><td>66,538 &rarr; 97,664</td><td>+0.000288</td><td>0.005513</td><td><span class="good">+0.05</span></td></tr>
+<tr><td>k8v4</td><td>97,664 &rarr; 128,522</td><td>-0.000428</td><td>0.004834</td><td><span class="good">-0.09</span></td></tr>
+<tr><td>k8v4</td><td>128,522 &rarr; 163,302</td><td>+0.002333</td><td>0.005192</td><td><span class="good">+0.45</span></td></tr>
+<tr><td>k8v4</td><td>163,302 &rarr; 196,628</td><td>-0.002627</td><td>0.005637</td><td><span class="good">-0.47</span></td></tr>
+<tr><td>k8v4</td><td>196,628 &rarr; 229,348</td><td>+0.004190</td><td>0.005519</td><td><span class="good">+0.76</span></td></tr>
+<tr><td>k8v4</td><td>229,348 &rarr; 256,772</td><td>-0.004628</td><td>0.005313</td><td><span class="good">-0.87</span></td></tr>
+</tbody></table></div>
+<h2>3. 斜率：历史每长 10 倍，NLL 变多少</h2>
+<p><b>全区</b>用全部深度，会被"历史从 0 到 1K"的剧烈改善主导；<b>深区</b>只用历史 ≥ 16,384 的运行，才是"长上下文"这个问题的适用区间。</p>
+<div class="card"><table><thead><tr><th>arm</th><th>estimator</th><th>slope (nats / decade)</th><th>se</th><th>t</th><th>points</th></tr></thead><tbody>
+<tr><td>bf16</td><td>run-mean</td><td>-0.167312</td><td>+0.023778</td><td><span class="bad">-7.04</span></td><td>9</td></tr>
+<tr><td>bf16</td><td>run-mean (deep)</td><td>-0.168826</td><td>+0.044655</td><td><span class="bad">-3.78</span></td><td>5</td></tr>
+<tr><td>bf16</td><td>panel</td><td>-0.164390</td><td>+0.015548</td><td><span class="bad">-10.57</span></td><td>1008</td></tr>
+<tr><td>bf16</td><td>panel (deep)</td><td>-0.168795</td><td>+0.032161</td><td><span class="bad">-5.25</span></td><td>1008</td></tr>
+<tr><td>int8</td><td>run-mean</td><td>-0.145784</td><td>+0.016900</td><td><span class="bad">-8.63</span></td><td>13</td></tr>
+<tr><td>int8</td><td>run-mean (deep)</td><td>-0.111292</td><td>+0.024249</td><td><span class="bad">-4.59</span></td><td>9</td></tr>
+<tr><td>int8</td><td>panel</td><td>-0.144678</td><td>+0.014495</td><td><span class="bad">-9.98</span></td><td>1008</td></tr>
+<tr><td>int8</td><td>panel (deep)</td><td>-0.109210</td><td>+0.021811</td><td><span class="bad">-5.01</span></td><td>1008</td></tr>
+<tr><td>fp8</td><td>run-mean</td><td>-0.146391</td><td>+0.016924</td><td><span class="bad">-8.65</span></td><td>13</td></tr>
+<tr><td>fp8</td><td>run-mean (deep)</td><td>-0.117999</td><td>+0.024591</td><td><span class="bad">-4.80</span></td><td>9</td></tr>
+<tr><td>fp8</td><td>panel</td><td>-0.145199</td><td>+0.014402</td><td><span class="bad">-10.08</span></td><td>1008</td></tr>
+<tr><td>fp8</td><td>panel (deep)</td><td>-0.119033</td><td>+0.021986</td><td><span class="bad">-5.41</span></td><td>1008</td></tr>
+<tr><td>nvfp4</td><td>run-mean</td><td>-0.150415</td><td>+0.020575</td><td><span class="bad">-7.31</span></td><td>11</td></tr>
+<tr><td>nvfp4</td><td>run-mean (deep)</td><td>-0.119774</td><td>+0.033030</td><td><span class="bad">-3.63</span></td><td>7</td></tr>
+<tr><td>nvfp4</td><td>panel</td><td>-0.149103</td><td>+0.014699</td><td><span class="bad">-10.14</span></td><td>1008</td></tr>
+<tr><td>nvfp4</td><td>panel (deep)</td><td>-0.119770</td><td>+0.023345</td><td><span class="bad">-5.13</span></td><td>1008</td></tr>
+<tr><td>k8v4</td><td>run-mean</td><td>-0.145886</td><td>+0.016766</td><td><span class="bad">-8.70</span></td><td>13</td></tr>
+<tr><td>k8v4</td><td>run-mean (deep)</td><td>-0.116913</td><td>+0.025226</td><td><span class="bad">-4.63</span></td><td>9</td></tr>
+<tr><td>k8v4</td><td>panel</td><td>-0.144880</td><td>+0.014482</td><td><span class="bad">-10.00</span></td><td>1008</td></tr>
+<tr><td>k8v4</td><td>panel (deep)</td><td>-0.116536</td><td>+0.022157</td><td><span class="bad">-5.26</span></td><td>1008</td></tr>
+</tbody></table><p class="sub" style="margin-bottom:0">负 = 历史越长越好，正 = 历史越长越差。|t| &lt; 2 表示测不出与零斜率的差别。</p></div>
+<h2>4. 臂间配对差值随历史长度变化</h2>
+<p>ΔNLL 是同一个 token 在两条臂上的差值，再对块内 1008 个 token 取平均。这是"量化代价是否随上下文放大"的直接答案。</p>
+<div class="card"><svg viewBox="0 0 1040 470" width="100%" role="img">
+<rect x="0" y="0" width="1040" height="470" fill="#ffffff"/>
+<text x="92" y="24" font-size="15" font-weight="600" fill="#111827">delta NLL vs bf16</text>
+<line x1="92" y1="410.0" x2="772" y2="410.0" stroke="#e5e7eb"/>
+<text x="84" y="414.0" font-size="11" fill="#6b7280" text-anchor="end">-0.0360</text>
+<line x1="92" y1="319.5" x2="772" y2="319.5" stroke="#e5e7eb"/>
+<text x="84" y="323.5" font-size="11" fill="#6b7280" text-anchor="end">-0.0180</text>
+<line x1="92" y1="229.0" x2="772" y2="229.0" stroke="#e5e7eb"/>
+<text x="84" y="233.0" font-size="11" fill="#6b7280" text-anchor="end">0</text>
+<line x1="92" y1="138.5" x2="772" y2="138.5" stroke="#e5e7eb"/>
+<text x="84" y="142.5" font-size="11" fill="#6b7280" text-anchor="end">0.0180</text>
+<line x1="92" y1="48.0" x2="772" y2="48.0" stroke="#e5e7eb"/>
+<text x="84" y="52.0" font-size="11" fill="#6b7280" text-anchor="end">0.0360</text>
+<line x1="174.1" y1="48" x2="174.1" y2="410" stroke="#e5e7eb"/>
+<text x="174.1" y="428" font-size="11" fill="#6b7280" text-anchor="middle">1,000</text>
+<line x1="457.6" y1="48" x2="457.6" y2="410" stroke="#e5e7eb"/>
+<text x="457.6" y="428" font-size="11" fill="#6b7280" text-anchor="middle">10,000</text>
+<line x1="741.1" y1="48" x2="741.1" y2="410" stroke="#e5e7eb"/>
+<text x="741.1" y="428" font-size="11" fill="#6b7280" text-anchor="middle">100,000</text>
+<line x1="92" y1="229.0" x2="772" y2="229.0" stroke="#9ca3af" stroke-dasharray="4,4"/>
+<text x="96" y="225.0" font-size="10" fill="#6b7280">zero</text>
+<line x1="92" y1="410" x2="772" y2="410" stroke="#9ca3af"/>
+<text x="432" y="456" font-size="12" fill="#374151" text-anchor="middle">visible history (tokens)</text>
+<text x="18" y="229" font-size="12" fill="#374151" text-anchor="middle" transform="rotate(-90 18 229)">delta NLL (nats)</text>
+<line x1="92.0" y1="249.5" x2="92.0" y2="191.0" stroke="#2563eb" opacity="0.55"/>
+<line x1="143.6" y1="249.0" x2="143.6" y2="188.6" stroke="#2563eb" opacity="0.55"/>
+<line x1="226.8" y1="332.2" x2="226.8" y2="274.5" stroke="#2563eb" opacity="0.55"/>
+<line x1="359.2" y1="258.9" x2="359.2" y2="201.5" stroke="#2563eb" opacity="0.55"/>
+<line x1="521.1" y1="271.3" x2="521.1" y2="217.4" stroke="#2563eb" opacity="0.55"/>
+<line x1="600.9" y1="260.7" x2="600.9" y2="210.0" stroke="#2563eb" opacity="0.55"/>
+<line x1="690.9" y1="225.6" x2="690.9" y2="176.5" stroke="#2563eb" opacity="0.55"/>
+<line x1="738.2" y1="274.8" x2="738.2" y2="223.8" stroke="#2563eb" opacity="0.55"/>
+<line x1="772.0" y1="228.3" x2="772.0" y2="177.3" stroke="#2563eb" opacity="0.55"/>
+<path d="M92.0,220.3 L143.6,218.8 L226.8,303.4 L359.2,230.2 L521.1,244.3 L600.9,235.4 L690.9,201.1 L738.2,249.3 L772.0,202.8" fill="none" stroke="#2563eb" stroke-width="2.2" stroke-dasharray="10,5"/>
+<circle cx="92.0" cy="220.3" r="3.4" fill="#2563eb"/>
+<circle cx="143.6" cy="218.8" r="3.4" fill="#2563eb"/>
+<circle cx="226.8" cy="303.4" r="3.4" fill="#2563eb"/>
+<circle cx="359.2" cy="230.2" r="3.4" fill="#2563eb"/>
+<circle cx="521.1" cy="244.3" r="3.4" fill="#2563eb"/>
+<circle cx="600.9" cy="235.4" r="3.4" fill="#2563eb"/>
+<circle cx="690.9" cy="201.1" r="3.4" fill="#2563eb"/>
+<circle cx="738.2" cy="249.3" r="3.4" fill="#2563eb"/>
+<circle cx="772.0" cy="202.8" r="3.4" fill="#2563eb"/>
+<line x1="92.0" y1="228.9" x2="92.0" y2="168.1" stroke="#059669" opacity="0.55"/>
+<line x1="143.6" y1="284.4" x2="143.6" y2="230.8" stroke="#059669" opacity="0.55"/>
+<line x1="226.8" y1="336.4" x2="226.8" y2="281.3" stroke="#059669" opacity="0.55"/>
+<line x1="359.2" y1="232.7" x2="359.2" y2="183.7" stroke="#059669" opacity="0.55"/>
+<line x1="521.1" y1="235.9" x2="521.1" y2="183.3" stroke="#059669" opacity="0.55"/>
+<line x1="600.9" y1="249.8" x2="600.9" y2="199.8" stroke="#059669" opacity="0.55"/>
+<line x1="690.9" y1="238.6" x2="690.9" y2="184.8" stroke="#059669" opacity="0.55"/>
+<line x1="738.2" y1="264.5" x2="738.2" y2="214.0" stroke="#059669" opacity="0.55"/>
+<line x1="772.0" y1="240.4" x2="772.0" y2="187.7" stroke="#059669" opacity="0.55"/>
+<path d="M92.0,198.5 L143.6,257.6 L226.8,308.8 L359.2,208.2 L521.1,209.6 L600.9,224.8 L690.9,211.7 L738.2,239.3 L772.0,214.0" fill="none" stroke="#059669" stroke-width="2.2"/>
+<circle cx="92.0" cy="198.5" r="3.4" fill="#059669"/>
+<circle cx="143.6" cy="257.6" r="3.4" fill="#059669"/>
+<circle cx="226.8" cy="308.8" r="3.4" fill="#059669"/>
+<circle cx="359.2" cy="208.2" r="3.4" fill="#059669"/>
+<circle cx="521.1" cy="209.6" r="3.4" fill="#059669"/>
+<circle cx="600.9" cy="224.8" r="3.4" fill="#059669"/>
+<circle cx="690.9" cy="211.7" r="3.4" fill="#059669"/>
+<circle cx="738.2" cy="239.3" r="3.4" fill="#059669"/>
+<circle cx="772.0" cy="214.0" r="3.4" fill="#059669"/>
+<line x1="92.0" y1="228.5" x2="92.0" y2="166.1" stroke="#dc2626" opacity="0.55"/>
+<line x1="143.6" y1="270.9" x2="143.6" y2="208.0" stroke="#dc2626" opacity="0.55"/>
+<line x1="226.8" y1="336.7" x2="226.8" y2="275.3" stroke="#dc2626" opacity="0.55"/>
+<line x1="359.2" y1="271.9" x2="359.2" y2="215.2" stroke="#dc2626" opacity="0.55"/>
+<line x1="521.1" y1="239.7" x2="521.1" y2="184.4" stroke="#dc2626" opacity="0.55"/>
+<line x1="600.9" y1="263.6" x2="600.9" y2="208.9" stroke="#dc2626" opacity="0.55"/>
+<line x1="690.9" y1="257.0" x2="690.9" y2="204.9" stroke="#dc2626" opacity="0.55"/>
+<line x1="738.2" y1="263.6" x2="738.2" y2="213.6" stroke="#dc2626" opacity="0.55"/>
+<line x1="772.0" y1="260.6" x2="772.0" y2="207.3" stroke="#dc2626" opacity="0.55"/>
+<path d="M92.0,197.3 L143.6,239.4 L226.8,306.0 L359.2,243.5 L521.1,212.1 L600.9,236.3 L690.9,231.0 L738.2,238.6 L772.0,234.0" fill="none" stroke="#dc2626" stroke-width="4.2"/>
+<circle cx="92.0" cy="197.3" r="3.4" fill="#dc2626"/>
+<circle cx="143.6" cy="239.4" r="3.4" fill="#dc2626"/>
+<circle cx="226.8" cy="306.0" r="3.4" fill="#dc2626"/>
+<circle cx="359.2" cy="243.5" r="3.4" fill="#dc2626"/>
+<circle cx="521.1" cy="212.1" r="3.4" fill="#dc2626"/>
+<circle cx="600.9" cy="236.3" r="3.4" fill="#dc2626"/>
+<circle cx="690.9" cy="231.0" r="3.4" fill="#dc2626"/>
+<circle cx="738.2" cy="238.6" r="3.4" fill="#dc2626"/>
+<circle cx="772.0" cy="234.0" r="3.4" fill="#dc2626"/>
+<line x1="92.0" y1="237.7" x2="92.0" y2="180.9" stroke="#d97706" opacity="0.55"/>
+<line x1="143.6" y1="277.3" x2="143.6" y2="216.7" stroke="#d97706" opacity="0.55"/>
+<line x1="226.8" y1="301.9" x2="226.8" y2="242.1" stroke="#d97706" opacity="0.55"/>
+<line x1="359.2" y1="250.0" x2="359.2" y2="196.4" stroke="#d97706" opacity="0.55"/>
+<line x1="521.1" y1="234.9" x2="521.1" y2="182.0" stroke="#d97706" opacity="0.55"/>
+<line x1="600.9" y1="233.1" x2="600.9" y2="180.0" stroke="#d97706" opacity="0.55"/>
+<line x1="690.9" y1="229.4" x2="690.9" y2="176.1" stroke="#d97706" opacity="0.55"/>
+<line x1="738.2" y1="256.5" x2="738.2" y2="211.7" stroke="#d97706" opacity="0.55"/>
+<line x1="772.0" y1="233.8" x2="772.0" y2="187.6" stroke="#d97706" opacity="0.55"/>
+<path d="M92.0,209.3 L143.6,247.0 L226.8,272.0 L359.2,223.2 L521.1,208.5 L600.9,206.6 L690.9,202.7 L738.2,234.1 L772.0,210.7" fill="none" stroke="#d97706" stroke-width="2.6" stroke-dasharray="1,6"/>
+<circle cx="92.0" cy="209.3" r="3.4" fill="#d97706"/>
+<circle cx="143.6" cy="247.0" r="3.4" fill="#d97706"/>
+<circle cx="226.8" cy="272.0" r="3.4" fill="#d97706"/>
+<circle cx="359.2" cy="223.2" r="3.4" fill="#d97706"/>
+<circle cx="521.1" cy="208.5" r="3.4" fill="#d97706"/>
+<circle cx="600.9" cy="206.6" r="3.4" fill="#d97706"/>
+<circle cx="690.9" cy="202.7" r="3.4" fill="#d97706"/>
+<circle cx="738.2" cy="234.1" r="3.4" fill="#d97706"/>
+<circle cx="772.0" cy="210.7" r="3.4" fill="#d97706"/>
+<line x1="788" y1="54" x2="810" y2="54" stroke="#2563eb" stroke-width="2.2" stroke-dasharray="10,5"/>
+<text x="816" y="58" font-size="11" fill="#374151">int8 - bf16</text>
+<line x1="788" y1="74" x2="810" y2="74" stroke="#059669" stroke-width="2.2"/>
+<text x="816" y="78" font-size="11" fill="#374151">fp8 - bf16</text>
+<line x1="788" y1="94" x2="810" y2="94" stroke="#dc2626" stroke-width="4.2"/>
+<text x="816" y="98" font-size="11" fill="#374151">nvfp4 - bf16</text>
+<line x1="788" y1="114" x2="810" y2="114" stroke="#d97706" stroke-width="2.6" stroke-dasharray="1,6"/>
+<text x="816" y="118" font-size="11" fill="#374151">k8v4 - bf16</text>
+<text x="788" y="148" font-size="10.5" fill="#6b7280">reference reaches 131,072 tokens of history</text>
+</svg></div>
+<div class="card"><svg viewBox="0 0 1040 470" width="100%" role="img">
+<rect x="0" y="0" width="1040" height="470" fill="#ffffff"/>
+<text x="92" y="24" font-size="15" font-weight="600" fill="#111827">delta NLL vs fp8</text>
+<line x1="92" y1="410.0" x2="772" y2="410.0" stroke="#e5e7eb"/>
+<text x="84" y="414.0" font-size="11" fill="#6b7280" text-anchor="end">-0.0360</text>
+<line x1="92" y1="319.5" x2="772" y2="319.5" stroke="#e5e7eb"/>
+<text x="84" y="323.5" font-size="11" fill="#6b7280" text-anchor="end">-0.0180</text>
+<line x1="92" y1="229.0" x2="772" y2="229.0" stroke="#e5e7eb"/>
+<text x="84" y="233.0" font-size="11" fill="#6b7280" text-anchor="end">0</text>
+<line x1="92" y1="138.5" x2="772" y2="138.5" stroke="#e5e7eb"/>
+<text x="84" y="142.5" font-size="11" fill="#6b7280" text-anchor="end">0.0180</text>
+<line x1="92" y1="48.0" x2="772" y2="48.0" stroke="#e5e7eb"/>
+<text x="84" y="52.0" font-size="11" fill="#6b7280" text-anchor="end">0.0360</text>
+<line x1="164.9" y1="48" x2="164.9" y2="410" stroke="#e5e7eb"/>
+<text x="164.9" y="428" font-size="11" fill="#6b7280" text-anchor="middle">1,000</text>
+<line x1="416.9" y1="48" x2="416.9" y2="410" stroke="#e5e7eb"/>
+<text x="416.9" y="428" font-size="11" fill="#6b7280" text-anchor="middle">10,000</text>
+<line x1="668.8" y1="48" x2="668.8" y2="410" stroke="#e5e7eb"/>
+<text x="668.8" y="428" font-size="11" fill="#6b7280" text-anchor="middle">100,000</text>
+<line x1="92" y1="229.0" x2="772" y2="229.0" stroke="#9ca3af" stroke-dasharray="4,4"/>
+<text x="96" y="225.0" font-size="10" fill="#6b7280">zero</text>
+<line x1="92" y1="410" x2="772" y2="410" stroke="#9ca3af"/>
+<text x="432" y="456" font-size="12" fill="#374151" text-anchor="middle">visible history (tokens)</text>
+<text x="18" y="229" font-size="12" fill="#374151" text-anchor="middle" transform="rotate(-90 18 229)">delta NLL (nats)</text>
+<line x1="92.0" y1="289.9" x2="92.0" y2="229.1" stroke="#111827" opacity="0.55"/>
+<line x1="137.8" y1="227.2" x2="137.8" y2="173.6" stroke="#111827" opacity="0.55"/>
+<line x1="211.8" y1="176.7" x2="211.8" y2="121.6" stroke="#111827" opacity="0.55"/>
+<line x1="329.5" y1="274.3" x2="329.5" y2="225.3" stroke="#111827" opacity="0.55"/>
+<line x1="473.3" y1="274.7" x2="473.3" y2="222.1" stroke="#111827" opacity="0.55"/>
+<line x1="544.2" y1="258.2" x2="544.2" y2="208.2" stroke="#111827" opacity="0.55"/>
+<line x1="624.2" y1="273.2" x2="624.2" y2="219.4" stroke="#111827" opacity="0.55"/>
+<line x1="666.2" y1="244.0" x2="666.2" y2="193.5" stroke="#111827" opacity="0.55"/>
+<line x1="696.3" y1="270.3" x2="696.3" y2="217.6" stroke="#111827" opacity="0.55"/>
+<path d="M92.0,259.5 L137.8,200.4 L211.8,149.2 L329.5,249.8 L473.3,248.4 L544.2,233.2 L624.2,246.3 L666.2,218.7 L696.3,244.0" fill="none" stroke="#111827" stroke-width="2.2"/>
+<circle cx="92.0" cy="259.5" r="3.4" fill="#111827"/>
+<circle cx="137.8" cy="200.4" r="3.4" fill="#111827"/>
+<circle cx="211.8" cy="149.2" r="3.4" fill="#111827"/>
+<circle cx="329.5" cy="249.8" r="3.4" fill="#111827"/>
+<circle cx="473.3" cy="248.4" r="3.4" fill="#111827"/>
+<circle cx="544.2" cy="233.2" r="3.4" fill="#111827"/>
+<circle cx="624.2" cy="246.3" r="3.4" fill="#111827"/>
+<circle cx="666.2" cy="218.7" r="3.4" fill="#111827"/>
+<circle cx="696.3" cy="244.0" r="3.4" fill="#111827"/>
+<line x1="92.0" y1="279.3" x2="92.0" y2="222.3" stroke="#2563eb" opacity="0.55"/>
+<line x1="137.8" y1="219.1" x2="137.8" y2="161.3" stroke="#2563eb" opacity="0.55"/>
+<line x1="211.8" y1="251.0" x2="211.8" y2="196.0" stroke="#2563eb" opacity="0.55"/>
+<line x1="329.5" y1="277.7" x2="329.5" y2="224.3" stroke="#2563eb" opacity="0.55"/>
+<line x1="473.3" y1="291.7" x2="473.3" y2="235.8" stroke="#2563eb" opacity="0.55"/>
+<line x1="544.2" y1="268.0" x2="544.2" y2="211.2" stroke="#2563eb" opacity="0.55"/>
+<line x1="624.2" y1="244.6" x2="624.2" y2="192.1" stroke="#2563eb" opacity="0.55"/>
+<line x1="666.2" y1="264.2" x2="666.2" y2="213.9" stroke="#2563eb" opacity="0.55"/>
+<line x1="696.3" y1="244.8" x2="696.3" y2="190.7" stroke="#2563eb" opacity="0.55"/>
+<line x1="722.5" y1="235.3" x2="722.5" y2="186.3" stroke="#2563eb" opacity="0.55"/>
+<line x1="742.8" y1="250.9" x2="742.8" y2="203.9" stroke="#2563eb" opacity="0.55"/>
+<line x1="759.6" y1="270.1" x2="759.6" y2="217.4" stroke="#2563eb" opacity="0.55"/>
+<line x1="772.0" y1="220.7" x2="772.0" y2="170.2" stroke="#2563eb" opacity="0.55"/>
+<path d="M92.0,250.8 L137.8,190.2 L211.8,223.5 L329.5,251.0 L473.3,263.7 L544.2,239.6 L624.2,218.4 L666.2,239.1 L696.3,217.7 L722.5,210.8 L742.8,227.4 L759.6,243.7 L772.0,195.4" fill="none" stroke="#2563eb" stroke-width="2.2" stroke-dasharray="10,5"/>
+<circle cx="92.0" cy="250.8" r="3.4" fill="#2563eb"/>
+<circle cx="137.8" cy="190.2" r="3.4" fill="#2563eb"/>
+<circle cx="211.8" cy="223.5" r="3.4" fill="#2563eb"/>
+<circle cx="329.5" cy="251.0" r="3.4" fill="#2563eb"/>
+<circle cx="473.3" cy="263.7" r="3.4" fill="#2563eb"/>
+<circle cx="544.2" cy="239.6" r="3.4" fill="#2563eb"/>
+<circle cx="624.2" cy="218.4" r="3.4" fill="#2563eb"/>
+<circle cx="666.2" cy="239.1" r="3.4" fill="#2563eb"/>
+<circle cx="696.3" cy="217.7" r="3.4" fill="#2563eb"/>
+<circle cx="722.5" cy="210.8" r="3.4" fill="#2563eb"/>
+<circle cx="742.8" cy="227.4" r="3.4" fill="#2563eb"/>
+<circle cx="759.6" cy="243.7" r="3.4" fill="#2563eb"/>
+<circle cx="772.0" cy="195.4" r="3.4" fill="#2563eb"/>
+<line x1="92.0" y1="258.2" x2="92.0" y2="197.4" stroke="#dc2626" opacity="0.55"/>
+<line x1="137.8" y1="240.0" x2="137.8" y2="181.6" stroke="#dc2626" opacity="0.55"/>
+<line x1="211.8" y1="256.4" x2="211.8" y2="196.0" stroke="#dc2626" opacity="0.55"/>
+<line x1="329.5" y1="292.5" x2="329.5" y2="236.1" stroke="#dc2626" opacity="0.55"/>
+<line x1="473.3" y1="259.9" x2="473.3" y2="202.9" stroke="#dc2626" opacity="0.55"/>
+<line x1="544.2" y1="268.6" x2="544.2" y2="212.4" stroke="#dc2626" opacity="0.55"/>
+<line x1="624.2" y1="273.5" x2="624.2" y2="223.1" stroke="#dc2626" opacity="0.55"/>
+<line x1="666.2" y1="256.3" x2="666.2" y2="200.3" stroke="#dc2626" opacity="0.55"/>
+<line x1="696.3" y1="276.8" x2="696.3" y2="221.1" stroke="#dc2626" opacity="0.55"/>
+<line x1="742.8" y1="248.8" x2="742.8" y2="195.7" stroke="#dc2626" opacity="0.55"/>
+<line x1="772.0" y1="225.1" x2="772.0" y2="170.6" stroke="#dc2626" opacity="0.55"/>
+<path d="M92.0,227.8 L137.8,210.8 L211.8,226.2 L329.5,264.3 L473.3,231.4 L544.2,240.5 L624.2,248.3 L666.2,228.3 L696.3,248.9 L742.8,222.3 L772.0,197.8" fill="none" stroke="#dc2626" stroke-width="4.2"/>
+<circle cx="92.0" cy="227.8" r="3.4" fill="#dc2626"/>
+<circle cx="137.8" cy="210.8" r="3.4" fill="#dc2626"/>
+<circle cx="211.8" cy="226.2" r="3.4" fill="#dc2626"/>
+<circle cx="329.5" cy="264.3" r="3.4" fill="#dc2626"/>
+<circle cx="473.3" cy="231.4" r="3.4" fill="#dc2626"/>
+<circle cx="544.2" cy="240.5" r="3.4" fill="#dc2626"/>
+<circle cx="624.2" cy="248.3" r="3.4" fill="#dc2626"/>
+<circle cx="666.2" cy="228.3" r="3.4" fill="#dc2626"/>
+<circle cx="696.3" cy="248.9" r="3.4" fill="#dc2626"/>
+<circle cx="742.8" cy="222.3" r="3.4" fill="#dc2626"/>
+<circle cx="772.0" cy="197.8" r="3.4" fill="#dc2626"/>
+<line x1="92.0" y1="269.9" x2="92.0" y2="209.8" stroke="#d97706" opacity="0.55"/>
+<line x1="137.8" y1="247.5" x2="137.8" y2="189.4" stroke="#d97706" opacity="0.55"/>
+<line x1="211.8" y1="219.2" x2="211.8" y2="165.1" stroke="#d97706" opacity="0.55"/>
+<line x1="329.5" y1="269.0" x2="329.5" y2="218.9" stroke="#d97706" opacity="0.55"/>
+<line x1="473.3" y1="253.7" x2="473.3" y2="202.0" stroke="#d97706" opacity="0.55"/>
+<line x1="544.2" y1="237.1" x2="544.2" y2="184.5" stroke="#d97706" opacity="0.55"/>
+<line x1="624.2" y1="246.8" x2="624.2" y2="193.3" stroke="#d97706" opacity="0.55"/>
+<line x1="666.2" y1="247.6" x2="666.2" y2="200.1" stroke="#d97706" opacity="0.55"/>
+<line x1="696.3" y1="253.0" x2="696.3" y2="198.3" stroke="#d97706" opacity="0.55"/>
+<line x1="722.5" y1="229.8" x2="722.5" y2="180.8" stroke="#d97706" opacity="0.55"/>
+<line x1="742.8" y1="263.0" x2="742.8" y2="205.2" stroke="#d97706" opacity="0.55"/>
+<line x1="759.6" y1="228.4" x2="759.6" y2="176.2" stroke="#d97706" opacity="0.55"/>
+<line x1="772.0" y1="244.9" x2="772.0" y2="191.4" stroke="#d97706" opacity="0.55"/>
+<path d="M92.0,239.8 L137.8,218.4 L211.8,192.2 L329.5,244.0 L473.3,227.9 L544.2,210.8 L624.2,220.1 L666.2,223.9 L696.3,225.7 L722.5,205.3 L742.8,234.1 L759.6,202.3 L772.0,218.2" fill="none" stroke="#d97706" stroke-width="2.6" stroke-dasharray="1,6"/>
+<circle cx="92.0" cy="239.8" r="3.4" fill="#d97706"/>
+<circle cx="137.8" cy="218.4" r="3.4" fill="#d97706"/>
+<circle cx="211.8" cy="192.2" r="3.4" fill="#d97706"/>
+<circle cx="329.5" cy="244.0" r="3.4" fill="#d97706"/>
+<circle cx="473.3" cy="227.9" r="3.4" fill="#d97706"/>
+<circle cx="544.2" cy="210.8" r="3.4" fill="#d97706"/>
+<circle cx="624.2" cy="220.1" r="3.4" fill="#d97706"/>
+<circle cx="666.2" cy="223.9" r="3.4" fill="#d97706"/>
+<circle cx="696.3" cy="225.7" r="3.4" fill="#d97706"/>
+<circle cx="722.5" cy="205.3" r="3.4" fill="#d97706"/>
+<circle cx="742.8" cy="234.1" r="3.4" fill="#d97706"/>
+<circle cx="759.6" cy="202.3" r="3.4" fill="#d97706"/>
+<circle cx="772.0" cy="218.2" r="3.4" fill="#d97706"/>
+<line x1="788" y1="54" x2="810" y2="54" stroke="#111827" stroke-width="2.2"/>
+<text x="816" y="58" font-size="11" fill="#374151">bf16 - fp8</text>
+<line x1="788" y1="74" x2="810" y2="74" stroke="#2563eb" stroke-width="2.2" stroke-dasharray="10,5"/>
+<text x="816" y="78" font-size="11" fill="#374151">int8 - fp8</text>
+<line x1="788" y1="94" x2="810" y2="94" stroke="#dc2626" stroke-width="4.2"/>
+<text x="816" y="98" font-size="11" fill="#374151">nvfp4 - fp8</text>
+<line x1="788" y1="114" x2="810" y2="114" stroke="#d97706" stroke-width="2.6" stroke-dasharray="1,6"/>
+<text x="816" y="118" font-size="11" fill="#374151">k8v4 - fp8</text>
+<text x="788" y="148" font-size="10.5" fill="#6b7280">reference reaches 257,439 tokens of history</text>
+</svg></div>
+<h3>vs bf16（无损参考，最多到 131,072）</h3><div class="card"><table><thead><tr><th>comparison</th><th>visible history</th><th>delta NLL</th><th>se</th><th>t</th></tr></thead><tbody>
+<tr><td>fp8 - bf16</td><td>514</td><td>+0.006065</td><td>0.006049</td><td><span class="good">+1.00</span></td></tr>
+<tr><td>fp8 - bf16</td><td>780</td><td>-0.005685</td><td>0.005328</td><td><span class="good">-1.07</span></td></tr>
+<tr><td>fp8 - bf16</td><td>1,534</td><td>-0.015875</td><td>0.005476</td><td><span class="bad">-2.90</span></td></tr>
+<tr><td>fp8 - bf16</td><td>4,498</td><td>+0.004134</td><td>0.004875</td><td><span class="good">+0.85</span></td></tr>
+<tr><td>fp8 - bf16</td><td>16,748</td><td>+0.003857</td><td>0.005224</td><td><span class="good">+0.74</span></td></tr>
+<tr><td>fp8 - bf16</td><td>32,024</td><td>+0.000840</td><td>0.004968</td><td><span class="good">+0.17</span></td></tr>
+<tr><td>fp8 - bf16</td><td>66,538</td><td>+0.003444</td><td>0.005356</td><td><span class="good">+0.64</span></td></tr>
+<tr><td>fp8 - bf16</td><td>97,664</td><td>-0.002040</td><td>0.005024</td><td><span class="good">-0.41</span></td></tr>
+<tr><td>fp8 - bf16</td><td>128,522</td><td>+0.002978</td><td>0.005246</td><td><span class="good">+0.57</span></td></tr>
+<tr><td>int8 - bf16</td><td>514</td><td>+0.001736</td><td>0.005815</td><td><span class="good">+0.30</span></td></tr>
+<tr><td>int8 - bf16</td><td>780</td><td>+0.002032</td><td>0.006011</td><td><span class="good">+0.34</span></td></tr>
+<tr><td>int8 - bf16</td><td>1,534</td><td>-0.014788</td><td>0.005739</td><td><span class="bad">-2.58</span></td></tr>
+<tr><td>int8 - bf16</td><td>4,498</td><td>-0.000246</td><td>0.005711</td><td><span class="good">-0.04</span></td></tr>
+<tr><td>int8 - bf16</td><td>16,748</td><td>-0.003051</td><td>0.005354</td><td><span class="good">-0.57</span></td></tr>
+<tr><td>int8 - bf16</td><td>32,024</td><td>-0.001271</td><td>0.005042</td><td><span class="good">-0.25</span></td></tr>
+<tr><td>int8 - bf16</td><td>66,538</td><td>+0.005557</td><td>0.004877</td><td><span class="good">+1.14</span></td></tr>
+<tr><td>int8 - bf16</td><td>97,664</td><td>-0.004041</td><td>0.005069</td><td><span class="good">-0.80</span></td></tr>
+<tr><td>int8 - bf16</td><td>128,522</td><td>+0.005217</td><td>0.005071</td><td><span class="good">+1.03</span></td></tr>
+<tr><td>k8v4 - bf16</td><td>514</td><td>+0.003912</td><td>0.005651</td><td><span class="good">+0.69</span></td></tr>
+<tr><td>k8v4 - bf16</td><td>780</td><td>-0.003583</td><td>0.006033</td><td><span class="good">-0.59</span></td></tr>
+<tr><td>k8v4 - bf16</td><td>1,534</td><td>-0.008549</td><td>0.005942</td><td><span class="good">-1.44</span></td></tr>
+<tr><td>k8v4 - bf16</td><td>4,498</td><td>+0.001160</td><td>0.005333</td><td><span class="good">+0.22</span></td></tr>
+<tr><td>k8v4 - bf16</td><td>16,748</td><td>+0.004084</td><td>0.005259</td><td><span class="good">+0.78</span></td></tr>
+<tr><td>k8v4 - bf16</td><td>32,024</td><td>+0.004464</td><td>0.005288</td><td><span class="good">+0.84</span></td></tr>
+<tr><td>k8v4 - bf16</td><td>66,538</td><td>+0.005222</td><td>0.005297</td><td><span class="good">+0.99</span></td></tr>
+<tr><td>k8v4 - bf16</td><td>97,664</td><td>-0.001016</td><td>0.004464</td><td><span class="good">-0.23</span></td></tr>
+<tr><td>k8v4 - bf16</td><td>128,522</td><td>+0.003643</td><td>0.004600</td><td><span class="good">+0.79</span></td></tr>
+<tr><td>nvfp4 - bf16</td><td>514</td><td>+0.006305</td><td>0.006205</td><td><span class="good">+1.02</span></td></tr>
+<tr><td>nvfp4 - bf16</td><td>780</td><td>-0.002074</td><td>0.006257</td><td><span class="good">-0.33</span></td></tr>
+<tr><td>nvfp4 - bf16</td><td>1,534</td><td>-0.015323</td><td>0.006106</td><td><span class="bad">-2.51</span></td></tr>
+<tr><td>nvfp4 - bf16</td><td>4,498</td><td>-0.002886</td><td>0.005638</td><td><span class="good">-0.51</span></td></tr>
+<tr><td>nvfp4 - bf16</td><td>16,748</td><td>+0.003371</td><td>0.005503</td><td><span class="good">+0.61</span></td></tr>
+<tr><td>nvfp4 - bf16</td><td>32,024</td><td>-0.001443</td><td>0.005437</td><td><span class="good">-0.27</span></td></tr>
+<tr><td>nvfp4 - bf16</td><td>66,538</td><td>-0.000392</td><td>0.005180</td><td><span class="good">-0.08</span></td></tr>
+<tr><td>nvfp4 - bf16</td><td>97,664</td><td>-0.001904</td><td>0.004976</td><td><span class="good">-0.38</span></td></tr>
+<tr><td>nvfp4 - bf16</td><td>128,522</td><td>-0.000987</td><td>0.005305</td><td><span class="good">-0.19</span></td></tr>
+</tbody></table></div>
+<h3>vs fp8（全深度）</h3><div class="card"><table><thead><tr><th>comparison</th><th>visible history</th><th>delta NLL</th><th>se</th><th>t</th></tr></thead><tbody>
+<tr><td>bf16 - fp8</td><td>514</td><td>-0.006065</td><td>0.006049</td><td><span class="good">-1.00</span></td></tr>
+<tr><td>bf16 - fp8</td><td>780</td><td>+0.005685</td><td>0.005328</td><td><span class="good">+1.07</span></td></tr>
+<tr><td>bf16 - fp8</td><td>1,534</td><td>+0.015875</td><td>0.005476</td><td><span class="bad">+2.90</span></td></tr>
+<tr><td>bf16 - fp8</td><td>4,498</td><td>-0.004134</td><td>0.004875</td><td><span class="good">-0.85</span></td></tr>
+<tr><td>bf16 - fp8</td><td>16,748</td><td>-0.003857</td><td>0.005224</td><td><span class="good">-0.74</span></td></tr>
+<tr><td>bf16 - fp8</td><td>32,024</td><td>-0.000840</td><td>0.004968</td><td><span class="good">-0.17</span></td></tr>
+<tr><td>bf16 - fp8</td><td>66,538</td><td>-0.003444</td><td>0.005356</td><td><span class="good">-0.64</span></td></tr>
+<tr><td>bf16 - fp8</td><td>97,664</td><td>+0.002040</td><td>0.005024</td><td><span class="good">+0.41</span></td></tr>
+<tr><td>bf16 - fp8</td><td>128,522</td><td>-0.002978</td><td>0.005246</td><td><span class="good">-0.57</span></td></tr>
+<tr><td>int8 - fp8</td><td>514</td><td>-0.004330</td><td>0.005665</td><td><span class="good">-0.76</span></td></tr>
+<tr><td>int8 - fp8</td><td>780</td><td>+0.007718</td><td>0.005755</td><td><span class="good">+1.34</span></td></tr>
+<tr><td>int8 - fp8</td><td>1,534</td><td>+0.001087</td><td>0.005468</td><td><span class="good">+0.20</span></td></tr>
+<tr><td>int8 - fp8</td><td>4,498</td><td>-0.004380</td><td>0.005307</td><td><span class="good">-0.83</span></td></tr>
+<tr><td>int8 - fp8</td><td>16,748</td><td>-0.006907</td><td>0.005563</td><td><span class="good">-1.24</span></td></tr>
+<tr><td>int8 - fp8</td><td>32,024</td><td>-0.002111</td><td>0.005647</td><td><span class="good">-0.37</span></td></tr>
+<tr><td>int8 - fp8</td><td>66,538</td><td>+0.002113</td><td>0.005219</td><td><span class="good">+0.40</span></td></tr>
+<tr><td>int8 - fp8</td><td>97,664</td><td>-0.002001</td><td>0.004996</td><td><span class="good">-0.40</span></td></tr>
+<tr><td>int8 - fp8</td><td>128,522</td><td>+0.002239</td><td>0.005387</td><td><span class="good">+0.42</span></td></tr>
+<tr><td>int8 - fp8</td><td>163,302</td><td>+0.003617</td><td>0.004871</td><td><span class="good">+0.74</span></td></tr>
+<tr><td>int8 - fp8</td><td>196,628</td><td>+0.000322</td><td>0.004670</td><td><span class="good">+0.07</span></td></tr>
+<tr><td>int8 - fp8</td><td>229,348</td><td>-0.002933</td><td>0.005240</td><td><span class="good">-0.56</span></td></tr>
+<tr><td>int8 - fp8</td><td>256,772</td><td>+0.006675</td><td>0.005024</td><td><span class="good">+1.33</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>514</td><td>-0.002153</td><td>0.005977</td><td><span class="good">-0.36</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>780</td><td>+0.002103</td><td>0.005774</td><td><span class="good">+0.36</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>1,534</td><td>+0.007326</td><td>0.005387</td><td><span class="good">+1.36</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>4,498</td><td>-0.002974</td><td>0.004991</td><td><span class="good">-0.60</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>16,748</td><td>+0.000227</td><td>0.005136</td><td><span class="good">+0.04</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>32,024</td><td>+0.003624</td><td>0.005228</td><td><span class="good">+0.69</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>66,538</td><td>+0.001778</td><td>0.005316</td><td><span class="good">+0.33</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>97,664</td><td>+0.001024</td><td>0.004728</td><td><span class="good">+0.22</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>128,522</td><td>+0.000666</td><td>0.005437</td><td><span class="good">+0.12</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>163,302</td><td>+0.004720</td><td>0.004874</td><td><span class="good">+0.97</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>196,628</td><td>-0.001021</td><td>0.005747</td><td><span class="good">-0.18</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>229,348</td><td>+0.005314</td><td>0.005189</td><td><span class="good">+1.02</span></td></tr>
+<tr><td>k8v4 - fp8</td><td>256,772</td><td>+0.002157</td><td>0.005327</td><td><span class="good">+0.40</span></td></tr>
+<tr><td>nvfp4 - fp8</td><td>514</td><td>+0.000240</td><td>0.006044</td><td><span class="good">+0.04</span></td></tr>
+<tr><td>nvfp4 - fp8</td><td>780</td><td>+0.003612</td><td>0.005806</td><td><span class="good">+0.62</span></td></tr>
+<tr><td>nvfp4 - fp8</td><td>1,534</td><td>+0.000553</td><td>0.006008</td><td><span class="good">+0.09</span></td></tr>
+<tr><td>nvfp4 - fp8</td><td>4,498</td><td>-0.007020</td><td>0.005604</td><td><span class="good">-1.25</span></td></tr>
+<tr><td>nvfp4 - fp8</td><td>16,748</td><td>-0.000486</td><td>0.005668</td><td><span class="good">-0.09</span></td></tr>
+<tr><td>nvfp4 - fp8</td><td>32,024</td><td>-0.002283</td><td>0.005593</td><td><span class="good">-0.41</span></td></tr>
+<tr><td>nvfp4 - fp8</td><td>66,538</td><td>-0.003837</td><td>0.005016</td><td><span class="good">-0.76</span></td></tr>
+<tr><td>nvfp4 - fp8</td><td>97,664</td><td>+0.000136</td><td>0.005575</td><td><span class="good">+0.02</span></td></tr>
+<tr><td>nvfp4 - fp8</td><td>128,522</td><td>-0.003965</td><td>0.005545</td><td><span class="good">-0.72</span></td></tr>
+<tr><td>nvfp4 - fp8</td><td>196,628</td><td>+0.001336</td><td>0.005283</td><td><span class="good">+0.25</span></td></tr>
+<tr><td>nvfp4 - fp8</td><td>256,772</td><td>+0.006201</td><td>0.005417</td><td><span class="good">+1.14</span></td></tr>
+</tbody></table></div>
+<h3>配对差值的面板回归</h3><div class="card"><table><thead><tr><th>comparison</th><th>range</th><th>slope (nats / decade)</th><th>se</th><th>t</th><th>tokens</th></tr></thead><tbody>
+<tr><td>bf16 - fp8</td><td>whole</td><td>-0.002560</td><td>+0.002158</td><td><span class="good">-1.19</span></td><td>1008</td></tr>
+<tr><td>bf16 - fp8</td><td>deep</td><td>+0.005919</td><td>+0.007586</td><td><span class="good">+0.78</span></td><td>1008</td></tr>
+<tr><td>fp8 - bf16</td><td>whole</td><td>+0.002560</td><td>+0.002158</td><td><span class="good">+1.19</span></td><td>1008</td></tr>
+<tr><td>fp8 - bf16</td><td>deep</td><td>-0.005919</td><td>+0.007586</td><td><span class="good">-0.78</span></td><td>1008</td></tr>
+<tr><td>int8 - bf16</td><td>whole</td><td>+0.001932</td><td>+0.002169</td><td><span class="good">+0.89</span></td><td>1008</td></tr>
+<tr><td>int8 - bf16</td><td>deep</td><td>+0.007940</td><td>+0.007351</td><td><span class="good">+1.08</span></td><td>1008</td></tr>
+<tr><td>int8 - fp8</td><td>whole</td><td>+0.000521</td><td>+0.001418</td><td><span class="good">+0.37</span></td><td>1008</td></tr>
+<tr><td>int8 - fp8</td><td>deep</td><td>+0.009823</td><td>+0.004649</td><td><span class="bad">+2.11</span></td><td>1008</td></tr>
+<tr><td>k8v4 - bf16</td><td>whole</td><td>+0.002203</td><td>+0.002080</td><td><span class="good">+1.06</span></td><td>1008</td></tr>
+<tr><td>k8v4 - bf16</td><td>deep</td><td>-0.002792</td><td>+0.007226</td><td><span class="good">-0.39</span></td><td>1008</td></tr>
+<tr><td>k8v4 - fp8</td><td>whole</td><td>+0.000319</td><td>+0.001646</td><td><span class="good">+0.19</span></td><td>1008</td></tr>
+<tr><td>k8v4 - fp8</td><td>deep</td><td>+0.002498</td><td>+0.004798</td><td><span class="good">+0.52</span></td><td>1008</td></tr>
+<tr><td>nvfp4 - bf16</td><td>whole</td><td>+0.000601</td><td>+0.002200</td><td><span class="good">+0.27</span></td><td>1008</td></tr>
+<tr><td>nvfp4 - bf16</td><td>deep</td><td>-0.006089</td><td>+0.008548</td><td><span class="good">-0.71</span></td><td>1008</td></tr>
+<tr><td>nvfp4 - fp8</td><td>whole</td><td>-0.000019</td><td>+0.001803</td><td><span class="good">-0.01</span></td><td>1008</td></tr>
+<tr><td>nvfp4 - fp8</td><td>deep</td><td>+0.004786</td><td>+0.005693</td><td><span class="good">+0.84</span></td><td>1008</td></tr>
+</tbody></table><p class="sub" style="margin-bottom:0">斜率显著为正才说明"上下文越长，量化代价越大"。</p></div>
+<h3>长上下文区的平均量化代价（把所有深度 ≥ 16,384 的 token 汇总）</h3>
+<div class="card"><table><thead><tr><th>comparison</th><th>mean delta NLL</th><th>se</th><th>t</th><th>equivalent PPL</th><th>runs</th><th>tokens</th></tr></thead><tbody>
+<tr><td>fp8 - bf16</td><td>+0.001306</td><td>+0.002575</td><td><span class="good">+0.51</span></td><td>+0.131% PPL</td><td>4</td><td>4,032</td></tr>
+<tr><td>int8 - bf16</td><td>+0.001366</td><td>+0.002508</td><td><span class="good">+0.54</span></td><td>+0.137% PPL</td><td>4</td><td>4,032</td></tr>
+<tr><td>k8v4 - bf16</td><td>+0.003078</td><td>+0.002463</td><td><span class="good">+1.25</span></td><td>+0.308% PPL</td><td>4</td><td>4,032</td></tr>
+<tr><td>nvfp4 - bf16</td><td>-0.001182</td><td>+0.002613</td><td><span class="good">-0.45</span></td><td>-0.118% PPL</td><td>4</td><td>4,032</td></tr>
+<tr><td>bf16 - fp8</td><td>-0.001306</td><td>+0.002575</td><td><span class="good">-0.51</span></td><td>-0.130% PPL</td><td>4</td><td>4,032</td></tr>
+<tr><td>int8 - fp8</td><td>+0.000990</td><td>+0.001817</td><td><span class="good">+0.55</span></td><td>+0.099% PPL</td><td>8</td><td>8,064</td></tr>
+<tr><td>k8v4 - fp8</td><td>+0.002283</td><td>+0.001852</td><td><span class="good">+1.23</span></td><td>+0.229% PPL</td><td>8</td><td>8,064</td></tr>
+<tr><td>nvfp4 - fp8</td><td>-0.000402</td><td>+0.002208</td><td><span class="good">-0.18</span></td><td>-0.040% PPL</td><td>6</td><td>6,048</td></tr>
+</tbody></table><p class="sub" style="margin-bottom:0">这就是"长上下文下的量化代价"这一个数字；它的 se 只有 1e-3 量级，而随深度的斜率项只有 1e-3/十倍程 —— 代价是常数。</p></div>
+<h2>5. 每次运行的原始数字</h2>
+<div class="card"><table><thead><tr><th>nominal k</th><th>visible history</th><th>bf16</th><th>int8</th><th>fp8</th><th>nvfp4</th><th>k8v4</th></tr></thead><tbody>
+<tr><td>0</td><td>513.5</td><td>1.893563</td><td>1.895299</td><td>1.899629</td><td>1.899868</td><td>1.897476</td></tr>
+<tr><td>256</td><td>780.5</td><td>1.747431</td><td>1.749463</td><td>1.741746</td><td>1.745357</td><td>1.743849</td></tr>
+<tr><td>1024</td><td>1534.5</td><td>1.635928</td><td>1.621140</td><td>1.620052</td><td>1.620605</td><td>1.627378</td></tr>
+<tr><td>4096</td><td>4498.5</td><td>1.546693</td><td>1.546446</td><td>1.550826</td><td>1.543806</td><td>1.547852</td></tr>
+<tr><td>16384</td><td>16748.5</td><td>1.531679</td><td>1.528628</td><td>1.535535</td><td>1.535049</td><td>1.535763</td></tr>
+<tr><td>32768</td><td>32023.5</td><td>1.536464</td><td>1.535193</td><td>1.537304</td><td>1.535021</td><td>1.540929</td></tr>
+<tr><td>65536</td><td>66537.5</td><td>1.408563</td><td>1.414121</td><td>1.412008</td><td>1.408171</td><td>1.413785</td></tr>
+<tr><td>98304</td><td>97663.5</td><td>1.415089</td><td>1.411048</td><td>1.413049</td><td>1.413185</td><td>1.414073</td></tr>
+<tr><td>130048</td><td>128522.5</td><td>1.410002</td><td>1.415219</td><td>1.412980</td><td>1.409015</td><td>1.413646</td></tr>
+<tr><td>163840</td><td>163301.5</td><td>-</td><td>1.414875</td><td>1.411258</td><td>-</td><td>1.415978</td></tr>
+<tr><td>196608</td><td>196627.5</td><td>-</td><td>1.414694</td><td>1.414372</td><td>1.415709</td><td>1.413352</td></tr>
+<tr><td>229376</td><td>229347.5</td><td>-</td><td>1.409295</td><td>1.412228</td><td>-</td><td>1.417542</td></tr>
+<tr><td>256415</td><td>256772.5</td><td>-</td><td>1.417433</td><td>1.410757</td><td>1.416958</td><td>1.412914</td></tr>
+</tbody></table></div>
+</div></body></html>

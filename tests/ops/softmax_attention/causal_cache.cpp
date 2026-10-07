@@ -2236,6 +2236,77 @@ int report_quantization_quality(KvCacheStorage storage, std::uint32_t seed) {
     return 0;
 }
 
+// Reports how the codec's attention error grows with the number of cached positions. One long
+// key/value sequence is generated once; every length writes a prefix of it and then reads that
+// prefix back with the same query rows, so the only variable between lines is how many positions
+// the softmax spans. This measures the codec, not the model: the fixture keeps the random
+// key/value distribution of the fixed-length oracle above.
+int report_quantization_length_sweep(KvCacheStorage storage, std::uint32_t seed) {
+    const Geometry& geometry          = kGeometries[0];
+    constexpr std::int32_t kQueries   = 4;
+    constexpr std::int32_t kMaxLength = 16384;
+    constexpr std::int32_t kLengths[] = {6, 64, 256, 1024, 4096, 16384};
+    const std::size_t q_elements =
+        static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(geometry.q_heads) * kQueries;
+    const std::size_t kv_elements =
+        static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(geometry.kv_heads) * kMaxLength;
+    const std::vector<float> q_full = make_bf16_values(q_elements, seed, -0.25f, 0.25f);
+    const std::vector<float> k_full = make_bf16_values(kv_elements, seed + 1u, -0.25f, 0.25f);
+    const std::vector<float> v_full = make_bf16_values(kv_elements, seed + 2u, -1.0f, 1.0f);
+
+    int failures = 0;
+    for (const std::int32_t length : kLengths) {
+        const std::size_t keep = static_cast<std::size_t>(kHeadDim) *
+                                 static_cast<std::size_t>(geometry.kv_heads) *
+                                 static_cast<std::size_t>(length);
+        std::vector<float> k(k_full.begin(), k_full.begin() + static_cast<std::ptrdiff_t>(keep));
+        std::vector<float> v(v_full.begin(), v_full.begin() + static_cast<std::ptrdiff_t>(keep));
+        inject_codec_edges(geometry, length, k, v);
+        std::vector<std::int32_t> write_positions(static_cast<std::size_t>(length));
+        for (std::int32_t token = 0; token < length; ++token) {
+            write_positions[static_cast<std::size_t>(token)] = token;
+        }
+        std::vector<std::int32_t> query_positions(kQueries);
+        for (std::int32_t token = 0; token < kQueries; ++token) {
+            query_positions[static_cast<std::size_t>(token)] = length - kQueries + token;
+        }
+
+        HostCache represented = make_cache(geometry, storage, length, seed + 10u);
+        HostCache unquantized = make_cache(geometry, KvCacheStorage::BFloat16, length, seed + 10u);
+        append_cache(represented, k, v, write_positions);
+        append_cache(unquantized, k, v, write_positions);
+        const std::vector<double> quantized_output =
+            ideal_attention(q_full, represented, query_positions);
+        const std::vector<double> bf16_output =
+            ideal_attention(q_full, unquantized, query_positions);
+
+        double sum_abs = 0.0, sum_sq = 0.0, reference_sq = 0.0, maximum_error = 0.0;
+        for (std::size_t i = 0; i < quantized_output.size(); ++i) {
+            const double error = quantized_output[i] - bf16_output[i];
+            sum_abs += std::abs(error);
+            sum_sq += error * error;
+            reference_sq += bf16_output[i] * bf16_output[i];
+            maximum_error = std::max(maximum_error, std::abs(error));
+        }
+        const double count         = static_cast<double>(quantized_output.size());
+        const double mae           = sum_abs / count;
+        const double rmse          = std::sqrt(sum_sq / count);
+        const double reference_rms = std::sqrt(reference_sq / count);
+        const double relative_rmse = reference_rms == 0.0 ? 0.0 : rmse / reference_rms;
+        if (!std::isfinite(mae) || !std::isfinite(rmse) || !std::isfinite(relative_rmse) ||
+            !std::isfinite(maximum_error)) {
+            std::cerr << cache_name(storage) << " length sweep produced non-finite statistics at "
+                      << length << " positions\n";
+            ++failures;
+            continue;
+        }
+        std::cout << cache_name(storage) << " quantized-vs-bf16 length sweep" << " length=" << length
+                  << " mae=" << mae << " rmse=" << rmse << " rel_rmse=" << relative_rmse
+                  << " max_abs=" << maximum_error << '\n';
+    }
+    return failures;
+}
+
 int run_quantized_batch_cases(KvCacheStorage storage, std::uint32_t seed) {
     int failures = 0;
     failures += run_batch_case(kGeometries[0], storage,
@@ -2590,6 +2661,8 @@ int run_softmax_attention_causal_cache_tests() {
 
     int failures = verify_route_selection();
     failures += verify_workspace_capacity_contract();
+    failures += report_quantization_quality(KvCacheStorage::Int8Group64, 903u);
+    failures += report_quantization_quality(KvCacheStorage::Fp8E4M3Row256, 907u);
     failures += run_nvfp4_cases();
     failures += run_quantized_batch_cases(KvCacheStorage::Nvfp4Group16, 720u);
     failures += report_quantization_quality(KvCacheStorage::Nvfp4Group16, 724u);
@@ -2602,6 +2675,18 @@ int run_softmax_attention_causal_cache_tests() {
     failures += run_dflash2_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention public-contract correctness\n";
+    return failures == 0 ? 0 : 1;
+}
+
+int run_softmax_attention_quant_sweep_tests() {
+    if (cuda_unavailable()) return 77;
+    int failures = 0;
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        failures += report_quantization_length_sweep(storage, 1301u);
+    }
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " quantized attention length sweep\n";
     return failures == 0 ? 0 : 1;
 }
 

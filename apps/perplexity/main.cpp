@@ -49,16 +49,23 @@ struct Options {
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
     int device                          = 0;
+    // Second device of a two-device tensor-parallel pair. Negative selects the single-device route;
+    // a nonnegative value is what lets an artifact larger than one card be scored at all.
+    int device_b                        = -1;
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool quick                          = false;
+    // Writes one line per scored token so a caller can plot the metric against the history depth
+    // each target actually saw instead of only reading the corpus-wide average.
+    bool dump_token_nll                 = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
 
 std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-           "       [--context N] [--stride N] [--device N]\n"
+           "       [--context N] [--stride N] [--device N | --devices A,B]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
+           "       [--dump-token-nll]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -85,6 +92,8 @@ Options parse_options(int argc, char** argv) {
     }
     Options out;
     out.artifact = argv[1];
+    bool single_device_seen = false;
+    bool devices_seen       = false;
     for (int i = 2; i < argc; ++i) {
         const std::string_view option = argv[i];
         const auto value              = [&](const char* label) -> std::string_view {
@@ -97,12 +106,29 @@ Options parse_options(int argc, char** argv) {
             out.text = std::filesystem::path(value("--text"));
         } else if (option == "--quick") {
             out.quick = true;
+        } else if (option == "--dump-token-nll") {
+            out.dump_token_nll = true;
         } else if (option == "--context") {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
         } else if (option == "--device") {
-            out.device = parse_integer<int>(value("--device"), "device");
+            if (devices_seen) { usage_error("give either --device or --devices, not both"); }
+            single_device_seen = true;
+            out.device         = parse_integer<int>(value("--device"), "device");
+        } else if (option == "--devices") {
+            if (single_device_seen) { usage_error("give either --device or --devices, not both"); }
+            devices_seen             = true;
+            const std::string_view devices = value("--devices");
+            const std::size_t comma        = devices.find(',');
+            if (comma == std::string_view::npos) {
+                usage_error("--devices must be a pair: A,B");
+            }
+            out.device   = parse_integer<int>(devices.substr(0, comma), "devices");
+            out.device_b = parse_integer<int>(devices.substr(comma + 1), "devices");
+            if (out.device < 0 || out.device_b < 0 || out.device == out.device_b) {
+                usage_error("--devices must name two distinct nonnegative devices: A,B");
+            }
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -174,10 +200,20 @@ std::string timestamp() {
 std::filesystem::path prepare_output_directory(const Options& options,
                                                const ninfer::LoadSummary& load,
                                                const CorpusSelection& corpus) {
-    std::filesystem::path output = options.output.value_or(
-        std::filesystem::path("profiles/perplexity") / safe_component(load.model_name) /
-        safe_component(load.prefill_signature) / kv_name(options.kv) /
-        safe_component(corpus.corpus_id) / safe_component(corpus.mode) / timestamp());
+    // A two-device run gets its own path component so its reports never sit next to the single-device
+    // ones for the same artifact and KV format; the single-device tree keeps its historical shape.
+    std::filesystem::path default_output = std::filesystem::path("profiles/perplexity") /
+                                           safe_component(load.model_name) /
+                                           safe_component(load.prefill_signature);
+    if (options.device_b >= 0) {
+        default_output /= safe_component("tp2-" + std::to_string(options.device) + "-" +
+                                         std::to_string(options.device_b));
+    }
+    default_output /= kv_name(options.kv);
+    default_output /= safe_component(corpus.corpus_id);
+    default_output /= safe_component(corpus.mode);
+    default_output /= timestamp();
+    std::filesystem::path output = options.output.value_or(default_output);
     if (std::filesystem::exists(output)) {
         if (!std::filesystem::is_directory(output) ||
             std::filesystem::directory_iterator(output) != std::filesystem::directory_iterator()) {
@@ -215,6 +251,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.artifact_path    = options.artifact;
     engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
+    engine_options.device_b         = options.device_b;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
     engine_options.startup_observer = startup_log.observer();
@@ -281,6 +318,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         const Clock::time_point stream_started = Clock::now();
         ScoreAggregate stream_score;
         json window_reports = json::array();
+        std::vector<std::pair<std::uint64_t, double>> token_nll;
         for (std::size_t window_index = 0; window_index < stream.windows.size(); ++window_index) {
             const WindowPlan& window = stream.windows[window_index];
             std::vector<ninfer::TokenId> input(
@@ -301,6 +339,14 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             }
             ScoreAggregate window_score;
             window_score.add(logprobs);
+            if (options.dump_token_nll) {
+                // Target index t is token t, predicted from tokens [0, t). Its history depth is
+                // therefore exactly t, which is what the curve is plotted against.
+                for (std::size_t i = 0; i < logprobs.size(); ++i) {
+                    token_nll.emplace_back(static_cast<std::uint64_t>(window.target_begin) + i,
+                                           -static_cast<double>(logprobs[i]));
+                }
+            }
             stream_score.add(window_score);
             overall.add(window_score);
             domains[stream.source.domain].add(window_score);
@@ -351,6 +397,17 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         stream_report["seconds"]         = stream_seconds;
         stream_report["windows"]         = std::move(window_reports);
         stream_reports.push_back(std::move(stream_report));
+        if (options.dump_token_nll) {
+            const std::filesystem::path dump =
+                output_directory / ("token_nll." + safe_component(stream.source.id) + ".tsv");
+            std::ofstream file(dump, std::ios::binary | std::ios::trunc);
+            if (!file) { throw std::runtime_error("cannot create token NLL dump: " + dump.string()); }
+            file << "# target_index\tnll\n" << std::setprecision(8);
+            for (const auto& [index, nll] : token_nll) { file << index << '\t' << nll << '\n'; }
+            file.flush();
+            if (!file) { throw std::runtime_error("cannot write token NLL dump: " + dump.string()); }
+            logger->info("token NLL dump | {} | {} rows", dump.string(), token_nll.size());
+        }
     }
 
     const double scoring_seconds = seconds_since(scoring_started);
@@ -385,11 +442,13 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         {"execution",
          {{"purpose", "causal_scoring"},
           {"device", options.device},
+          {"device_b", options.device_b},
           {"context_tokens", options.context},
           {"stride_tokens", options.stride},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
-          {"kv_dtype", kv_name(options.kv)}}},
+          {"kv_dtype", kv_name(options.kv)},
+          {"token_nll_dump", options.dump_token_nll}}},
         {"timing",
          {{"load_seconds", load.load_seconds},
           {"read_and_tokenize_seconds", preflight_seconds},

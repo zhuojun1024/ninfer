@@ -284,7 +284,11 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     std::vector<float> result  = std::visit(
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+            // Both scoring routes expose the same contract: a prepared prompt in, one log-probability
+            // per target out. The single-GPU route runs the whole walk in-process, the TP-2 route
+            // splits it across two devices and reuses its generation core's shards.
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::TP2Core>>) {
                 return core->score(std::move(prompt.impl_->value), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");

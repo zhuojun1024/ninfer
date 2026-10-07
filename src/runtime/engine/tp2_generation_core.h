@@ -137,6 +137,17 @@ public:
     [[nodiscard]] RuntimeStats runtime_stats() const;
     void reset_memory_peaks() noexcept;
 
+    // Causal scoring (EnginePurpose::CausalScoring): one text prompt, no session, no decode. The
+    // returned values are the log-probabilities of targets [first_target, token_ids.size()), in
+    // token order -- the same contract as the single-device Program::causal_score. It reuses the
+    // generation core's shards and the validated forward_tp2 prefill; what it does not touch is the
+    // session catalog, the checkpoint ring and the speculative rounds, which the CausalScoring
+    // normalization disables and which the constructor therefore never builds. The walk starts from
+    // a zeroed linear-attention state, and every chunk reads only the positions it just appended
+    // (the forward's envelope ends at the chunk), so successive calls never share KV history.
+    [[nodiscard]] std::vector<float> score(models::qwen3_5::PreparedPrompt&& prompt,
+                                          std::uint32_t first_target);
+
 private:
     // One lane's GDN image inside a whole-pool state buffer (the live pool or a device snapshot).
     // NInfer tensors vary dim 0 fastest, so the slot -- the last dimension of both state shapes --
@@ -570,6 +581,10 @@ private:
     std::mutex execution_mutex_;
 
     EngineOptions options_;
+    // Workspace arena size both shards are built with, resolved in build_shard once the shard model
+    // is known. The scoring route keeps the per-column logits tile ([vocab, tile] BF16) alive across
+    // a chunk forward, which the generation budget does not cover, so its arenas are larger.
+    std::size_t workspace_bytes_ = 0;
     std::unique_ptr<models::qwen3_5::Frontend> frontend_;
     Shard shard_a_;
     Shard shard_b_;

@@ -1,0 +1,119 @@
+{
+  "artifact": {
+    "architecture": "Qwen3_5ForCausalLM",
+    "formats": [
+      "bf16",
+      "fp32",
+      "gguf_iq1_m",
+      "gguf_iq2_s",
+      "gguf_iq2_xs",
+      "gguf_iq2_xxs",
+      "gguf_iq3_s",
+      "gguf_iq3_xxs",
+      "gguf_iq4_xs",
+      "gguf_q2_k",
+      "gguf_q4_k",
+      "int32"
+    ],
+    "name": "qwen3.8-27b",
+    "path": "D:\\LLM\\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer",
+    "prefill_signature": "ca46744e16b78d881be4e4a8f19687699facde0605895aa45c0b147b9f250f0b"
+  },
+  "corpus": {
+    "id": "custom-20260927-0000_tiny.txt",
+    "mode": "custom",
+    "source": "D:\\Documents\\workbench\\ninfer\\_temp\\20260927-0000_tiny.txt",
+    "stream_count": 1
+  },
+  "domains": [
+    {
+      "domain": "custom",
+      "mean_nll": 2.22695606286249,
+      "perplexity": 9.271600912270827,
+      "scored_tokens": 871,
+      "total_nll": 1939.6787307532286
+    }
+  ],
+  "execution": {
+    "context_tokens": 512,
+    "device": 0,
+    "kv_dtype": "bf16",
+    "prefill_chunk_tokens": 1024,
+    "purpose": "causal_scoring",
+    "score_tile_tokens": 1024,
+    "stride_tokens": 256
+  },
+  "metric": {
+    "log_base": "natural",
+    "name": "fixed-window truncated-context causal perplexity"
+  },
+  "overall": {
+    "mean_nll": 2.22695606286249,
+    "perplexity": 9.271600912270827,
+    "scored_tokens": 871,
+    "total_nll": 1939.6787307532286
+  },
+  "schema_version": 2,
+  "streams": [
+    {
+      "domain": "custom",
+      "id": "20260927-0000_tiny.txt",
+      "input_tokens": 872,
+      "mean_nll": 2.22695606286249,
+      "path": "D:\\Documents\\workbench\\ninfer\\_temp\\20260927-0000_tiny.txt",
+      "perplexity": 9.271600912270827,
+      "scored_tokens": 871,
+      "seconds": 2.4170207,
+      "total_nll": 1939.6787307532286,
+      "unscored_tokens": 1,
+      "windows": [
+        {
+          "first_target": 1,
+          "index": 0,
+          "input_begin": 0,
+          "input_end": 512,
+          "mean_nll": 2.2447256018066013,
+          "perplexity": 9.437825478859287,
+          "scored_tokens": 511,
+          "seconds": 1.5019652,
+          "target_begin": 1,
+          "target_end": 512,
+          "total_nll": 1147.0547825231733
+        },
+        {
+          "first_target": 256,
+          "index": 1,
+          "input_begin": 256,
+          "input_end": 768,
+          "mean_nll": 1.847231611651054,
+          "perplexity": 6.342237420606282,
+          "scored_tokens": 256,
+          "seconds": 0.4625349,
+          "target_begin": 512,
+          "target_end": 768,
+          "total_nll": 472.89129258266985
+        },
+        {
+          "first_target": 408,
+          "index": 2,
+          "input_begin": 360,
+          "input_end": 872,
+          "mean_nll": 3.0743524581479367,
+          "perplexity": 21.635867244913413,
+          "scored_tokens": 104,
+          "seconds": 0.4525127,
+          "target_begin": 768,
+          "target_end": 872,
+          "total_nll": 319.7326556473854
+        }
+      ]
+    }
+  ],
+  "timing": {
+    "load_seconds": 6.4735305,
+    "read_and_tokenize_seconds": 0.0015161,
+    "score_seconds": 2.4171153,
+    "scored_tokens_per_second": 360.34689780830894,
+    "total_seconds": 8.9800103
+  }
+}
