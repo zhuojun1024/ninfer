@@ -640,6 +640,17 @@ private:
                                                      std::int32_t lane  = -1);
     // Launches one captured window on both devices, leaving shard A's device current.
     void launch_window_graph(WindowGraph& graph);
+    // Instantiates both replicas of a freshly captured window and uploads them on their own streams
+    // while the devices are idle. The upload must not be left to the first launch: cudaGraphLaunch
+    // uploads a graph it has never launched before, that upload needs the target device to drain, and
+    // the graph it just submitted is running on that same device. A window whose replay waits on its
+    // peer therefore blocks the host inside the peer's own launch until the transport gives the round
+    // up, which fails the request on both lanes even though neither device is at fault. Measured on
+    // the batched verify window: the first launch blocked for the full all-reduce bound (10.003 s
+    // against the 10 s bound, 60.006 s against a 60 s bound) while the other replica's stream started
+    // only afterwards, whereas an upload on idle devices costs 2-5 ms and every later launch is
+    // enqueue-only (308 launches, <= 1 ms each).
+    void install_window_graph(WindowGraph& graph);
     void capture_verify_graph(WindowGraph& graph, const std::int32_t* ids,
                               const std::int32_t* positions, Tensor& logits_columns,
                               Tensor& hidden_columns,

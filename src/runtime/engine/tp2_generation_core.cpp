@@ -1431,6 +1431,27 @@ void TP2GenerationCore::launch_window_graph(WindowGraph& graph) {
     shard_a_.device.bind_to_current_thread();
 }
 
+// Instantiates and uploads both replicas of a freshly captured window. See the header for why the
+// upload cannot be left to the first launch.
+void TP2GenerationCore::install_window_graph(WindowGraph& graph) {
+    shard_a_.device.bind_to_current_thread();
+    graph.executable[0].instantiate(graph.definition[0]);
+    shard_b_.device.bind_to_current_thread();
+    graph.executable[1].instantiate(graph.definition[1]);
+    shard_a_.device.bind_to_current_thread();
+    graph.executable[0].upload(shard_a_.device.stream);
+    shard_b_.device.bind_to_current_thread();
+    graph.executable[1].upload(shard_b_.device.stream);
+    // The uploads are asynchronous on their own streams, so drain them here, while the devices are
+    // still idle: no later launch may be the one that waits for an upload.
+    shard_a_.device.bind_to_current_thread();
+    shard_a_.device.synchronize();
+    shard_b_.device.bind_to_current_thread();
+    shard_b_.device.synchronize();
+    shard_a_.device.bind_to_current_thread();
+    graph.captured = true;
+}
+
 void TP2GenerationCore::capture_verify_graph(WindowGraph& graph, const std::int32_t* ids,
                                              const std::int32_t* positions, Tensor& logits_columns,
                                              Tensor& hidden_columns,
@@ -1468,12 +1489,7 @@ void TP2GenerationCore::capture_verify_graph(WindowGraph& graph, const std::int3
     pair_.end_capture();
     graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
     graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
-    shard_a.device.bind_to_current_thread();
-    graph.executable[0].instantiate(graph.definition[0]);
-    shard_b.device.bind_to_current_thread();
-    graph.executable[1].instantiate(graph.definition[1]);
-    shard_a.device.bind_to_current_thread();
-    graph.captured = true;
+    install_window_graph(graph);
 }
 
 void TP2GenerationCore::capture_verify_batch_graph(
@@ -1515,12 +1531,7 @@ void TP2GenerationCore::capture_verify_batch_graph(
     pair_.end_capture();
     graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
     graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
-    shard_a.device.bind_to_current_thread();
-    graph.executable[0].instantiate(graph.definition[0]);
-    shard_b.device.bind_to_current_thread();
-    graph.executable[1].instantiate(graph.definition[1]);
-    shard_a.device.bind_to_current_thread();
-    graph.captured = true;
+    install_window_graph(graph);
 }
 
 void TP2GenerationCore::run_verify_window(const std::int32_t* ids, std::int32_t first_position,
@@ -1721,12 +1732,7 @@ void TP2GenerationCore::capture_decode_graph(WindowGraph& graph, const std::int3
     pair_.end_capture();
     graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
     graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
-    shard_a.device.bind_to_current_thread();
-    graph.executable[0].instantiate(graph.definition[0]);
-    shard_b.device.bind_to_current_thread();
-    graph.executable[1].instantiate(graph.definition[1]);
-    shard_a.device.bind_to_current_thread();
-    graph.captured = true;
+    install_window_graph(graph);
 }
 
 Tensor TP2GenerationCore::run_plain_decode_step(std::int32_t token, std::uint32_t position) {
@@ -1816,12 +1822,7 @@ void TP2GenerationCore::capture_decode_batch_graph(WindowGraph& graph, const std
     pair_.end_capture();
     graph.arena_bytes[0] = shard_a.workspace->used() - graph.arena_begin[0];
     graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
-    shard_a.device.bind_to_current_thread();
-    graph.executable[0].instantiate(graph.definition[0]);
-    shard_b.device.bind_to_current_thread();
-    graph.executable[1].instantiate(graph.definition[1]);
-    shard_a.device.bind_to_current_thread();
-    graph.captured = true;
+    install_window_graph(graph);
 }
 
 void TP2GenerationCore::run_plain_decode_step_batch(
@@ -1953,12 +1954,7 @@ void TP2GenerationCore::capture_mtp_chain_graph(WindowGraph& graph, Tensor& mtp_
     pair_.end_capture();
     graph.arena_bytes[0] = ws.used() - graph.arena_begin[0];
     graph.arena_bytes[1] = shard_b.workspace->used() - graph.arena_begin[1];
-    shard_a.device.bind_to_current_thread();
-    graph.executable[0].instantiate(graph.definition[0]);
-    shard_b.device.bind_to_current_thread();
-    graph.executable[1].instantiate(graph.definition[1]);
-    shard_a.device.bind_to_current_thread();
-    graph.captured = true;
+    install_window_graph(graph);
 }
 
 std::vector<TokenId> TP2GenerationCore::mtp_propose_window(Shard& shard, Tensor& mtp_input,

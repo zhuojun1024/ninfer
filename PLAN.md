@@ -517,3 +517,30 @@ TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，
 
 **顺带**：`src/core/arena.cu` 的容量不足分支现在打印被拒尺寸、偏移、容量与当前/峰值用量（原先只有裸 `throw std::bad_alloc()`）；这次定位完全依赖该信息。
 
+### 4.13 TP-2 多 lane 窗口图首放：隐式上传阻塞宿主导致集合超时（已修复）
+
+**现象**：`C:\ninfer\serve-win.log` 两路并发时 `[tp2-lane] batch of 2 failed: TP-2 allreduce stalled at rendezvous id 12884901888: the request was failed and the reusable context was discarded` ⇒ 同一毫秒两条 `request_error`、两路 HTTP 503。§4.12 修掉视觉 workspace 之后，这是同一份日志里的第二个独立缺陷。
+
+**范围定位**：单路（batch=1）从不触发，双路（batch=2）必现；`NINFER_TP2_VERIFY_BATCH_GRAPH=0`（批量 verify 改走 eager）后完全消失，而 `NINFER_TP2_DECODE_BATCH_GRAPH=0` 无效 ⇒ 肇事者是多 lane 的 **verify batch 捕获图**（通道 3 = 首个 batch=2 窗口），与 decode batch 图无关。
+
+**定位链**（每步都用临时插桩取得，插桩已在提交前全部移除）：
+1. 节点普查（`cudaGraphGetNodes` + `cudaGraphNodeGetType` + `cudaGraphKernelNodeGetParams`）：batch=2 的两侧图各含**全部 178 个** `ar_exchange` 核（`def0 nodes=2731 kerns=2191 ar=178 | def1 nodes=2725 kerns=2186 ar=178`）⇒ 不是「对端图缺集合核」。
+2. 内核入口/参与计数（探针写在每侧 64 B 停滞缓存行的 `+32/+40/+48/+56`）：A 侧入口 7224 / 参与 7109、B 侧入口 7114 / 参与 7108 ⇒ B 确实进入过通道 3 的 #0..#2，但三次都在入口放弃；入口放弃的唯一条件是 `*stall_mine != 0 || *stall_peer != 0`，而 B 侧 `flagsB=0` ⇒ B 的放弃只可能来自 A 的标志，而该标志只在 A 在 #0 自旋满 `ar_timeout_ns_ = 10 s`（`src/core/tp/device_pair.cu:941`）之后置位 ⇒ **B 的流比 A 的流晚 ≥10 s 才开始执行同一张图**。
+3. 宿主时间戳（`[ar-launch]` 在 `launch_window_graph` 每步打毫秒、`[ar-mark]` 用映射 pinned 缓冲在两侧图头各放一个标记核）：`[ar-launch] host_ms=217113215 ch=3 bindA=0 launchA=10003 bindB=0 launchB=36 bindEnd=0 total=10039`（通道 2 的历次发射都是 0–1 ms）；A 侧图头标记在该次 launch 调用后 **1 ms** 触发（A 已经在跑），B 侧图头标记晚 **+10016 ms**。
+4. 把 `NINFER_TP2_AR_TIMEOUT_MS` 改成 60000 复现：`launchA=60006 ms`、B 侧标记 +60002 ms、仍然 503 ⇒ **阻塞时长精确跟随集合超时上限**，说明阻塞的不是「上传慢」，而是上传/首放与该图自己的集合等待互相咬住。
+
+**根因**：`cudaGraphLaunch` 对**从未上传过**的 executable 会先做隐式上传，而上传需要目标设备排空。`launch_window_graph`（`src/runtime/engine/tp2_generation_core.cpp:1419-1432`）先发射 shard A 再发射 shard B，两次发射之间没有任何同步（注释明确「Nothing here may synchronize the host」）。A 的图一旦提交就在设备上跑起来并停在通道 3 的第一个集合上等对端；宿主却卡在 `graph.executable[0].launch(...)` 里等这次隐式上传完成，而上传要等设备排空——设备正被那张图占着，于是只能等集合超时。对端 `executable[1].launch(...)` 直到 10 s 后才发出 ⇒ B 的流晚 10 s ⇒ A 超时置位、B 入口放弃、`abort_if_ar_stalled()` 抛错。**这不是并发正确性问题，也不是设备问题；单 lane 的首放同样会阻塞（只是那张图不依赖对端，阻塞时长等于它自己的执行时间）。**
+
+**修复**：新增 `TP2GenerationCore::install_window_graph(WindowGraph&)`（声明在 `src/runtime/engine/tp2_generation_core.h`，定义在 `src/runtime/engine/tp2_generation_core.cpp` 的 `capture_verify_graph` 之前），把 5 个捕获函数（`capture_verify_graph`/`capture_verify_batch_graph`/`capture_decode_graph`/`capture_decode_batch_graph`/`capture_mtp_chain_graph`）原本相同的尾部（两侧 `instantiate` + `graph.captured = true`）统一改为：两侧 `instantiate` → 两侧 `executable.upload(stream)` → 两侧 `device.synchronize()` → `graph.captured = true`。上传发生在设备空闲的捕获期，实测 `instantiate` 8–27 ms、`upload_sync` 2–5 ms；此后每次重放都是纯入队。这里采用 `src/models/qwen3_5/program/graphs.cpp:67-75` 的既有单卡惯用法（`upload` + `synchronize`），**不用**同文件 :85-89 的「预热 launch」——TP-2 的预热会真的执行 178 个集合并与对端交互。
+
+**实测**（`_temp/20261008-0134_tp2-badalloc/`，`build-win`，2×RTX 5060 Ti，`--devices 0,1 --max-concurrency 3 --prefill-chunk 1024 --spec dflash2 --vision-item-tokens 8192`）：
+
+- 修复前（带插桩）：`[ar-launch] ch=3 launchA=10003`、两路同时 503、`[ar-watch] stalled ... id=12884901888`。
+- 修复后（带插桩）：`[ar-launch]` 308 条全部 ≤1 ms（含每个通道的首放）、`[ar-mark]` 616 条两侧计数逐条对齐（差 0–2 ms）、`[ar-watch]` 0 行；双路（lane1 文本 + lane2 4 图）两路完成：lane1 `192 events/51 deltas @19.6 s`、lane2 `918/291 @29.4 s`，台账 0 个 `request_error`，`decode 103.4 tok/s`、`prefill 3263 tok/s`（修复前同一用例 5.4 tok/s）。
+- 修复后（干净构建，`run_regression.ps1` 三组，全程 `NINFER_TP2_*` 未设）：
+  - 单路 + 4 图：`stream-end 763 events/240 deltas @25.7 s`，`prefill 16,315 token / TTFT 16.7 s / decode 8.6 s`，markers 0、`request_error` 0。
+  - 双路 + 4 图（原始复现用例）：lane1 `192/51 @19.5 s`、lane2 `918/291 @29.0 s`；req#2 `prompt 16,315 / TTFT 17.5 s / decode 11.1 s`，markers 0、`request_error` 0。
+  - 双路纯文本：lane1 `192/51 @14.8 s`、lane2 `325/94 @17.0 s`；req#2 `prompt 12,211 / TTFT 12.4 s`，markers 0、`request_error` 0。
+
+**顺带**：§3.6 记录的「低频传输 stall」之所以在本用例里必现，是因为批量 verify 窗口的首放必然走隐式上传；修复后这类首放延迟也一并消失。诊断期间新增的打印（`[ar-cap]/[ar-arm]/[ar-launch]/[ar-mark]/[ar-watch]` 与内核探针）**全部为临时插桩，已在提交前移除**，最终提交只含 `install_window_graph` 与其 5 个调用点。
+
