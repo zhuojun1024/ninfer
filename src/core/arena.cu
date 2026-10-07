@@ -212,7 +212,16 @@ DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
         throw std::overflow_error("arena allocation end offset overflows size_t");
     }
     const std::size_t end = aligned_offset + bytes;
-    if (end > cap_) { throw std::bad_alloc(); }
+    if (end > cap_) {
+        // A failed arena allocation is fatal for the request that asked for it, and the size of the
+        // refused request is what says whether the arena is undersized or something is holding a
+        // watermark it should have given back.
+        std::fprintf(stderr,
+                     "[arena] out of memory: %zu bytes at offset %zu does not fit %zu bytes "
+                     "(used %zu, peak %zu)\n",
+                     bytes, aligned_offset, cap_, off_, peak_);
+        throw std::bad_alloc();
+    }
 
     auto* ptr = static_cast<unsigned char*>(base_) + aligned_offset;
     off_      = end;

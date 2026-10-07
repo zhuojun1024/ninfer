@@ -498,3 +498,22 @@ TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，
 
 **未做**：`release_lane_kv` 保持原样。catalog 已覆盖真实场景；保留 lane lineage 只在 `session_capacity_ == 0` 时有意义，而那时页已释放、本就无法复用。
 
+### 4.12 TP-2 视觉 prefill 撑爆 192 MiB text workspace（已修复）
+
+**现象**：`C:\ninfer\serve-win.log` 两路并发时 `[tp2-lane] batch of 2 failed: text/layers/4 prefill columns=1024: bad allocation` ⇒ HTTP 5xx。
+
+**定位**：与并发无关。单路 + 4 张图在干净服务器上必现，且偏移逐字节相同（`[arena] out of memory: 5916672 bytes at offset 195712256 does not fit 201326592 bytes (used 195712256, peak 195712256)`）；纯文本双路只是随后命中 §3.6 的传输 stall，两者是不同缺陷。
+
+**根因**：`src/models/qwen3_5/execution/text.cpp` 的 `forward_tp2_prefill` 把每 shard 的 handoff staging（`hidden × count × 2 = 5120 × 1024 × 2 = 10.0 MiB`，peer 侧另有 `source`）从 `ops::scatter` 一直保留到本次 forward 结束，于是它的 10.0 MiB 叠加在层峰值之上。纯文本 1024 宽 chunk 的层峰值实测 **182.3 MiB**（arena 容量 `src/runtime/engine/tp2_generation_core.cpp:197` `kWorkspaceBytes = 192ULL << 20`），加 10.0 MiB ⇒ 192.3 MiB，第一个 100% 视觉 token 的 1024 宽 chunk（实测 `t0=13221 vision_tokens=1024`）在 layer 4（GDN/linear_attention，`text.cpp:2015-2019` 的 `mixer_layer` 包装）处溢出。`staging = 5120 × 1024 × 2` 正是被拒的 5,916,672 B 量级，偏移 195712256 落在层循环内。
+
+**修复**：handoff 在 scatter 之后即死，故把两个 arena 的 `scope()` 下移到视觉块开头（`text.cpp:2633-2634` 的 `handoff_scope_a` / `handoff_scope_b`），使 `staging`/`source`/`indices`/`indices_peer` 在层循环之前回退。安全性：`ar_exchange<true>` 只读写本设备自己的 buffer，跨设备交换走 `DevicePair` 的 mapped pinned host staging，从不写对端 arena（`src/core/tp/device_pair.cu:1224-1232,1267-1301`；host-staging 回退路径还会 `cudaStreamSynchronize` 两条流，`:1313-1336`），而消费它的 `ops::scatter` 与产出它的 kernel 在同一条流上。回退后媒体块峰值回到 182.3 MiB（余量 9.7 MiB）。
+
+**实测**（`_temp/20261008-0134_tp2-badalloc/`，`build-win`，2×RTX 5060 Ti，`--devices 0,1 --max-concurrency 3 --prefill-chunk 1024 --vision-item-tokens 8192`）：
+
+- 单路 + 4 图（16,315 token 提示词）：修复前 `bad allocation`，修复后 `done | prefill 1.01k tok/s (16,315 tok) | decode 91.4 tok/s`。
+- 双路（lane1 文本 + lane2 4 图）：prefill 无溢出，`t0=5035 len=1024 vision_tokens=1024` 的纯视觉 chunk 峰值 182.3 MiB；随后仍命中 §3.6 的 stall（同一批两条一起 503），属独立缺陷。
+- 双路纯文本：两路均 `done`（decode 65.0 / 49.8 tok/s）。
+- 三组用例全程 `[arena] out of memory` 计数 0，`[wsdiag]` 里 lane0 的峰值集合最大值为 182.3 MiB（修复前同一 chunk 为 195.7 MiB）。
+
+**顺带**：`src/core/arena.cu` 的容量不足分支现在打印被拒尺寸、偏移、容量与当前/峰值用量（原先只有裸 `throw std::bad_alloc()`）；这次定位完全依赖该信息。
+

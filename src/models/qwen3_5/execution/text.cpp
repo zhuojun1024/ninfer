@@ -2620,6 +2620,18 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
             // pair copies this chunk's contiguous column range into both arenas with one in-place
             // all-reduce over a zeroed text-shard buffer. That is exact (a sum with zero), keeps the
             // resident cost bounded by the chunk rather than by the item, and needs no second tower.
+            //
+            // The handoff is dead once the scatter below has consumed it, so it is released here
+            // rather than held to the end of the forward. Each shard's buffer is touched by that
+            // shard's stream alone - ar_exchange reduces through the pair's mapped host staging,
+            // never through the peer's arena - and the scatter that reads it is ordered after the
+            // collective on the same stream, so rewinding both arenas before the layer loop cannot
+            // race the layers that reuse the bytes. Holding it instead adds a full chunk of visual
+            // rows on top of the layer peak, which is what overruns the fixed workspace when a
+            // chunk is built entirely of vision tokens: 182.3 MiB of layers (the measured all-text
+            // peak at a 1024-column chunk) plus this chunk's 10.0 MiB of staging against 192 MiB.
+            auto handoff_scope_a = work_.scope();
+            auto handoff_scope_b = peer.work_.scope();
             ctx_.bind_to_current_thread();
             Tensor staging = work_.alloc(DType::BF16, {hidden, count});
             CUDA_CHECK(cudaMemsetAsync(staging.data, 0, bytes, ctx_.stream));
