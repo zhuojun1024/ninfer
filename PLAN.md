@@ -543,4 +543,28 @@ TP-2 把 64 层切两卡 ⇒ 需跨卡 handoff（两卡 residual 逐位相同，
   - 双路纯文本：lane1 `192/51 @14.8 s`、lane2 `325/94 @17.0 s`；req#2 `prompt 12,211 / TTFT 12.4 s`，markers 0、`request_error` 0。
 
 **顺带**：§3.6 记录的「低频传输 stall」之所以在本用例里必现，是因为批量 verify 窗口的首放必然走隐式上传；修复后这类首放延迟也一并消失。诊断期间新增的打印（`[ar-cap]/[ar-arm]/[ar-launch]/[ar-mark]/[ar-watch]` 与内核探针）**全部为临时插桩，已在提交前移除**，最终提交只含 `install_window_graph` 与其 5 个调用点。
+### 4.14 TP-2 客户端断开连接：传输异常退役可复用前缀，下一次同会话全量 prefill（已修复）
+
+**现象**：`C:\ninfer\serve-win.log` 的 req#93 是 `cache 0 (0.0%)`、`prefill 1.11k tok/s (126,001 tok)`、TTFT 1m59.4s，而会话目录里有一条与它共享 124,759 token 的记录却不可召回。
+
+**范围定位**：同一份日志里 6 条业务级 0 命中只有 req#93 是真缺陷（req#2 是进程内首个真实会话、目录为空；req#9 与候选只共享极短前缀；其余是 177/400 token 的小请求）。分水岭是「客户端在引擎 walk 内点停止」：req#92（`cancelled during transport`，HTTP 499）之后就是 req#93，而同样点停止、但引擎已正常返回的 req#64/#80（`response failed during transport`）没有毁掉缓存。
+
+**定位链**（时间线来自 DSH 会话记录 `session-f8ad33fd-1280-4192-88fb-f892b6e332a7` 逐 zstd 帧解压后与 serve 日志逐毫秒对齐）：
+1. `turn/end` 四条全部是用户中止；turn3 的最后一个 step 结束于 21:44:51.165 == `req#92 cancelled` 同一毫秒，turn4 step1 结束于 21:47:20.900 == `req#93 done`（`cache 0`、`prefill 126,001 tok`）。
+2. 文本判别器：`src/serve/operational_log.cpp:311-320` 的 `render_request_failure` 在 `RequestFailureClass::ClientDisconnected` 时打 `" cancelled during "`，`render_response_failure`（同文件 :322-327）打 `"response failed during "` ⇒ req#92 的异常是从引擎 walk 内抛出的，req#64/#80 走的是响应渲染路径（引擎已返回）。
+3. req#93 的召回扫描：5 条目录条目全部 `kv_end=0 resident=0`，`switch active_shared=0 resident_depth=0 stored=1 entries=5` ⇒ 所有条目 `host_kv_end == 0`，召回 ceiling 恒为 0（`src/runtime/engine/tp2_generation_core.cpp:6209-6213`），与 shared 多大无关。
+4. 索引位移：req#92 扫描 6 条（打印 5 + 跳过 active 的 125054），淘汰 112533 后 125054 前移到 index 4，新建条目占 index 5；req#93 扫描 5 条、125054 仍在 index 4 ⇒ 新建的条目被删了，而 125054 存活且 `device_lane=-1`、`host_kv_end=0`。
+
+**根因**：req#92 的 decode 里 `preview_terminal(Cancelled)+publish_preview(false)` 往已断开的连接写，`ClientDisconnected`（`src/serve/http_transport.h:22`）从 `src/serve/openai_responses_http.cpp:424-427` 抛出后穿出 `execute_walk`，命中 `execute` 的 catch-all ⇒ `session_invalidate_active` → `session_drop` 删掉刚发布的条目。而那次 walk 的召回走的是 `resident_continues` 的 `continue` 分支（`tp2_generation_core.cpp:6277-6290`，不写 host slab），真 resident 125054 的 `host_kv_end` 从未写过 ⇒ 新条目被删之后，125054 留在目录里但召回 ceiling 为 0、永久不可达，req#93 只能全量 prefill。
+
+**修复**：`RetentionState` 新增 `terminal_published`（`src/runtime/engine/tp2_generation_core.h:1015`）。`execute` 每轮先清位（:6408-6409），catch-all 只在「walk 未发布终态」时才 `session_invalidate_active`（:6411-6414）——抛异常前已发布终态的 walk 已经把设备停下的 frontier 写进目录，它代价是这次请求、不是前缀。`execute_walk` 不再让传输异常立刻解栈：`sink->start`/`sink->publish` 的第一个异常被记下（:7059-7067、:7155-7161），之后不再往 sink 写、并按取消停住 decode（:7626、:8143），照常走终态发布（环检查点 valid 化 + 条目 frontier），在两个出口置位 `terminal_published` 后重抛（:7343、:8212）。walk 未发布就抛异常时仍是原来的全量失效，安全性不变。
+
+**实测**（新增 `check_transport_failure_keeps_prefix`，`tests/models/qwen3_5/test_tp2_sessions.cpp:875`，`DisconnectingSink` 在第二个 delta 抛异常，断言下一轮 `reused_prompt_tokens` == 失败 walk 发布的 prompt end（408），修复前为 0）：
+- 修复前（`git stash` 两个 src 文件后重建）：dflash2 `FAIL: reused 0 prompt tokens, expected ... at 408`（`_temp/20261009-0025_baseline_dflash2.log`）、plain 同（`_temp/20261008-2359_prefixcheck_plain.log`）。
+- 修复后（文档基线件 `D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer`）：dflash2 `passed: reused 408`（`_temp/20261009-0145_final_swift15_dflash2.log`）、mtp `passed: reused 408`（`_temp/20261009-0205_final_swift15_mtp.log`）；两条路线各只剩一个已记录的既有失败，token 逐字相同（dflash2 = `docs/tp2-dual-5060ti-worklog.md:6549-6554` 记录的 `a recalled conversation`；mtp = `docs/PLAN-tp2-concurrency.md:660` 记录的 `a conversation behind a shared system prompt`）。
+- 修复后（plain + q4 件）：该用例 `reused 408` 且与 from-scratch oracle 逐 token 一致（`_temp/20261008-2335_tp2_sessions_plain.log`）。
+
+**附注**：用 `D:/LLM/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3-dflash2-q4.ninfer` 跑时 `run_scenario` 的「浅层稳定块」断言失败（reused 0，期望 8）；把全部改动 stash 回 HEAD 后同样失败（`_temp/20261009-0035_head_dflash2.log`），与本次修复无关，且该件不是这套测试的文档基线件。
+
+**顺带**：`tools/win_port/build.ps1` 的 `Repair-MsvcDepsPrefix` 修复了 `build-win/CMakeFiles/rules.ninja` 里 `msvc_deps_prefix` 的乱码（§3 记录的既有构建缺陷），此后改头文件能正常触发重编。
 

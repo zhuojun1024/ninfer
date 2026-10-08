@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <set>
 #include <span>
@@ -6399,12 +6400,17 @@ void TP2GenerationCore::session_publish(
 GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
                                             const CancellationView& cancellation) {
     // The live-frontier shortcut is only sound while the device GDN state sits exactly where the
-    // catalog says it does. A walk that throws leaves it somewhere the catalog cannot name, so the
-    // guard retires both the claim and the resident entry before the next request reads them.
+    // catalog says it does. A walk that throws before it publishes leaves the state somewhere the
+    // catalog cannot name, so the guard retires both the claim and the resident entry before the next
+    // request reads them. A walk that already published its terminal frontier named exactly where the
+    // device stopped, so that throw cost the request, not the prefix: the catalog keeps the entry and
+    // the next prompt can still recall it.
+    const std::uint32_t lane = static_cast<std::uint32_t>(active_lane_);
+    retention(lane).terminal_published = false;
     try {
         return execute_walk(request, sink, cancellation);
     } catch (...) {
-        session_invalidate_active(static_cast<std::uint32_t>(active_lane_));
+        if (!retention(lane).terminal_published) { session_invalidate_active(lane); }
         throw;
     }
 }
@@ -7045,8 +7051,20 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         state_done = Clock::now();
     }
 
+    // The sink is the client's connection, and a connection can die mid-answer. That must cost the
+    // request, not the conversation: the states this walk still has to publish describe the device
+    // exactly where it will stop, so record the first transport failure, write nothing more to the
+    // sink, and rethrow once the terminal state is on the books (execute reads terminal_published to
+    // tell a failed request apart from a prefix it can no longer name).
+    bool sink_failed = false;
+    std::exception_ptr transport_error;
     if (streaming) {
-        sink->start(GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
+        try {
+            sink->start(GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
+        } catch (...) {
+            sink_failed     = true;
+            transport_error = std::current_exception();
+        }
     }
     result.reused_prompt_tokens   = reuse;
     result.prefix_reuse_path =
@@ -7126,14 +7144,28 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     auto& ctx_a = *shard_a_.context;
     auto& ctx_b = *shard_b_.context;
 
+    // Accumulates the answer whether or not the sink still accepts it: the walk's own accounting has
+    // to stay complete for the terminal publication below.
     auto publish_preview = [&](bool terminal) {
         if (terminal) { (void)request.output.preview_terminal(request.budget.limit_reason()); }
         auto published = request.output.commit_preview();
         for (auto& delta : published) {
             (delta.channel == OutputChannel::Reasoning ? result.reasoning : result.content) +=
                 delta.text;
-            if (streaming) { sink->publish(delta); }
+            if (streaming && !sink_failed) {
+                try {
+                    sink->publish(delta);
+                } catch (...) {
+                    sink_failed     = true;
+                    transport_error = std::current_exception();
+                }
+            }
         }
+    };
+    // Called at every exit of the walk, after the terminal publication and after terminal_published
+    // is set: the caller sees the transport failure while the catalog keeps what the walk published.
+    auto rethrow_transport_failure = [&]() {
+        if (transport_error != nullptr) { std::rethrow_exception(transport_error); }
     };
 
     // The round scratch is the whole pool, because the fold restores it wholesale on the shard's
@@ -7305,6 +7337,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             // two are no longer the same number.
             result.timings.prompt_wall_seconds =
                 std::chrono::duration<double>(Clock::now() - start).count();
+            // The partial prefill above named the position the device stopped at - its snapshot, its
+            // prompt-end checkpoint and the entry's frontier all say t0 - so this walk published a
+            // nameable state too, and a dead transport must not retire it.
+            lane_state.terminal_published = true;
+            rethrow_transport_failure();
             return result;
         }
         std::uint32_t length = std::min(prefill_chunk, prompt_tokens - t0);
@@ -7586,6 +7623,13 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     };
     bool finished = first_token_finish != FinishReason::None;
     if (finished) { result.finish_reason = first_token_finish; }
+    if (sink_failed) {
+        // The first token's delta already met a dead connection. Decoding on would only produce text
+        // no client can receive, so stop the way a cancellation does and let the terminal publication
+        // below name the frontier the device actually reached.
+        result.finish_reason = FinishReason::Cancelled;
+        finished             = true;
+    }
     while (!finished) {
         if (cancellation.requested()) {
             (void)request.output.preview_terminal(FinishReason::Cancelled);
@@ -8096,6 +8140,13 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         }
         finished = decision.finished();
         if (finished) { result.finish_reason = decision.finish_reason; }
+        if (sink_failed && !finished) {
+            // This round's committed columns are already folded into the device state above, so
+            // stopping here leaves that state exactly at the frontier the terminal publication below
+            // names. Decoding on would only build output for a connection that is already gone.
+            result.finish_reason = FinishReason::Cancelled;
+            finished             = true;
+        }
         timing.committed += decision.accepted_tokens;
         ++timing.rounds;
         timing.round_ms +=
@@ -8155,6 +8206,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             }
         }
     }
+    // The catalog now names the frontier the device stopped at, the ring holds this walk's own
+    // checkpoints and the live shortcut is honest, so record that and hand a recorded transport
+    // failure back to the caller: the request failed, the reusable prefix did not.
+    lane_state.terminal_published = true;
+    rethrow_transport_failure();
     result.generated_token_ids = std::move(request.generated);
     result.tool_calls          = request.output.take_tool_calls();
     result.tool_call_parse     = request.output.tool_call_parse_diagnostics();

@@ -18,7 +18,10 @@
 // state frozen at its own prompt end. A last one cancels a prompt mid-prefill and checks that the
 // retry continues from the prefix the cancelled walk published, and the one before it forces a
 // recall onto a shallow shared-prefix image and checks that the walk freezes where the stable block
-// really ends on that conversation's slabs, so the next conversation of the family comes back there.
+// really ends on that conversation's slabs, so the next conversation of the family comes back
+// there. One more drops the client's connection mid-answer and checks that the failure costs the
+// request, not the conversation: the turn after it still starts at the prompt end the failed walk
+// published instead of prefilling the whole history again.
 //
 // The from-scratch comparison is the strong claim: a reuse that changes the answer must not hide
 // behind a matching token count. Every recall that keeps the oracle's draft pattern - the switch
@@ -842,6 +845,92 @@ int check_unaligned_dialogue(const char* artifact, int device_a, int device_b, R
     return 0;
 }
 
+// A client connection that dies: publish throws on the delta it was told to drop. The walk treats any
+// sink failure as a transport failure, so the test uses a plain runtime_error rather than the serve
+// layer's own ClientDisconnected.
+class DisconnectingSink final : public ninfer::OutputSink {
+public:
+    explicit DisconnectingSink(int allowed_deltas) : allowed_deltas_(allowed_deltas) {}
+
+    void start(ninfer::GenerationStart) override {}
+    void progress(ninfer::PromptProgress) override {}
+    void timing(ninfer::GenerationTimingObservation) override {}
+    void publish(ninfer::OutputDelta delta) override {
+        (void)delta;
+        if (++published_ > allowed_deltas_) { throw std::runtime_error("client disconnected"); }
+    }
+
+private:
+    int allowed_deltas_ = 0;
+    int published_      = 0;
+};
+
+// The transport dies mid-answer. The sink is the client's connection, and a write that throws has to
+// cost the request, not the conversation: the exception used to unwind through the request guard,
+// which retired the resident entry and the lane's lineage, so the next request of the same
+// conversation prefilled its whole history again. That is the served incident - a 126k-token prompt
+// after a client disconnect cancelled the turn before it, 1m59s of time to first token. The guard now
+// reads whether the throwing walk had already published its terminal frontier, which this scenario
+// forces by dropping the connection on the second delta the walk delivers.
+int check_transport_failure_keeps_prefix(const char* artifact, int device_a, int device_b,
+                                         Route route) {
+    const std::string label = std::string("dropped transport (") + route_name(route) + ")";
+    // The failing walk has to deliver a delta it can lose and then keep going, so it asks for more
+    // than one token.
+    constexpr std::uint32_t kDroppedBudget = 16;
+    std::vector<TokenId> turn;
+    std::vector<TokenId> retry;
+    std::uint32_t prompt_end = 0;
+    ninfer::GenerationResult got;
+    {
+        ninfer::Engine engine(engine_options(artifact, device_a, device_b, true, route));
+        const std::vector<TokenId> opening = make_prompt(41000, 384);
+        const ninfer::GenerationResult first = run(engine, opening);
+        if (first.generated_token_ids.empty()) {
+            return fail(label, "the opening turn generated nothing");
+        }
+        turn = opening;
+        append(turn, first.generated_token_ids);
+        append(turn, make_prompt(51000, 16));
+        prompt_end = static_cast<std::uint32_t>(turn.size());
+
+        ninfer::RequestOptions dropped            = greedy_request();
+        dropped.execution.requested_output_tokens = kDroppedBudget;
+        DisconnectingSink sink(1);
+        bool reported = false;
+        try {
+            (void)engine.generate(engine.prepare_tokens(turn), dropped, &sink);
+        } catch (const std::exception&) {
+            reported = true;
+        }
+        if (!reported) {
+            return fail(label, "a walk whose sink threw reported no transport failure");
+        }
+
+        // The client's next request is the same conversation one turn further on, so the deepest
+        // boundary it shares with what the failed walk published is that walk's prompt end. Before the
+        // guard kept it, the scan found nothing here and the whole history was prefilled from zero.
+        retry = turn;
+        append(retry, make_prompt(52000, 16));
+        got = run_budget(engine, retry, kDroppedBudget);
+    }
+    // What this pins is the boundary, not the answer: the recall resumes beside a chunk boundary, so
+    // its suffix walks a different execution shape than a from-scratch prefill of the same prompt and
+    // its near ties resolve their own way - the bounded-recall tolerance the other scenarios document.
+    // The observable the served incident produced is the reuse count, which a retired entry reports as
+    // zero.
+    if (got.reused_prompt_tokens != prompt_end) {
+        return fail(label, "the turn after a dropped transport reused " +
+                               std::to_string(got.reused_prompt_tokens) +
+                               " prompt tokens, expected the prompt end the failed walk published "
+                               "at " + std::to_string(prompt_end));
+    }
+    std::cout << "TP-2 dropped transport (" << label << ") passed: the turn after a dropped transport"
+                 " reused "
+              << got.reused_prompt_tokens << " prompt tokens instead of prefilling the history\n";
+    return 0;
+}
+
 // A client that hands back the answer it was given. The turn after a re-rendered answer has to stand
 // on the prompt the previous turn was built from: a conversation that spends a prompt and then
 // restarts behind it pays again for tokens it already holds, which is the shape every turn of an
@@ -1054,6 +1143,11 @@ int main() {
             }
             if (const int status =
                     check_unaligned_dialogue(artifact, devices.first, devices.second, route);
+                status != 0) {
+                return status;
+            }
+            if (const int status = check_transport_failure_keeps_prefix(
+                    artifact, devices.first, devices.second, route);
                 status != 0) {
                 return status;
             }

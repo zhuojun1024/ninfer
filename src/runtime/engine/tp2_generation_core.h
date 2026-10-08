@@ -1008,6 +1008,11 @@ private:
         // prompt that extends that history can reuse it in place with no state copy at all. Every
         // path that aborts a walk clears it before the catalog can be read again.
         bool live_state_valid = false;
+        // Set once the running walk has published its terminal state: the catalog names the frontier
+        // the device GDN state actually sits at, the ring holds this walk's checkpoints, and the live
+        // shortcut is honest. A walk that throws after this point failed the request, not the prefix,
+        // so the execute guard leaves the catalog alone instead of retiring the resident entry.
+        bool terminal_published = false;
         // The block boundary the last prefill's own prompt named, and the ring id that froze its
         // state. A conversation keeps it across its turns and hands it to its slabs when it is
         // evicted, so the next conversation that opens with the same block is recalled on the
