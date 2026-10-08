@@ -467,3 +467,12 @@ python3 tools/convert/merge_parts.py merge \
 The parts file is a normal v3 artifact: it can be shared, inspected, and re-merged into any
 compatible base. `--components` defaults to `mtp,dflash2,vision`; `--no-verify` skips the
 byte-for-byte check for a faster but unverified write.
+
+When the donor's text component declares a proposal table (`text.proposal`, the reduced
+lm-head that `--lm-head-draft` reads) and the base has none, the proposal sub-tree is
+transplanted in the same step: the `text.proposal` field, the `proposal/*` bindings and their
+objects, and the Uses that reference a proposal parameter. This requires the donor's and the
+base's text config to match, since the proposal head is a reduced view of the same lm-head; a
+mismatch is rejected. A parts file made by `extract` never carries a proposal, so this only
+kicks in when merging with a full donor that has one, and it is what lets a single merge
+produce a `--lm-head-draft` ready artifact.

@@ -11,6 +11,16 @@ Two subcommands:
            mtp/dflash2/vision components, when present, are replaced by the
            donor's; a donor component absent from the base is added.
 
+           When the donor's text component declares a proposal table
+           (text.proposal, the reduced lm-head that --lm-head-draft reads) and
+           the base has none, the proposal sub-tree is transplanted too: the
+           text.proposal field, the proposal/* bindings and their objects, and
+           the Uses that reference a proposal parameter. This requires the
+           donor's and the base's text config to match, since the proposal
+           head is a reduced view of the same lm-head. A parts artifact made by
+           extract never carries a proposal, so this only kicks in when merging
+           with a full donor that has one.
+
 The text side never crosses the merge boundary: components are self-contained
 (no object is shared across components), so the merge is a byte-exact
 transplant with a compact relayout. Object ids that collide between the two
@@ -245,6 +255,31 @@ def cmd_merge(args: argparse.Namespace) -> int:
                 f"parts artifact has none of the requested components {components}; "
                 f"has {sorted(parts.directory.components)}"
             )
+        # The text component's proposal sub-tree: when the donor's text declares a
+        # proposal table and the base has none, transplant it so a single merge can
+        # produce a --lm-head-draft ready artifact. "proposal" is treated as a
+        # pseudo-component so the existing binding/use/object/rename machinery picks
+        # it up; only the text.proposal field must be written separately.
+        donor_proposal = parts.directory.components.get("text", {}).get("proposal")
+        base_proposal = base.directory.components.get("text", {}).get("proposal")
+        transplant_proposal = False
+        if donor_proposal is not None:
+            if base_proposal is None:
+                if parts.directory.components["text"]["config"] != \
+                        base.directory.components["text"]["config"]:
+                    raise ArtifactError(
+                        "donor carries a proposal table but its text config differs "
+                        "from the base's; the proposal head cannot be shared"
+                    )
+                transplant_proposal = True
+            elif base_proposal != donor_proposal:
+                raise ArtifactError(
+                    "base and parts declare different proposal tables; merge one "
+                    "side's text instead"
+                )
+        if transplant_proposal:
+            selected = selected + ["proposal"]
+            print("transplanting donor proposal table (text.proposal + proposal/* objects)")
         dropped = set(selected) & set(base.directory.components)
         dropped_ids = set()
         for component in dropped:
@@ -299,8 +334,13 @@ def cmd_merge(args: argparse.Namespace) -> int:
             if component_of(use["parameter"]) in selected
         ]
         out_components = {"text": base.directory.components["text"]}
+        if transplant_proposal:
+            text = dict(base.directory.components["text"])
+            text["proposal"] = dict(donor_proposal)
+            out_components["text"] = text
         out_components.update(
-            {c: remap_component(parts.directory.components[c], idmap) for c in selected}
+            {c: remap_component(parts.directory.components[c], idmap)
+             for c in selected if c in parts.directory.components}
         )
         out_bindings = {
             name: binding
@@ -319,6 +359,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
                 "base": str(base.path),
                 "parts": str(parts.path),
                 "components": selected,
+                "proposal_transplanted": transplant_proposal,
                 "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
         }
